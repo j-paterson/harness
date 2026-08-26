@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
 import time
 from collections.abc import Sequence
@@ -80,6 +81,7 @@ async def _run_daemon(
     once: bool,
     interval: int,
     dispatch: Dispatch | None = None,
+    shutdown_event: asyncio.Event | None = None,
 ) -> Supervisor:
     supervisor = Supervisor(
         service,
@@ -89,11 +91,26 @@ async def _run_daemon(
     if once:
         await supervisor.run_once()
         return supervisor
+    stop = shutdown_event or asyncio.Event()
+    registered_signals: list[signal.Signals] = []
+    if shutdown_event is None:
+        loop = asyncio.get_running_loop()
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(shutdown_signal, stop.set)
+            except NotImplementedError:
+                continue
+            registered_signals.append(shutdown_signal)
     await supervisor.start()
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
     finally:
+        if shutdown_event is None:
+            loop = asyncio.get_running_loop()
+            for shutdown_signal in registered_signals:
+                loop.remove_signal_handler(shutdown_signal)
         await supervisor.shutdown()
+    return supervisor
 
 
 def _issue_payload(issue: QueuedIssue) -> dict[str, Any]:

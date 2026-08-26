@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
-from hermes_orchestrator.cli import main
+import pytest
+
+from hermes_orchestrator.cli import _run_daemon, main
+from tests.test_supervisor import FakeService
 
 
 @dataclass(frozen=True)
@@ -133,3 +137,26 @@ def test_daemon_once_reconciles_and_samples(
     payload = json.loads(result.stdout)
     assert payload["ticks"] == 1
     assert payload["mode"] == "observe"
+
+
+@pytest.mark.asyncio
+async def test_continuous_daemon_stops_cleanly_when_signaled() -> None:
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        _run_daemon(
+            FakeService(),
+            once=False,
+            interval=60,
+            shutdown_event=stop,
+        )
+    )
+    await asyncio.sleep(0)
+
+    stop.set()
+    supervisor = await task
+
+    assert supervisor.events[-3:] == [
+        "admission.closed",
+        "workers.checkpoint_requested",
+        "supervisor.stopped",
+    ]
