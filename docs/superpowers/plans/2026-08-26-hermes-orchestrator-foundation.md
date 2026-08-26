@@ -442,10 +442,13 @@ Expected: all tests pass, Ruff is clean, and CLI help lists all six commands.
 
 ## Phase exit gate
 
-Do not begin the Claude and Linear phase until:
+Phase 2 implementation may begin in dry-run mode while resource observation
+continues. Do not enable live Claude dispatch, Linear writes, or automated
+resource cleanup until:
 
 - The full test suite passes twice with a supervisor restart between runs.
-- The service records resource samples for one normal workday without modifying an external system.
+- The service records enough representative idle and worker-load samples to
+  calibrate resource thresholds without modifying an external system.
 - Initial green, yellow, and red thresholds are reviewed by the operator and committed to config/policies.yaml.
 - The operator verifies that queue admission cannot happen without an explicit instruction identifier.
 - The runtime database and all config directories remain ignored by Git.
