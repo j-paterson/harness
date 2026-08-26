@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 _SECRET_KEY_PARTS = ("token", "secret", "password", "api_key", "email", "phone")
+NonEmptyId = Annotated[str, Field(min_length=1)]
 
 
 class ProjectConfig(BaseModel):
@@ -21,6 +22,50 @@ class ProjectConfig(BaseModel):
     repo_path: Path
     integration_branch: str = Field(min_length=1)
     github_repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")
+
+
+class LinearStatusIds(BaseModel):
+    """Team-specific workflow identifiers for the approved projection states."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    todo: str = Field(alias="Todo", min_length=1)
+    in_development: str = Field(alias="In Development", min_length=1)
+    review: str = Field(alias="Review", min_length=1)
+    qa: str = Field(alias="QA", min_length=1)
+    done: str = Field(alias="Done", min_length=1)
+
+    def as_mapping(self) -> dict[str, str]:
+        """Return the exact public workflow labels consumed by LinearProjection."""
+
+        return {
+            "Todo": self.todo,
+            "In Development": self.in_development,
+            "Review": self.review,
+            "QA": self.qa,
+            "Done": self.done,
+        }
+
+
+class LinearTeamConfig(BaseModel):
+    """One registered Linear team's immutable routing identifiers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    team_id: str = Field(min_length=1)
+    status_ids: LinearStatusIds
+
+
+class LinearRuntimeConfig(BaseModel):
+    """Non-secret Linear routing used only by an active local runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assignee_ids: dict[Literal["operator", "ryan"], NonEmptyId] = Field(
+        min_length=2,
+        max_length=2,
+    )
+    teams: dict[str, LinearTeamConfig] = Field(min_length=1)
 
 
 class ResourcePolicy(BaseModel):
@@ -40,7 +85,7 @@ class PolicyConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["observe"] = "observe"
+    mode: Literal["observe", "active"] = "observe"
     max_unresolved_ci_merges: Literal[2] = 2
     context_prepare_percent: int = Field(default=70, ge=1, le=100)
     context_rotate_percent: int = Field(default=80, ge=1, le=100)
@@ -59,6 +104,7 @@ class Settings(BaseModel):
     state_dir: Path
     projects: dict[str, ProjectConfig]
     policy: PolicyConfig
+    linear: LinearRuntimeConfig | None = None
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -101,6 +147,37 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
     _reject_secret_like_keys(project_values)
 
     policy_document = _read_yaml(config_dir / "policies.yaml")
+    local_policy_path = config_dir / "policies.local.yaml"
+    if local_policy_path.exists():
+        policy_document.update(_read_yaml(local_policy_path))
+    policy = PolicyConfig.model_validate(policy_document)
+
+    linear_path = config_dir / "linear.yaml"
+    linear = (
+        LinearRuntimeConfig.model_validate(_read_yaml(linear_path))
+        if linear_path.exists()
+        else None
+    )
+    if policy.mode == "active" and linear is None:
+        raise ValueError("active mode requires config/linear.yaml")
+
+    projects = {
+        alias: ProjectConfig.model_validate(project)
+        for alias, project in project_values.items()
+    }
+    if linear is not None:
+        missing_teams = sorted(
+            {
+                project.linear_team
+                for project in projects.values()
+                if project.linear_team not in linear.teams
+            }
+        )
+        if missing_teams:
+            raise ValueError(
+                "projects reference unregistered Linear teams: "
+                + ", ".join(missing_teams)
+            )
     resolved_state = (
         state_dir
         if state_dir is not None
@@ -110,9 +187,7 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
     return Settings(
         repo_root=resolved_root,
         state_dir=resolved_state,
-        projects={
-            alias: ProjectConfig.model_validate(project)
-            for alias, project in project_values.items()
-        },
-        policy=PolicyConfig.model_validate(policy_document),
+        projects=projects,
+        policy=policy,
+        linear=linear,
     )

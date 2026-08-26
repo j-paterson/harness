@@ -90,6 +90,11 @@ class RecordingRunner:
 class RecordingLinear:
     def __init__(self) -> None:
         self.targets: list[tuple[str, str, str]] = []
+        self.validations: list[tuple[str, str]] = []
+
+    async def validate(self, project_key: str, issue_id: str) -> object:
+        self.validations.append((project_key, issue_id))
+        return object()
 
     async def project(
         self,
@@ -210,6 +215,21 @@ async def test_two_issues_share_one_project_lead(
     assert first.session_id == second.session_id == SESSION_ID
     assert runner.start_count == 1
     assert runner.resume_count == 1
+
+
+@pytest.mark.asyncio
+async def test_linear_team_is_validated_before_claude_starts(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+) -> None:
+    admit(queue, "ENG-9")
+
+    await cell_service.dispatch("ENG-9")
+
+    assert linear.validations == [("demo", "ENG-9")]
+    assert runner.start_count == 1
 
 
 @pytest.mark.asyncio

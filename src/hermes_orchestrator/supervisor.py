@@ -44,6 +44,7 @@ class Supervisor:
         self._closing = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._reconciled = False
+        self._admission_open = False
         self.events: list[str] = []
         self.ticks = 0
 
@@ -67,6 +68,7 @@ class Supervisor:
         for action in getattr(result, "planned_actions", ()):
             if (
                 getattr(action, "execute", False)
+                and self._admission_open
                 and getattr(action, "issue_id", None)
                 and self._dispatch is not None
             ):
@@ -90,7 +92,10 @@ class Supervisor:
 
     def _ensure_reconciled(self) -> None:
         if not self._reconciled:
-            self._service.start()
+            result = self._service.start()
+            self._admission_open = bool(
+                getattr(result, "admission_open", True)
+            )
             self._reconciled = True
             self.events.append("reconciliation.completed")
 

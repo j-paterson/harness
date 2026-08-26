@@ -43,3 +43,80 @@ def test_rejects_secret_like_project_keys(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="secret-like"):
         load_settings(tmp_path, tmp_path / "state")
+
+
+def test_active_local_policy_requires_complete_linear_routing(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: engineering\n"
+        f"    repo_path: {tmp_path}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (config / "policies.yaml").write_text("mode: observe\n", encoding="utf-8")
+    (config / "policies.local.yaml").write_text(
+        "mode: active\n",
+        encoding="utf-8",
+    )
+    (config / "linear.yaml").write_text(
+        "assignee_ids:\n"
+        "  operator: user-operator\n"
+        "  ryan: user-ryan\n"
+        "teams:\n"
+        "  engineering:\n"
+        "    team_id: team-engineering\n"
+        "    status_ids:\n"
+        "      Todo: state-todo\n"
+        "      In Development: state-development\n"
+        "      Review: state-review\n"
+        "      QA: state-qa\n"
+        "      Done: state-done\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.policy.mode == "active"
+    assert settings.linear is not None
+    assert settings.linear.teams["engineering"].status_ids.review == "state-review"
+
+
+def test_active_mode_fails_closed_without_linear_routing(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text("projects: {}\n", encoding="utf-8")
+    (config / "policies.yaml").write_text("mode: observe\n", encoding="utf-8")
+    (config / "policies.local.yaml").write_text(
+        "mode: active\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"linear\.yaml"):
+        load_settings(tmp_path, tmp_path / "state")
+
+
+def test_active_linear_routing_requires_both_assignees(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text("projects: {}\n", encoding="utf-8")
+    (config / "policies.yaml").write_text("mode: active\n", encoding="utf-8")
+    (config / "linear.yaml").write_text(
+        "assignee_ids: {operator: user-operator}\n"
+        "teams:\n"
+        "  engineering:\n"
+        "    team_id: team-engineering\n"
+        "    status_ids:\n"
+        "      Todo: state-todo\n"
+        "      In Development: state-development\n"
+        "      Review: state-review\n"
+        "      QA: state-qa\n"
+        "      Done: state-done\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="at least 2 items"):
+        load_settings(tmp_path, tmp_path / "state")

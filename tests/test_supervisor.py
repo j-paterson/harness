@@ -14,15 +14,26 @@ class FakeTick:
     planned_actions: tuple[PlannedAction, ...] = ()
 
 
+@dataclass(frozen=True)
+class FakeReconciliation:
+    admission_open: bool
+
+
 class FakeService:
-    def __init__(self, actions: tuple[PlannedAction, ...] = ()) -> None:
+    def __init__(
+        self,
+        actions: tuple[PlannedAction, ...] = (),
+        *,
+        admission_open: bool = True,
+    ) -> None:
         self.actions = actions
+        self.admission_open = admission_open
         self.started = 0
         self.ticks = 0
 
     def start(self) -> object:
         self.started += 1
-        return object()
+        return FakeReconciliation(self.admission_open)
 
     def tick(self) -> FakeTick:
         self.ticks += 1
@@ -69,6 +80,32 @@ async def test_run_once_dispatches_only_enabled_actions() -> None:
     await supervisor.run_once()
 
     assert dispatched == ["ENG-9"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_dispatch_when_reconciliation_closes_admission(
+) -> None:
+    action = PlannedAction(
+        "start_project_cell",
+        "demo",
+        "ENG-9",
+        "ready",
+        True,
+        {},
+    )
+    dispatched: list[str] = []
+
+    async def dispatch(issue_id: str) -> None:
+        dispatched.append(issue_id)
+
+    supervisor = Supervisor(
+        FakeService((action,), admission_open=False),
+        dispatch=dispatch,
+    )
+
+    await supervisor.run_once()
+
+    assert dispatched == []
 
 
 @pytest.mark.asyncio

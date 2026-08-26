@@ -39,6 +39,8 @@ class LeadRunner(Protocol):
 class LinearProjector(Protocol):
     """Approved Linear projection boundary used by project cells."""
 
+    async def validate(self, project_key: str, issue_id: str) -> object: ...
+
     async def project(
         self,
         issue_id: str,
@@ -138,6 +140,7 @@ class ProjectCellService:
         """Start or resume the issue's project lead after explicit admission."""
 
         issue = self._queue.get(issue_id)
+        await self._linear.validate(issue.project_key, issue_id)
         cell = self._find_active_cell(issue.project_key)
         created = cell is None
         if cell is None:

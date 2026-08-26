@@ -12,14 +12,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from hermes_orchestrator.config import Settings, load_settings
-from hermes_orchestrator.db import Database
+from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.domain import AdmissionRequest, QueuedIssue
-from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
-from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict, QueueService
-from hermes_orchestrator.resources import ResourceSampler, ResourceSnapshot
-from hermes_orchestrator.scheduler import Scheduler
+from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
+from hermes_orchestrator.resources import ResourceSnapshot
+from hermes_orchestrator.runtime import Dispatch, open_runtime
 from hermes_orchestrator.service import OrchestratorService
 from hermes_orchestrator.supervisor import Supervisor
 
@@ -81,8 +79,13 @@ async def _run_daemon(
     *,
     once: bool,
     interval: int,
+    dispatch: Dispatch | None = None,
 ) -> Supervisor:
-    supervisor = Supervisor(service, interval_seconds=interval)
+    supervisor = Supervisor(
+        service,
+        dispatch=dispatch,
+        interval_seconds=interval,
+    )
     if once:
         await supervisor.run_once()
         return supervisor
@@ -91,29 +94,6 @@ async def _run_daemon(
         await asyncio.Event().wait()
     finally:
         await supervisor.shutdown()
-
-
-def _open(settings: Settings) -> tuple[Database, QueueService, OrchestratorService]:
-    database = Database.open(settings.state_dir / "state.db")
-    events = EventStore(database)
-    queue = QueueService(database, events, settings.projects)
-    scheduler = Scheduler(queue, mode=settings.policy.mode)
-    repository_paths = {
-        alias: project.repo_path for alias, project in settings.projects.items()
-    }
-    repository_paths["orchestrator_state"] = settings.state_dir
-    sampler = ResourceSampler(
-        policy=settings.policy,
-        repository_paths=repository_paths,
-    )
-    service = OrchestratorService(
-        database=database,
-        events=events,
-        sampler=sampler,
-        scheduler=scheduler,
-        policy=settings.policy,
-    )
-    return database, queue, service
 
 
 def _issue_payload(issue: QueuedIssue) -> dict[str, Any]:
@@ -155,7 +135,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     args = _parser().parse_args(arguments)
     settings = load_settings(args.repo_root, args.state_dir)
-    database, queue, service = _open(settings)
+    enable_live = args.command == "daemon" and settings.policy.mode == "active"
+    runtime = open_runtime(settings, enable_live=enable_live)
+    database = runtime.database
+    queue = runtime.queue
+    service = runtime.service
     try:
         if args.command == "init":
             payload = {
@@ -183,12 +167,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     service,
                     once=args.once,
                     interval=args.interval,
+                    dispatch=runtime.dispatch,
                 )
             )
             payload = {
                 "mode": settings.policy.mode,
                 "ticks": supervisor.ticks,
                 "events": supervisor.events,
+                "profiles": [
+                    {
+                        "alias": health.profile_alias,
+                        "eligible": health.eligible,
+                        "reason": health.reason,
+                    }
+                    for health in runtime.profile_health
+                ],
             }
             _print(
                 payload,
@@ -295,7 +288,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     return 0
                 time.sleep(args.watch)
     finally:
-        database.close()
+        runtime.close()
 
     raise AssertionError(f"unhandled command: {args.command}")
 

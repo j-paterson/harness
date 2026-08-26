@@ -2,7 +2,7 @@
 
 Hermes orchestrator is a local control plane for explicitly assigned coding work. It maintains a private queue, durable project cells, isolated Claude Max profiles, minimal Linear workflow projection, complete lead handoffs, and continuous host-resource observation.
 
-The checked-in policy remains in `observe` mode. Running the CLI does not start Claude, update Linear, stop processes, or remove worktrees unless those actions are separately configured and enabled. The Phase 2 adapters and supervisor flow are covered with local fakes; no live Linear mutation is part of the default setup.
+The checked-in policy remains in `observe` mode. Running the CLI does not start Claude, update Linear, stop processes, or remove worktrees unless those actions are separately configured and enabled. Live Phase 2 assembly requires an ignored local policy override plus complete project, profile, and Linear routing configuration; missing or inconsistent inputs fail closed.
 
 ## Set up the orchestrator
 
@@ -17,6 +17,10 @@ Copy `config/projects.example.yaml` to the ignored `config/projects.yaml` and ad
 Copy `config/profiles.example.yaml` to the ignored `config/profiles.yaml`. Keep exactly four opaque aliases and point each one at a separate Claude configuration directory. Do not put account email addresses in the aliases, configuration file, or runtime database.
 
 Before a profile can receive work, its scrubbed probe must report `loggedIn=true`, `authMethod=claude.ai`, and `apiProvider=firstParty`. Provider selectors such as Bedrock, AWS, Vertex, Foundry, and Anthropic API-key variables are removed from every Max-profile child process.
+
+Copy `config/linear.example.yaml` to the ignored `config/linear.yaml`. Register only the team IDs and exact state IDs used by projects in `projects.yaml`, plus the operator and QA assignee IDs. The runtime reads the issue first and proves that its Linear team matches the selected project before starting Claude.
+
+The final live switch is an ignored `config/policies.local.yaml` containing `mode: active`. The tracked `config/policies.yaml` stays observation-only, so a fresh clone cannot produce external effects. Active startup probes all four Max profiles and reads the Linear token from macOS Keychain; it does not persist account identity or the token.
 
 Initialize the local database:
 
@@ -47,7 +51,7 @@ uv run hermes-orchestrator observe
 uv run hermes-orchestrator daemon --once
 ```
 
-`observe` records one resource sample and prints a non-executing plan. Use `observe --watch 60` to continue at an interval of at least five seconds. Resource thresholds begin with conservative hard floors and are refined from real managed work; no waiting period or synthetic load is required.
+`observe` records one resource sample and prints a non-executing plan, even when the local active override exists. Use `observe --watch 60` to continue at an interval of at least five seconds. Resource thresholds begin with conservative hard floors and are refined from real managed work; no waiting period or synthetic load is required. An active daemon starts or resumes Claude only while the resource snapshot is green and startup reconciliation has explicitly opened admission.
 
 Hermes can use the same strict JSON boundary as the future phone console:
 
@@ -58,7 +62,7 @@ uv run hermes-orchestrator hermes-command --json \
 
 The boundary accepts only `queue_issue`, `status`, `pause`, `resume`, `retry`, `reprioritize`, and `approve_handoff`. It has no command for discovering or claiming Linear work.
 
-The Linear token is read at runtime from macOS Keychain service `hermes-orchestrator-linear`, account `default`. Linear projections read the issue first and can change only the approved state and assignee fields. Keep the daemon in `observe` mode until the token, workflow identifiers, and all four profile probes have been verified.
+The Linear token is read at runtime from macOS Keychain service `hermes-orchestrator-linear`, account `default`. Linear projections read the issue first and can change only the approved state and assignee fields. Team validation happens before Claude starts, and reconciliation can veto every otherwise executable dispatch.
 
 ## Verify the system
 

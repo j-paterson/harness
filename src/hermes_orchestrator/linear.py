@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -21,6 +21,7 @@ query Issue($id: String!) {
     updatedAt
     state { id name }
     assignee { id }
+    team { id }
   }
 }
 """.strip()
@@ -53,6 +54,7 @@ class LinearIssue:
     status: str
     state_id: str
     assignee_id: str | None
+    team_id: str
     revision: str
 
 
@@ -242,11 +244,13 @@ class LinearClient:
         effects: ExternalEffectStore,
         status_ids: Mapping[str, str],
         assignee_ids: Mapping[str, str],
+        expected_team_id: str | None = None,
     ) -> None:
         self._transport = transport
         self._effects = effects
         self._status_ids = dict(status_ids)
         self._assignee_ids = dict(assignee_ids)
+        self._expected_team_id = expected_team_id
 
     async def get_issue(self, issue_id: str) -> LinearIssue:
         """Read the fields required for an idempotent projection."""
@@ -261,8 +265,11 @@ class LinearClient:
             raise ValueError(f"Linear issue not found: {issue_id}")
         state = issue.get("state")
         assignee = issue.get("assignee")
+        team = issue.get("team")
         if not isinstance(state, dict):
             raise ValueError("Linear issue is missing state")
+        if not isinstance(team, dict):
+            raise ValueError("Linear issue is missing team")
         return LinearIssue(
             issue_id=str(issue["identifier"]),
             linear_id=str(issue["id"]),
@@ -271,8 +278,16 @@ class LinearClient:
             assignee_id=(
                 str(assignee["id"]) if isinstance(assignee, dict) else None
             ),
+            team_id=str(team["id"]),
             revision=str(issue["updatedAt"]),
         )
+
+    async def validate_issue(self, issue_id: str) -> LinearIssue:
+        """Read an issue and fail closed when it belongs to another team."""
+
+        issue = await self.get_issue(issue_id)
+        self._validate_team(issue)
+        return issue
 
     async def project(
         self,
@@ -287,7 +302,7 @@ class LinearClient:
         if effect.state == "completed" and effect.response is not None:
             return ProjectionResult.from_record(effect.response)
 
-        issue = await self.get_issue(issue_id)
+        issue = await self.validate_issue(issue_id)
         update: dict[str, str] = {}
         changed_fields: list[str] = []
         target_state_id = self._status_ids[target.status]
@@ -325,3 +340,47 @@ class LinearClient:
         )
         self._effects.complete(effect_id, result.as_record())
         return result
+
+    def _validate_team(self, issue: LinearIssue) -> None:
+        if (
+            self._expected_team_id is not None
+            and issue.team_id != self._expected_team_id
+        ):
+            raise ValueError(
+                f"Linear issue {issue.issue_id} is not in the configured Linear team"
+            )
+
+
+class ProjectLinearRouter:
+    """Route validated issue projections through project-scoped Linear clients."""
+
+    def __init__(
+        self,
+        *,
+        clients: Mapping[str, LinearClient],
+        project_for_issue: Callable[[str], str],
+    ) -> None:
+        self._clients = dict(clients)
+        self._project_for_issue = project_for_issue
+
+    async def validate(self, project_key: str, issue_id: str) -> LinearIssue:
+        """Prove issue/team routing before a Claude lead can start."""
+
+        return await self._client(project_key).validate_issue(issue_id)
+
+    async def project(
+        self,
+        issue_id: str,
+        target: LinearProjection,
+        effect_id: str,
+    ) -> ProjectionResult:
+        """Project using the issue's already-admitted project registration."""
+
+        project_key = self._project_for_issue(issue_id)
+        return await self._client(project_key).project(issue_id, target, effect_id)
+
+    def _client(self, project_key: str) -> LinearClient:
+        try:
+            return self._clients[project_key]
+        except KeyError as error:
+            raise ValueError(f"unregistered Linear project: {project_key}") from error

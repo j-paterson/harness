@@ -14,6 +14,7 @@ from hermes_orchestrator.linear import (
     LinearClient,
     LinearGraphQLTransport,
     LinearProjection,
+    ProjectLinearRouter,
 )
 
 
@@ -24,6 +25,7 @@ class RecordingLinearTransport:
         self.status = "Todo"
         self.state_id = "state-todo"
         self.assignee_id = "user-operator"
+        self.team_id = "team-engineering"
         self.revision = "2026-08-26T12:00:00Z"
 
     def issue(
@@ -55,6 +57,7 @@ class RecordingLinearTransport:
                     "updatedAt": self.revision,
                     "state": {"id": self.state_id, "name": self.status},
                     "assignee": {"id": self.assignee_id},
+                    "team": {"id": self.team_id},
                 }
             }
         update = variables["input"]
@@ -101,6 +104,7 @@ def linear_client(
             "Done": "state-done",
         },
         assignee_ids={"operator": "user-operator", "ryan": "user-ryan"},
+        expected_team_id="team-engineering",
     )
 
 
@@ -164,6 +168,39 @@ async def test_completed_effect_retry_does_not_touch_linear(
 
 def test_allowed_projection_has_no_comment_or_label_fields() -> None:
     assert set(LinearProjection.model_fields) == {"status", "assignee_alias"}
+
+
+@pytest.mark.asyncio
+async def test_project_validation_rejects_issue_from_another_team(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    transport.team_id = "team-other"
+
+    with pytest.raises(ValueError, match="configured Linear team"):
+        await linear_client.validate_issue("ENG-9")
+
+    assert transport.operations == ["Issue"]
+
+
+@pytest.mark.asyncio
+async def test_project_router_validates_before_routing_projection(
+    linear_client: LinearClient,
+) -> None:
+    router = ProjectLinearRouter(
+        clients={"demo": linear_client},
+        project_for_issue=lambda issue_id: "demo" if issue_id == "ENG-9" else "other",
+    )
+
+    issue = await router.validate("demo", "ENG-9")
+    result = await router.project(
+        "ENG-9",
+        LinearProjection(status="In Development", assignee_alias="operator"),
+        "effect-router",
+    )
+
+    assert issue.issue_id == "ENG-9"
+    assert result.changed_fields == ("status",)
 
 
 @pytest.mark.asyncio
