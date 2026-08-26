@@ -1,0 +1,9 @@
+profiles:
+  - alias: max-a
+    config_dir: /Users/OPERATOR/.claude-max-a
+  - alias: max-b
+    config_dir: /Users/OPERATOR/.claude-max-b
+  - alias: max-c
+    config_dir: /Users/OPERATOR/.claude-max-c
+  - alias: max-d
+    config_dir: /Users/OPERATOR/.claude-max-d
