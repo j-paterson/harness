@@ -4,6 +4,7 @@ context_prepare_percent: 70
 context_rotate_percent: 80
 max_active_session_hours: 6
 stall_consultations_before_automation: 2
+resource_sample_retention_hours: 24
 resource_thresholds:
   calibrated: false
   yellow_available_memory_gib: null

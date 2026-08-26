@@ -46,6 +46,7 @@ class PolicyConfig(BaseModel):
     context_rotate_percent: int = Field(default=80, ge=1, le=100)
     max_active_session_hours: int = Field(default=6, ge=1)
     stall_consultations_before_automation: Literal[2] = 2
+    resource_sample_retention_hours: int = Field(default=24, ge=1, le=168)
     resource_thresholds: ResourcePolicy = Field(default_factory=ResourcePolicy)
 
 
