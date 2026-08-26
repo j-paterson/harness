@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -104,6 +105,35 @@ def test_parser_extracts_session_subagent_and_limit_events() -> None:
     assert events[1].usage == {"input_tokens": 120, "output_tokens": 8}
     assert events[2].parent_tool_use_id == "toolu-agent-1"
     assert events[2].error_code == "subscription_limit"
+
+
+def test_handoff_schema_is_passed_and_acknowledgement_is_parsed(
+    runner: ClaudeRunner,
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "type": "object",
+        "required": ["acknowledged", "restated_next_action"],
+    }
+    request = new_request(tmp_path)
+    request = LeadTurnRequest(
+        session_id=request.session_id,
+        cwd=request.cwd,
+        prompt=request.prompt,
+        profile_alias=request.profile_alias,
+        output_schema=schema,
+    )
+
+    command, _ = runner.build_command(request)
+    event = ClaudeEventParser().feed(
+        b'{"type":"result","session_id":"11111111-1111-4111-8111-'
+        b'111111111111","structured_output":{"acknowledged":true,'
+        b'"restated_next_action":"Run the failing test."}}'
+    )
+
+    assert json.loads(command[command.index("--json-schema") + 1]) == schema
+    assert event.kind == "handoff.acknowledged"
+    assert event.restated_next_action == "Run the failing test."
 
 
 class CapturingProcessFactory:

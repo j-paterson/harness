@@ -232,6 +232,7 @@ class ProfilePool:
         self._now = now or (lambda: datetime.now(UTC))
         self._states = {profile.alias: _PoolState() for profile in registry.profiles}
         self._leases: dict[str, ProfileLease] = {}
+        self._replacement_reservations: dict[str, ProfileLease] = {}
 
     def acquire(self, project_key: str) -> ProfileLease | None:
         """Return the existing affinity or lease the first available slot."""
@@ -261,6 +262,79 @@ class ProfilePool:
         lease = self._leases.pop(project_key, None)
         if lease is not None:
             self._states[lease.profile_alias].active_project_count -= 1
+
+    def reserve_replacement(
+        self,
+        project_key: str,
+        exclude_alias: str,
+    ) -> ProfileLease | None:
+        """Reserve another healthy slot while preserving the current lease."""
+
+        existing = self._leases.get(project_key)
+        if existing is None or existing.profile_alias != exclude_alias:
+            raise ValueError("project does not hold the excluded profile lease")
+        reserved = self._replacement_reservations.get(project_key)
+        if reserved is not None:
+            return reserved
+        now = self._now()
+        replacement_alias = None
+        for profile in self._registry.profiles:
+            state = self._states[profile.alias]
+            cooling_down = (
+                state.cooldown_until is not None and state.cooldown_until > now
+            )
+            if (
+                profile.alias != exclude_alias
+                and state.eligible
+                and not cooling_down
+                and state.active_project_count == 0
+            ):
+                replacement_alias = profile.alias
+                break
+        if replacement_alias is None:
+            return None
+
+        self._states[replacement_alias].active_project_count += 1
+        replacement = ProfileLease(project_key, replacement_alias, now)
+        self._replacement_reservations[project_key] = replacement
+        return replacement
+
+    def cancel_replacement(self, project_key: str) -> None:
+        """Release an uncommitted replacement reservation."""
+
+        reserved = self._replacement_reservations.pop(project_key, None)
+        if reserved is not None:
+            self._states[reserved.profile_alias].active_project_count -= 1
+
+    def commit_rotation(
+        self,
+        project_key: str,
+        exclude_alias: str,
+    ) -> ProfileLease:
+        """Transfer affinity to the acknowledged reserved replacement."""
+
+        existing = self._leases.get(project_key)
+        reserved = self._replacement_reservations.get(project_key)
+        if existing is None or existing.profile_alias != exclude_alias:
+            raise ValueError("project does not hold the excluded profile lease")
+        if reserved is None:
+            raise ValueError("project has no replacement reservation")
+        self._states[exclude_alias].active_project_count -= 1
+        self._leases[project_key] = reserved
+        del self._replacement_reservations[project_key]
+        return reserved
+
+    def rotate(
+        self,
+        project_key: str,
+        exclude_alias: str,
+    ) -> ProfileLease | None:
+        """Reserve and immediately commit a replacement lease."""
+
+        replacement = self.reserve_replacement(project_key, exclude_alias)
+        if replacement is None:
+            return None
+        return self.commit_rotation(project_key, exclude_alias)
 
     def set_cooldown(self, alias: str, cooldown_until: datetime | None) -> None:
         """Prevent new leases on a capped profile until the supplied time."""

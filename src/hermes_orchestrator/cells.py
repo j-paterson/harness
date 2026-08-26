@@ -33,6 +33,8 @@ class LeadRunner(Protocol):
         request: LeadTurnRequest,
     ) -> AsyncIterator[ClaudeEvent]: ...
 
+    async def retire_session(self, session_id: UUID) -> None: ...
+
 
 class LinearProjector(Protocol):
     """Approved Linear projection boundary used by project cells."""
@@ -43,6 +45,23 @@ class LinearProjector(Protocol):
         target: LinearProjection,
         effect_id: str,
     ) -> object: ...
+
+
+class HandoffPort(Protocol):
+    """Acknowledged handoff lookup used by rotation."""
+
+    def get(self, handoff_id: str) -> object: ...
+
+    def acknowledge(
+        self,
+        handoff_id: str,
+        session_id: UUID,
+        restated_next_action: str,
+    ) -> object: ...
+
+
+class RotationBlocked(RuntimeError):
+    """The old lead must remain active because rotation is not yet safe."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +106,8 @@ class ProjectCellService:
         session_ids: Callable[[], UUID] = uuid.uuid4,
         cell_ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] = _utc_now,
+        handoffs: HandoffPort | None = None,
+        replacement_session_ids: Callable[[], UUID] = uuid.uuid4,
     ) -> None:
         self._database = database
         self._events = events
@@ -98,6 +119,8 @@ class ProjectCellService:
         self._session_ids = session_ids
         self._cell_ids = cell_ids or (lambda: str(uuid.uuid4()))
         self._now = now
+        self._handoffs = handoffs
+        self._replacement_session_ids = replacement_session_ids
 
     def active_projects(self) -> frozenset[str]:
         """Return projects that already own a live logical lead cell."""
@@ -219,6 +242,127 @@ class ProjectCellService:
                     ),
                 )
 
+    async def rotate(self, cell_id: str, handoff_id: str) -> ProjectCell:
+        """Transfer a cell only after its replacement acknowledged the handoff."""
+
+        if self._handoffs is None:
+            raise RotationBlocked("handoff service is not configured")
+        handoff = self._handoffs.get(handoff_id)
+        if getattr(handoff, "cell_id", None) != cell_id:
+            raise RotationBlocked("handoff belongs to another project cell")
+        current = self._get_cell(cell_id)
+        reservation = self._profiles.reserve_replacement(
+            current.project_key,
+            current.profile_alias,
+        )
+        if reservation is None:
+            raise RotationBlocked("no different healthy profile is available")
+        replacement_session = getattr(handoff, "replacement_session_id", None)
+        already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
+        if not isinstance(replacement_session, UUID):
+            replacement_session = self._replacement_session_ids()
+
+        request = LeadTurnRequest(
+            session_id=replacement_session,
+            cwd=self._project_paths[current.project_key],
+            prompt=(
+                f"{getattr(handoff, 'markdown', '')}\n\n"
+                "Acknowledge this handoff and restate the exact next action."
+            ),
+            profile_alias=reservation.profile_alias,
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "acknowledged": {"const": True},
+                    "restated_next_action": {"type": "string", "minLength": 1},
+                },
+                "required": ["acknowledged", "restated_next_action"],
+                "additionalProperties": False,
+            },
+        )
+        session_started = False
+        acknowledged = already_acknowledged
+        try:
+            stream = self._runner.start_lead(request)
+            async for event in stream:
+                if event.kind == "session.started":
+                    session_started = event.session_id == replacement_session
+                elif (
+                    event.kind == "handoff.acknowledged"
+                    and event.session_id == replacement_session
+                    and event.restated_next_action
+                ):
+                    self._handoffs.acknowledge(
+                        handoff_id,
+                        replacement_session,
+                        event.restated_next_action,
+                    )
+                    acknowledged = True
+        except BaseException:
+            self._profiles.cancel_replacement(current.project_key)
+            raise
+        if not session_started:
+            self._profiles.cancel_replacement(current.project_key)
+            raise RotationBlocked("replacement session start was not confirmed")
+        if not acknowledged:
+            self._profiles.cancel_replacement(current.project_key)
+            raise RotationBlocked("handoff was not acknowledged by the replacement")
+
+        now = self._aware_now().isoformat()
+        rotated = ProjectCell(
+            cell_id=current.cell_id,
+            project_key=current.project_key,
+            state="active",
+            profile_alias=reservation.profile_alias,
+            session_id=replacement_session,
+        )
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM profile_leases WHERE profile_alias = ?",
+                    (current.profile_alias,),
+                )
+                connection.execute(
+                    "INSERT INTO profile_leases("
+                    "profile_alias, project_key, state, acquired_at"
+                    ") VALUES (?, ?, 'active', ?)",
+                    (rotated.profile_alias, rotated.project_key, now),
+                )
+                connection.execute(
+                    "UPDATE project_cells SET state = 'active', "
+                    "profile_alias = ?, session_id = ?, updated_at = ? "
+                    "WHERE cell_id = ?",
+                    (
+                        rotated.profile_alias,
+                        str(rotated.session_id),
+                        now,
+                        rotated.cell_id,
+                    ),
+                )
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="project_cell.rotated",
+                        aggregate_type="project_cell",
+                        aggregate_id=rotated.cell_id,
+                        payload={
+                            "from_profile": current.profile_alias,
+                            "to_profile": rotated.profile_alias,
+                            "handoff_id": handoff_id,
+                            "session_id": str(rotated.session_id),
+                        },
+                    ),
+                )
+        except BaseException:
+            self._profiles.cancel_replacement(current.project_key)
+            raise
+        self._profiles.commit_rotation(
+            current.project_key,
+            current.profile_alias,
+        )
+        await self._runner.retire_session(current.session_id)
+        return rotated
+
     def _find_active_cell(self, project_key: str) -> ProjectCell | None:
         placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
         row = self._database.execute(
@@ -227,6 +371,15 @@ class ProjectCellService:
             (project_key, *_ACTIVE_CELL_STATES),
         ).fetchone()
         return self._row_to_cell(row) if row is not None else None
+
+    def _get_cell(self, cell_id: str) -> ProjectCell:
+        row = self._database.execute(
+            "SELECT * FROM project_cells WHERE cell_id = ?",
+            (cell_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(cell_id)
+        return self._row_to_cell(row)
 
     def _create_cell(self, project_key: str) -> ProjectCell | None:
         lease = self._profiles.acquire(project_key)

@@ -25,6 +25,7 @@ class LeadTurnRequest:
     prompt: str
     profile_alias: str
     resume: bool = False
+    output_schema: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class ClaudeEvent:
     timestamp: str | None
     usage: dict[str, int]
     error_code: str | None = None
+    restated_next_action: str | None = None
 
 
 class ClaudeStreamError(ValueError):
@@ -74,10 +76,14 @@ class ClaudeEventParser:
 
         kind = f"stream.{original_type}"
         error_code = None
+        restated_next_action = None
         if original_type == "system" and subtype == "init":
             kind = "session.started"
         elif self._starts_subagent(value):
             kind = "subagent.started"
+        elif action := self._handoff_acknowledgement(value):
+            kind = "handoff.acknowledged"
+            restated_next_action = action
         elif self._is_subscription_limit(value):
             kind = "provider.limit"
             error_code = "subscription_limit"
@@ -90,6 +96,7 @@ class ClaudeEventParser:
             timestamp=timestamp,
             usage=usage,
             error_code=error_code,
+            restated_next_action=restated_next_action,
         )
 
     @staticmethod
@@ -151,6 +158,18 @@ class ClaudeEventParser:
             return any(cls._is_subscription_limit(item) for item in value.values())
         return False
 
+    @staticmethod
+    def _handoff_acknowledgement(value: dict[str, Any]) -> str | None:
+        structured = value.get("structured_output")
+        if not isinstance(structured, dict):
+            return None
+        next_action = structured.get("restated_next_action")
+        if structured.get("acknowledged") is not True or not isinstance(
+            next_action, str
+        ):
+            return None
+        stripped = next_action.strip()
+        return stripped or None
 
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
@@ -195,6 +214,17 @@ class ClaudeRunner:
             command.extend(["--resume", str(request.session_id)])
         else:
             command.extend(["--session-id", str(request.session_id)])
+        if request.output_schema is not None:
+            command.extend(
+                [
+                    "--json-schema",
+                    json.dumps(
+                        request.output_schema,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ]
+            )
         command.extend(
             [
                 "--input-format",
@@ -230,6 +260,11 @@ class ClaudeRunner:
         """Resume the same persistent session and stream normalized events."""
 
         return self._run(replace(request, session_id=session_id, resume=True))
+
+    async def retire_session(self, session_id: UUID) -> None:
+        """Retire a logical print-mode session after its final turn has exited."""
+
+        del session_id
 
     async def _run(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
         command, environment = self.build_command(request)

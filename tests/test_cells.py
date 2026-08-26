@@ -29,9 +29,16 @@ class RecordingRunner:
         self.resume_count = 0
         self.emit_session_started = True
         self.emit_limit = False
+        self.emit_handoff_ack = False
+        self.raise_on_start = False
+        self.retired_sessions: list[UUID] = []
+        self.start_requests: list[LeadTurnRequest] = []
 
     def start_lead(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+        if self.raise_on_start:
+            raise RuntimeError("replacement start failed")
         self.start_count += 1
+        self.start_requests.append(request)
         return self._events(request)
 
     def resume_lead(
@@ -63,6 +70,21 @@ class RecordingRunner:
                 usage={},
                 error_code="subscription_limit",
             )
+        if self.emit_handoff_ack:
+            yield ClaudeEvent(
+                kind="handoff.acknowledged",
+                original_type="result",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:02:00Z",
+                usage={},
+                restated_next_action=(
+                    "Run the failing unit test and correct ENG-9."
+                ),
+            )
+
+    async def retire_session(self, session_id: UUID) -> None:
+        self.retired_sessions.append(session_id)
 
 
 class RecordingLinear:
