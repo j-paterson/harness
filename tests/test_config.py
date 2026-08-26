@@ -30,6 +30,27 @@ def test_loads_registered_project(tmp_path: Path) -> None:
     assert settings.state_dir == tmp_path / "state"
 
 
+def test_resolves_relative_project_path_from_repo_root(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  orchestrator:\n"
+        "    linear_team: infrastructure\n"
+        "    repo_path: .\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/orchestrator\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.projects["orchestrator"].repo_path == tmp_path
+
+
 def test_rejects_secret_like_project_keys(tmp_path: Path) -> None:
     (tmp_path / "config").mkdir()
     (tmp_path / "config/projects.yaml").write_text(
@@ -120,3 +141,43 @@ def test_active_linear_routing_requires_both_assignees(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="at least 2 items"):
         load_settings(tmp_path, tmp_path / "state")
+
+
+def test_linear_team_without_qa_state_loads_non_qa_routing(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text(
+        "projects:\n"
+        "  orchestrator:\n"
+        "    linear_team: infrastructure\n"
+        f"    repo_path: {tmp_path}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/orchestrator\n",
+        encoding="utf-8",
+    )
+    (config / "policies.yaml").write_text("mode: observe\n", encoding="utf-8")
+    (config / "linear.yaml").write_text(
+        "assignee_ids:\n"
+        "  operator: user-operator\n"
+        "  ryan: user-ryan\n"
+        "teams:\n"
+        "  infrastructure:\n"
+        "    team_id: team-infrastructure\n"
+        "    status_ids:\n"
+        "      Todo: state-todo\n"
+        "      In Development: state-progress\n"
+        "      Review: state-review\n"
+        "      Done: state-done\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.linear is not None
+    statuses = settings.linear.teams["infrastructure"].status_ids.as_mapping()
+    assert statuses == {
+        "Todo": "state-todo",
+        "In Development": "state-progress",
+        "Review": "state-review",
+        "Done": "state-done",
+    }

@@ -2,11 +2,10 @@ assignee_ids:
   operator: LINEAR_OPERATOR_USER_ID
   ryan: LINEAR_QA_USER_ID
 teams:
-  project-team:
-    team_id: LINEAR_TEAM_ID
+  infrastructure:
+    team_id: LINEAR_INFRASTRUCTURE_TEAM_ID
     status_ids:
       Todo: LINEAR_TODO_STATE_ID
-      In Development: LINEAR_DEVELOPMENT_STATE_ID
-      Review: LINEAR_REVIEW_STATE_ID
-      QA: LINEAR_QA_STATE_ID
+      In Development: LINEAR_IN_PROGRESS_STATE_ID
+      Review: LINEAR_IN_REVIEW_STATE_ID
       Done: LINEAR_DONE_STATE_ID

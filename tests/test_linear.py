@@ -184,6 +184,34 @@ async def test_project_validation_rejects_issue_from_another_team(
 
 
 @pytest.mark.asyncio
+async def test_qa_projection_fails_closed_when_team_has_no_qa_state(
+    database: Database,
+    transport: RecordingLinearTransport,
+) -> None:
+    client = LinearClient(
+        transport=transport,
+        effects=ExternalEffectStore(database),
+        status_ids={
+            "Todo": "state-todo",
+            "In Development": "state-progress",
+            "Review": "state-review",
+            "Done": "state-done",
+        },
+        assignee_ids={"operator": "user-operator", "ryan": "user-ryan"},
+        expected_team_id="team-engineering",
+    )
+
+    with pytest.raises(ValueError, match=r"QA.*not configured"):
+        await client.project(
+            "ENG-9",
+            LinearProjection(status="QA", assignee_alias="ryan"),
+            effect_id="effect-missing-qa",
+        )
+
+    assert transport.operations == ["Issue"]
+
+
+@pytest.mark.asyncio
 async def test_project_router_validates_before_routing_projection(
     linear_client: LinearClient,
 ) -> None:

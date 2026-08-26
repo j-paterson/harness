@@ -1,1 +1,6 @@
-projects: {}
+projects:
+  agent-orchestration:
+    linear_team: infrastructure
+    repo_path: .
+    integration_branch: main
+    github_repo: j-paterson/hermes-orchestrator
