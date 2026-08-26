@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import pytest
@@ -68,3 +69,27 @@ async def test_run_once_dispatches_only_enabled_actions() -> None:
     await supervisor.run_once()
 
     assert dispatched == ["ENG-9"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_timeout_does_not_abort_shutdown() -> None:
+    never = asyncio.Event()
+
+    async def checkpoint() -> None:
+        await never.wait()
+
+    supervisor = Supervisor(
+        FakeService(),
+        checkpoint_workers=checkpoint,
+        interval_seconds=60,
+        checkpoint_timeout=0.01,
+    )
+    await supervisor.start()
+
+    await supervisor.shutdown()
+
+    assert supervisor.events[-3:] == [
+        "admission.closed",
+        "workers.checkpoint_requested",
+        "supervisor.stopped",
+    ]

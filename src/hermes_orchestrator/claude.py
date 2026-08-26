@@ -279,8 +279,12 @@ class ClaudeRunner:
         if process.stdout is None:
             await self._terminate(process)
             raise RuntimeError("Claude stdout pipe was not created")
+        if process.stderr is None:
+            await self._terminate(process)
+            raise RuntimeError("Claude stderr pipe was not created")
 
         parser = ClaudeEventParser()
+        stderr_task = asyncio.create_task(self._drain(process.stderr))
         try:
             while line := await process.stdout.readline():
                 yield parser.feed(line)
@@ -290,6 +294,14 @@ class ClaudeRunner:
         finally:
             if process.returncode is None:
                 await self._terminate(process)
+            await stderr_task
+
+    @staticmethod
+    async def _drain(stream: asyncio.StreamReader) -> None:
+        """Drain and discard child diagnostics so its pipe cannot deadlock."""
+
+        while await stream.read(65536):
+            pass
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         """Terminate only the owned process group, then force a bounded stop."""

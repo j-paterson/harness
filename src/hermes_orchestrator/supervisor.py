@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Protocol
 
 
@@ -76,10 +77,11 @@ class Supervisor:
 
         self.events.append("admission.closed")
         self._closing.set()
-        await asyncio.wait_for(
-            self._checkpoint_workers(),
-            timeout=self._checkpoint_timeout,
-        )
+        with suppress(TimeoutError):
+            await asyncio.wait_for(
+                self._checkpoint_workers(),
+                timeout=self._checkpoint_timeout,
+            )
         self.events.append("workers.checkpoint_requested")
         if self._task is not None:
             await self._task

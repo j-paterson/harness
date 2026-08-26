@@ -165,6 +165,29 @@ class CapturingProcessFactory:
         return self.process
 
 
+class VerboseProcessFactory:
+    async def __call__(
+        self,
+        *command: str,
+        **kwargs: Any,
+    ) -> asyncio.subprocess.Process:
+        del command, kwargs
+        child_code = (
+            "import json,sys;"
+            "sys.stderr.write('x'*16777216);sys.stderr.flush();"
+            "print(json.dumps({'type':'system','subtype':'init',"
+            "'session_id':'11111111-1111-4111-8111-111111111111'}),flush=True)"
+        )
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            child_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_closing_stream_kills_hung_process_group(
     registry: ProfileRegistry,
@@ -188,3 +211,22 @@ async def test_closing_stream_kills_hung_process_group(
     assert factory.process.returncode == -signal.SIGKILL
     assert factory.call is not None
     assert factory.call[1]["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_verbose_stderr_cannot_block_stdout_events(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=tmp_path / "claude-lead.md",
+        base_env={"PATH": os.environ["PATH"]},
+        process_factory=VerboseProcessFactory(),
+    )
+    stream = runner.start_lead(new_request(tmp_path))
+
+    event = await asyncio.wait_for(anext(stream), timeout=0.5)
+    await stream.aclose()
+
+    assert event.kind == "session.started"
