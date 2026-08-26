@@ -67,11 +67,13 @@ def _open(settings: Settings) -> tuple[Database, QueueService, OrchestratorServi
     events = EventStore(database)
     queue = QueueService(database, events, settings.projects)
     scheduler = Scheduler(queue, mode=settings.policy.mode)
+    repository_paths = {
+        alias: project.repo_path for alias, project in settings.projects.items()
+    }
+    repository_paths["orchestrator_state"] = settings.state_dir
     sampler = ResourceSampler(
         policy=settings.policy,
-        repository_paths={
-            alias: project.repo_path for alias, project in settings.projects.items()
-        },
+        repository_paths=repository_paths,
     )
     service = OrchestratorService(
         database=database,

@@ -74,3 +74,28 @@ def test_observe_rejects_watch_interval_below_five_seconds(
 
     assert result.exit_code == 2
     assert "at least 5 seconds" in result.output
+
+
+def test_observe_samples_state_volume_without_registered_projects(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text("projects: {}\n", encoding="utf-8")
+    (config / "policies.yaml").write_text("mode: observe\n", encoding="utf-8")
+    state_dir = tmp_path / "state"
+
+    result = invoke(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--state-dir",
+            str(state_dir),
+            "observe",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["snapshot"]["disk_free_bytes"]["orchestrator_state"] > 0
