@@ -6,12 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "hermes-orchestrator"
 version = "0.1.0"
 description = "Local, durable orchestration for Hermes-managed coding workers"
+readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "pydantic==2.13.4",
   "PyYAML==6.0.3",
   "psutil==7.2.2",
 ]
+
+[project.scripts]
+hermes-orchestrator = "hermes_orchestrator.cli:entrypoint"
 
 [dependency-groups]
 dev = [
