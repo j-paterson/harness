@@ -40,14 +40,18 @@ class Scheduler:
         self,
         queue: QueueService,
         mode: str,
-        active_projects: Iterable[str] = (),
+        active_projects: Iterable[str] | Callable[[], Iterable[str]] = (),
         now: Callable[[], datetime] = _utc_now,
     ) -> None:
         if mode not in {"observe", "active"}:
             raise ValueError(f"unsupported scheduler mode: {mode}")
         self._queue = queue
         self._mode = mode
-        self._active_projects = frozenset(active_projects)
+        self._active_projects = (
+            active_projects
+            if callable(active_projects)
+            else lambda: frozenset(active_projects)
+        )
         self._now = now
 
     def plan(self, snapshot: AdmissionSnapshot) -> list[PlannedAction]:
@@ -68,8 +72,9 @@ class Scheduler:
 
         actions: list[PlannedAction] = []
         planned_projects: set[str] = set()
+        active_projects = frozenset(self._active_projects())
         for issue in self._queue.list_ranked(self._now()):
-            if issue.project_key in self._active_projects:
+            if issue.project_key in active_projects:
                 continue
             if issue.project_key in planned_projects:
                 continue
