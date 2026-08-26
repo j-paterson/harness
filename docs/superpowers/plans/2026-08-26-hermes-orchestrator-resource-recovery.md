@@ -4,7 +4,7 @@
 
 **Goal:** Protect the Mac from memory and disk exhaustion by governing admission, checkpointing and pausing managed workers, rotating context-heavy sessions, learning stall remedies, reclaiming verified worktrees immediately, and reconciling safely after crashes.
 
-**Architecture:** The supervisor owns explicit process and worktree leases and combines calibrated host measurements with task priority. Cleanup is a state machine that requires a remote Git checkpoint before process termination and worktree removal. Stall and context policies request structured handoffs at safe boundaries and fail closed when evidence is incomplete.
+**Architecture:** The supervisor owns explicit process and worktree leases and combines continuously calibrated host measurements with task priority. Cleanup is a state machine that requires a remote Git checkpoint before process termination and worktree removal. Stall and context policies request structured handoffs at safe boundaries and fail closed when evidence is incomplete.
 
 **Tech Stack:** Prior phases, psutil 7.2.2, macOS process groups, Git worktree porcelain output, shutil.disk_usage, SQLite leases, pytest fake clocks and fake process/Git adapters
 
@@ -13,7 +13,7 @@
 ## Global constraints
 
 - Execute the foundation, Claude/Linear, and Codex Merger plans and pass their exit gates first.
-- The calibrated numeric resource thresholds in config/policies.yaml are the source of truth.
+- Versioned numeric resource thresholds in config/policies.yaml are the source of truth. They begin with conservative hard floors and are tuned from real managed workloads without synthetic calibration runs.
 - Green admits work, yellow stops lower-priority admission, and red checkpoints and pauses the lowest-priority safe candidates.
 - The scheduler treats four accounts as a maximum pool, not a concurrency target.
 - Every managed process belongs to an exact process-group lease.
@@ -420,7 +420,8 @@ Expected: all tests pass, including injected crashes before push, after push, af
 
 Do not expose remote mutations until:
 
-- A full workday of calibrated thresholds avoids memory-pressure emergencies and preserves operator responsiveness.
+- Conservative bootstrap thresholds are committed, real managed-workload samples
+  are recorded continuously, and threshold changes remain reviewable.
 - A controlled red-pressure drill creates a WIP commit, pushes it, proves it remotely, stops only the leased process group, removes the worktree through Git, and resumes from the recorded next action.
 - Deliberately dirty, untracked, unpushed, and active-process worktrees all block removal.
 - Six active hours, 70%, 80%, compaction, rapid-refill, and context-error paths produce the approved handoff behavior.

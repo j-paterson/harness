@@ -274,7 +274,10 @@ The resource governor continuously samples:
 - Repository and worktree disk consumption.
 - Active Claude leads, subagents, Codex turns, test runners, and development servers.
 
-It classifies the host as green, yellow, or red. Exact thresholds are versioned configuration established during the observation phase rather than being hard-coded in this design.
+It classifies the host as green, yellow, or red. Versioned configuration starts
+with conservative hard safety floors and is refined continuously from real
+managed workloads. Calibration does not require a waiting period or synthetic
+load.
 
 - **Green:** Admit independent work that fits its estimated resource envelope.
 - **Yellow:** Stop admitting lower-priority work and ask workers to checkpoint at natural boundaries.
@@ -501,11 +504,11 @@ Logs use structured events with correlation identifiers for issue, project, work
 
 ### Foundation and observation
 
-Create the repository, domain model, SQLite state, project registry, event journal, resource sampler, fake adapters, and dry-run mode. Observe existing workflows without controlling them. Use the observation period to calibrate green, yellow, and red resource thresholds.
+Create the repository, domain model, SQLite state, project registry, event journal, resource sampler, fake adapters, and dry-run mode. Observe existing workflows without controlling them and establish conservative green, yellow, and red bootstrap thresholds.
 
 ### Queue and Claude profiles
 
-Enable explicit chat intake, Linear projection, profile health and leases, one lead per project, subagent supervision, checkpoints, handoffs, and account rotation.
+Enable explicit chat intake, Linear projection, profile health and leases, one lead per project, subagent supervision, checkpoints, handoffs, and account rotation. Continue refining the resource profile from actual worker measurements during normal use.
 
 ### Codex Merger
 
@@ -575,7 +578,8 @@ Implementation planning must resolve these details without changing the approved
 
 - The exact programming language and web framework for the durable service and phone console.
 - The Claude Code event-capture mechanism supported by the installed version.
-- Initial numeric resource thresholds after observation.
+- Conservative initial resource safety floors and the policy for tuning them
+  from live managed-workload observations.
 - The exact SQLite schema and migration library.
 - The supported Linear and GitHub authentication mechanisms available locally.
 - Whether the Codex adapter uses a managed App Server daemon or a dedicated stdio child process in the first release.

@@ -12,7 +12,7 @@
 
 ## Global constraints
 
-- Execute docs/superpowers/plans/2026-08-26-hermes-orchestrator-foundation.md first. Phase 2 implementation and fake-backed tests may proceed while its resource-calibration gate remains open; live Claude dispatch and Linear writes may not.
+- Execute docs/superpowers/plans/2026-08-26-hermes-orchestrator-foundation.md first. Live Claude dispatch may begin under committed conservative safety floors while real workloads continuously refine the resource profile. Linear writes remain gated on verified credentials and contract tests.
 - There are exactly four eligible Claude Max profile slots.
 - Each profile has a separate CLAUDE_CONFIG_DIR and an opaque alias; account emails never enter Git or SQLite.
 - Max-profile processes must unset Bedrock, Vertex, Foundry, AWS, and API-key provider selectors before launch.
@@ -466,6 +466,7 @@ Do not begin Codex merging until:
 - Linear changes contain only allowed status and assignee fields.
 - The supervisor can restart mid-turn without duplicating a lead or Linear transition.
 
-Until the Phase 1 resource-calibration gate is satisfied, run this phase with
-fake adapters or explicit dry-run actions only. Keep live Claude dispatch,
-Linear writes, and automated resource cleanup disabled.
+Resource calibration is continuous during real use and is not a time-based exit
+gate. The first live launch still requires a verified firstParty profile and
+committed conservative resource safety floors. Linear writes and automated
+resource cleanup keep their independent phase-specific gates.
