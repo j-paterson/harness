@@ -305,7 +305,12 @@ class LinearClient:
         issue = await self.validate_issue(issue_id)
         update: dict[str, str] = {}
         changed_fields: list[str] = []
-        target_state_id = self._status_ids[target.status]
+        try:
+            target_state_id = self._status_ids[target.status]
+        except KeyError as error:
+            raise ValueError(
+                f"Linear status {target.status} is not configured for this team"
+            ) from error
         target_assignee_id = self._assignee_ids[target.assignee_alias]
         if issue.state_id != target_state_id:
             update["stateId"] = target_state_id

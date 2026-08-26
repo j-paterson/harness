@@ -62,6 +62,16 @@ uv run hermes-orchestrator hermes-command --json \
 
 The boundary accepts only `queue_issue`, `status`, `pause`, `resume`, `retry`, `reprioritize`, and `approve_handoff`. It has no command for discovering or claiming Linear work.
 
+For Hermes chat intake, trust this repository once with:
+
+```bash
+hermes skills trust /PATH/TO/hermes-orchestrator
+```
+
+New Hermes sessions started inside the trusted repository can load the repo-local `hermes-orchestrator-intake` skill. The skill reads only the explicitly supplied issue through the official Linear MCP, routes Infrastructure issues to the `agent-orchestration` project, submits the strict `queue_issue` command, and verifies the private queue read-back. It does not replace or wrap Hermes's direct Linear MCP access.
+
+Linear status keys in `config/linear.yaml` are logical orchestrator milestones. A team may map `In Development` and `Review` to differently named workflow states such as Infrastructure's `In Progress` and `In Review`. `QA` may be omitted for teams without a QA state; requesting a QA projection on such a route fails closed.
+
 The Linear token is read at runtime from macOS Keychain service `hermes-orchestrator-linear`, account `default`. Linear projections read the issue first and can change only the approved state and assignee fields. Team validation happens before Claude starts, and reconciliation can veto every otherwise executable dispatch.
 
 ## Verify the system

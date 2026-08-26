@@ -32,19 +32,21 @@ class LinearStatusIds(BaseModel):
     todo: str = Field(alias="Todo", min_length=1)
     in_development: str = Field(alias="In Development", min_length=1)
     review: str = Field(alias="Review", min_length=1)
-    qa: str = Field(alias="QA", min_length=1)
+    qa: str | None = Field(default=None, alias="QA", min_length=1)
     done: str = Field(alias="Done", min_length=1)
 
     def as_mapping(self) -> dict[str, str]:
         """Return the exact public workflow labels consumed by LinearProjection."""
 
-        return {
+        statuses = {
             "Todo": self.todo,
             "In Development": self.in_development,
             "Review": self.review,
-            "QA": self.qa,
             "Done": self.done,
         }
+        if self.qa is not None:
+            statuses["QA"] = self.qa
+        return statuses
 
 
 class LinearTeamConfig(BaseModel):
@@ -161,10 +163,18 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
     if policy.mode == "active" and linear is None:
         raise ValueError("active mode requires config/linear.yaml")
 
-    projects = {
-        alias: ProjectConfig.model_validate(project)
-        for alias, project in project_values.items()
-    }
+    projects: dict[str, ProjectConfig] = {}
+    for alias, project in project_values.items():
+        validated = ProjectConfig.model_validate(project)
+        if not validated.repo_path.is_absolute():
+            validated = validated.model_copy(
+                update={
+                    "repo_path": (resolved_root / validated.repo_path).resolve(
+                        strict=False
+                    )
+                }
+            )
+        projects[alias] = validated
     if linear is not None:
         missing_teams = sorted(
             {
