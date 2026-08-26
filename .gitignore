@@ -1,1 +1,16 @@
 .worktrees/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+config/projects.yaml
+config/profiles.yaml

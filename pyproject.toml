@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-orchestrator"
+version = "0.1.0"
+description = "Local, durable orchestration for Hermes-managed coding workers"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "pydantic==2.13.4",
+  "PyYAML==6.0.3",
+  "psutil==7.2.2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.3.0",
+  "ruff==0.15.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hermes_orchestrator = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
