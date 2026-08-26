@@ -121,6 +121,7 @@ class ProjectCellService:
         self._now = now
         self._handoffs = handoffs
         self._replacement_session_ids = replacement_session_ids
+        self._restore_profile_leases()
 
     def active_projects(self) -> frozenset[str]:
         """Return projects that already own a live logical lead cell."""
@@ -371,6 +372,22 @@ class ProjectCellService:
             (project_key, *_ACTIVE_CELL_STATES),
         ).fetchone()
         return self._row_to_cell(row) if row is not None else None
+
+    def _restore_profile_leases(self) -> None:
+        rows = self._database.execute(
+            "SELECT profile_alias, project_key, acquired_at, cooldown_until "
+            "FROM profile_leases WHERE state IN ('active', 'capped')"
+        ).fetchall()
+        for row in rows:
+            cooldown = row["cooldown_until"]
+            self._profiles.restore(
+                project_key=str(row["project_key"]),
+                profile_alias=str(row["profile_alias"]),
+                acquired_at=datetime.fromisoformat(str(row["acquired_at"])),
+                cooldown_until=(
+                    datetime.fromisoformat(str(cooldown)) if cooldown else None
+                ),
+            )
 
     def _get_cell(self, cell_id: str) -> ProjectCell:
         row = self._database.execute(

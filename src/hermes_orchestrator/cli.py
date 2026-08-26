@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import time
@@ -15,10 +16,12 @@ from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, QueuedIssue
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict, QueueService
 from hermes_orchestrator.resources import ResourceSampler, ResourceSnapshot
 from hermes_orchestrator.scheduler import Scheduler
 from hermes_orchestrator.service import OrchestratorService
+from hermes_orchestrator.supervisor import Supervisor
 
 
 def _watch_interval(raw: str) -> int:
@@ -59,7 +62,35 @@ def _parser() -> argparse.ArgumentParser:
 
     reconcile = commands.add_parser("reconcile", help="reconcile durable local state")
     reconcile.add_argument("--json", action="store_true")
+
+    daemon = commands.add_parser("daemon", help="run the local supervisor loop")
+    daemon.add_argument("--once", action="store_true")
+    daemon.add_argument("--interval", type=_watch_interval, default=30)
+    daemon.add_argument("--json", action="store_true")
+
+    hermes_command = commands.add_parser(
+        "hermes-command",
+        help="execute one strict Hermes JSON command",
+    )
+    hermes_command.add_argument("--json", dest="request_json", required=True)
     return parser
+
+
+async def _run_daemon(
+    service: OrchestratorService,
+    *,
+    once: bool,
+    interval: int,
+) -> Supervisor:
+    supervisor = Supervisor(service, interval_seconds=interval)
+    if once:
+        await supervisor.run_once()
+        return supervisor
+    await supervisor.start()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await supervisor.shutdown()
 
 
 def _open(settings: Settings) -> tuple[Database, QueueService, OrchestratorService]:
@@ -133,6 +164,37 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "mode": settings.policy.mode,
             }
             _print(payload, json_output=args.json, human="Local state initialized.")
+            return 0
+
+        if args.command == "hermes-command":
+            try:
+                request = json.loads(args.request_json)
+            except json.JSONDecodeError:
+                print("invalid JSON command", file=sys.stderr)
+                return 2
+            result = HermesCommandService(queue).execute(request)
+            print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+            rejected = {"invalid_command", "intent_not_allowed"}
+            return 0 if result.code not in rejected else 1
+
+        if args.command == "daemon":
+            supervisor = asyncio.run(
+                _run_daemon(
+                    service,
+                    once=args.once,
+                    interval=args.interval,
+                )
+            )
+            payload = {
+                "mode": settings.policy.mode,
+                "ticks": supervisor.ticks,
+                "events": supervisor.events,
+            }
+            _print(
+                payload,
+                json_output=args.json,
+                human=f"Supervisor completed {supervisor.ticks} tick(s).",
+            )
             return 0
 
         if args.command == "queue-add":

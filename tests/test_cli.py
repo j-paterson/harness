@@ -99,3 +99,37 @@ def test_observe_samples_state_volume_without_registered_projects(
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["snapshot"]["disk_free_bytes"]["orchestrator_state"] > 0
+
+
+def test_hermes_command_accepts_strict_json_queue_intent(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    request = json.dumps(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-9",
+        }
+    )
+
+    result = invoke(
+        [*base_arguments(configured_repo), "hermes-command", "--json", request]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["code"] == "queued"
+
+
+def test_daemon_once_reconciles_and_samples(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    result = invoke(
+        [*base_arguments(configured_repo), "daemon", "--once", "--json"]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["ticks"] == 1
+    assert payload["mode"] == "observe"

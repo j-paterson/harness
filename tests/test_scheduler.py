@@ -75,6 +75,19 @@ def test_active_project_does_not_plan_second_lead(queue_service: QueueService) -
     assert not any(action.kind == "start_project_cell" for action in actions)
 
 
+def test_active_project_plans_issue_for_existing_lead(
+    queue_service: QueueService,
+) -> None:
+    admit(queue_service, "ENG-7", "demo", 1)
+    scheduler = Scheduler(queue_service, mode="active", active_projects={"demo"})
+
+    actions = scheduler.plan(FakeSnapshot(pressure="green", can_admit=True))
+
+    assert [(action.kind, action.issue_id, action.execute) for action in actions] == [
+        ("resume_project_cell", "ENG-7", True)
+    ]
+
+
 def test_red_pressure_plans_no_new_work(queue_service: QueueService) -> None:
     admit(queue_service, "ENG-7", "demo", 1)
     scheduler = Scheduler(queue_service, mode="observe")

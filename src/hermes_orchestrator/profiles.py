@@ -254,6 +254,31 @@ class ProfilePool:
                 return lease
         return None
 
+    def restore(
+        self,
+        project_key: str,
+        profile_alias: str,
+        acquired_at: datetime,
+        *,
+        cooldown_until: datetime | None = None,
+    ) -> ProfileLease:
+        """Rehydrate one durable affinity before new admission begins."""
+
+        self._registry.get(profile_alias)
+        existing = self._leases.get(project_key)
+        if existing is not None:
+            if existing.profile_alias == profile_alias:
+                return existing
+            raise ValueError("project has conflicting durable profile leases")
+        state = self._states[profile_alias]
+        if state.active_project_count != 0:
+            raise ValueError("profile has conflicting durable project leases")
+        lease = ProfileLease(project_key, profile_alias, acquired_at)
+        self._leases[project_key] = lease
+        state.active_project_count = 1
+        state.cooldown_until = cooldown_until
+        return lease
+
     def release(self, project_key: str, reason: str) -> None:
         """Release a project affinity with a reason for the caller's journal."""
 

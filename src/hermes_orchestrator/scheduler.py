@@ -74,17 +74,22 @@ class Scheduler:
         planned_projects: set[str] = set()
         active_projects = frozenset(self._active_projects())
         for issue in self._queue.list_ranked(self._now()):
-            if issue.project_key in active_projects:
-                continue
             if issue.project_key in planned_projects:
                 continue
             planned_projects.add(issue.project_key)
+            active = issue.project_key in active_projects
             actions.append(
                 PlannedAction(
-                    kind="start_project_cell",
+                    kind=(
+                        "resume_project_cell" if active else "start_project_cell"
+                    ),
                     project_key=issue.project_key,
                     issue_id=issue.issue_id,
-                    reason="highest-ranked ready work for an inactive project",
+                    reason=(
+                        "highest-ranked ready work for the active project lead"
+                        if active
+                        else "highest-ranked ready work for an inactive project"
+                    ),
                     execute=self._mode == "active",
                     evidence={
                         "pressure": str(pressure),
