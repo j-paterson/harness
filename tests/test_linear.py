@@ -120,7 +120,7 @@ async def test_projection_updates_assignee_without_mutating_status(
     )
 
     assert result.changed_fields == ("assignee",)
-    assert transport.operations == ["Issue", "IssueUpdate"]
+    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
     assert transport.variables[1] == {
         "id": "linear-eng-9",
         "input": {"assigneeId": "user-ryan"},
@@ -128,7 +128,26 @@ async def test_projection_updates_assignee_without_mutating_status(
 
 
 @pytest.mark.asyncio
-async def test_projection_refuses_non_atomic_status_transition(
+async def test_projection_updates_allowed_status_transition(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    result = await linear_client.project(
+        "ENG-9",
+        LinearProjection(status="In Development", assignee_alias="operator"),
+        effect_id="effect-status",
+    )
+
+    assert result.changed_fields == ("status",)
+    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
+    assert transport.variables[1] == {
+        "id": "linear-eng-9",
+        "input": {"stateId": "state-development"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_projection_refuses_terminal_status_regression(
     linear_client: LinearClient,
     transport: RecordingLinearTransport,
 ) -> None:
@@ -139,7 +158,7 @@ async def test_projection_refuses_non_atomic_status_transition(
         revision="done-r1",
     )
 
-    with pytest.raises(ValueError, match="status mutation requires compare-and-set"):
+    with pytest.raises(ValueError, match=r"status transition.*not allowed"):
         await linear_client.project(
             "ENG-9",
             LinearProjection(status="In Development", assignee_alias="operator"),
@@ -147,6 +166,60 @@ async def test_projection_refuses_non_atomic_status_transition(
         )
 
     assert transport.operations == ["Issue"]
+
+
+@pytest.mark.asyncio
+async def test_pending_projection_does_not_overwrite_newer_linear_change(
+    database: Database,
+) -> None:
+    class LostResponseTransport(RecordingLinearTransport):
+        fail_after_update = True
+
+        async def execute(
+            self,
+            operation: str,
+            query: str,
+            variables: dict[str, Any],
+        ) -> dict[str, Any]:
+            result = await super().execute(operation, query, variables)
+            if operation == "IssueUpdate" and self.fail_after_update:
+                self.fail_after_update = False
+                raise TimeoutError("Linear response was lost")
+            return result
+
+    transport = LostResponseTransport()
+    client = LinearClient(
+        transport=transport,
+        effects=ExternalEffectStore(database),
+        status_ids={
+            "Todo": "state-todo",
+            "In Development": "state-development",
+            "Review": "state-review",
+            "QA": "state-qa",
+            "Done": "state-done",
+        },
+        assignee_ids={"operator": "user-operator", "ryan": "user-ryan"},
+        expected_team_id="team-engineering",
+    )
+    target = LinearProjection(
+        status="In Development",
+        assignee_alias="operator",
+    )
+
+    with pytest.raises(TimeoutError, match="response was lost"):
+        await client.project("ENG-9", target, effect_id="effect-race")
+    transport.issue(
+        status="Review",
+        state_id="state-review",
+        assignee_id="user-operator",
+        revision="human-r3",
+    )
+
+    with pytest.raises(RuntimeError, match="changed after projection began"):
+        await client.project("ENG-9", target, effect_id="effect-race")
+
+    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
+    assert transport.state_id == "state-review"
 
 
 @pytest.mark.asyncio

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from pathlib import Path
+from typing import Protocol, TextIO
 
 from hermes_orchestrator.cells import DispatchResult, ProjectCellService
 from hermes_orchestrator.claude import ClaudeRunner
@@ -35,6 +37,41 @@ from hermes_orchestrator.service import OrchestratorService
 Dispatch = Callable[[str], Awaitable[DispatchResult]]
 
 
+class DaemonAlreadyRunning(RuntimeError):
+    """Raised when another live runtime owns the durable daemon state."""
+
+
+class _DaemonLock:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: TextIO | None = None
+
+    def acquire(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self._path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            handle.close()
+            raise DaemonAlreadyRunning(
+                "another hermes-orchestrator daemon is already running"
+            ) from error
+        except BaseException:
+            handle.close()
+            raise
+        self._handle = handle
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle = None
+            handle.close()
+
+
 class KeychainReader(Protocol):
     """Narrow credential boundary used during live assembly."""
 
@@ -51,11 +88,16 @@ class Runtime:
     dispatch: Dispatch | None
     cells: ProjectCellService | None
     profile_health: tuple[ProfileHealth, ...]
+    _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
         """Close durable local state after all workers have stopped."""
 
-        self.database.close()
+        try:
+            self.database.close()
+        finally:
+            if self._daemon_lock is not None:
+                self._daemon_lock.release()
 
 
 def open_runtime(
@@ -71,7 +113,17 @@ def open_runtime(
     if enable_live and settings.policy.mode != "active":
         raise ValueError("live runtime requires active policy mode")
 
-    database = Database.open(settings.state_dir / "state.db")
+    daemon_lock = (
+        _DaemonLock(settings.state_dir / "daemon.lock") if enable_live else None
+    )
+    if daemon_lock is not None:
+        daemon_lock.acquire()
+    try:
+        database = Database.open(settings.state_dir / "state.db")
+    except BaseException:
+        if daemon_lock is not None:
+            daemon_lock.release()
+        raise
     try:
         events = EventStore(database)
         queue = QueueService(database, events, settings.projects)
@@ -187,7 +239,12 @@ def open_runtime(
             dispatch=dispatch,
             cells=cells,
             profile_health=profile_health,
+            _daemon_lock=daemon_lock,
         )
     except BaseException:
-        database.close()
+        try:
+            database.close()
+        finally:
+            if daemon_lock is not None:
+                daemon_lock.release()
         raise

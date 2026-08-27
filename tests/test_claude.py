@@ -71,6 +71,7 @@ def test_new_lead_uses_subscription_profile_and_persistent_session(
         "11111111-1111-4111-8111-111111111111"
     )
     assert "--output-format=stream-json" in command
+    assert "--verbose" in command
     assert "--include-hook-events" in command
     assert "--forward-subagent-text" in command
     assert env["CLAUDE_CONFIG_DIR"].endswith(".claude-max-a")
@@ -105,6 +106,32 @@ def test_parser_extracts_session_subagent_and_limit_events() -> None:
     assert events[1].usage == {"input_tokens": 120, "output_tokens": 8}
     assert events[2].parent_tool_use_id == "toolu-agent-1"
     assert events[2].error_code == "subscription_limit"
+
+
+def test_parser_recognizes_reached_fable_limit_message() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": None,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've reached your Fable 5 limit. "
+                            "Switch to another model, or manage usage credits "
+                            "to continue.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
 
 
 def test_handoff_schema_is_passed_and_acknowledgement_is_parsed(

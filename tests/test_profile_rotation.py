@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 from hermes_orchestrator.cells import ProjectCellService, RotationBlocked
+from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
@@ -15,6 +16,122 @@ from hermes_orchestrator.profiles import ProfileHealth, ProfilePool, ProfileRegi
 from hermes_orchestrator.queue import QueueService
 from tests.test_cells import SESSION_ID, RecordingLinear, RecordingRunner, admit
 from tests.test_handoffs import valid_handoff
+
+
+@pytest.mark.asyncio
+async def test_rotation_closes_replacement_stream_when_acknowledgement_fails(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        "  - {alias: max-a, config_dir: /tmp/max-a}\n"
+        "  - {alias: max-b, config_dir: /tmp/max-b}\n"
+        "  - {alias: max-c, config_dir: /tmp/max-c}\n"
+        "  - {alias: max-d, config_dir: /tmp/max-d}\n",
+        encoding="utf-8",
+    )
+    registry = ProfileRegistry.load(config)
+    profiles = ProfilePool(registry)
+    for profile in registry.profiles:
+        profiles.record_health(
+            ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=True,
+                reason="eligible",
+                last_checked_at=datetime(2026, 8, 26, tzinfo=UTC),
+            )
+        )
+    database = Database.open(tmp_path / "state.db")
+    replacement_session = UUID("22222222-2222-4222-8222-222222222222")
+
+    class ReplacementStream:
+        def __init__(self) -> None:
+            self.events = iter(
+                [
+                    ClaudeEvent(
+                        "session.started",
+                        "system",
+                        replacement_session,
+                        None,
+                        None,
+                        {},
+                    ),
+                    ClaudeEvent(
+                        "handoff.acknowledged",
+                        "result",
+                        replacement_session,
+                        None,
+                        None,
+                        {},
+                        restated_next_action="Run the failing test.",
+                    ),
+                ]
+            )
+            self.closed = False
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __anext__(self) -> ClaudeEvent:
+            try:
+                return next(self.events)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = ReplacementStream()
+
+    class RotationRunner(RecordingRunner):
+        def start_lead(self, request: LeadTurnRequest):  # type: ignore[no-untyped-def]
+            return stream
+
+    try:
+        now = datetime(2026, 8, 26, tzinfo=UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) "
+                "VALUES (?, 'demo', 'active', 'max-a', ?, ?, ?)",
+                ("cell-demo", str(SESSION_ID), now, now),
+            )
+            connection.execute(
+                "INSERT INTO profile_leases("
+                "profile_alias, project_key, state, acquired_at) "
+                "VALUES ('max-a', 'demo', 'active', ?)",
+                (now,),
+            )
+        handoffs = HandoffService(database, handoff_ids=lambda: "handoff-1")
+        record = handoffs.submit(valid_handoff())
+
+        class FailingAcknowledgement:
+            def get(self, handoff_id: str):  # type: ignore[no-untyped-def]
+                return handoffs.get(handoff_id)
+
+            def acknowledge(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                raise RuntimeError("acknowledgement failed")
+
+        cells = ProjectCellService(
+            database=database,
+            events=EventStore(database),
+            queue=QueueService(database, EventStore(database), {"demo"}),
+            profiles=profiles,
+            runner=RotationRunner(),
+            linear=RecordingLinear(),
+            project_paths={"demo": tmp_path},
+            handoffs=FailingAcknowledgement(),  # type: ignore[arg-type]
+            replacement_session_ids=lambda: replacement_session,
+        )
+
+        with pytest.raises(RuntimeError, match="acknowledgement failed"):
+            await cells.rotate("cell-demo", record.handoff_id)
+
+        assert stream.closed is True
+    finally:
+        database.close()
 
 
 @pytest.mark.asyncio

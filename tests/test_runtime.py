@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+import hermes_orchestrator.runtime as runtime_module
 from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.profiles import JsonCommand
-from hermes_orchestrator.runtime import open_runtime
+from hermes_orchestrator.runtime import DaemonAlreadyRunning, open_runtime
 
 
 class EligibleProfileCommand(JsonCommand):
@@ -113,6 +114,141 @@ def test_active_runtime_assembles_live_dispatch_without_identity_persistence(
         assert runtime.database.scalar("SELECT count(*) FROM profile_leases") == 0
     finally:
         runtime.close()
+
+
+def test_only_one_live_runtime_can_own_daemon_state(tmp_path: Path) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    first = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        with pytest.raises(DaemonAlreadyRunning, match="already running"):
+            open_runtime(
+                settings,
+                enable_live=True,
+                profile_command=EligibleProfileCommand(),
+                keychain=FakeKeychain(),
+                base_env={},
+            )
+    finally:
+        first.close()
+
+    replacement = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    replacement.close()
+
+
+def test_daemon_lock_closes_handle_when_acquire_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Handle:
+        closed = False
+
+        def fileno(self) -> int:
+            return 42
+
+        def close(self) -> None:
+            self.closed = True
+
+    handle = Handle()
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: handle)
+
+    def fail_flock(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("flock failed")
+
+    monkeypatch.setattr(runtime_module.fcntl, "flock", fail_flock)
+    lock = runtime_module._DaemonLock(tmp_path / "daemon.lock")
+
+    with pytest.raises(OSError, match="flock failed"):
+        lock.acquire()
+
+    assert handle.closed is True
+
+
+def test_daemon_lock_closes_handle_when_unlock_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Handle:
+        closed = False
+
+        def fileno(self) -> int:
+            return 42
+
+        def close(self) -> None:
+            self.closed = True
+
+    handle = Handle()
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: handle)
+    calls = 0
+
+    def flaky_flock(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("unlock failed")
+
+    monkeypatch.setattr(runtime_module.fcntl, "flock", flaky_flock)
+    lock = runtime_module._DaemonLock(tmp_path / "daemon.lock")
+    lock.acquire()
+
+    with pytest.raises(OSError, match="unlock failed"):
+        lock.release()
+
+    assert handle.closed is True
+
+
+def test_runtime_releases_daemon_lock_when_database_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+
+    class RecordingLock:
+        acquired = False
+        released = False
+
+        def acquire(self) -> None:
+            self.acquired = True
+
+        def release(self) -> None:
+            self.released = True
+
+    class ClosingDatabase:
+        def close(self) -> None:
+            raise RuntimeError("database close failed")
+
+    lock = RecordingLock()
+    database = ClosingDatabase()
+    monkeypatch.setattr(runtime_module, "_DaemonLock", lambda path: lock)
+    monkeypatch.setattr(
+        runtime_module.Database,
+        "open",
+        classmethod(lambda cls, path: database),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "EventStore",
+        lambda value: (_ for _ in ()).throw(ValueError("assembly failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="database close failed"):
+        open_runtime(settings, enable_live=True)
+
+    assert lock.acquired is True
+    assert lock.released is True
 
 
 def test_observation_runtime_never_loads_live_credentials(tmp_path: Path) -> None:

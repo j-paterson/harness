@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import signal
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -151,7 +151,9 @@ class ClaudeEventParser:
     def _is_subscription_limit(cls, value: object) -> bool:
         if isinstance(value, str):
             normalized = value.lower()
-            return "hit your" in normalized and "limit" in normalized
+            return (
+                "hit your" in normalized or "reached your" in normalized
+            ) and "limit" in normalized
         if isinstance(value, list):
             return any(cls._is_subscription_limit(item) for item in value)
         if isinstance(value, dict):
@@ -230,6 +232,7 @@ class ClaudeRunner:
                 "--input-format",
                 "text",
                 "--output-format=stream-json",
+                "--verbose",
                 "--include-hook-events",
                 "--forward-subagent-text",
                 "--permission-mode",
@@ -247,7 +250,7 @@ class ClaudeRunner:
     def start_lead(
         self,
         request: LeadTurnRequest,
-    ) -> AsyncIterator[ClaudeEvent]:
+    ) -> AsyncGenerator[ClaudeEvent]:
         """Start a new persistent session and stream normalized events."""
 
         return self._run(replace(request, resume=False))
@@ -256,7 +259,7 @@ class ClaudeRunner:
         self,
         session_id: UUID,
         request: LeadTurnRequest,
-    ) -> AsyncIterator[ClaudeEvent]:
+    ) -> AsyncGenerator[ClaudeEvent]:
         """Resume the same persistent session and stream normalized events."""
 
         return self._run(replace(request, session_id=session_id, resume=True))
@@ -266,7 +269,7 @@ class ClaudeRunner:
 
         del session_id
 
-    async def _run(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+    async def _run(self, request: LeadTurnRequest) -> AsyncGenerator[ClaudeEvent]:
         command, environment = self.build_command(request)
         process = await self._process_factory(
             *command,

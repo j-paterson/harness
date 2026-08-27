@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -22,16 +23,26 @@ from hermes_orchestrator.queue import QueueService
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
 
+class LeadStream(Protocol):
+    """A lead event stream with deterministic process cleanup."""
+
+    def __aiter__(self) -> AsyncIterator[ClaudeEvent]: ...
+
+    async def __anext__(self) -> ClaudeEvent: ...
+
+    async def aclose(self) -> None: ...
+
+
 class LeadRunner(Protocol):
     """Claude lead execution boundary used by project cells."""
 
-    def start_lead(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]: ...
+    def start_lead(self, request: LeadTurnRequest) -> LeadStream: ...
 
     def resume_lead(
         self,
         session_id: UUID,
         request: LeadTurnRequest,
-    ) -> AsyncIterator[ClaudeEvent]: ...
+    ) -> LeadStream: ...
 
     async def retire_session(self, session_id: UUID) -> None: ...
 
@@ -127,6 +138,7 @@ class ProjectCellService:
         self._now = now
         self._handoffs = handoffs
         self._replacement_session_ids = replacement_session_ids
+        self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
     def active_projects(self) -> frozenset[str]:
@@ -144,16 +156,32 @@ class ProjectCellService:
         """Start or resume the issue's project lead after explicit admission."""
 
         issue = self._queue.get(issue_id)
+        lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
+        async with lock:
+            return await self._dispatch_locked(issue_id)
+
+    async def _dispatch_locked(self, issue_id: str) -> DispatchResult:
+        """Dispatch one issue while holding its project-wide in-process lock."""
+
+        issue = self._queue.get(issue_id)
         await self._linear.validate(issue.project_key, issue_id)
         cell = self._find_active_cell(issue.project_key)
-        created = cell is None
+        created = False
         if cell is None:
             try:
-                cell = self._create_cell(issue.project_key, issue_id)
+                cell, created = self._create_cell(issue.project_key, issue_id)
             except _IssueAlreadyCompleted:
                 return DispatchResult(status="already_completed", issue_id=issue_id)
             if cell is None:
                 return DispatchResult(status="waiting_for_profile", issue_id=issue_id)
+        elif cell.state == "starting":
+            return DispatchResult(
+                status="start_reconciliation_required",
+                issue_id=issue_id,
+                cell_id=cell.cell_id,
+                session_id=cell.session_id,
+                profile_alias=cell.profile_alias,
+            )
         elif cell.state == "handoff_required":
             return DispatchResult(
                 status="handoff_required",
@@ -173,36 +201,54 @@ class ProjectCellService:
             profile_alias=cell.profile_alias,
             resume=not created,
         )
-        stream = (
-            self._runner.start_lead(request)
-            if created
-            else self._runner.resume_lead(cell.session_id, request)
-        )
-
         session_confirmed = False
         handoff_required = False
         issue_completed = False
-        async for event in stream:
-            self.record(cell, event)
-            if event.kind == "session.started":
-                if event.session_id != cell.session_id:
-                    raise RuntimeError(
-                        "Claude session id did not match its project cell"
-                    )
-                if self._activate_issue(cell, issue_id):
-                    session_confirmed = True
-                    await self._linear.project(
-                        issue_id,
-                        LinearProjection(
-                            assignee_alias="operator",
-                        ),
-                        effect_id=f"linear:{issue_id}:in-development",
-                    )
-                else:
-                    issue_completed = True
-            elif event.kind == "provider.limit":
-                handoff_required = True
-                self._require_handoff(cell, "subscription_limit")
+        start_capped = False
+        try:
+            stream = (
+                self._runner.start_lead(request)
+                if created
+                else self._runner.resume_lead(cell.session_id, request)
+            )
+            try:
+                async for event in stream:
+                    self.record(cell, event)
+                    if event.kind == "session.started":
+                        if event.session_id != cell.session_id:
+                            raise RuntimeError(
+                                "Claude session id did not match its project cell"
+                            )
+                        await self._linear.project(
+                            issue_id,
+                            LinearProjection(
+                                status="In Development",
+                                assignee_alias="operator",
+                            ),
+                            effect_id=f"linear:{issue_id}:in-development:v2",
+                        )
+                        if self._activate_issue(cell, issue_id):
+                            session_confirmed = True
+                        else:
+                            issue_completed = (
+                                self._queue.get(issue_id).state == IssueState.DONE
+                            )
+                    elif event.kind == "provider.limit":
+                        if session_confirmed:
+                            handoff_required = True
+                            self._require_handoff(cell, "subscription_limit")
+                        else:
+                            start_capped = True
+                            break
+            finally:
+                await stream.aclose()
+        except BaseException:
+            if created and not session_confirmed:
+                self._fail_unconfirmed_start(cell)
+            raise
+
+        if created and not session_confirmed and not handoff_required:
+            self._fail_unconfirmed_start(cell, capped=start_capped)
 
         if issue_completed:
             status = "already_completed"
@@ -299,20 +345,23 @@ class ProjectCellService:
         acknowledged = already_acknowledged
         try:
             stream = self._runner.start_lead(request)
-            async for event in stream:
-                if event.kind == "session.started":
-                    session_started = event.session_id == replacement_session
-                elif (
-                    event.kind == "handoff.acknowledged"
-                    and event.session_id == replacement_session
-                    and event.restated_next_action
-                ):
-                    self._handoffs.acknowledge(
-                        handoff_id,
-                        replacement_session,
-                        event.restated_next_action,
-                    )
-                    acknowledged = True
+            try:
+                async for event in stream:
+                    if event.kind == "session.started":
+                        session_started = event.session_id == replacement_session
+                    elif (
+                        event.kind == "handoff.acknowledged"
+                        and event.session_id == replacement_session
+                        and event.restated_next_action
+                    ):
+                        self._handoffs.acknowledge(
+                            handoff_id,
+                            replacement_session,
+                            event.restated_next_action,
+                        )
+                        acknowledged = True
+            finally:
+                await stream.aclose()
         except BaseException:
             self._profiles.cancel_replacement(current.project_key)
             raise
@@ -389,11 +438,42 @@ class ProjectCellService:
 
     def _restore_profile_leases(self) -> None:
         rows = self._database.execute(
-            "SELECT profile_alias, project_key, acquired_at, cooldown_until "
+            "SELECT profile_alias, project_key, state, acquired_at, cooldown_until "
             "FROM profile_leases WHERE state IN ('active', 'capped')"
         ).fetchall()
         for row in rows:
             cooldown = row["cooldown_until"]
+            if str(row["state"]) == "capped":
+                if not cooldown:
+                    raise ValueError("capped profile lease is missing cooldown_until")
+                cooldown_until = datetime.fromisoformat(str(cooldown))
+                active_cell = self._database.execute(
+                    "SELECT 1 FROM project_cells WHERE project_key = ? "
+                    "AND profile_alias = ? "
+                    "AND state IN ('starting', 'active', 'handoff_required', 'paused')",
+                    (str(row["project_key"]), str(row["profile_alias"])),
+                ).fetchone()
+                if active_cell is not None:
+                    self._profiles.restore(
+                        project_key=str(row["project_key"]),
+                        profile_alias=str(row["profile_alias"]),
+                        acquired_at=datetime.fromisoformat(str(row["acquired_at"])),
+                        cooldown_until=cooldown_until,
+                    )
+                    continue
+                if cooldown_until <= self._aware_now():
+                    with self._database.transaction() as connection:
+                        connection.execute(
+                            "DELETE FROM profile_leases "
+                            "WHERE profile_alias = ? AND state = 'capped'",
+                            (str(row["profile_alias"]),),
+                        )
+                    continue
+                self._profiles.set_cooldown(
+                    str(row["profile_alias"]),
+                    cooldown_until,
+                )
+                continue
             self._profiles.restore(
                 project_key=str(row["project_key"]),
                 profile_alias=str(row["profile_alias"]),
@@ -402,6 +482,57 @@ class ProjectCellService:
                     datetime.fromisoformat(str(cooldown)) if cooldown else None
                 ),
             )
+
+    def _fail_unconfirmed_start(
+        self,
+        cell: ProjectCell,
+        *,
+        capped: bool = False,
+    ) -> bool:
+        now_value = self._aware_now()
+        now = now_value.isoformat()
+        cooldown_until = now_value + timedelta(hours=1) if capped else None
+        with self._database.transaction() as connection:
+            updated = connection.execute(
+                "UPDATE project_cells SET state = 'failed', updated_at = ? "
+                "WHERE cell_id = ? AND state = 'starting'",
+                (now, cell.cell_id),
+            )
+            if updated.rowcount == 0:
+                return False
+            if capped:
+                connection.execute(
+                    "UPDATE profile_leases SET state = 'capped', cooldown_until = ? "
+                    "WHERE project_key = ? AND profile_alias = ?",
+                    (
+                        cooldown_until.isoformat(),
+                        cell.project_key,
+                        cell.profile_alias,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM profile_leases WHERE project_key = ? "
+                    "AND profile_alias = ?",
+                    (cell.project_key, cell.profile_alias),
+                )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="project_cell.start_failed",
+                    aggregate_type="project_cell",
+                    aggregate_id=cell.cell_id,
+                    payload={
+                        "project_key": cell.project_key,
+                        "profile_alias": cell.profile_alias,
+                        "reason": "subscription_limit" if capped else "unconfirmed",
+                    },
+                ),
+            )
+        if cooldown_until is not None:
+            self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
+        self._profiles.release(cell.project_key, "lead_start_failed")
+        return True
 
     def _get_cell(self, cell_id: str) -> ProjectCell:
         row = self._database.execute(
@@ -412,10 +543,14 @@ class ProjectCellService:
             raise KeyError(cell_id)
         return self._row_to_cell(row)
 
-    def _create_cell(self, project_key: str, issue_id: str) -> ProjectCell | None:
+    def _create_cell(
+        self,
+        project_key: str,
+        issue_id: str,
+    ) -> tuple[ProjectCell | None, bool]:
         lease = self._profiles.acquire(project_key)
         if lease is None:
-            return None
+            return None, False
         now = self._aware_now().isoformat()
         cell = ProjectCell(
             cell_id=self._cell_ids(),
@@ -450,6 +585,12 @@ class ProjectCellService:
                     ),
                 )
                 connection.execute(
+                    "DELETE FROM profile_leases WHERE profile_alias = ? "
+                    "AND state = 'capped' AND cooldown_until IS NOT NULL "
+                    "AND cooldown_until <= ?",
+                    (cell.profile_alias, now),
+                )
+                connection.execute(
                     "INSERT INTO profile_leases("
                     "profile_alias, project_key, state, acquired_at"
                     ") VALUES (?, ?, 'active', ?)",
@@ -475,13 +616,32 @@ class ProjectCellService:
             self._profiles.release(project_key, "cell_creation_conflict")
             existing = self._find_active_cell(project_key)
             if existing is not None:
-                return existing
+                return existing, False
             raise
-        return cell
+        return cell, True
 
     def _activate_issue(self, cell: ProjectCell, issue_id: str) -> bool:
         now = self._aware_now().isoformat()
         with self._database.transaction() as connection:
+            issue_row = connection.execute(
+                "SELECT state FROM admitted_issues WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+            if issue_row is None:
+                raise KeyError(issue_id)
+            if str(issue_row["state"]) == IssueState.DONE.value:
+                return False
+            activated = connection.execute(
+                "UPDATE project_cells SET state = 'active', updated_at = ? "
+                "WHERE cell_id = ? AND state IN ('starting', 'active') "
+                "AND EXISTS ("
+                "SELECT 1 FROM profile_leases "
+                "WHERE project_key = ? AND profile_alias = ? AND state = 'active'"
+                ")",
+                (now, cell.cell_id, cell.project_key, cell.profile_alias),
+            )
+            if activated.rowcount == 0:
+                return False
             updated = connection.execute(
                 "UPDATE admitted_issues SET state = ?, updated_at = ? "
                 "WHERE issue_id = ? AND state != ?",
@@ -494,11 +654,6 @@ class ProjectCellService:
             )
             if updated.rowcount == 0:
                 return False
-            connection.execute(
-                "UPDATE project_cells SET state = 'active', updated_at = ? "
-                "WHERE cell_id = ?",
-                (now, cell.cell_id),
-            )
             self._events.append(
                 connection,
                 EventInput(

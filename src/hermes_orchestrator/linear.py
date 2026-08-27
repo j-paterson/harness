@@ -35,6 +35,18 @@ mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
 }
 """.strip()
 
+_ALLOWED_STATUS_TRANSITIONS = frozenset(
+    {
+        ("Todo", "In Development"),
+        ("In Development", "Review"),
+        ("Review", "In Development"),
+        ("Review", "QA"),
+        ("Review", "Done"),
+        ("QA", "In Development"),
+        ("QA", "Done"),
+    }
+)
+
 
 class LinearProjection(BaseModel):
     """The complete set of workflow fields Hermes may change."""
@@ -275,9 +287,7 @@ class LinearClient:
             linear_id=str(issue["id"]),
             status=str(state["name"]),
             state_id=str(state["id"]),
-            assignee_id=(
-                str(assignee["id"]) if isinstance(assignee, dict) else None
-            ),
+            assignee_id=(str(assignee["id"]) if isinstance(assignee, dict) else None),
             team_id=str(team["id"]),
             revision=str(issue["updatedAt"]),
         )
@@ -297,10 +307,20 @@ class LinearClient:
     ) -> ProjectionResult:
         """Apply only differing state or assignee values exactly once."""
 
-        request = {"issue_id": issue_id, "target": target.model_dump(mode="json")}
-        effect = self._effects.begin(effect_id, target=issue_id, request=request)
-        if effect.state == "completed" and effect.response is not None:
-            return ProjectionResult.from_record(effect.response)
+        requested_target = {
+            "issue_id": issue_id,
+            "target": target.model_dump(mode="json"),
+        }
+        effect = self._effects.get(effect_id)
+        if effect is not None:
+            recorded_target = {
+                "issue_id": effect.request.get("issue_id"),
+                "target": effect.request.get("target"),
+            }
+            if recorded_target != requested_target:
+                raise ValueError("effect_id was already used for another request")
+            if effect.state == "completed" and effect.response is not None:
+                return ProjectionResult.from_record(effect.response)
 
         issue = await self.validate_issue(issue_id)
         update: dict[str, str] = {}
@@ -314,13 +334,48 @@ class LinearClient:
                     f"Linear status {target.status} is not configured for this team"
                 ) from error
         target_assignee_id = self._assignee_ids[target.assignee_alias]
-        if target_state_id is not None and issue.state_id != target_state_id:
-            raise ValueError(
-                "Linear status mutation requires compare-and-set support"
+        target_matches = (
+            target_state_id is None or issue.state_id == target_state_id
+        ) and issue.assignee_id == target_assignee_id
+        if effect is not None and target_matches:
+            result = ProjectionResult(
+                issue_id=issue_id,
+                changed_fields=tuple(
+                    str(field) for field in effect.request.get("changed_fields", ())
+                ),
+                source_revision=str(
+                    effect.request.get("source_revision", issue.revision)
+                ),
+                response_revision=issue.revision,
             )
+            self._effects.complete(effect_id, result.as_record())
+            return result
+        if (
+            effect is not None
+            and effect.request.get("source_revision") != issue.revision
+        ):
+            raise RuntimeError("Linear issue changed after projection began")
+
+        if target_state_id is not None and issue.state_id != target_state_id:
+            current_status = self._logical_status(issue.state_id)
+            if (current_status, target.status) not in _ALLOWED_STATUS_TRANSITIONS:
+                raise ValueError(
+                    f"Linear status transition {current_status} -> "
+                    f"{target.status} is not allowed"
+                )
+            update["stateId"] = target_state_id
+            changed_fields.append("status")
         if issue.assignee_id != target_assignee_id:
             update["assigneeId"] = target_assignee_id
             changed_fields.append("assignee")
+
+        if effect is None:
+            request = {
+                **requested_target,
+                "source_revision": issue.revision,
+                "changed_fields": changed_fields,
+            }
+            effect = self._effects.begin(effect_id, target=issue_id, request=request)
 
         response_revision = issue.revision
         if update:
@@ -338,7 +393,12 @@ class LinearClient:
             updated_issue = update_result.get("issue")
             if not isinstance(updated_issue, dict):
                 raise ValueError("Linear issue update is missing its issue")
-            response_revision = str(updated_issue["updatedAt"])
+            verified = await self.validate_issue(issue_id)
+            if target_state_id is not None and verified.state_id != target_state_id:
+                raise RuntimeError("Linear status projection verification failed")
+            if verified.assignee_id != target_assignee_id:
+                raise RuntimeError("Linear assignee projection verification failed")
+            response_revision = verified.revision
 
         result = ProjectionResult(
             issue_id=issue_id,
@@ -348,6 +408,18 @@ class LinearClient:
         )
         self._effects.complete(effect_id, result.as_record())
         return result
+
+    def _logical_status(self, state_id: str) -> str:
+        matches = [
+            name
+            for name, configured_id in self._status_ids.items()
+            if configured_id == state_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Linear issue has an unknown or ambiguous configured status"
+            )
+        return matches[0]
 
     def _validate_team(self, issue: LinearIssue) -> None:
         if (
