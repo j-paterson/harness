@@ -52,6 +52,15 @@ def _parser() -> argparse.ArgumentParser:
     queue_list = commands.add_parser("queue-list", help="list the private queue")
     queue_list.add_argument("--json", action="store_true")
 
+    queue_complete = commands.add_parser(
+        "queue-complete",
+        help="reconcile an explicitly completed issue",
+    )
+    queue_complete.add_argument("issue_id")
+    queue_complete.add_argument("--reason", required=True)
+    queue_complete.add_argument("--evidence", required=True)
+    queue_complete.add_argument("--json", action="store_true")
+
     status = commands.add_parser("status", help="show durable status")
     status.add_argument("--json", action="store_true")
 
@@ -238,13 +247,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "queue-complete":
+            try:
+                issue = queue.complete(
+                    args.issue_id,
+                    reason=args.reason,
+                    evidence=args.evidence,
+                )
+            except (KeyError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print(
+                _issue_payload(issue),
+                json_output=args.json,
+                human=f"Completed {issue.issue_id}.",
+            )
+            return 0
+
         if args.command == "status":
             payload = {
                 "mode": settings.policy.mode,
                 "admission_open": False,
-                "queue_count": int(
-                    database.scalar("SELECT count(*) FROM admitted_issues")
-                ),
+                "queue_count": len(queue.list_ranked(datetime.now(UTC))),
                 "project_count": len(settings.projects),
                 "schema_version": database.schema_version(),
             }

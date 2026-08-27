@@ -109,22 +109,44 @@ def linear_client(
 
 
 @pytest.mark.asyncio
-async def test_projection_reads_before_writing(
+async def test_projection_updates_assignee_without_mutating_status(
     linear_client: LinearClient,
     transport: RecordingLinearTransport,
 ) -> None:
     result = await linear_client.project(
         "ENG-9",
-        LinearProjection(status="In Development", assignee_alias="operator"),
+        LinearProjection(assignee_alias="ryan"),
         effect_id="effect-1",
     )
 
-    assert result.changed_fields == ("status",)
+    assert result.changed_fields == ("assignee",)
     assert transport.operations == ["Issue", "IssueUpdate"]
     assert transport.variables[1] == {
         "id": "linear-eng-9",
-        "input": {"stateId": "state-development"},
+        "input": {"assigneeId": "user-ryan"},
     }
+
+
+@pytest.mark.asyncio
+async def test_projection_refuses_non_atomic_status_transition(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    transport.issue(
+        status="Done",
+        state_id="state-done",
+        assignee_id="user-operator",
+        revision="done-r1",
+    )
+
+    with pytest.raises(ValueError, match="status mutation requires compare-and-set"):
+        await linear_client.project(
+            "ENG-9",
+            LinearProjection(status="In Development", assignee_alias="operator"),
+            effect_id="effect-terminal-guard",
+        )
+
+    assert transport.operations == ["Issue"]
 
 
 @pytest.mark.asyncio
@@ -154,7 +176,7 @@ async def test_completed_effect_retry_does_not_touch_linear(
     linear_client: LinearClient,
     transport: RecordingLinearTransport,
 ) -> None:
-    target = LinearProjection(status="In Development", assignee_alias="operator")
+    target = LinearProjection(assignee_alias="ryan")
     first = await linear_client.project("ENG-9", target, effect_id="effect-3")
     transport.operations.clear()
     transport.variables.clear()
@@ -223,12 +245,12 @@ async def test_project_router_validates_before_routing_projection(
     issue = await router.validate("demo", "ENG-9")
     result = await router.project(
         "ENG-9",
-        LinearProjection(status="In Development", assignee_alias="operator"),
+        LinearProjection(assignee_alias="ryan"),
         "effect-router",
     )
 
     assert issue.issue_id == "ENG-9"
-    assert result.changed_fields == ("status",)
+    assert result.changed_fields == ("assignee",)
 
 
 @pytest.mark.asyncio

@@ -124,6 +124,55 @@ class QueueService:
             )
         return self.get(issue_id)
 
+    def complete(self, issue_id: str, *, reason: str, evidence: str) -> QueuedIssue:
+        """Mark externally completed work done and journal the operator evidence."""
+
+        if not reason.strip():
+            raise ValueError("completion reason is required")
+        if not evidence.strip():
+            raise ValueError("completion evidence is required")
+        now = self._aware_now().isoformat()
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM admitted_issues WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(issue_id)
+            current = self._row_to_issue(row)
+            if current.state is not IssueState.DONE:
+                active_cell = connection.execute(
+                    "SELECT 1 FROM project_cells WHERE project_key = ? "
+                    "AND state IN ('starting', 'active', 'handoff_required', 'paused') "
+                    "LIMIT 1",
+                    (current.project_key,),
+                ).fetchone()
+                if active_cell is not None:
+                    raise ValueError(
+                        f"issue {issue_id} belongs to a project "
+                        "with an active project cell"
+                    )
+                connection.execute(
+                    "UPDATE admitted_issues SET state = ?, updated_at = ? "
+                    "WHERE issue_id = ?",
+                    (IssueState.DONE.value, now, issue_id),
+                )
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="issue.completed",
+                        aggregate_type="issue",
+                        aggregate_id=issue_id,
+                        actor="operator",
+                        payload={
+                            "from": current.state.value,
+                            "reason": reason,
+                            "evidence": evidence,
+                        },
+                    ),
+                )
+        return self.get(issue_id)
+
     def get(self, issue_id: str) -> QueuedIssue:
         """Read one admitted issue."""
 

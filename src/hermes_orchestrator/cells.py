@@ -66,6 +66,10 @@ class RotationBlocked(RuntimeError):
     """The old lead must remain active because rotation is not yet safe."""
 
 
+class _IssueAlreadyCompleted(RuntimeError):
+    """Dispatch lost the race to an explicit terminal reconciliation."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectCell:
     """One durable persistent lead for a project."""
@@ -144,7 +148,10 @@ class ProjectCellService:
         cell = self._find_active_cell(issue.project_key)
         created = cell is None
         if cell is None:
-            cell = self._create_cell(issue.project_key)
+            try:
+                cell = self._create_cell(issue.project_key, issue_id)
+            except _IssueAlreadyCompleted:
+                return DispatchResult(status="already_completed", issue_id=issue_id)
             if cell is None:
                 return DispatchResult(status="waiting_for_profile", issue_id=issue_id)
         elif cell.state == "handoff_required":
@@ -174,6 +181,7 @@ class ProjectCellService:
 
         session_confirmed = False
         handoff_required = False
+        issue_completed = False
         async for event in stream:
             self.record(cell, event)
             if event.kind == "session.started":
@@ -181,21 +189,24 @@ class ProjectCellService:
                     raise RuntimeError(
                         "Claude session id did not match its project cell"
                     )
-                session_confirmed = True
-                self._activate_issue(cell, issue_id)
-                await self._linear.project(
-                    issue_id,
-                    LinearProjection(
-                        status="In Development",
-                        assignee_alias="operator",
-                    ),
-                    effect_id=f"linear:{issue_id}:in-development",
-                )
+                if self._activate_issue(cell, issue_id):
+                    session_confirmed = True
+                    await self._linear.project(
+                        issue_id,
+                        LinearProjection(
+                            assignee_alias="operator",
+                        ),
+                        effect_id=f"linear:{issue_id}:in-development",
+                    )
+                else:
+                    issue_completed = True
             elif event.kind == "provider.limit":
                 handoff_required = True
                 self._require_handoff(cell, "subscription_limit")
 
-        if handoff_required:
+        if issue_completed:
+            status = "already_completed"
+        elif handoff_required:
             status = "handoff_required"
         elif session_confirmed:
             status = "working"
@@ -401,7 +412,7 @@ class ProjectCellService:
             raise KeyError(cell_id)
         return self._row_to_cell(row)
 
-    def _create_cell(self, project_key: str) -> ProjectCell | None:
+    def _create_cell(self, project_key: str, issue_id: str) -> ProjectCell | None:
         lease = self._profiles.acquire(project_key)
         if lease is None:
             return None
@@ -415,6 +426,14 @@ class ProjectCellService:
         )
         try:
             with self._database.transaction() as connection:
+                issue_row = connection.execute(
+                    "SELECT state FROM admitted_issues WHERE issue_id = ?",
+                    (issue_id,),
+                ).fetchone()
+                if issue_row is None:
+                    raise KeyError(issue_id)
+                if str(issue_row["state"]) == IssueState.DONE.value:
+                    raise _IssueAlreadyCompleted(issue_id)
                 connection.execute(
                     "INSERT INTO project_cells("
                     "cell_id, project_key, state, profile_alias, session_id, "
@@ -449,6 +468,9 @@ class ProjectCellService:
                         },
                     ),
                 )
+        except _IssueAlreadyCompleted:
+            self._profiles.release(project_key, "issue_already_completed")
+            raise
         except sqlite3.IntegrityError:
             self._profiles.release(project_key, "cell_creation_conflict")
             existing = self._find_active_cell(project_key)
@@ -457,18 +479,25 @@ class ProjectCellService:
             raise
         return cell
 
-    def _activate_issue(self, cell: ProjectCell, issue_id: str) -> None:
+    def _activate_issue(self, cell: ProjectCell, issue_id: str) -> bool:
         now = self._aware_now().isoformat()
         with self._database.transaction() as connection:
+            updated = connection.execute(
+                "UPDATE admitted_issues SET state = ?, updated_at = ? "
+                "WHERE issue_id = ? AND state != ?",
+                (
+                    IssueState.IN_DEVELOPMENT.value,
+                    now,
+                    issue_id,
+                    IssueState.DONE.value,
+                ),
+            )
+            if updated.rowcount == 0:
+                return False
             connection.execute(
                 "UPDATE project_cells SET state = 'active', updated_at = ? "
                 "WHERE cell_id = ?",
                 (now, cell.cell_id),
-            )
-            connection.execute(
-                "UPDATE admitted_issues SET state = ?, updated_at = ? "
-                "WHERE issue_id = ?",
-                (IssueState.IN_DEVELOPMENT.value, now, issue_id),
             )
             self._events.append(
                 connection,
@@ -479,6 +508,7 @@ class ProjectCellService:
                     payload={"cell_id": cell.cell_id},
                 ),
             )
+        return True
 
     def _require_handoff(self, cell: ProjectCell, reason: str) -> None:
         now = self._aware_now()

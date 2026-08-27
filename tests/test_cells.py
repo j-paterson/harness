@@ -89,7 +89,7 @@ class RecordingRunner:
 
 class RecordingLinear:
     def __init__(self) -> None:
-        self.targets: list[tuple[str, str, str]] = []
+        self.targets: list[tuple[str, str | None, str]] = []
         self.validations: list[tuple[str, str]] = []
 
     async def validate(self, project_key: str, issue_id: str) -> object:
@@ -242,7 +242,49 @@ async def test_working_issue_projects_in_development(
 
     await cell_service.dispatch("ENG-9")
 
-    assert linear.targets == [("ENG-9", "In Development", "operator")]
+    assert linear.targets == [("ENG-9", None, "operator")]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_resurrect_issue_completed_during_validation(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+
+    class CompletingLinear(RecordingLinear):
+        async def validate(self, project_key: str, issue_id: str) -> object:
+            result = await super().validate(project_key, issue_id)
+            queue.complete(
+                issue_id,
+                reason="linear_completed",
+                evidence="https://linear.example/ENG-9",
+            )
+            return result
+
+    linear = CompletingLinear()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "already_completed"
+    assert queue.get("ENG-9").state.value == "done"
+    assert runner.start_count == 0
+    assert linear.targets == []
 
 
 @pytest.mark.asyncio

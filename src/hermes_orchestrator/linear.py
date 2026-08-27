@@ -41,7 +41,7 @@ class LinearProjection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["Todo", "In Development", "Review", "QA", "Done"]
+    status: Literal["Todo", "In Development", "Review", "QA", "Done"] | None = None
     assignee_alias: Literal["operator", "ryan"]
 
 
@@ -305,16 +305,19 @@ class LinearClient:
         issue = await self.validate_issue(issue_id)
         update: dict[str, str] = {}
         changed_fields: list[str] = []
-        try:
-            target_state_id = self._status_ids[target.status]
-        except KeyError as error:
-            raise ValueError(
-                f"Linear status {target.status} is not configured for this team"
-            ) from error
+        target_state_id: str | None = None
+        if target.status is not None:
+            try:
+                target_state_id = self._status_ids[target.status]
+            except KeyError as error:
+                raise ValueError(
+                    f"Linear status {target.status} is not configured for this team"
+                ) from error
         target_assignee_id = self._assignee_ids[target.assignee_alias]
-        if issue.state_id != target_state_id:
-            update["stateId"] = target_state_id
-            changed_fields.append("status")
+        if target_state_id is not None and issue.state_id != target_state_id:
+            raise ValueError(
+                "Linear status mutation requires compare-and-set support"
+            )
         if issue.assignee_id != target_assignee_id:
             update["assigneeId"] = target_assignee_id
             changed_fields.append("assignee")

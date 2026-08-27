@@ -126,6 +126,46 @@ def test_hermes_command_accepts_strict_json_queue_intent(
     assert json.loads(result.stdout)["code"] == "queued"
 
 
+def test_queue_complete_reconciles_externally_completed_issue(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-7",
+            "--project",
+            "demo",
+            "--priority",
+            "2",
+            "--operator-instruction",
+            "chat-7",
+            "--json",
+        ]
+    )
+    assert add.exit_code == 0
+
+    completed = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-complete",
+            "ENG-7",
+            "--reason",
+            "linear_completed",
+            "--evidence",
+            "https://linear.example/ENG-7",
+            "--json",
+        ]
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["state"] == "done"
+    listed = invoke([*base_arguments(configured_repo), "queue-list", "--json"])
+    assert json.loads(listed.stdout) == []
+    status = invoke([*base_arguments(configured_repo), "status", "--json"])
+    assert json.loads(status.stdout)["queue_count"] == 0
+
+
 def test_daemon_once_reconciles_and_samples(
     configured_repo: tuple[Path, Path],
 ) -> None:

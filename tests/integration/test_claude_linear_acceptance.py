@@ -78,7 +78,7 @@ async def test_explicit_queue_to_one_lead_and_linear_projection(tmp_path: Path) 
         assert admitted.code == "queued"
         assert result.status == "working"
         assert runner.start_count == 1
-        assert linear.targets == [("ENG-9", "In Development", "operator")]
+        assert linear.targets == [("ENG-9", None, "operator")]
 
         second = command.execute(
             {
@@ -116,6 +116,6 @@ async def test_explicit_queue_to_one_lead_and_linear_projection(tmp_path: Path) 
         assert restarted_runner.start_count == 0
         assert restarted_runner.resume_count == 1
         assert database.scalar("SELECT count(*) FROM project_cells") == 1
-        assert linear.targets[-1] == ("ENG-10", "In Development", "operator")
+        assert linear.targets[-1] == ("ENG-10", None, "operator")
     finally:
         database.close()
