@@ -1,0 +1,812 @@
+"""Verify checkpoint-then-reclaim safety for leased worktrees (INFRA-171)."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.git import GitError, WorktreeStatus
+from hermes_orchestrator.processes import StopResult
+from hermes_orchestrator.worktrees import (
+    CleanupBlocked,
+    RemoteProof,
+    RemoteVerificationFailed,
+    WorktreeCustodian,
+    WorktreeLeaseInput,
+    WorktreeLeases,
+)
+
+NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+WORKTREE = "/repo/.worktrees/eng-431"
+REPO = "/repo"
+
+
+@dataclass
+class FakeGit:
+    """In-memory git port recording every mutating command in order."""
+
+    status: WorktreeStatus = field(
+        default_factory=lambda: WorktreeStatus(modified=(), untracked=())
+    )
+    head: str = SHA_A
+    current_branch: str | None = "feature/eng-431"
+    ahead_count: int | None = 0
+    remote_contains_result: bool = True
+    fetch_error: GitError | None = None
+    remove_error: GitError | None = None
+    worktree_paths: list[str] = field(default_factory=lambda: [REPO, WORKTREE])
+    commands: list[tuple[str, ...]] = field(default_factory=list)
+    commit_messages: list[str] = field(default_factory=list)
+
+    def status_of(self, path: Path) -> WorktreeStatus:
+        return self.status
+
+    def head_sha(self, path: Path) -> str:
+        return self.head
+
+    def branch(self, path: Path) -> str | None:
+        return self.current_branch
+
+    def ahead(self, path: Path) -> int | None:
+        return self.ahead_count
+
+    def add_all(self, path: Path) -> None:
+        self.commands.append(("add", "-A"))
+
+    def commit(self, path: Path, message: str) -> str:
+        self.commands.append(("commit", message))
+        self.commit_messages.append(message)
+        self.status = WorktreeStatus(modified=(), untracked=())
+        self.head = SHA_B
+        return self.head
+
+    def push(self, path: Path, remote: str, branch: str) -> None:
+        self.commands.append(("push", remote, branch))
+
+    def fetch(self, path: Path, remote: str, branch: str) -> None:
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        self.commands.append(("fetch", remote, branch))
+
+    def remote_contains(
+        self, path: Path, sha: str, remote: str, branch: str
+    ) -> bool:
+        return self.remote_contains_result
+
+    def worktree_remove(self, repo_path: Path, path: Path) -> None:
+        if self.remove_error is not None:
+            raise self.remove_error
+        self.commands.append(("worktree", "remove", str(path)))
+        self.worktree_paths = [p for p in self.worktree_paths if p != str(path)]
+
+    def worktree_prune(self, repo_path: Path) -> None:
+        self.commands.append(("worktree", "prune"))
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
+        self.commands.append(("worktree", "list"))
+        return tuple(self.worktree_paths)
+
+
+@dataclass
+class FakeProcessLease:
+    lease_id: str
+    cwd: str | None
+    project_key: str = "demo"
+    state: str = "active"
+
+
+@dataclass
+class FakeRegistry:
+    leases: list[FakeProcessLease] = field(default_factory=list)
+    stop_results: dict[str, StopResult] = field(default_factory=dict)
+    stop_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def active(self, project_key: str | None = None) -> tuple[FakeProcessLease, ...]:
+        return tuple(
+            lease
+            for lease in self.leases
+            if lease.state in ("active", "stopping")
+            and (project_key is None or lease.project_key == project_key)
+        )
+
+    def request_stop(self, lease_id: str, checkpoint_id: str) -> StopResult:
+        self.stop_calls.append((lease_id, checkpoint_id))
+        result = self.stop_results.get(
+            lease_id,
+            StopResult(lease_id, 15, False, True, "terminated"),
+        )
+        if result.exited:
+            for lease in self.leases:
+                if lease.lease_id == lease_id:
+                    lease.state = "stopped"
+        return result
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Iterator[Database]:
+    value = Database.open(tmp_path / "state.db")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+@pytest.fixture
+def leases(database: Database) -> WorktreeLeases:
+    ids = iter(f"wt-{n}" for n in range(1, 20))
+    return WorktreeLeases(
+        database,
+        EventStore(database),
+        now=lambda: NOW,
+        ids=lambda: next(ids),
+    )
+
+
+@pytest.fixture
+def fake_git() -> FakeGit:
+    return FakeGit()
+
+
+@pytest.fixture
+def registry() -> FakeRegistry:
+    return FakeRegistry()
+
+
+@pytest.fixture
+def custodian(
+    leases: WorktreeLeases, fake_git: FakeGit, registry: FakeRegistry
+) -> WorktreeCustodian:
+    return WorktreeCustodian(
+        leases,
+        registry,
+        fake_git,
+        now=lambda: NOW,
+        max_proof_age_seconds=900.0,
+    )
+
+
+def register(leases: WorktreeLeases) -> str:
+    lease = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="ENG-431",
+            repo_path=REPO,
+            path=WORKTREE,
+            branch="feature/eng-431",
+            remote="origin",
+        )
+    )
+    return lease.lease_id
+
+
+def checkpointed_proof(custodian: WorktreeCustodian, lease_id: str):
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    return custodian.verify_remote(checkpoint)
+
+
+# -- lease registration ----------------------------------------------------
+
+
+def test_register_and_get_roundtrip(leases: WorktreeLeases) -> None:
+    lease_id = register(leases)
+    lease = leases.get(lease_id)
+    assert lease.state == "active"
+    assert lease.path == WORKTREE
+    assert lease.branch == "feature/eng-431"
+    assert lease.remote == "origin"
+
+
+def test_register_rejects_duplicate_path(leases: WorktreeLeases) -> None:
+    register(leases)
+    with pytest.raises(ValueError, match="already leased"):
+        register(leases)
+
+
+def test_unknown_lease_raises_key_error(leases: WorktreeLeases) -> None:
+    with pytest.raises(KeyError):
+        leases.get("missing")
+
+
+# -- checkpoint ------------------------------------------------------------
+
+
+def test_wip_checkpoint_uses_clear_commit_message(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    assert checkpoint.commit_message == (
+        "wip(ENG-431): checkpoint before resource cleanup"
+    )
+    assert fake_git.commit_messages == [checkpoint.commit_message]
+    assert checkpoint.sha == SHA_B
+    assert ("push", "origin", "feature/eng-431") in fake_git.commands
+
+
+def test_checkpoint_of_clean_worktree_pushes_without_commit(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    assert checkpoint.commit_message is None
+    assert checkpoint.sha == SHA_A
+    assert fake_git.commit_messages == []
+    assert ("push", "origin", "feature/eng-431") in fake_git.commands
+
+
+def test_checkpoint_records_durable_lease_state(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.checkpoint_sha == checkpoint.sha
+    assert lease.checkpoint_id == checkpoint.checkpoint_id
+
+
+def test_checkpoint_rejects_malformed_issue_id(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    with pytest.raises(ValueError, match="issue id"):
+        custodian.checkpoint(lease_id, "eng 431; rm -rf /")
+
+
+def test_checkpoint_of_reclaimed_lease_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    custodian.reclaim(lease_id, proof)
+    with pytest.raises(CleanupBlocked, match="reclaimed"):
+        custodian.checkpoint(lease_id, "ENG-431")
+
+
+# -- remote proof ----------------------------------------------------------
+
+
+def test_remote_proof_requires_branch_contains_sha(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    fake_git.remote_contains_result = False
+    with pytest.raises(RemoteVerificationFailed):
+        custodian.verify_remote(checkpoint)
+
+
+def test_remote_proof_fails_closed_when_fetch_fails(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    fake_git.fetch_error = GitError("network down")
+    with pytest.raises(RemoteVerificationFailed):
+        custodian.verify_remote(checkpoint)
+
+
+def test_remote_proof_rejects_superseded_checkpoint(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    stale = custodian.checkpoint(lease_id, "ENG-431")
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    custodian.checkpoint(lease_id, "ENG-431")
+    with pytest.raises(RemoteVerificationFailed, match="not the recorded"):
+        custodian.verify_remote(stale)
+
+
+def test_remote_proof_records_remote_branch_and_sha(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    assert proof.lease_id == lease_id
+    assert proof.remote == "origin"
+    assert proof.branch == "feature/eng-431"
+    assert proof.sha == SHA_A
+    assert proof.fetched_at == NOW.isoformat()
+
+
+# -- reclaim ---------------------------------------------------------------
+
+
+def test_dirty_worktree_blocks_direct_reclaim(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    with pytest.raises(CleanupBlocked, match="dirty"):
+        custodian.reclaim(lease_id, None)
+
+
+def test_untracked_files_block_direct_reclaim(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    fake_git.status = WorktreeStatus(modified=(), untracked=("notes.txt",))
+    with pytest.raises(CleanupBlocked, match="dirty"):
+        custodian.reclaim(lease_id, proof)
+
+
+def test_reclaim_without_proof_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    with pytest.raises(CleanupBlocked, match="remote proof"):
+        custodian.reclaim(lease_id, None)
+
+
+def test_reclaim_uses_git_worktree_remove_then_prune(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    result = custodian.reclaim(lease_id, proof)
+    assert result.removed is True
+    ordered = [c for c in fake_git.commands if c[0] == "worktree"]
+    assert ordered == [
+        ("worktree", "remove", WORKTREE),
+        ("worktree", "prune"),
+        ("worktree", "list"),
+    ]
+    assert leases.get(lease_id).state == "reclaimed"
+
+
+def test_reclaim_blocked_when_head_moved_after_proof(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    fake_git.head = SHA_B
+    with pytest.raises(CleanupBlocked, match="HEAD"):
+        custodian.reclaim(lease_id, proof)
+
+
+def test_reclaim_blocked_when_proof_is_stale(
+    leases: WorktreeLeases, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    custodian = WorktreeCustodian(
+        leases,
+        registry,
+        fake_git,
+        now=lambda: clock["now"],
+        max_proof_age_seconds=900.0,
+    )
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    clock["now"] = datetime(2026, 8, 28, 13, tzinfo=UTC)
+    with pytest.raises(CleanupBlocked, match="stale"):
+        custodian.reclaim(lease_id, proof)
+
+
+def test_reclaim_blocked_for_mismatched_lease_proof(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    other = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="ENG-432",
+            repo_path=REPO,
+            path="/repo/.worktrees/eng-432",
+            branch="feature/eng-432",
+            remote="origin",
+        )
+    )
+    proof = checkpointed_proof(custodian, other.lease_id)
+    with pytest.raises(CleanupBlocked, match="lease"):
+        custodian.reclaim(lease_id, proof)
+
+
+def test_active_process_lease_is_stopped_through_claimed_path(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    fake_git: FakeGit,
+    registry: FakeRegistry,
+) -> None:
+    lease_id = register(leases)
+    registry.leases.append(
+        FakeProcessLease("proc-1", cwd=f"{WORKTREE}/src")
+    )
+    proof = checkpointed_proof(custodian, lease_id)
+    result = custodian.reclaim(lease_id, proof)
+    assert registry.stop_calls == [("proc-1", proof.checkpoint_id)]
+    assert result.stopped_process_leases == ("proc-1",)
+
+
+def test_unconfirmed_process_stop_blocks_reclaim(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    registry: FakeRegistry,
+) -> None:
+    lease_id = register(leases)
+    registry.leases.append(FakeProcessLease("proc-1", cwd=WORKTREE))
+    registry.stop_results["proc-1"] = StopResult(
+        "proc-1", 9, True, False, "kill_unconfirmed"
+    )
+    proof = checkpointed_proof(custodian, lease_id)
+    with pytest.raises(CleanupBlocked, match="proc-1"):
+        custodian.reclaim(lease_id, proof)
+    assert leases.get(lease_id).state == "checkpointed"
+
+
+def test_unrelated_process_leases_are_never_stopped(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    registry: FakeRegistry,
+) -> None:
+    lease_id = register(leases)
+    registry.leases.append(FakeProcessLease("proc-9", cwd="/elsewhere/repo"))
+    registry.leases.append(FakeProcessLease("proc-8", cwd=None))
+    proof = checkpointed_proof(custodian, lease_id)
+    result = custodian.reclaim(lease_id, proof)
+    assert registry.stop_calls == []
+    assert result.stopped_process_leases == ()
+
+
+def test_failed_worktree_remove_blocks_and_keeps_lease(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    fake_git.remove_error = GitError("worktree is locked")
+    with pytest.raises(CleanupBlocked, match="remove"):
+        custodian.reclaim(lease_id, proof)
+    assert leases.get(lease_id).state == "checkpointed"
+    assert ("worktree", "prune") not in fake_git.commands
+
+
+def test_reclaim_fails_closed_when_path_survives_prune(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+
+    def keep_path(repo_path: Path, path: Path) -> None:
+        fake_git.commands.append(("worktree", "remove", str(path)))
+
+    fake_git.worktree_remove = keep_path  # type: ignore[method-assign]
+    with pytest.raises(CleanupBlocked, match="still registered"):
+        custodian.reclaim(lease_id, proof)
+    assert leases.get(lease_id).state == "checkpointed"
+
+
+def test_reclaim_of_reclaimed_lease_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    custodian.reclaim(lease_id, proof)
+    with pytest.raises(CleanupBlocked, match="reclaimed"):
+        custodian.reclaim(lease_id, proof)
+
+
+def test_lifecycle_events_are_journaled(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, database: Database
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    custodian.reclaim(lease_id, proof)
+    rows = database.execute(
+        "SELECT event_type FROM events WHERE aggregate_id = ? ORDER BY sequence",
+        (lease_id,),
+    ).fetchall()
+    assert [row["event_type"] for row in rows] == [
+        "worktree.registered",
+        "worktree.checkpointed",
+        "worktree.remote_verified",
+        "worktree.cleanup_claimed",
+        "worktree.reclaimed",
+    ]
+
+
+# -- durable remote proof (correction e17c9a84, packet 1) ------------------
+
+
+def hand_built_proof(leases: WorktreeLeases, lease_id: str) -> RemoteProof:
+    """A proof forged from the recorded checkpoint, never verified."""
+
+    lease = leases.get(lease_id)
+    assert lease.checkpoint_id is not None
+    assert lease.checkpoint_sha is not None
+    return RemoteProof(
+        lease_id=lease_id,
+        checkpoint_id=lease.checkpoint_id,
+        remote=lease.remote,
+        branch=lease.branch,
+        sha=lease.checkpoint_sha,
+        fetched_at=NOW.isoformat(),
+    )
+
+
+def test_hand_built_proof_without_verify_remote_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    custodian.checkpoint(lease_id, "ENG-431")
+    forged = hand_built_proof(leases, lease_id)
+    with pytest.raises(CleanupBlocked, match="durable remote verification"):
+        custodian.reclaim(lease_id, forged)
+
+
+def test_proof_remote_mismatch_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    with pytest.raises(CleanupBlocked, match="remote"):
+        custodian.reclaim(lease_id, replace(proof, remote="fork"))
+
+
+def test_proof_branch_mismatch_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    with pytest.raises(CleanupBlocked, match="branch"):
+        custodian.reclaim(lease_id, replace(proof, branch="main"))
+
+
+def test_future_durable_verification_is_blocked(
+    leases: WorktreeLeases, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    custodian = WorktreeCustodian(
+        leases, registry, fake_git, now=lambda: clock["now"]
+    )
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    clock["now"] = datetime(2026, 8, 28, 11, tzinfo=UTC)
+    with pytest.raises(CleanupBlocked, match="future"):
+        custodian.reclaim(lease_id, proof)
+
+
+def test_recheckpoint_clears_durable_verification(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    custodian.checkpoint(lease_id, "ENG-431")
+    lease = leases.get(lease_id)
+    assert lease.remote_verified_at is None
+    assert lease.verified_sha is None
+    assert lease.verified_checkpoint_id is None
+    forged = hand_built_proof(leases, lease_id)
+    with pytest.raises(CleanupBlocked, match="durable remote verification"):
+        custodian.reclaim(lease_id, forged)
+
+
+def test_fresh_caller_timestamp_cannot_mask_stale_durable_proof(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    ids = iter(f"wt-{n}" for n in range(1, 20))
+    leases = WorktreeLeases(
+        database,
+        EventStore(database),
+        now=lambda: clock["now"],
+        ids=lambda: next(ids),
+    )
+    custodian = WorktreeCustodian(
+        leases, registry, fake_git, now=lambda: clock["now"]
+    )
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    clock["now"] = datetime(2026, 8, 28, 14, tzinfo=UTC)
+    freshened = replace(proof, fetched_at=clock["now"].isoformat())
+    with pytest.raises(CleanupBlocked, match="stale"):
+        custodian.reclaim(lease_id, freshened)
+
+
+def test_durable_proof_survives_restart_within_age_limit(
+    tmp_path: Path, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    db_path = tmp_path / "restart.db"
+    first = Database.open(db_path)
+    ids = iter(f"wt-{n}" for n in range(1, 20))
+    leases = WorktreeLeases(
+        first, EventStore(first), now=lambda: NOW, ids=lambda: next(ids)
+    )
+    custodian = WorktreeCustodian(leases, registry, fake_git, now=lambda: NOW)
+    lease_id = register(leases)
+    custodian.verify_remote(custodian.checkpoint(lease_id, "ENG-431"))
+    first.close()
+
+    reopened = Database.open(db_path)
+    try:
+        leases2 = WorktreeLeases(reopened, EventStore(reopened), now=lambda: NOW)
+        custodian2 = WorktreeCustodian(
+            leases2, registry, fake_git, now=lambda: NOW
+        )
+        lease = leases2.get(lease_id)
+        assert lease.remote_verified_at == NOW.isoformat()
+        assert lease.verified_remote == "origin"
+        assert lease.verified_branch == "feature/eng-431"
+        proof = RemoteProof(
+            lease_id=lease_id,
+            checkpoint_id=lease.verified_checkpoint_id,
+            remote=lease.verified_remote,
+            branch=lease.verified_branch,
+            sha=lease.verified_sha,
+            fetched_at=lease.remote_verified_at,
+        )
+        result = custodian2.reclaim(lease_id, proof)
+        assert result.removed is True
+        assert leases2.get(lease_id).state == "reclaimed"
+    finally:
+        reopened.close()
+
+
+# -- atomic cleanup claim (correction e17c9a84, packet 2) ------------------
+
+
+def test_late_binding_process_blocks_removal(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    fake_git: FakeGit,
+    registry: FakeRegistry,
+) -> None:
+    lease_id = register(leases)
+    registry.leases.append(FakeProcessLease("proc-1", cwd=WORKTREE))
+    original = registry.request_stop
+
+    def stop_and_attach(process_lease_id: str, checkpoint_id: str) -> StopResult:
+        result = original(process_lease_id, checkpoint_id)
+        registry.leases.append(
+            FakeProcessLease("proc-late", cwd=f"{WORKTREE}/src")
+        )
+        return result
+
+    registry.request_stop = stop_and_attach  # type: ignore[method-assign]
+    proof = checkpointed_proof(custodian, lease_id)
+    with pytest.raises(CleanupBlocked, match="proc-late"):
+        custodian.reclaim(lease_id, proof)
+    assert ("worktree", "remove", WORKTREE) not in fake_git.commands
+    assert leases.get(lease_id).state == "checkpointed"
+
+
+def test_worktree_is_claimed_reclaiming_during_cleanup(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    registry: FakeRegistry,
+) -> None:
+    lease_id = register(leases)
+    registry.leases.append(FakeProcessLease("proc-1", cwd=WORKTREE))
+    observed: list[str] = []
+    original = registry.request_stop
+
+    def observe(process_lease_id: str, checkpoint_id: str) -> StopResult:
+        observed.append(leases.get(lease_id).state)
+        return original(process_lease_id, checkpoint_id)
+
+    registry.request_stop = observe  # type: ignore[method-assign]
+    proof = checkpointed_proof(custodian, lease_id)
+    custodian.reclaim(lease_id, proof)
+    assert observed == ["reclaiming"]
+    assert leases.get(lease_id).state == "reclaimed"
+
+
+def test_existing_cleanup_claim_blocks_concurrent_reclaim(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="other-custodian")
+    with pytest.raises(CleanupBlocked, match="claimed"):
+        custodian.reclaim(lease_id, proof)
+    leases.release_cleanup(
+        lease_id, owner="other-custodian", reason="test handback"
+    )
+    assert custodian.reclaim(lease_id, proof).removed is True
+
+
+def test_failed_stop_releases_cleanup_claim(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    registry: FakeRegistry,
+    database: Database,
+) -> None:
+    lease_id = register(leases)
+    registry.leases.append(FakeProcessLease("proc-1", cwd=WORKTREE))
+    registry.stop_results["proc-1"] = StopResult(
+        "proc-1", 9, True, False, "kill_unconfirmed"
+    )
+    proof = checkpointed_proof(custodian, lease_id)
+    with pytest.raises(CleanupBlocked, match="proc-1"):
+        custodian.reclaim(lease_id, proof)
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.cleanup_owner is None
+    rows = database.execute(
+        "SELECT event_type FROM events WHERE aggregate_id = ? ORDER BY sequence",
+        (lease_id,),
+    ).fetchall()
+    assert [row["event_type"] for row in rows][-2:] == [
+        "worktree.cleanup_claimed",
+        "worktree.cleanup_released",
+    ]
+    registry.stop_results.pop("proc-1")
+    assert custodian.reclaim(lease_id, proof).removed is True
+
+
+def test_failed_remove_releases_cleanup_claim(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    fake_git.remove_error = GitError("worktree is locked")
+    with pytest.raises(CleanupBlocked, match="remove"):
+        custodian.reclaim(lease_id, proof)
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.cleanup_owner is None
+    fake_git.remove_error = None
+    assert custodian.reclaim(lease_id, proof).removed is True
+
+
+def test_stale_cleanup_claim_is_reconciled_after_restart(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    ids = iter(f"wt-{n}" for n in range(1, 20))
+    leases = WorktreeLeases(
+        database,
+        EventStore(database),
+        now=lambda: clock["now"],
+        ids=lambda: next(ids),
+    )
+    custodian = WorktreeCustodian(
+        leases, registry, fake_git, now=lambda: clock["now"]
+    )
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    # A custodian that crashed mid-cleanup left its claim behind.
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+    clock["now"] = datetime(2026, 8, 28, 14, tzinfo=UTC)
+    # The stale claim is reconciled; the stale durable proof still blocks.
+    with pytest.raises(CleanupBlocked, match="stale"):
+        custodian.reclaim(lease_id, proof)
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.cleanup_owner is None
+    # Recovery: prove the checkpoint on the remote again, then reclaim.
+    fresh = custodian.verify_remote(custodian.checkpoint(lease_id, "ENG-431"))
+    assert custodian.reclaim(lease_id, fresh).removed is True
+
+
+# -- inspection ------------------------------------------------------------
+
+
+def test_inspect_reports_status_head_and_bound_processes(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    fake_git: FakeGit,
+    registry: FakeRegistry,
+) -> None:
+    register(leases)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=("n.txt",))
+    fake_git.ahead_count = 2
+    registry.leases.append(FakeProcessLease("proc-1", cwd=WORKTREE))
+    inspection = custodian.inspect(Path(WORKTREE))
+    assert inspection.clean is False
+    assert inspection.modified == ("src/a.py",)
+    assert inspection.untracked == ("n.txt",)
+    assert inspection.head_sha == SHA_A
+    assert inspection.branch == "feature/eng-431"
+    assert inspection.ahead == 2
+    assert inspection.process_lease_ids == ("proc-1",)

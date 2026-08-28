@@ -20,6 +20,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 
 import psutil
@@ -220,6 +221,20 @@ class ProcessRegistry:
         lease_id = self._ids()
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            # A worktree claimed for cleanup (INFRA-171) admits no new
+            # attachment; checking inside the write transaction serializes
+            # this refusal against the cleanup claim itself.
+            if request.cwd is not None:
+                claimed = connection.execute(
+                    "SELECT path FROM worktree_leases "
+                    "WHERE state = 'reclaiming'"
+                ).fetchall()
+                for row in claimed:
+                    if Path(request.cwd).is_relative_to(Path(str(row["path"]))):
+                        raise ValueError(
+                            f"cwd {request.cwd} is inside worktree "
+                            f"{row['path']}, which is claimed for cleanup"
+                        )
             connection.execute(
                 "INSERT INTO process_leases("
                 "lease_id, worker_id, project_key, kind, pid, pgid, executable, "
