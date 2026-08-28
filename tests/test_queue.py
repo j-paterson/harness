@@ -246,3 +246,41 @@ def test_complete_refuses_issue_for_project_with_active_cell(
         )
 
     assert queue_service.get("ENG-7").state is IssueState.QUEUED
+
+
+def test_complete_started_issue_keeps_persistent_project_cell(
+    queue_service: QueueService,
+    database: Database,
+) -> None:
+    queue_service.admit(request("ENG-7", "chat-123"))
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE admitted_issues SET state = 'in_development' "
+            "WHERE issue_id = 'ENG-7'"
+        )
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "cell-demo",
+                "demo",
+                "active",
+                "max-a",
+                "11111111-1111-4111-8111-111111111111",
+                "2026-08-26T09:00:00+00:00",
+                "2026-08-26T09:00:00+00:00",
+            ),
+        )
+
+    completed = queue_service.complete(
+        "ENG-7",
+        reason="pr_merged",
+        evidence="https://github.example/pull/7",
+    )
+
+    assert completed.state is IssueState.DONE
+    assert database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "active"

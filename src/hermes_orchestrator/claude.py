@@ -287,12 +287,18 @@ class ClaudeRunner:
             raise RuntimeError("Claude stderr pipe was not created")
 
         parser = ClaudeEventParser()
+        saw_subscription_limit = False
         stderr_task = asyncio.create_task(self._drain(process.stderr))
         try:
             while line := await process.stdout.readline():
-                yield parser.feed(line)
+                event = parser.feed(line)
+                saw_subscription_limit = (
+                    saw_subscription_limit or event.kind == "provider.limit"
+                )
+                yield event
             returncode = await process.wait()
-            if returncode != 0:
+            expected_limit_exit = returncode == 1 and saw_subscription_limit
+            if returncode != 0 and not expected_limit_exit:
                 raise ClaudeProcessError(returncode)
         finally:
             if process.returncode is None:

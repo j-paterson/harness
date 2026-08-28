@@ -141,17 +141,19 @@ class QueueService:
                 raise KeyError(issue_id)
             current = self._row_to_issue(row)
             if current.state is not IssueState.DONE:
-                active_cell = connection.execute(
-                    "SELECT 1 FROM project_cells WHERE project_key = ? "
-                    "AND state IN ('starting', 'active', 'handoff_required', 'paused') "
-                    "LIMIT 1",
-                    (current.project_key,),
-                ).fetchone()
-                if active_cell is not None:
-                    raise ValueError(
-                        f"issue {issue_id} belongs to a project "
-                        "with an active project cell"
-                    )
+                if current.state is IssueState.QUEUED:
+                    active_cell = connection.execute(
+                        "SELECT 1 FROM project_cells WHERE project_key = ? "
+                        "AND state IN ("
+                        "'starting', 'active', 'handoff_required', 'paused'"
+                        ") LIMIT 1",
+                        (current.project_key,),
+                    ).fetchone()
+                    if active_cell is not None:
+                        raise ValueError(
+                            f"issue {issue_id} belongs to a project "
+                            "with an active project cell"
+                        )
                 connection.execute(
                     "UPDATE admitted_issues SET state = ?, updated_at = ? "
                     "WHERE issue_id = ?",

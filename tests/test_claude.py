@@ -13,6 +13,7 @@ import pytest
 
 from hermes_orchestrator.claude import (
     ClaudeEventParser,
+    ClaudeProcessError,
     ClaudeRunner,
     LeadTurnRequest,
 )
@@ -215,6 +216,35 @@ class VerboseProcessFactory:
         )
 
 
+class CappedProcessFactory:
+    def __init__(self, returncode: int = 1) -> None:
+        self.returncode = returncode
+
+    async def __call__(
+        self,
+        *command: str,
+        **kwargs: Any,
+    ) -> asyncio.subprocess.Process:
+        del command, kwargs
+        child_code = (
+            "import json,sys;"
+            "print(json.dumps({'type':'system','subtype':'init',"
+            "'session_id':'11111111-1111-4111-8111-111111111111'}),flush=True);"
+            "print(json.dumps({'type':'result','subtype':'error_during_execution',"
+            "'session_id':'11111111-1111-4111-8111-111111111111',"
+            "'errors':[\"You've reached your Fable 5 limit.\"]}),flush=True);"
+            f"sys.exit({self.returncode})"
+        )
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            child_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_closing_stream_kills_hung_process_group(
     registry: ProfileRegistry,
@@ -257,3 +287,39 @@ async def test_verbose_stderr_cannot_block_stdout_events(
     await stream.aclose()
 
     assert event.kind == "session.started"
+
+
+@pytest.mark.asyncio
+async def test_subscription_limit_is_terminal_even_when_claude_exits_one(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=tmp_path / "claude-lead.md",
+        base_env={"PATH": os.environ["PATH"]},
+        process_factory=CappedProcessFactory(),
+    )
+
+    events = [event async for event in runner.start_lead(new_request(tmp_path))]
+
+    assert [event.kind for event in events] == [
+        "session.started",
+        "provider.limit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_subscription_limit_does_not_hide_another_process_failure(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=tmp_path / "claude-lead.md",
+        base_env={"PATH": os.environ["PATH"]},
+        process_factory=CappedProcessFactory(returncode=2),
+    )
+
+    with pytest.raises(ClaudeProcessError, match="status 2"):
+        _ = [event async for event in runner.start_lead(new_request(tmp_path))]

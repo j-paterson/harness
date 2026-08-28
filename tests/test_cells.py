@@ -863,6 +863,62 @@ async def test_provider_limit_explicitly_closes_the_lead_stream(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_provider_limit_requires_one_handoff(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+
+    class DuplicateLimitRunner(RecordingRunner):
+        async def _events(
+            self,
+            request: LeadTurnRequest,
+        ) -> AsyncIterator[ClaudeEvent]:
+            yield ClaudeEvent(
+                kind="session.started",
+                original_type="system",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:00:00Z",
+                usage={},
+            )
+            for _ in range(2):
+                yield ClaudeEvent(
+                    kind="provider.limit",
+                    original_type="result",
+                    session_id=request.session_id,
+                    parent_tool_use_id=None,
+                    timestamp="2026-08-26T12:01:00Z",
+                    usage={},
+                    error_code="subscription_limit",
+                )
+
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=DuplicateLimitRunner(),
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "handoff_required"
+    assert database.scalar(
+        "SELECT count(*) FROM events "
+        "WHERE event_type = 'project_cell.handoff_required'"
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_provider_limit_before_session_start_cannot_activate_later(
     database: Database,
     queue: QueueService,

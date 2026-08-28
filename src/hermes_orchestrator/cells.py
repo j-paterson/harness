@@ -668,13 +668,14 @@ class ProjectCellService:
     def _require_handoff(self, cell: ProjectCell, reason: str) -> None:
         now = self._aware_now()
         cooldown_until = now + timedelta(hours=1)
-        self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
         with self._database.transaction() as connection:
-            connection.execute(
+            updated = connection.execute(
                 "UPDATE project_cells SET state = 'handoff_required', updated_at = ? "
-                "WHERE cell_id = ?",
+                "WHERE cell_id = ? AND state != 'handoff_required'",
                 (now.isoformat(), cell.cell_id),
             )
+            if updated.rowcount == 0:
+                return
             connection.execute(
                 "UPDATE profile_leases SET state = 'capped', cooldown_until = ? "
                 "WHERE profile_alias = ?",
@@ -689,6 +690,7 @@ class ProjectCellService:
                     payload={"reason": reason},
                 ),
             )
+        self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
 
     def _aware_now(self) -> datetime:
         value = self._now()
