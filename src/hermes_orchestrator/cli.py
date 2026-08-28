@@ -413,6 +413,9 @@ async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
             verification=tuple(verification),
             blockers=tuple(args.blocker),
             status=args.status,
+            # The lead runs candidate-ready from its own checkout; the
+            # emitter validates it belongs to the project repository.
+            lead_checkout=Path.cwd(),
         )
         thread_status: str | None = None
         if emitted.delivery.thread_id is not None:
