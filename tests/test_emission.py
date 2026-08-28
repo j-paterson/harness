@@ -309,7 +309,7 @@ async def test_lead_worktree_checkout_is_validated_and_used(
         lead_checkout=worktree,
     )
 
-    assert result.manifest.candidate_sha == HEAD
+    assert result.event.candidate_sha == HEAD
     assert deliverer.events
     # Every freeze-boundary git check after the repository-identity
     # probes ran against the lead's own checkout, where the candidate
