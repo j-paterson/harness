@@ -46,9 +46,16 @@ class RecordingPort:
     def __init__(self) -> None:
         self.envelopes: list[tuple[CmuxSurfaceRef, str]] = []
         self.alive = True
+        self.focused: str | None = None
+        self.probe_error: Exception | None = None
 
     async def surface_alive(self, ref: CmuxSurfaceRef) -> bool:
+        if self.probe_error is not None:
+            raise self.probe_error
         return self.alive
+
+    async def focused_workspace_uuid(self) -> str | None:
+        return self.focused
 
     async def deliver_intake_envelope(
         self, ref: CmuxSurfaceRef, envelope: str
@@ -93,11 +100,32 @@ def seat(bindings: CmuxSurfaceBindings, *, classic: bool = True) -> object:
     return binding
 
 
+class FakeBoundary:
+    """Mutable lead-owned prompt-boundary evidence."""
+
+    def __init__(self, recorded_at: str | None = NOW.isoformat()) -> None:
+        self.recorded_at = recorded_at
+
+    def current(self, cell_id: str, session_id: str) -> object | None:
+        if self.recorded_at is None:
+            return None
+        evidence = type("Evidence", (), {})()
+        evidence.recorded_at = self.recorded_at
+        return evidence
+
+
 def transport(
-    database: Database, bindings: CmuxSurfaceBindings, port: RecordingPort
+    database: Database,
+    bindings: CmuxSurfaceBindings,
+    port: RecordingPort,
+    *,
+    safety: FakeBoundary | None = None,
 ) -> LeadIntakeTransport:
     return LeadIntakeTransport(
-        database=database, bindings=bindings, port=port
+        database=database,
+        bindings=bindings,
+        port=port,
+        safety=safety if safety is not None else FakeBoundary(),
     )
 
 
@@ -317,6 +345,7 @@ async def test_crash_after_claim_is_retried_after_the_window(
         database=database,
         bindings=bindings,
         port=CrashingPort(),
+        safety=FakeBoundary(),
         now=lambda: NOW,
     )
     with pytest.raises(Died):
@@ -335,6 +364,11 @@ async def test_crash_after_claim_is_retried_after_the_window(
         database=database,
         bindings=bindings,
         port=port,
+        # A lead-owned boundary recorded after the uncertain attempt is
+        # what re-arms recovery; the wall clock alone never does.
+        safety=FakeBoundary(
+            (NOW + timedelta(seconds=60)).isoformat()
+        ),
         now=lambda: NOW + timedelta(seconds=120),
     )
     result = await later.deliver(
@@ -368,6 +402,7 @@ async def test_failed_attempt_stays_durable_and_distinguishable(
         database=database,
         bindings=bindings,
         port=FailingPort(),
+        safety=FakeBoundary(),
         now=lambda: NOW,
     )
     outcome = await failing.deliver(
@@ -397,6 +432,11 @@ async def test_failed_attempt_stays_durable_and_distinguishable(
         database=database,
         bindings=bindings,
         port=port,
+        # A lead-owned boundary recorded after the uncertain attempt is
+        # what re-arms recovery; the wall clock alone never does.
+        safety=FakeBoundary(
+            (NOW + timedelta(seconds=60)).isoformat()
+        ),
         now=lambda: NOW + timedelta(seconds=120),
     )
     result = await later.deliver(
@@ -439,6 +479,11 @@ async def test_crash_after_return_recovers_without_losing_the_packet(
         database=database,
         bindings=bindings,
         port=port,
+        # A lead-owned boundary recorded after the uncertain attempt is
+        # what re-arms recovery; the wall clock alone never does.
+        safety=FakeBoundary(
+            (NOW + timedelta(seconds=60)).isoformat()
+        ),
         now=lambda: NOW + timedelta(seconds=120),
     )
     result = await later.deliver(**kwargs)
@@ -564,3 +609,134 @@ async def test_superseded_backfill_rows_are_never_typed(
     assert [text for _, text in port.envelopes] == [
         f"HERMES_CORRECTION_READY {CORRECTION_ID}"
     ]
+
+
+@pytest.mark.asyncio
+async def test_operator_owned_prompt_is_never_touched(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    # The operator is focused in the lead workspace with an unsent
+    # draft in its prompt. Keyboard input reaches only the focused
+    # surface, so focus IS the ownership signal: delivery stays
+    # pending, no keystroke of any kind is emitted, and the draft is
+    # untouched byte for byte.
+    seed_packets(database)
+    seat(bindings)
+    port = RecordingPort()
+    port.focused = LEAD.workspace_uuid
+
+    with pytest.raises(IntakeRefused, match="safe boundary"):
+        await transport(database, bindings, port).deliver(
+            kind=WORK_READY,
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+
+    assert port.envelopes == []
+    assert delivery_rows(database) == []
+
+
+@pytest.mark.asyncio
+async def test_unproven_prompt_boundary_holds_delivery_pending(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    seed_packets(database)
+    seat(bindings)
+    port = RecordingPort()
+
+    with pytest.raises(IntakeRefused, match="prompt boundary"):
+        await transport(
+            database, bindings, port, safety=FakeBoundary(None)
+        ).deliver(
+            kind=WORK_READY,
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+
+    assert port.envelopes == []
+    assert delivery_rows(database) == []
+
+
+@pytest.mark.asyncio
+async def test_uncertain_attempt_retry_waits_for_a_fresh_boundary(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from datetime import timedelta
+
+    from hermes_orchestrator.cmux import CmuxUnavailable
+
+    seed_packets(database)
+    seat(bindings)
+
+    class FailingPort(RecordingPort):
+        async def deliver_intake_envelope(self, ref, envelope):  # type: ignore[no-untyped-def]
+            raise CmuxUnavailable("cmux command timed out")
+
+    failing = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=FailingPort(),
+        safety=FakeBoundary(),
+        now=lambda: NOW,
+    )
+    outcome = await failing.deliver(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+    assert outcome.status == "attempt_failed"
+
+    # Even far past any wall-clock window, without a boundary recorded
+    # AFTER the attempt no keystroke is emitted: the partial line may
+    # coexist with operator input and only the lead's own turn cycle
+    # proves it was consumed.
+    port = RecordingPort()
+    stale_boundary = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=port,
+        safety=FakeBoundary(NOW.isoformat()),
+        now=lambda: NOW + timedelta(seconds=3600),
+    )
+    held = await stale_boundary.deliver(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+    assert held.status == "pending"
+    assert port.envelopes == []
+    assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
+
+
+@pytest.mark.asyncio
+async def test_probe_failures_are_contained_and_recovery_delivers_once(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from hermes_orchestrator.cmux import CmuxUnavailable
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+
+    seed_packets(database)
+    seed_active_cell(database)
+    seat(bindings)
+    port = RecordingPort()
+    port.probe_error = CmuxUnavailable("cmux command timed out")
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    # A liveness-probe failure never escapes the tick, types nothing,
+    # and loses nothing.
+    assert await router.tick() == ()
+    assert port.envelopes == []
+    assert delivery_rows(database) == []
+
+    # cmux recovers: the retained packets deliver exactly once.
+    port.probe_error = None
+    delivered = await router.tick()
+    assert sorted(delivered) == sorted([CORRECTION_ID, WAKE_ID])
+    assert await router.tick() == ()
+    assert len(port.envelopes) == 2

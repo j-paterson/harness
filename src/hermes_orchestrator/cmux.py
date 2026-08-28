@@ -116,6 +116,8 @@ class CmuxControlPort(Protocol):
         self, *, title_marker: str
     ) -> frozenset[str]: ...
 
+    async def focused_workspace_uuid(self) -> str | None: ...
+
     async def surface_alive(self, ref: CmuxSurfaceRef) -> bool: ...
 
     async def close_workspace(self, workspace_uuid: str) -> None: ...
@@ -269,6 +271,21 @@ class CmuxCliAdapter:
         output = await self._run("list-workspaces")
         return frozenset(_UUID_PATTERN.findall(output))
 
+    async def focused_workspace_uuid(self) -> str | None:
+        """The currently focused workspace, from listing metadata only.
+
+        The listing marks the selected workspace with a leading ``*``;
+        keyboard input reaches only the focused surface, so this is the
+        content-free signal the intake transport uses to prove it is
+        not delivering into a pane the operator is interacting with.
+        """
+
+        output = await self._run("list-workspaces")
+        for line in output.splitlines():
+            if line.startswith("*"):
+                return _first_uuid(line)
+        return None
+
     async def find_workspace_uuids(
         self, *, title_marker: str
     ) -> frozenset[str]:
@@ -380,11 +397,13 @@ class CmuxCliAdapter:
         target surface is never focused, no screen content is read, and
         nothing else can ever be typed through it.
 
-        Every sequence begins by clearing the input line (ctrl+u): a
-        prior attempt that typed text but never submitted Return leaves
-        a partial line no one can read back, and the reset makes the
-        retry idempotent — recovery re-types exactly one envelope
-        instead of concatenating onto the partial.
+        The sequence is strictly non-destructive: it types the envelope
+        and submits Return, and nothing else — no clearing, editing, or
+        cursor keystrokes that could alter operator-authored input. The
+        caller must hold a safe-delivery boundary proof before invoking
+        this (unfocused target plus a current lead-owned prompt
+        boundary), and recovery after an uncertain partial waits for a
+        fresh boundary instead of emitting destructive keystrokes.
         """
 
         if INTAKE_ENVELOPE_PATTERN.fullmatch(envelope) is None:
@@ -397,7 +416,6 @@ class CmuxCliAdapter:
             "--surface",
             ref.surface_uuid,
         )
-        await self._execute("send-key", *target, "ctrl+u")
         await self._execute("send", *target, envelope)
         await self._execute("send-key", *target, "Return")
 

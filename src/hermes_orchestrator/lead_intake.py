@@ -24,10 +24,25 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 from hermes_orchestrator.cmux import CmuxControlPort
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.db import Database
+
+
+class BoundaryEvidence(Protocol):
+    """Durable proof of a lead-owned prompt boundary."""
+
+    recorded_at: str
+
+
+class SafeBoundarySource(Protocol):
+    """Where the transport reads prompt-boundary evidence from."""
+
+    def current(
+        self, cell_id: str, session_id: str
+    ) -> BoundaryEvidence | None: ...
 
 CORRECTION_READY = "HERMES_CORRECTION_READY"
 WORK_READY = "HERMES_WORK_READY"
@@ -78,6 +93,7 @@ class LeadIntakeTransport:
         database: Database,
         bindings: CmuxSurfaceBindings,
         port: CmuxControlPort,
+        safety: SafeBoundarySource,
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
         retry_after_seconds: float = 60.0,
@@ -85,6 +101,7 @@ class LeadIntakeTransport:
         self._database = database
         self._bindings = bindings
         self._port = port
+        self._safety = safety
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or (lambda: datetime.now(UTC))
         self._retry_after_seconds = retry_after_seconds
@@ -132,11 +149,6 @@ class LeadIntakeTransport:
                 "evidence; envelopes are never typed into a non-classic "
                 "surface"
             )
-        if not await self._port.surface_alive(binding.ref):
-            raise IntakeRefused(
-                "the bound surface is no longer live; refusing the "
-                "stale binding"
-            )
         envelope = f"{kind} {packet_id}"
 
         def outcome(status: str) -> IntakeDelivery:
@@ -147,31 +159,80 @@ class LeadIntakeTransport:
                 surface_uuid=binding.surface_uuid,
             )
 
-        delivery_id = self._claim(
-            kind=kind,
-            packet_id=packet_id,
-            cell_id=cell_id,
-            session_id=session_id,
-            surface_uuid=binding.surface_uuid,
-        )
-        if delivery_id is None:
-            row = self._database.execute(
-                "SELECT delivery_id, state, updated_at "
-                "FROM lead_intake_deliveries "
-                "WHERE kind = ? AND packet_id = ? AND session_id = ?",
-                (kind, packet_id, session_id),
-            ).fetchone()
-            if row is None or str(row["state"]) in (
-                "delivered",
-                "superseded",
-            ):
-                return outcome("deduplicated")
-            delivery_id = self._take_over_stale(
-                str(row["delivery_id"]), str(row["updated_at"])
+        # Terminal dedup before any external probe: a delivered or
+        # superseded row never touches cmux again.
+        existing = self._database.execute(
+            "SELECT delivery_id, state, updated_at "
+            "FROM lead_intake_deliveries "
+            "WHERE kind = ? AND packet_id = ? AND session_id = ?",
+            (kind, packet_id, session_id),
+        ).fetchone()
+        if existing is not None and str(existing["state"]) in (
+            "delivered",
+            "superseded",
+        ):
+            return outcome("deduplicated")
+        # Optional-cmux containment: a denial, timeout, protocol
+        # failure, or any other adapter error during the pre-claim
+        # probes refuses this delivery and retains the durable packet —
+        # it can never escape into the daemon's startup or maintenance
+        # pass.
+        try:
+            alive = await self._port.surface_alive(binding.ref)
+            focused = await self._port.focused_workspace_uuid()
+        except Exception as error:
+            raise IntakeRefused(
+                "cmux was unavailable during liveness validation "
+                f"({type(error).__name__}); the packet is retained"
+            ) from None
+        if not alive:
+            raise IntakeRefused(
+                "the bound surface is no longer live; refusing the "
+                "stale binding"
+            )
+        # The safe-delivery boundary, proven without reading any
+        # terminal content: keyboard input reaches only the focused
+        # surface, so an unfocused target cannot carry in-flight
+        # operator typing; and a current lead-owned prompt boundary
+        # (recorded when the lead's turn completed normally) attests
+        # the prompt line belongs to the lead. Anything unproven stays
+        # durably pending instead of emitting keystrokes.
+        if focused == binding.workspace_uuid:
+            raise IntakeRefused(
+                "the target workspace is focused and the operator may "
+                "own its prompt; delivery stays pending until a safe "
+                "boundary"
+            )
+        evidence = self._safety.current(cell_id, session_id)
+        if evidence is None:
+            raise IntakeRefused(
+                "no current lead-owned prompt boundary is proven; "
+                "delivery stays pending until a safe boundary"
+            )
+        if existing is None:
+            delivery_id = self._claim(
+                kind=kind,
+                packet_id=packet_id,
+                cell_id=cell_id,
+                session_id=session_id,
+                surface_uuid=binding.surface_uuid,
             )
             if delivery_id is None:
-                # Another owner holds a fresh claim or attempt; this
-                # caller types nothing and the packet stays pending.
+                # Lost the claim race since the read above; the winner
+                # owns the delivery and this caller types nothing.
+                return outcome("pending")
+        else:
+            delivery_id = self._take_over(
+                delivery_id=str(existing["delivery_id"]),
+                state=str(existing["state"]),
+                observed_updated_at=str(existing["updated_at"]),
+                boundary_recorded_at=str(evidence.recorded_at),
+            )
+            if delivery_id is None:
+                # Another owner holds a fresh claim, or the uncertain
+                # attempt still awaits a fresh lead-owned boundary;
+                # this caller types nothing and the packet stays
+                # pending.
                 return outcome("pending")
         # Record the attempt durably BEFORE the external sequence: an
         # interruption from here on leaves a distinguishable
@@ -238,23 +299,41 @@ class LeadIntakeTransport:
                 return delivery_id
         return None
 
-    def _take_over_stale(
-        self, delivery_id: str, observed_updated_at: str
+    def _take_over(
+        self,
+        *,
+        delivery_id: str,
+        state: str,
+        observed_updated_at: str,
+        boundary_recorded_at: str,
     ) -> str | None:
-        """Adopt a crashed or failed owner's claim, or None.
+        """Adopt a crashed or failed owner's delivery row, or None.
 
-        Eligibility requires the row's last transition to be older than
-        ``retry_after``; ownership itself transfers only through a
-        compare-and-swap on the exact observed ``updated_at`` token, so
-        two takers can never both win.
+        A ``claimed`` row proves no keystroke was ever emitted, so it
+        becomes eligible once ``retry_after`` has passed. An
+        ``attempted`` row is an uncertain partial: keystrokes may have
+        landed, so it is retried only after a lead-owned prompt
+        boundary recorded strictly AFTER the attempt — the lead's own
+        turn cycle consumed the prompt line, so a non-destructive
+        retype can neither concatenate nor touch anyone's input.
+        Ownership itself always transfers through a compare-and-swap on
+        the exact observed ``updated_at`` token, so two takers can
+        never both win.
         """
 
-        try:
-            last = datetime.fromisoformat(observed_updated_at)
-        except ValueError:
-            return None
-        age = (self._now() - last).total_seconds()
-        if age < self._retry_after_seconds:
+        if state == "claimed":
+            try:
+                last = datetime.fromisoformat(observed_updated_at)
+            except ValueError:
+                return None
+            if (self._now() - last).total_seconds() < (
+                self._retry_after_seconds
+            ):
+                return None
+        elif state == "attempted":
+            if boundary_recorded_at <= observed_updated_at:
+                return None
+        else:
             return None
         with self._database.transaction() as connection:
             cursor = connection.execute(
@@ -352,6 +431,11 @@ class LeadIntakeRouter:
         except IntakeRefused:
             # Fail closed without losing anything: the durable packet
             # stays pending for a later pass with a valid seat.
+            return
+        except Exception:
+            # The intake channel is optional: no adapter or database
+            # surprise on one packet may take the daemon's startup or
+            # maintenance pass down. The durable packet stays pending.
             return
         if result.status == "delivered":
             delivered.append(packet_id)

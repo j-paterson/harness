@@ -952,3 +952,54 @@ def test_migration_env_mark_stamps_only_a_linked_worktree(
     marker = (worktree / ".fable-isolated-worktree").read_text()
     assert "slug=infra_189" in marker
     assert "repository=" in marker
+
+
+@pytest.mark.asyncio
+async def test_daemon_starts_when_intake_probes_fail(
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.cmux import CmuxUnavailable
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+    from tests.test_lead_intake import (
+        RecordingPort,
+        seat,
+        seed_active_cell,
+        seed_packets,
+        transport,
+    )
+
+    database = Database.open(tmp_path / "state.db")
+    try:
+        bindings = CmuxSurfaceBindings(
+            database=database, events=EventStore(database)
+        )
+        seed_packets(database)
+        seed_active_cell(database)
+        seat(bindings)
+        port = RecordingPort()
+        port.probe_error = CmuxUnavailable("cmux command timed out")
+        router = LeadIntakeRouter(
+            database=database,
+            transport=transport(database, bindings, port),
+        )
+        service = FakeService()
+
+        supervisor = await _run_daemon(
+            service, once=True, interval=60, lead_intake=router
+        )
+
+        # The optional intake channel timing out never blocks startup
+        # or the supervised tick; nothing was typed and the durable
+        # packets stayed pending for the next pass.
+        assert service.ticks == 1
+        assert supervisor is not None
+        assert port.envelopes == []
+        pending = database.scalar(
+            "SELECT count(*) FROM lead_corrections WHERE state = 'pending'"
+        )
+        assert int(pending) == 1
+    finally:
+        database.close()
