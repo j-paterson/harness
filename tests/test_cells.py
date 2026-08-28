@@ -2792,3 +2792,87 @@ async def test_resumed_cell_already_completed_wake_reconstructs_after_crash(
     # lost already_completed wake is reconstructed.
     assert reconciler.reconcile() == ()
     assert len(wake_rows(database)) == 2
+
+
+@pytest.mark.asyncio
+async def test_confirmed_session_gets_exactly_one_lead_seat(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    class RecordingSeater:
+        def __init__(self) -> None:
+            self.ensured: list[dict[str, str]] = []
+
+        async def ensure(self, **identity: str) -> None:
+            self.ensured.append(dict(identity))
+
+    seater = RecordingSeater()
+    admit(queue, "ENG-9")
+    events = EventStore(database)
+    service = ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        surfaces=seater,
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    assert seater.ensured == [
+        {
+            "project_key": "demo",
+            "cell_id": "cell-demo",
+            "session_id": str(SESSION_ID),
+            "profile_alias": "max-a",
+            "issue_id": "ENG-9",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_seat_creation_never_disturbs_the_turn(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    class ExplodingSeater:
+        async def ensure(self, **identity: str) -> None:
+            raise RuntimeError("cmux socket denied this process")
+
+    admit(queue, "ENG-9")
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        surfaces=ExplodingSeater(),
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    failures = database.execute(
+        "SELECT aggregate_id FROM events WHERE event_type = 'cmux.seat_failed'"
+    ).fetchall()
+    assert [str(row["aggregate_id"]) for row in failures] == ["cell-demo"]

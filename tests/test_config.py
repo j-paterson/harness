@@ -259,3 +259,40 @@ def test_hermes_wake_command_must_not_be_empty(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         load_settings(tmp_path, tmp_path / "state")
+
+
+def test_cmux_cli_loads_from_optional_config(tmp_path: Path) -> None:
+    _write_minimal_config(tmp_path)
+    (tmp_path / "config/cmux.yaml").write_text(
+        "cli:\n  - /Applications/cmux.app/Contents/Resources/bin/cmux\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.cmux is not None
+    assert settings.cmux.cli == [
+        "/Applications/cmux.app/Contents/Resources/bin/cmux"
+    ]
+
+
+def test_absent_cmux_config_disables_terminal_visibility(
+    tmp_path: Path,
+) -> None:
+    _write_minimal_config(tmp_path)
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.cmux is None
+
+
+def test_cmux_config_rejects_unknown_or_secret_like_keys(
+    tmp_path: Path,
+) -> None:
+    _write_minimal_config(tmp_path)
+    (tmp_path / "config/cmux.yaml").write_text(
+        "cli:\n  - cmux\nsocket_password: nope\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, tmp_path / "state")

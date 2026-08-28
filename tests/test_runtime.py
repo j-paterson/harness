@@ -351,3 +351,53 @@ def test_observation_runtime_still_exposes_lead_wakes(tmp_path: Path) -> None:
         assert runtime.lead_wakes.pending() == ()
     finally:
         runtime.close()
+
+
+def test_active_runtime_assembles_cmux_visibility_when_configured(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    (repo_root / "config/cmux.yaml").write_text(
+        "cli:\n  - /apps/cmux\n", encoding="utf-8"
+    )
+    settings = load_settings(repo_root, state_dir)
+    keychain = FakeKeychain()
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=keychain,
+        base_env={},
+    )
+    try:
+        assert runtime.cmux_bindings is not None
+        assert runtime.cmux_reconciler is not None
+        assert runtime.cmux_hibernation is not None
+        # The cmux socket password is read lazily at call time, never
+        # during assembly: the documented credential read order holds.
+        assert keychain.reads == [
+            ("hermes-orchestrator-linear", "default"),
+            ("hermes-orchestrator-github", "default"),
+            ("hermes-orchestrator-circleci", "default"),
+        ]
+    finally:
+        runtime.close()
+
+
+def test_observation_runtime_exposes_bindings_without_a_cmux_port(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    (repo_root / "config/cmux.yaml").write_text(
+        "cli:\n  - /apps/cmux\n", encoding="utf-8"
+    )
+    settings = load_settings(repo_root, state_dir)
+
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        assert runtime.cmux_bindings is not None
+        assert runtime.cmux_reconciler is None
+        assert runtime.cmux_hibernation is None
+    finally:
+        runtime.close()

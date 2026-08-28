@@ -51,6 +51,20 @@ class LeadRunner(Protocol):
     async def retire_session(self, session_id: UUID) -> None: ...
 
 
+class LeadSeatEnsurer(Protocol):
+    """Optional observational terminal seat for a confirmed lead session."""
+
+    async def ensure(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+        issue_id: str,
+    ) -> object | None: ...
+
+
 class LinearProjector(Protocol):
     """Approved Linear projection boundary used by project cells."""
 
@@ -146,6 +160,7 @@ class ProjectCellService:
         context_window_tokens: int = 200_000,
         replacement_session_ids: Callable[[], UUID] = uuid.uuid4,
         completion_sink: LeadCompletionSink | None = None,
+        surfaces: LeadSeatEnsurer | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -165,6 +180,7 @@ class ProjectCellService:
         self._context_window_tokens = context_window_tokens
         self._replacement_session_ids = replacement_session_ids
         self._completion_sink = completion_sink
+        self._surfaces = surfaces
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
@@ -276,6 +292,7 @@ class ProjectCellService:
                                 self._active_time.open(
                                     self._worker_key(cell), self._aware_now()
                                 )
+                            await self._ensure_lead_seat(cell, issue_id)
                         else:
                             issue_completed = (
                                 self._queue.get(issue_id).state == IssueState.DONE
@@ -448,6 +465,38 @@ class ProjectCellService:
                 reset_at=reset_at,
             )
         )
+
+    async def _ensure_lead_seat(self, cell: ProjectCell, issue_id: str) -> None:
+        """Give the confirmed session its observational cmux seat, if any.
+
+        Terminal visibility is a side effect of durable orchestration
+        state: a failed or denied seat creation journals one metadata
+        event and never disturbs the turn.
+        """
+
+        if self._surfaces is None:
+            return
+        try:
+            await self._surfaces.ensure(
+                project_key=cell.project_key,
+                cell_id=cell.cell_id,
+                session_id=str(cell.session_id),
+                profile_alias=cell.profile_alias,
+                issue_id=issue_id,
+            )
+        except Exception:
+            with suppress(Exception), (
+                self._database.transaction()
+            ) as connection:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="cmux.seat_failed",
+                        aggregate_type="project_cell",
+                        aggregate_id=cell.cell_id,
+                        payload={"issue_id": issue_id},
+                    ),
+                )
 
     def _record_issue_already_completed(
         self, cell: ProjectCell, issue_id: str

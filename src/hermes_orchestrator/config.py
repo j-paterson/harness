@@ -92,6 +92,21 @@ class HermesRuntimeConfig(BaseModel):
     wake_command: list[NonEmptyId] = Field(min_length=1)
 
 
+class CmuxRuntimeConfig(BaseModel):
+    """Optional cmux terminal visibility for the production daemon.
+
+    ``cli`` is the argv prefix of the bundled cmux CLI. Presence of
+    ``config/cmux.yaml`` enables durable workspace/surface bindings and
+    metadata-only status publication; without it the orchestrator runs
+    with no terminal visibility at all. The socket password never appears
+    here — it is read from the Keychain at call time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cli: list[NonEmptyId] = Field(min_length=1)
+
+
 class ResourcePolicy(BaseModel):
     """Resource thresholds; null values keep admission observation-only."""
 
@@ -136,6 +151,7 @@ class Settings(BaseModel):
     policy: PolicyConfig
     linear: LinearRuntimeConfig | None = None
     hermes: HermesRuntimeConfig | None = None
+    cmux: CmuxRuntimeConfig | None = None
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -190,6 +206,13 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
         else None
     )
 
+    cmux_path = config_dir / "cmux.yaml"
+    cmux = (
+        CmuxRuntimeConfig.model_validate(_read_yaml(cmux_path))
+        if cmux_path.exists()
+        else None
+    )
+
     linear_path = config_dir / "linear.yaml"
     linear = (
         LinearRuntimeConfig.model_validate(_read_yaml(linear_path))
@@ -237,4 +260,5 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
         policy=policy,
         linear=linear,
         hermes=hermes,
+        cmux=cmux,
     )

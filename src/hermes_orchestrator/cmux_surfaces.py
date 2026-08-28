@@ -1,0 +1,1495 @@
+"""Durable cmux surface bindings, reconciliation, and hibernation gating.
+
+INFRA-185: Hermes binds each orchestration seat — the Orchestrator pane
+and one workspace per active Claude project lead — to exact cmux
+workspace/surface UUIDs in durable state. Every lifecycle transition
+(bound, replaced, closed, lost) journals a replay-safe event; ownership
+never transfers silently and reconciliation validates the exact live
+surface rather than adopting terminals by cwd or title. Terminal
+visibility stays observational: nothing in this module reads screens or
+advances issue state, and hibernation clearance derives only from durable
+cell, lease, and checkpoint-safety evidence.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from collections.abc import Callable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Protocol
+
+from hermes_orchestrator.cmux import (
+    CmuxControlPort,
+    CmuxError,
+    CmuxSurfaceRef,
+)
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventInput, EventStore
+
+CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID"
+CMUX_SURFACE_ID_ENV = "CMUX_SURFACE_ID"
+
+ORCHESTRATOR_TITLE = "Orchestrator"
+
+_RUNNING_LEASE_STATES = ("active", "stopping")
+
+# Which prior lifecycle state may enter each target state. 'residual'
+# holds ownership evidence for a workspace that is not (or not yet) the
+# active seat: a write-ahead activation or an unconfirmed close. It
+# resolves forward to active (promotion), closed, or lost only.
+_TRANSITION_SOURCES: Mapping[str, tuple[str, ...]] = {
+    "active": ("residual",),
+    "stale": ("active",),
+    "residual": ("active",),
+    "closed": ("active", "residual"),
+    "lost": ("active", "residual"),
+}
+
+
+class CmuxBindingConflict(RuntimeError):
+    """A live binding already owns this seat; replacement must be explicit."""
+
+
+@dataclass(frozen=True, slots=True)
+class CmuxActivationIntent:
+    """One write-ahead workspace activation, committed before the create.
+
+    The intent_id is the durable unique operation identity: it travels
+    inside the created workspace's title, so an interruption anywhere
+    between the external create and the durable UUID bind still leaves
+    the exact workspace correlatable to this row and to nothing else.
+    """
+
+    intent_id: str
+    project_key: str
+    cell_id: str
+    session_id: str
+    profile_alias: str
+    state: str
+    binding_id: str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def title_marker(self) -> str:
+        return f"[hermes:{self.intent_id}]"
+
+
+@dataclass(frozen=True, slots=True)
+class CmuxBinding:
+    """One durable seat binding to an exact cmux workspace and surface."""
+
+    binding_id: str
+    role: str
+    project_key: str | None
+    cell_id: str | None
+    session_id: str | None
+    profile_alias: str | None
+    workspace_uuid: str
+    surface_uuid: str
+    generation: int
+    state: str
+    created_at: str
+    updated_at: str
+
+    @property
+    def ref(self) -> CmuxSurfaceRef:
+        return CmuxSurfaceRef(
+            workspace_uuid=self.workspace_uuid,
+            surface_uuid=self.surface_uuid,
+        )
+
+
+class ProfileDirectory(Protocol):
+    """Resolve a profile alias to its exact CLAUDE_CONFIG_DIR."""
+
+    def config_dir(self, alias: str) -> Path: ...
+
+
+class CmuxSurfaceBindings:
+    """Own the durable seat-to-surface identity map and its lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        events: EventStore,
+        now: Callable[[], datetime] | None = None,
+        ids: Callable[[], str] | None = None,
+    ) -> None:
+        self._database = database
+        self._events = events
+        self._now = now or (lambda: datetime.now(UTC))
+        self._ids = ids or (lambda: uuid.uuid4().hex)
+
+    def bind_orchestrator(self, ref: CmuxSurfaceRef) -> CmuxBinding:
+        """Bind the single Orchestrator seat; duplicates reuse the row.
+
+        A second activation against the same live surface returns the
+        existing binding unchanged. A different surface while one is
+        active is an ownership conflict: the caller must go through
+        :meth:`replace` with an explicit reason.
+        """
+
+        existing = self.active_orchestrator()
+        if existing is not None:
+            if existing.ref == ref:
+                return existing
+            raise CmuxBindingConflict(
+                "an active Orchestrator binding already owns another surface"
+            )
+        return self._insert(
+            role="orchestrator",
+            project_key=None,
+            cell_id=None,
+            session_id=None,
+            profile_alias=None,
+            ref=ref,
+            generation=self._next_generation(role="orchestrator"),
+        )
+
+    def bind_lead(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+        ref: CmuxSurfaceRef,
+    ) -> CmuxBinding:
+        """Bind one lead cell's seat; duplicate activation reuses the row."""
+
+        existing = self.active_lead(cell_id)
+        if existing is not None:
+            if existing.ref == ref and existing.session_id == session_id:
+                return existing
+            raise CmuxBindingConflict(
+                "an active binding already owns this cell's surface"
+            )
+        return self._insert(
+            role="lead",
+            project_key=project_key,
+            cell_id=cell_id,
+            session_id=session_id,
+            profile_alias=profile_alias,
+            ref=ref,
+            generation=self._next_generation(cell_id=cell_id),
+        )
+
+    def replace(
+        self, binding_id: str, ref: CmuxSurfaceRef, *, reason: str
+    ) -> CmuxBinding:
+        """Retire one binding as stale and activate its next generation.
+
+        Both generations commit in one transaction: no failure or
+        interruption can leave the old generation terminal without its
+        durable successor.
+        """
+
+        current = self.get(binding_id)
+        if current.state != "active":
+            raise CmuxBindingConflict(
+                f"a {current.state} binding cannot be replaced"
+            )
+        successor_id = self._ids()
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            self._write_transition(
+                connection,
+                current,
+                "stale",
+                event="replaced",
+                reason=reason,
+                stamp=stamp,
+            )
+            self._write_insert(
+                connection,
+                successor_id,
+                role=current.role,
+                project_key=current.project_key,
+                cell_id=current.cell_id,
+                session_id=current.session_id,
+                profile_alias=current.profile_alias,
+                ref=ref,
+                generation=current.generation + 1,
+                state="active",
+                event="bound",
+                reason=None,
+                stamp=stamp,
+            )
+        return self.get(successor_id)
+
+    def activate_residual(
+        self,
+        binding_id: str,
+        *,
+        replacing: str | None = None,
+        reason: str | None = None,
+    ) -> CmuxBinding:
+        """Atomically commit a write-ahead residual as the active seat.
+
+        The replaced predecessor (when given) retires in the same
+        transaction as the promotion, so an interruption can never leave
+        a terminal old generation without a durable successor, and the
+        pending row itself was already recoverable ownership evidence.
+        """
+
+        pending = self.get(binding_id)
+        if pending.state != "residual":
+            raise CmuxBindingConflict(
+                "only a residual binding can be activated"
+            )
+        predecessor = None if replacing is None else self.get(replacing)
+        if predecessor is not None and predecessor.state != "active":
+            raise CmuxBindingConflict(
+                f"a {predecessor.state} binding cannot be replaced"
+            )
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            if predecessor is not None:
+                self._write_transition(
+                    connection,
+                    predecessor,
+                    "stale",
+                    event="replaced",
+                    reason=reason or "replaced",
+                    stamp=stamp,
+                )
+            self._write_transition(
+                connection,
+                pending,
+                "active",
+                event="bound",
+                reason=None,
+                stamp=stamp,
+            )
+        return self.get(binding_id)
+
+    def mark_closed(self, binding_id: str, *, reason: str) -> CmuxBinding:
+        """Record the seat's explicit terminal closure."""
+
+        return self._transition(
+            self.get(binding_id), "closed", event="closed", reason=reason
+        )
+
+    def mark_lost(self, binding_id: str, *, reason: str) -> CmuxBinding:
+        """Record that the seat's exact surface no longer exists."""
+
+        return self._transition(
+            self.get(binding_id), "lost", event="lost", reason=reason
+        )
+
+    def mark_residual(self, binding_id: str, *, reason: str) -> CmuxBinding:
+        """Hold a seat whose workspace close was never confirmed.
+
+        The binding leaves the active set but keeps its exact workspace
+        identity as ownership evidence: reconciliation retries the close
+        and hibernation stays blocked until the residue is resolved.
+        """
+
+        return self._transition(
+            self.get(binding_id), "residual", event="residual", reason=reason
+        )
+
+    def record_residual(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+        ref: CmuxSurfaceRef,
+        reason: str,
+    ) -> CmuxBinding:
+        """Persist ownership of a created workspace that never activated.
+
+        Compensating a failed activation may itself fail; this records the
+        exact live workspace as a residual binding so startup
+        reconciliation can close it instead of leaking an untracked seat.
+        """
+
+        return self._insert(
+            role="lead",
+            project_key=project_key,
+            cell_id=cell_id,
+            session_id=session_id,
+            profile_alias=profile_alias,
+            ref=ref,
+            generation=self._next_generation(cell_id=cell_id),
+            state="residual",
+            event="residual",
+            reason=reason,
+        )
+
+    def record_intent(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+    ) -> CmuxActivationIntent:
+        """Commit the activation's durable identity before any external
+        create, so no later interruption can orphan the workspace."""
+
+        intent_id = self._ids()
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO cmux_activation_intents("
+                "intent_id, project_key, cell_id, session_id, "
+                "profile_alias, state, binding_id, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?)",
+                (
+                    intent_id,
+                    project_key,
+                    cell_id,
+                    session_id,
+                    profile_alias,
+                    stamp,
+                    stamp,
+                ),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="cmux_intent.recorded",
+                    aggregate_type="cmux_intent",
+                    aggregate_id=intent_id,
+                    payload={
+                        "project_key": project_key,
+                        "cell_id": cell_id,
+                        "session_id": session_id,
+                        "profile_alias": profile_alias,
+                    },
+                ),
+            )
+        return self.get_intent(intent_id)
+
+    def bind_intent(
+        self, intent_id: str, *, ref: CmuxSurfaceRef
+    ) -> CmuxBinding:
+        """Atomically bind the returned workspace identities to their
+        write-ahead intent as a residual (not yet active) seat.
+
+        The binding insert and the intent's pending → bound transition
+        commit in one transaction: from this point the binding lifecycle
+        owns the workspace and the intent can never resolve again.
+        """
+
+        intent = self._pending_intent(intent_id, action="bind a workspace")
+        binding_id = self._ids()
+        stamp = self._now().isoformat()
+        generation = self._next_generation(cell_id=intent.cell_id)
+        with self._database.transaction() as connection:
+            self._write_insert(
+                connection,
+                binding_id,
+                role="lead",
+                project_key=intent.project_key,
+                cell_id=intent.cell_id,
+                session_id=intent.session_id,
+                profile_alias=intent.profile_alias,
+                ref=ref,
+                generation=generation,
+                state="residual",
+                event="residual",
+                reason="activation_pending",
+                stamp=stamp,
+            )
+            self._write_intent_transition(
+                connection,
+                intent,
+                "bound",
+                event="bound",
+                binding_id=binding_id,
+                stamp=stamp,
+                extra={"workspace_uuid": ref.workspace_uuid},
+            )
+        return self.get(binding_id)
+
+    def abort_intent(
+        self, intent_id: str, *, reason: str
+    ) -> CmuxActivationIntent:
+        """Record that no workspace ever carried this intent's identity."""
+
+        intent = self._pending_intent(intent_id, action="be aborted")
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            self._write_intent_transition(
+                connection,
+                intent,
+                "aborted",
+                event="aborted",
+                binding_id=None,
+                stamp=stamp,
+                extra={"reason": reason},
+            )
+        return self.get_intent(intent_id)
+
+    def reclaim_intent(
+        self,
+        intent_id: str,
+        *,
+        workspace_uuids: tuple[str, ...],
+        reason: str,
+    ) -> CmuxActivationIntent:
+        """Record that the intent's unbound workspace was closed by exact
+        identity after cmux confirmed the close."""
+
+        intent = self._pending_intent(intent_id, action="be reclaimed")
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            self._write_intent_transition(
+                connection,
+                intent,
+                "reclaimed",
+                event="reclaimed",
+                binding_id=None,
+                stamp=stamp,
+                extra={
+                    "workspace_uuids": list(workspace_uuids),
+                    "reason": reason,
+                },
+            )
+        return self.get_intent(intent_id)
+
+    def pending_intents(self) -> tuple[CmuxActivationIntent, ...]:
+        rows = self._database.execute(
+            "SELECT * FROM cmux_activation_intents "
+            "WHERE state = 'pending' ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        return tuple(_row_to_intent(row) for row in rows)
+
+    def pending_intents_for_cell(
+        self, cell_id: str
+    ) -> tuple[CmuxActivationIntent, ...]:
+        rows = self._database.execute(
+            "SELECT * FROM cmux_activation_intents "
+            "WHERE state = 'pending' AND cell_id = ? "
+            "ORDER BY created_at ASC, rowid ASC",
+            (cell_id,),
+        ).fetchall()
+        return tuple(_row_to_intent(row) for row in rows)
+
+    def get_intent(self, intent_id: str) -> CmuxActivationIntent:
+        row = self._database.execute(
+            "SELECT * FROM cmux_activation_intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(intent_id)
+        return _row_to_intent(row)
+
+    def _pending_intent(
+        self, intent_id: str, *, action: str
+    ) -> CmuxActivationIntent:
+        intent = self.get_intent(intent_id)
+        if intent.state != "pending":
+            raise CmuxBindingConflict(
+                f"a {intent.state} activation intent cannot {action}"
+            )
+        return intent
+
+    def _write_intent_transition(
+        self,
+        connection: Any,
+        intent: CmuxActivationIntent,
+        state: str,
+        *,
+        event: str,
+        binding_id: str | None,
+        stamp: str,
+        extra: Mapping[str, Any],
+    ) -> None:
+        connection.execute(
+            "UPDATE cmux_activation_intents "
+            "SET state = ?, binding_id = ?, updated_at = ? "
+            "WHERE intent_id = ? AND state = 'pending'",
+            (state, binding_id, stamp, intent.intent_id),
+        )
+        payload: dict[str, Any] = {
+            "project_key": intent.project_key,
+            "cell_id": intent.cell_id,
+            "session_id": intent.session_id,
+            "profile_alias": intent.profile_alias,
+        }
+        if binding_id is not None:
+            payload["binding_id"] = binding_id
+        payload.update(extra)
+        self._events.append(
+            connection,
+            EventInput(
+                event_type=f"cmux_intent.{event}",
+                aggregate_type="cmux_intent",
+                aggregate_id=intent.intent_id,
+                payload=payload,
+            ),
+        )
+
+    def active(self) -> tuple[CmuxBinding, ...]:
+        rows = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings WHERE state = 'active' "
+            "ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        return tuple(_row_to_binding(row) for row in rows)
+
+    def residual(self) -> tuple[CmuxBinding, ...]:
+        rows = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings WHERE state = 'residual' "
+            "ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        return tuple(_row_to_binding(row) for row in rows)
+
+    def residual_for_cell(self, cell_id: str) -> tuple[CmuxBinding, ...]:
+        rows = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings "
+            "WHERE state = 'residual' AND cell_id = ? "
+            "ORDER BY created_at ASC, rowid ASC",
+            (cell_id,),
+        ).fetchall()
+        return tuple(_row_to_binding(row) for row in rows)
+
+    def active_orchestrator(self) -> CmuxBinding | None:
+        row = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings "
+            "WHERE role = 'orchestrator' AND state = 'active'"
+        ).fetchone()
+        return None if row is None else _row_to_binding(row)
+
+    def active_lead(self, cell_id: str) -> CmuxBinding | None:
+        row = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings "
+            "WHERE role = 'lead' AND cell_id = ? AND state = 'active'",
+            (cell_id,),
+        ).fetchone()
+        return None if row is None else _row_to_binding(row)
+
+    def active_lead_for_project(self, project_key: str) -> CmuxBinding | None:
+        row = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings "
+            "WHERE role = 'lead' AND project_key = ? AND state = 'active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (project_key,),
+        ).fetchone()
+        return None if row is None else _row_to_binding(row)
+
+    def get(self, binding_id: str) -> CmuxBinding:
+        row = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings WHERE binding_id = ?",
+            (binding_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(binding_id)
+        return _row_to_binding(row)
+
+    def _next_generation(
+        self, *, role: str = "lead", cell_id: str | None = None
+    ) -> int:
+        if cell_id is not None:
+            highest = self._database.scalar(
+                "SELECT max(generation) FROM cmux_surface_bindings "
+                "WHERE cell_id = ?",
+                (cell_id,),
+            )
+        else:
+            highest = self._database.scalar(
+                "SELECT max(generation) FROM cmux_surface_bindings "
+                "WHERE role = ?",
+                (role,),
+            )
+        return int(highest or 0) + 1
+
+    def _insert(
+        self,
+        *,
+        role: str,
+        project_key: str | None,
+        cell_id: str | None,
+        session_id: str | None,
+        profile_alias: str | None,
+        ref: CmuxSurfaceRef,
+        generation: int,
+        state: str = "active",
+        event: str = "bound",
+        reason: str | None = None,
+    ) -> CmuxBinding:
+        binding_id = self._ids()
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            self._write_insert(
+                connection,
+                binding_id,
+                role=role,
+                project_key=project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias=profile_alias,
+                ref=ref,
+                generation=generation,
+                state=state,
+                event=event,
+                reason=reason,
+                stamp=stamp,
+            )
+        return self.get(binding_id)
+
+    def _write_insert(
+        self,
+        connection: Any,
+        binding_id: str,
+        *,
+        role: str,
+        project_key: str | None,
+        cell_id: str | None,
+        session_id: str | None,
+        profile_alias: str | None,
+        ref: CmuxSurfaceRef,
+        generation: int,
+        state: str,
+        event: str,
+        reason: str | None,
+        stamp: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO cmux_surface_bindings("
+            "binding_id, role, project_key, cell_id, session_id, "
+            "profile_alias, workspace_uuid, surface_uuid, generation, "
+            "state, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                binding_id,
+                role,
+                project_key,
+                cell_id,
+                session_id,
+                profile_alias,
+                ref.workspace_uuid,
+                ref.surface_uuid,
+                generation,
+                state,
+                stamp,
+                stamp,
+            ),
+        )
+        payload = _identity_payload(
+            role=role,
+            project_key=project_key,
+            cell_id=cell_id,
+            session_id=session_id,
+            profile_alias=profile_alias,
+            ref=ref,
+            generation=generation,
+        )
+        if reason is not None:
+            payload["reason"] = reason
+        self._events.append(
+            connection,
+            EventInput(
+                event_type=f"cmux_binding.{event}",
+                aggregate_type="cmux_binding",
+                aggregate_id=binding_id,
+                payload=payload,
+            ),
+        )
+
+    def _transition(
+        self,
+        binding: CmuxBinding,
+        state: str,
+        *,
+        event: str,
+        reason: str,
+    ) -> CmuxBinding:
+        if binding.state == state:
+            return binding
+        if binding.state not in _TRANSITION_SOURCES[state]:
+            raise CmuxBindingConflict(
+                f"a {binding.state} binding cannot become {state}"
+            )
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            self._write_transition(
+                connection,
+                binding,
+                state,
+                event=event,
+                reason=reason,
+                stamp=stamp,
+            )
+        return self.get(binding.binding_id)
+
+    def _write_transition(
+        self,
+        connection: Any,
+        binding: CmuxBinding,
+        state: str,
+        *,
+        event: str,
+        reason: str | None,
+        stamp: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE cmux_surface_bindings SET state = ?, updated_at = ? "
+            "WHERE binding_id = ? AND state = ?",
+            (state, stamp, binding.binding_id, binding.state),
+        )
+        payload = _identity_payload(
+            role=binding.role,
+            project_key=binding.project_key,
+            cell_id=binding.cell_id,
+            session_id=binding.session_id,
+            profile_alias=binding.profile_alias,
+            ref=binding.ref,
+            generation=binding.generation,
+        )
+        if reason is not None:
+            payload["reason"] = reason
+        self._events.append(
+            connection,
+            EventInput(
+                event_type=f"cmux_binding.{event}",
+                aggregate_type="cmux_binding",
+                aggregate_id=binding.binding_id,
+                payload=payload,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CmuxReconciliationReport:
+    """The outcome of one startup pass over the seat bindings.
+
+    ``available`` records whether the socket answered the initial ping;
+    ``completed`` whether the whole pass finished without a cmux failure.
+    A partial pass (``available`` without ``completed``) left every
+    unfinished binding in a recoverable state for the next startup — it
+    never aborts the daemon.
+    """
+
+    available: bool
+    completed: bool = True
+    verified: tuple[str, ...] = ()
+    replaced: tuple[str, ...] = ()
+    lost: tuple[str, ...] = ()
+    reclaimed: tuple[str, ...] = ()
+    intents_reclaimed: tuple[str, ...] = ()
+    intents_aborted: tuple[str, ...] = ()
+    intents_ambiguous: tuple[str, ...] = ()
+
+
+class CmuxSurfaceReconciler:
+    """Restore visible seats from durable identity before accepting work.
+
+    Each active binding is validated against the exact live workspace and
+    surface UUIDs. A missing lead surface is replaced with one new
+    generation whose workspace carries the recorded project cwd, the
+    profile's CLAUDE_CONFIG_DIR, and a sanitized native resume command —
+    never a prompt or credential. A missing Orchestrator seat is rebound
+    only to this process's own cmux seat (from the environment cmux
+    itself injected); otherwise it is recorded lost and the operator
+    relaunches the pane, so ownership never transfers silently. When the
+    socket denies or fails, durable state is left untouched.
+    """
+
+    def __init__(
+        self,
+        *,
+        bindings: CmuxSurfaceBindings,
+        port: CmuxControlPort,
+        project_paths: Mapping[str, Path],
+        profile_dirs: ProfileDirectory,
+        environ: Mapping[str, str],
+    ) -> None:
+        self._bindings = bindings
+        self._port = port
+        self._project_paths = dict(project_paths)
+        self._profile_dirs = profile_dirs
+        self._environ = dict(environ)
+
+    def own_seat(self) -> CmuxSurfaceRef | None:
+        """The cmux seat this very process runs in, if any."""
+
+        workspace = self._environ.get(CMUX_WORKSPACE_ID_ENV, "").strip()
+        surface = self._environ.get(CMUX_SURFACE_ID_ENV, "").strip()
+        if not workspace or not surface:
+            return None
+        return CmuxSurfaceRef(
+            workspace_uuid=workspace, surface_uuid=surface
+        )
+
+    async def reconcile(self) -> CmuxReconciliationReport:
+        try:
+            await self._port.ping()
+        except CmuxError:
+            # Denial or unavailability fails closed: durable bindings are
+            # the truth and stay untouched until cmux is reachable.
+            return CmuxReconciliationReport(available=False, completed=False)
+        verified: list[str] = []
+        replaced: list[str] = []
+        lost: list[str] = []
+        reclaimed: list[str] = []
+        intents_reclaimed: list[str] = []
+        intents_aborted: list[str] = []
+        intents_ambiguous: list[str] = []
+        completed = True
+        try:
+            # Interrupted activations resolve first: each pending
+            # write-ahead intent either reclaims the exact workspace its
+            # unique identity created, is aborted, or is surfaced as
+            # ambiguous, before any binding is verified or replaced.
+            await _resolve_pending_intents(
+                self._port,
+                self._bindings,
+                self._bindings.pending_intents(),
+                reclaimed=intents_reclaimed,
+                aborted=intents_aborted,
+                ambiguous=intents_ambiguous,
+            )
+            await self._reclaim_residuals(reclaimed, lost)
+            for binding in self._bindings.active():
+                if await self._port.surface_alive(binding.ref):
+                    verified.append(binding.binding_id)
+                    continue
+                if binding.role == "orchestrator":
+                    self._reconcile_orchestrator(binding, replaced, lost)
+                else:
+                    await self._reconcile_lead(binding, replaced, lost)
+            seat = self.own_seat()
+            if (
+                seat is not None
+                and self._bindings.active_orchestrator() is None
+            ):
+                self._bindings.bind_orchestrator(seat)
+        except CmuxError:
+            # cmux failed mid-pass. Visibility is optional: every
+            # unfinished binding keeps its recoverable durable state, no
+            # further cmux mutation is attempted, and the partial report
+            # lets daemon startup continue; the next pass retries.
+            completed = False
+        return CmuxReconciliationReport(
+            available=True,
+            # An ambiguous intent is unresolved ownership evidence: the
+            # pass is honestly incomplete until an operator resolves it.
+            completed=completed and not intents_ambiguous,
+            verified=tuple(verified),
+            replaced=tuple(replaced),
+            lost=tuple(lost),
+            reclaimed=tuple(reclaimed),
+            intents_reclaimed=tuple(intents_reclaimed),
+            intents_aborted=tuple(intents_aborted),
+            intents_ambiguous=tuple(intents_ambiguous),
+        )
+
+    async def _reclaim_residuals(
+        self, reclaimed: list[str], lost: list[str]
+    ) -> None:
+        """Resolve workspaces whose earlier close was never confirmed.
+
+        Each residual row is ownership evidence for an exact workspace
+        UUID. One that is no longer live is recorded lost; a live one is
+        closed and journaled. A cmux failure leaves the row residual —
+        still owned, still blocking hibernation — for the next startup.
+        """
+
+        await _resolve_residual_bindings(
+            self._port,
+            self._bindings,
+            self._bindings.residual(),
+            reclaimed=reclaimed,
+            lost=lost,
+        )
+
+    def _reconcile_orchestrator(
+        self,
+        binding: CmuxBinding,
+        replaced: list[str],
+        lost: list[str],
+    ) -> None:
+        seat = self.own_seat()
+        if seat is not None:
+            successor = self._bindings.replace(
+                binding.binding_id, seat, reason="orchestrator_reseated"
+            )
+            replaced.append(successor.binding_id)
+        else:
+            self._bindings.mark_lost(
+                binding.binding_id, reason="orchestrator_surface_missing"
+            )
+            lost.append(binding.binding_id)
+
+    async def _reconcile_lead(
+        self,
+        binding: CmuxBinding,
+        replaced: list[str],
+        lost: list[str],
+    ) -> None:
+        assert binding.project_key is not None
+        assert binding.profile_alias is not None
+        cwd = self._project_paths.get(binding.project_key)
+        try:
+            config_dir = self._profile_dirs.config_dir(
+                binding.profile_alias
+            )
+        except (KeyError, ValueError):
+            config_dir = None
+        if cwd is None or config_dir is None:
+            # The recorded identity can no longer be satisfied exactly;
+            # adopting a different project path or profile would break
+            # isolation, so the seat is recorded lost instead.
+            self._bindings.mark_lost(
+                binding.binding_id,
+                reason=(
+                    "project_missing" if cwd is None else "profile_missing"
+                ),
+            )
+            lost.append(binding.binding_id)
+            return
+        successor = await _activate_lead_seat(
+            self._port,
+            self._bindings,
+            project_key=binding.project_key,
+            cwd=cwd,
+            config_dir=config_dir,
+            cell_id=str(binding.cell_id),
+            session_id=str(binding.session_id),
+            profile_alias=binding.profile_alias,
+            replacing=binding.binding_id,
+            replace_reason="surface_missing",
+        )
+        replaced.append(successor.binding_id)
+
+
+async def _activate_lead_seat(
+    port: CmuxControlPort,
+    bindings: CmuxSurfaceBindings,
+    *,
+    project_key: str,
+    cwd: Path,
+    config_dir: Path,
+    cell_id: str,
+    session_id: str,
+    profile_alias: str,
+    replacing: str | None = None,
+    replace_reason: str | None = None,
+) -> CmuxBinding:
+    """Create, prepare, and durably bind one lead seat as a write-ahead
+    compensated activation from durable identity alone.
+
+    The activation intent — a durable unique operation identity — commits
+    before the external create, and the create carries that identity
+    inside the workspace title. The workspace carries the recorded
+    project cwd and the profile's exact CLAUDE_CONFIG_DIR; its native
+    resume command is the sanitized ``claude --resume <session>`` — never
+    a prompt or credential. Once cmux returns, the identities bind
+    atomically to the intent as a residual row, then promote to the
+    active seat (retiring ``replacing`` in the same transaction). A
+    failure or crash at any point therefore leaves either nothing, a
+    pending intent whose marker finds the exact workspace, or a
+    recoverable residual — never an untracked live workspace.
+    """
+
+    title = f"{project_key} lead"
+    intent = bindings.record_intent(
+        project_key=project_key,
+        cell_id=cell_id,
+        session_id=session_id,
+        profile_alias=profile_alias,
+    )
+    ref = await port.create_workspace(
+        title=f"{title} {intent.title_marker}",
+        cwd=cwd,
+        env={"CLAUDE_CONFIG_DIR": str(config_dir)},
+    )
+    try:
+        pending = bindings.bind_intent(intent.intent_id, ref=ref)
+    except Exception:
+        # The returned identities could not be durably bound; closing the
+        # workspace keeps every live seat inside durable ownership, and
+        # an unconfirmed close leaves the pending intent to find it again.
+        with suppress(CmuxError):
+            await port.close_workspace(ref.workspace_uuid)
+        raise
+    try:
+        await port.set_surface_resume(ref, f"claude --resume {session_id}")
+        active = bindings.activate_residual(
+            pending.binding_id, replacing=replacing, reason=replace_reason
+        )
+    except Exception:
+        await _release_pending_seat(port, bindings, pending)
+        raise
+    with suppress(CmuxError):
+        # The marker's correlation job ended when the identities bound;
+        # the visible title is cosmetic.
+        await port.rename_workspace(ref.workspace_uuid, title)
+    return active
+
+
+async def _release_pending_seat(
+    port: CmuxControlPort,
+    bindings: CmuxSurfaceBindings,
+    pending: CmuxBinding,
+) -> None:
+    """Compensate a write-ahead seat whose activation did not finish.
+
+    The exact workspace is closed by UUID and its row retired; if cmux
+    cannot confirm the close, the row simply stays residual — recoverable
+    ownership that blocks hibernation until reconciliation resolves it.
+    """
+
+    try:
+        await port.close_workspace(pending.workspace_uuid)
+    except CmuxError:
+        return
+    bindings.mark_closed(pending.binding_id, reason="activation_abandoned")
+
+
+async def _resolve_pending_intents(
+    port: CmuxControlPort,
+    bindings: CmuxSurfaceBindings,
+    intents: tuple[CmuxActivationIntent, ...],
+    *,
+    reclaimed: list[str] | None = None,
+    aborted: list[str] | None = None,
+    ambiguous: list[str] | None = None,
+) -> None:
+    """Resolve write-ahead activations that never bound their identities.
+
+    Correlation is only through each intent's unique title marker, and a
+    workspace is reclaimed only when exactly one live workspace carries
+    it: the intent's single create can own one workspace, so a second
+    exact match (operator duplication, copied metadata) means ownership
+    cannot be uniquely proven and nothing is closed — the intent stays
+    pending, blocking hibernation, until an operator resolves it. With
+    ``ambiguous`` given, the ambiguity is recorded there and resolution
+    continues; without it, the ambiguity raises
+    :class:`CmuxBindingConflict` and refuses the caller's activation. No
+    match means the create never happened (or its workspace already
+    vanished) and the intent is aborted. Unrelated workspaces are never
+    adopted or closed, and a cmux failure propagates with the intent
+    still pending — still owned, still blocking hibernation — for the
+    next pass.
+    """
+
+    for intent in intents:
+        matches = await port.find_workspace_uuids(
+            title_marker=intent.title_marker
+        )
+        if not matches:
+            bindings.abort_intent(
+                intent.intent_id, reason="no_workspace_carries_identity"
+            )
+            if aborted is not None:
+                aborted.append(intent.intent_id)
+            continue
+        if len(matches) > 1:
+            if ambiguous is None:
+                raise CmuxBindingConflict(
+                    "multiple workspaces carry one activation intent's "
+                    "identity; ownership requires operator resolution"
+                )
+            ambiguous.append(intent.intent_id)
+            continue
+        [workspace_uuid] = matches
+        await port.close_workspace(workspace_uuid)
+        bindings.reclaim_intent(
+            intent.intent_id,
+            workspace_uuids=(workspace_uuid,),
+            reason="unbound_workspace_reclaimed",
+        )
+        if reclaimed is not None:
+            reclaimed.append(intent.intent_id)
+
+
+async def _resolve_residual_bindings(
+    port: CmuxControlPort,
+    bindings: CmuxSurfaceBindings,
+    residuals: tuple[CmuxBinding, ...],
+    *,
+    reclaimed: list[str] | None = None,
+    lost: list[str] | None = None,
+) -> None:
+    """Resolve workspaces whose earlier lifecycle was never confirmed.
+
+    Each residual row is ownership evidence for an exact workspace UUID.
+    One that is no longer live is recorded lost; a live one is closed and
+    journaled. A cmux failure propagates with the row still residual —
+    still owned, still blocking hibernation — for the caller's boundary.
+    """
+
+    if not residuals:
+        return
+    live = await port.live_workspace_uuids()
+    for binding in residuals:
+        if binding.workspace_uuid not in live:
+            bindings.mark_lost(
+                binding.binding_id, reason="residual_workspace_vanished"
+            )
+            if lost is not None:
+                lost.append(binding.binding_id)
+            continue
+        await port.close_workspace(binding.workspace_uuid)
+        bindings.mark_closed(
+            binding.binding_id, reason="residual_reclaimed"
+        )
+        if reclaimed is not None:
+            reclaimed.append(binding.binding_id)
+
+
+class CmuxLeadSeater:
+    """Ensure each confirmed lead session owns exactly one visible seat.
+
+    Called from the dispatch path once a session is confirmed: a cell
+    that already holds an active binding for the same session reuses it
+    untouched; otherwise one workspace is created and durably bound. The
+    profile alias must still resolve to its exact config directory before
+    a seat is created — a vanished profile creates nothing.
+    """
+
+    def __init__(
+        self,
+        *,
+        bindings: CmuxSurfaceBindings,
+        port: CmuxControlPort,
+        project_paths: Mapping[str, Path],
+        profile_dirs: ProfileDirectory,
+    ) -> None:
+        self._bindings = bindings
+        self._port = port
+        self._project_paths = dict(project_paths)
+        self._profile_dirs = profile_dirs
+
+    async def ensure(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+        issue_id: str | None = None,
+    ) -> CmuxBinding | None:
+        existing = self._bindings.active_lead(cell_id)
+        if existing is not None:
+            if existing.session_id == session_id:
+                await self._show_issue(existing, issue_id)
+                return existing
+            # The cell rotated to a new session: the old seat's exact
+            # workspace is closed and its binding retired before any
+            # replacement carries the new identity.
+            await self._retire_rotated_seat(existing)
+        # Any unresolved residual workspace or interrupted write-ahead
+        # activation for this cell must be confirmed closed, lost, or
+        # aborted first — a replacement seat while a prior workspace is
+        # still owned-but-unresolved would let one cell operate two live
+        # seats. A cmux failure here propagates and refuses the seat; the
+        # unresolved evidence keeps blocking hibernation.
+        await _resolve_residual_bindings(
+            self._port,
+            self._bindings,
+            self._bindings.residual_for_cell(cell_id),
+        )
+        await _resolve_pending_intents(
+            self._port,
+            self._bindings,
+            self._bindings.pending_intents_for_cell(cell_id),
+        )
+        cwd = self._project_paths.get(project_key)
+        if cwd is None:
+            return None
+        try:
+            config_dir = self._profile_dirs.config_dir(profile_alias)
+        except (KeyError, ValueError):
+            return None
+        bound = await _activate_lead_seat(
+            self._port,
+            self._bindings,
+            project_key=project_key,
+            cwd=cwd,
+            config_dir=config_dir,
+            cell_id=cell_id,
+            session_id=session_id,
+            profile_alias=profile_alias,
+        )
+        await self._show_issue(bound, issue_id)
+        return bound
+
+    async def _retire_rotated_seat(self, existing: CmuxBinding) -> None:
+        """Close the rotated-away workspace by exact identity.
+
+        The binding leaves 'active' only after cmux confirms the close.
+        An unconfirmed close holds the seat as residual — still owned and
+        blocking hibernation — and stops this activation until startup
+        reconciliation resolves the residue.
+        """
+
+        try:
+            await self._port.close_workspace(existing.workspace_uuid)
+        except CmuxError:
+            self._bindings.mark_residual(
+                existing.binding_id,
+                reason="session_rotated_close_uncertain",
+            )
+            raise
+        self._bindings.mark_closed(
+            existing.binding_id, reason="session_rotated"
+        )
+
+    async def _show_issue(
+        self, binding: CmuxBinding, issue_id: str | None
+    ) -> None:
+        """Display the seat's current issue id; cosmetic, never binding."""
+
+        if issue_id is None:
+            return
+        try:
+            await self._port.set_status(
+                binding.workspace_uuid, "issue", issue_id
+            )
+        except CmuxError:
+            return
+
+
+@dataclass(frozen=True, slots=True)
+class HibernationDecision:
+    """Whether every visible lead seat may hibernate, with any blockers."""
+
+    clear: bool
+    blockers: tuple[str, ...] = ()
+
+
+class SafetyEvidenceSource(Protocol):
+    def current(self, cell_id: str, session_id: str) -> object | None: ...
+
+
+class CmuxHibernationGate:
+    """Permit cmux hibernation only for idle, restorable, safe leads.
+
+    cmux's hibernation toggle is app-wide, so clearance requires every
+    active lead binding to be provably safe from durable state alone: no
+    live process lease for its session (idle), a current checkpoint-safety
+    boundary bound to its exact session (protected), and a cell state that
+    a resume can restore. Any running, needs-input, or uncheckpointed lead
+    blocks hibernation entirely.
+    """
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        safety: SafetyEvidenceSource,
+    ) -> None:
+        self._database = database
+        self._bindings = bindings
+        self._safety = safety
+
+    def decide(self) -> HibernationDecision:
+        blockers: list[str] = []
+        for binding in self._bindings.active():
+            if binding.role != "lead":
+                continue
+            assert binding.cell_id is not None
+            assert binding.session_id is not None
+            placeholders = ",".join("?" for _ in _RUNNING_LEASE_STATES)
+            running = self._database.scalar(
+                f"SELECT count(*) FROM process_leases "
+                f"WHERE worker_id = ? AND state IN ({placeholders})",
+                (binding.session_id, *_RUNNING_LEASE_STATES),
+            )
+            if int(running or 0):
+                blockers.append(f"{binding.cell_id}:running")
+                continue
+            cell_state = self._database.scalar(
+                "SELECT state FROM project_cells WHERE cell_id = ?",
+                (binding.cell_id,),
+            )
+            if str(cell_state or "") != "active":
+                blockers.append(f"{binding.cell_id}:unrestorable")
+                continue
+            evidence = self._safety.current(
+                binding.cell_id, binding.session_id
+            )
+            if evidence is None:
+                blockers.append(f"{binding.cell_id}:uncheckpointed")
+        for binding in self._bindings.residual():
+            # A residual workspace is owned but not confirmed closed;
+            # app-wide hibernation waits until reconciliation resolves it.
+            blockers.append(f"{binding.cell_id}:residual")
+        for intent in self._bindings.pending_intents():
+            # A pending intent may own a live workspace whose identities
+            # were never bound; hibernation waits for its resolution.
+            blockers.append(f"{intent.cell_id}:activation_intent")
+        return HibernationDecision(
+            clear=not blockers, blockers=tuple(blockers)
+        )
+
+
+class RegistryProfileDirectory:
+    """Resolve profile aliases through the validated profile registry."""
+
+    def __init__(self, registry: Any) -> None:
+        self._registry = registry
+
+    def config_dir(self, alias: str) -> Path:
+        return Path(self._registry.get(alias).config_dir)
+
+
+class CmuxWakeAnnouncer:
+    """Mirror committed lead wakes onto their cmux seats, event-driven.
+
+    Subscribes to the durable wake outbox: each commit schedules one
+    metadata-only status/notification push for the wake's bound seat.
+    There is no polling and no model involvement, publication failures are
+    swallowed (the durable wake row is the truth and the pane is only a
+    view), and outside a running event loop the push is skipped entirely.
+    """
+
+    def __init__(
+        self,
+        *,
+        bindings: CmuxSurfaceBindings,
+        port: CmuxControlPort,
+    ) -> None:
+        self._bindings = bindings
+        self._port = port
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def attach(self, wakes: Any) -> None:
+        wakes.subscribe(self._on_commit)
+
+    def _on_commit(self, wake: Any) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._publish(wake))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _publish(self, wake: Any) -> None:
+        binding = self._bindings.active_lead(str(wake.cell_id))
+        if binding is None:
+            return
+        try:
+            await self._port.set_status(
+                binding.workspace_uuid,
+                "wake",
+                f"{wake.kind}:{wake.reason}",
+            )
+            await self._port.notify(
+                binding.workspace_uuid,
+                f"{wake.issue_id}: {wake.kind}",
+                wake.reason,
+            )
+        except CmuxError:
+            return
+
+
+class CmuxHibernationDriver:
+    """Apply the hibernation gate's decision to cmux, on change only."""
+
+    def __init__(
+        self,
+        *,
+        gate: CmuxHibernationGate,
+        port: CmuxControlPort,
+        database: Database,
+        events: EventStore,
+    ) -> None:
+        self._gate = gate
+        self._port = port
+        self._database = database
+        self._events = events
+        self._last: bool | None = None
+
+    async def tick(self) -> None:
+        decision = self._gate.decide()
+        if decision.clear == self._last:
+            return
+        try:
+            await self._port.set_hibernation(decision.clear)
+        except CmuxError:
+            # The toggle stays unacknowledged; the next tick retries with
+            # a freshly derived decision.
+            return
+        self._last = decision.clear
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="cmux.hibernation",
+                    aggregate_type="cmux_binding",
+                    aggregate_id="hibernation",
+                    payload={
+                        "enabled": decision.clear,
+                        "blockers": list(decision.blockers),
+                    },
+                ),
+            )
+
+
+def _identity_payload(
+    *,
+    role: str,
+    project_key: str | None,
+    cell_id: str | None,
+    session_id: str | None,
+    profile_alias: str | None,
+    ref: CmuxSurfaceRef,
+    generation: int,
+) -> dict[str, Any]:
+    return {
+        "role": role,
+        "project_key": project_key,
+        "cell_id": cell_id,
+        "session_id": session_id,
+        "profile_alias": profile_alias,
+        "workspace_uuid": ref.workspace_uuid,
+        "surface_uuid": ref.surface_uuid,
+        "generation": generation,
+    }
+
+
+def _row_to_intent(row: Any) -> CmuxActivationIntent:
+    return CmuxActivationIntent(
+        intent_id=str(row["intent_id"]),
+        project_key=str(row["project_key"]),
+        cell_id=str(row["cell_id"]),
+        session_id=str(row["session_id"]),
+        profile_alias=str(row["profile_alias"]),
+        state=str(row["state"]),
+        binding_id=(
+            None if row["binding_id"] is None else str(row["binding_id"])
+        ),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _row_to_binding(row: Any) -> CmuxBinding:
+    return CmuxBinding(
+        binding_id=str(row["binding_id"]),
+        role=str(row["role"]),
+        project_key=(
+            None if row["project_key"] is None else str(row["project_key"])
+        ),
+        cell_id=(None if row["cell_id"] is None else str(row["cell_id"])),
+        session_id=(
+            None if row["session_id"] is None else str(row["session_id"])
+        ),
+        profile_alias=(
+            None
+            if row["profile_alias"] is None
+            else str(row["profile_alias"])
+        ),
+        workspace_uuid=str(row["workspace_uuid"]),
+        surface_uuid=str(row["surface_uuid"]),
+        generation=int(row["generation"]),
+        state=str(row["state"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )

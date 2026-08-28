@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 24
+    assert json.loads(result.stdout)["schema_version"] == 27
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -200,6 +200,50 @@ async def test_continuous_daemon_stops_cleanly_when_signaled() -> None:
         "workers.checkpoint_requested",
         "supervisor.stopped",
     ]
+
+
+@pytest.mark.asyncio
+async def test_daemon_starts_when_cmux_fails_after_ping(
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.cmux import CmuxUnavailable
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from tests.test_cmux_surfaces import LEAD, SESSION, FakePort, reconciler
+
+    database = Database.open(tmp_path / "state.db")
+    try:
+        bindings = CmuxSurfaceBindings(
+            database=database, events=EventStore(database)
+        )
+        binding = bindings.bind_lead(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id=SESSION,
+            profile_alias="max-a",
+            ref=LEAD,
+        )
+        port = FakePort(
+            fail={"surface_alive": CmuxUnavailable("cmux command timed out")}
+        )
+        service = FakeService()
+
+        supervisor = await _run_daemon(
+            service,
+            once=True,
+            interval=60,
+            cmux_reconciler=reconciler(bindings, port),
+        )
+
+        # cmux answered the ping but failed mid-reconciliation; the
+        # optional boundary absorbed it, the daemon ran its tick, and the
+        # binding stayed active and recoverable.
+        assert service.ticks == 1
+        assert supervisor is not None
+        assert bindings.get(binding.binding_id).state == "active"
+    finally:
+        database.close()
 
 
 def test_merge_flow_commands_are_registered() -> None:
@@ -715,3 +759,71 @@ def test_daemon_reconstructs_lost_wake_from_terminal_evidence(
     again = invoke([*base_arguments(configured_repo), "daemon", "--once"])
     assert again.exit_code == 0
     assert len(_wake_states(state_dir)) == 1
+
+
+def test_cmux_focus_requires_configuration(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    result = invoke(
+        [*base_arguments(configured_repo), "cmux-focus", "--json"]
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "cmux is not configured"
+
+
+def test_cmux_focus_fails_closed_from_binding_to_socket(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    repo_root, state_dir = configured_repo
+    (repo_root / "config" / "cmux.yaml").write_text(
+        "cli:\n  - /usr/bin/false\n", encoding="utf-8"
+    )
+
+    missing = invoke(
+        [
+            *base_arguments(configured_repo),
+            "cmux-focus",
+            "--project",
+            "demo",
+            "--json",
+        ]
+    )
+    assert missing.exit_code == 1
+    assert json.loads(missing.stdout)["error"] == "no active binding"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        CmuxSurfaceBindings(
+            database=database, events=EventStore(database)
+        ).bind_lead(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id="11111111-1111-4111-8111-111111111111",
+            profile_alias="max-a",
+            ref=CmuxSurfaceRef(
+                workspace_uuid="22222222-2222-4222-8222-222222222222",
+                surface_uuid="33333333-3333-4333-8333-333333333333",
+            ),
+        )
+    finally:
+        database.close()
+
+    denied = invoke(
+        [
+            *base_arguments(configured_repo),
+            "cmux-focus",
+            "--project",
+            "demo",
+            "--json",
+        ]
+    )
+    # The CLI exits nonzero, so focusing fails closed and the durable
+    # binding is untouched; only the error type is ever printed.
+    assert denied.exit_code == 1
+    assert json.loads(denied.stdout)["error"] == "CmuxUnavailable"

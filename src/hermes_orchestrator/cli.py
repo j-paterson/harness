@@ -16,6 +16,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
+from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
+from hermes_orchestrator.cmux_surfaces import (
+    CmuxHibernationDriver,
+    CmuxSurfaceReconciler,
+)
 from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
@@ -45,6 +50,7 @@ from hermes_orchestrator.runtime import (
     Dispatch,
     Runtime,
     build_linear_router,
+    cmux_password_source,
     open_runtime,
 )
 from hermes_orchestrator.service import OrchestratorService
@@ -112,6 +118,14 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument("--once", action="store_true")
     daemon.add_argument("--interval", type=_watch_interval, default=30)
     daemon.add_argument("--json", action="store_true")
+
+    cmux_focus = commands.add_parser(
+        "cmux-focus",
+        help="focus the cmux surface bound to a project's lead "
+        "or the Orchestrator pane",
+    )
+    cmux_focus.add_argument("--project", default=None)
+    cmux_focus.add_argument("--json", action="store_true")
 
     candidate = commands.add_parser(
         "candidate-ready",
@@ -270,6 +284,8 @@ async def _run_daemon(
     checkpoint_dispatcher: CheckpointDispatcher | None = None,
     wake_delivery: LeadWakeDelivery | None = None,
     wake_reconciler: LeadWakeReconciler | None = None,
+    cmux_reconciler: CmuxSurfaceReconciler | None = None,
+    cmux_hibernation: CmuxHibernationDriver | None = None,
 ) -> Supervisor:
     supervisor = Supervisor(
         service,
@@ -278,7 +294,15 @@ async def _run_daemon(
         checkpoint_dispatcher=checkpoint_dispatcher,
         interval_seconds=interval,
         wake_delivery=wake_delivery,
+        maintenance=(
+            None if cmux_hibernation is None else cmux_hibernation.tick
+        ),
     )
+    if cmux_reconciler is not None:
+        # Visible cmux seats are restored from durable identity before
+        # any work is accepted; a denied or unreachable socket leaves the
+        # bindings untouched and never blocks orchestration.
+        await cmux_reconciler.reconcile()
     if wake_reconciler is not None:
         # Deterministic repair before replay: a wake lost between a
         # terminal commit and its outbox insert is reconstructed from
@@ -920,6 +944,52 @@ def main(arguments: Sequence[str] | None = None) -> int:
             _print(payload, json_output=args.json, human="Local state initialized.")
             return 0
 
+        if args.command == "cmux-focus":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            binding = (
+                runtime.cmux_bindings.active_lead_for_project(args.project)
+                if args.project
+                else runtime.cmux_bindings.active_orchestrator()
+            )
+            if binding is None:
+                _print(
+                    {"error": "no active binding", "project": args.project},
+                    json_output=args.json,
+                    human="No active cmux binding for that seat.",
+                )
+                return 1
+            port = CmuxCliAdapter(
+                settings.cmux.cli,
+                base_env=os.environ,
+                password_source=cmux_password_source(Keychain()),
+            )
+            try:
+                asyncio.run(port.focus_workspace(binding.workspace_uuid))
+            except CmuxError as error:
+                _print(
+                    {"error": type(error).__name__},
+                    json_output=args.json,
+                    human="cmux focus failed; the binding is unchanged.",
+                )
+                return 1
+            _print(
+                {
+                    "workspace_uuid": binding.workspace_uuid,
+                    "surface_uuid": binding.surface_uuid,
+                    "role": binding.role,
+                    "project": binding.project_key,
+                },
+                json_output=args.json,
+                human="Focused the bound cmux surface.",
+            )
+            return 0
+
         if args.command == "hermes-command":
             try:
                 request = json.loads(args.request_json)
@@ -992,6 +1062,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             wakes=runtime.lead_wakes,
                         )
                     ),
+                    cmux_reconciler=runtime.cmux_reconciler,
+                    cmux_hibernation=runtime.cmux_hibernation,
                 )
             )
             payload = {

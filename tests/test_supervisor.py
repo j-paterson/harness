@@ -339,3 +339,20 @@ async def test_failed_transport_retries_on_interval_without_polling(
         assert wakes.get(wake.wake_id).state == "delivered"
     finally:
         database.close()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_runs_each_tick_and_never_breaks_the_loop() -> None:
+    ran: list[int] = []
+
+    async def maintenance() -> None:
+        ran.append(1)
+        raise RuntimeError("cmux went away")
+
+    supervisor = Supervisor(FakeService(), maintenance=maintenance)
+
+    await supervisor.run_once()
+    await supervisor.run_once()
+
+    assert len(ran) == 2
+    assert supervisor.ticks == 2

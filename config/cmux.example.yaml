@@ -1,0 +1,9 @@
+# Optional cmux terminal visibility (INFRA-185). Presence of a real
+# config/cmux.yaml enables durable workspace/surface bindings and
+# metadata-only status publication; absence disables cmux entirely.
+# The socket password is never configured here: store it with
+#   security add-generic-password -s hermes-orchestrator-cmux -a default -w
+# and it is read from the Keychain at call time only. A daemon started
+# inside a cmux terminal needs no password at all.
+cli:
+  - /Applications/cmux.app/Contents/Resources/bin/cmux

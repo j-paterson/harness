@@ -44,6 +44,7 @@ class Supervisor:
         interval_seconds: float = 30.0,
         checkpoint_timeout: float = 30.0,
         wake_delivery: WakeDeliveryDriver | None = None,
+        maintenance: AsyncAction | None = None,
     ) -> None:
         if interval_seconds <= 0 or checkpoint_timeout <= 0:
             raise ValueError("supervisor intervals must be positive")
@@ -53,6 +54,7 @@ class Supervisor:
         self._checkpoint_dispatcher = checkpoint_dispatcher
         self._checkpoint_workers = checkpoint_workers
         self._wake_delivery = wake_delivery
+        self._maintenance = maintenance
         self.checkpoint_requests: list[tuple[str, str]] = []
         self.checkpoint_deliveries: list[tuple[str, str]] = []
         self.wake_deliveries: list[str] = []
@@ -87,6 +89,11 @@ class Supervisor:
         # transport left pending — the interval is the retry backoff.
         if self._wake_delivery is not None:
             self.wake_deliveries.extend(await self._wake_delivery.drain())
+        # Optional metadata-only maintenance (e.g. the cmux hibernation
+        # driver): observational side effects may never take the loop down.
+        if self._maintenance is not None:
+            with suppress(Exception):
+                await self._maintenance()
         # Red pressure: exactly one checkpoint request per tick; the next
         # tick re-samples and continues only while red persists. Every
         # reserved request is delivered through the dispatcher, which

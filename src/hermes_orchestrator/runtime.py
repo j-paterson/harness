@@ -18,6 +18,16 @@ from hermes_orchestrator.circleci import (
     HttpxCircleCiTransport,
 )
 from hermes_orchestrator.claude import ClaudeRunner
+from hermes_orchestrator.cmux import CMUX_KEYCHAIN_SERVICE, CmuxCliAdapter
+from hermes_orchestrator.cmux_surfaces import (
+    CmuxHibernationDriver,
+    CmuxHibernationGate,
+    CmuxLeadSeater,
+    CmuxSurfaceBindings,
+    CmuxSurfaceReconciler,
+    CmuxWakeAnnouncer,
+    RegistryProfileDirectory,
+)
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.db import Database
@@ -145,6 +155,9 @@ class Runtime:
     resets: ScheduledResets | None = None
     reconciliation: ReconciliationReport | None = None
     lead_wakes: LeadTerminalWakes | None = None
+    cmux_bindings: CmuxSurfaceBindings | None = None
+    cmux_reconciler: CmuxSurfaceReconciler | None = None
+    cmux_hibernation: CmuxHibernationDriver | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -155,6 +168,30 @@ class Runtime:
         finally:
             if self._daemon_lock is not None:
                 self._daemon_lock.release()
+
+
+def cmux_password_source(
+    keychain: KeychainReader,
+) -> Callable[[], str | None]:
+    """Read the optional cmux socket password from the Keychain once.
+
+    A process seated inside cmux needs no password, so absence is normal:
+    any read failure resolves to no password and the socket's own denial
+    is the fail-closed boundary. The result is memoized so a missing item
+    is not re-probed on every cmux call.
+    """
+
+    cache: list[str | None] = []
+
+    def read() -> str | None:
+        if not cache:
+            try:
+                cache.append(keychain.read(CMUX_KEYCHAIN_SERVICE, "default"))
+            except Exception:
+                cache.append(None)
+        return cache[0]
+
+    return read
 
 
 def build_linear_router(
@@ -222,6 +259,7 @@ def open_runtime(
         checkpoints = CheckpointRequests(database, events)
         resets = ScheduledResets(database, events)
         lead_wakes = LeadTerminalWakes(database=database, events=events)
+        cmux_bindings = CmuxSurfaceBindings(database=database, events=events)
         queue = QueueService(database, events, settings.projects)
         worktree_git = WorktreeGit()
         worktree_leases = WorktreeLeases(database, events)
@@ -320,6 +358,8 @@ def open_runtime(
         dispatch: Dispatch | None = None
         merge_flow: MergeFlow | None = None
         profile_health: tuple[ProfileHealth, ...] = ()
+        cmux_reconciler: CmuxSurfaceReconciler | None = None
+        cmux_hibernation: CmuxHibernationDriver | None = None
 
         if enable_live:
             assert reader is not None
@@ -364,6 +404,49 @@ def open_runtime(
                 processes=processes,
                 freeze_dir=settings.state_dir / "freezes",
             )
+            cmux_seater: CmuxLeadSeater | None = None
+            if settings.cmux is not None:
+                # Terminal visibility is observational: the port speaks
+                # only allow-listed metadata commands, the socket password
+                # flows Keychain → environment and nowhere else, and a
+                # denied or absent cmux never blocks orchestration.
+                cmux_port = CmuxCliAdapter(
+                    settings.cmux.cli,
+                    base_env=environment,
+                    password_source=cmux_password_source(reader),
+                )
+                cmux_project_paths = {
+                    alias: project.repo_path
+                    for alias, project in settings.projects.items()
+                }
+                cmux_profile_dirs = RegistryProfileDirectory(registry)
+                cmux_seater = CmuxLeadSeater(
+                    bindings=cmux_bindings,
+                    port=cmux_port,
+                    project_paths=cmux_project_paths,
+                    profile_dirs=cmux_profile_dirs,
+                )
+                cmux_reconciler = CmuxSurfaceReconciler(
+                    bindings=cmux_bindings,
+                    port=cmux_port,
+                    project_paths=cmux_project_paths,
+                    profile_dirs=cmux_profile_dirs,
+                    environ=environment,
+                )
+                cmux_hibernation = CmuxHibernationDriver(
+                    gate=CmuxHibernationGate(
+                        database=database,
+                        bindings=cmux_bindings,
+                        safety=safety,
+                    ),
+                    port=cmux_port,
+                    database=database,
+                    events=events,
+                )
+                CmuxWakeAnnouncer(
+                    bindings=cmux_bindings, port=cmux_port
+                ).attach(lead_wakes)
+
             cells = ProjectCellService(
                 database=database,
                 events=events,
@@ -382,6 +465,7 @@ def open_runtime(
                 active_time=ActiveTimeTracker(database),
                 context_window_tokens=settings.policy.context_window_tokens,
                 completion_sink=lead_wakes,
+                surfaces=cmux_seater,
             )
             dispatch = cells.dispatch
 
@@ -430,6 +514,9 @@ def open_runtime(
             resets=resets,
             reconciliation=reconciliation,
             lead_wakes=lead_wakes,
+            cmux_bindings=cmux_bindings,
+            cmux_reconciler=cmux_reconciler,
+            cmux_hibernation=cmux_hibernation,
             _daemon_lock=daemon_lock,
         )
     except BaseException:
