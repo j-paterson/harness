@@ -5,20 +5,32 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.domain import AdmissionRequest, QueuedIssue
+from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
+from hermes_orchestrator.keychain import Keychain
+from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
 from hermes_orchestrator.resources import ResourceSnapshot
-from hermes_orchestrator.runtime import Dispatch, open_runtime
+from hermes_orchestrator.runtime import (
+    Dispatch,
+    Runtime,
+    build_linear_router,
+    open_runtime,
+)
 from hermes_orchestrator.service import OrchestratorService
 from hermes_orchestrator.supervisor import Supervisor
 
@@ -76,12 +88,93 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument("--interval", type=_watch_interval, default=30)
     daemon.add_argument("--json", action="store_true")
 
+    candidate = commands.add_parser(
+        "candidate-ready",
+        help="publish an immutable candidate manifest and wake the Merger",
+    )
+    candidate.add_argument("issue_id")
+    candidate.add_argument("--project", required=True)
+    candidate.add_argument(
+        "--verified",
+        action="append",
+        required=True,
+        metavar="COMMAND=RESULT",
+        help="one recorded verification, repeatable",
+    )
+    candidate.add_argument("--blocker", action="append", default=[])
+    candidate.add_argument("--status", default="FABLE_READY")
+    candidate.add_argument("--json", action="store_true")
+
+    merger_turn = commands.add_parser(
+        "merger-turn",
+        help="settle the Merger's completed turn for one project",
+    )
+    merger_turn.add_argument("--project", required=True)
+    merger_turn.add_argument("--json", action="store_true")
+
     hermes_command = commands.add_parser(
         "hermes-command",
         help="execute one strict Hermes JSON command",
     )
     hermes_command.add_argument("--json", dest="request_json", required=True)
     return parser
+
+
+async def _listen_for_merger_turns(flow: MergeFlow) -> None:
+    """Settle Merger turns as the App Server reports them; never poll."""
+
+    async for notification in flow.rpc.notifications():
+        if notification.method == "thread/status/changed":
+            status = notification.params.get("status")
+            print(
+                json.dumps(
+                    {
+                        "thread_status": (
+                            status.get("type") if isinstance(status, dict) else None
+                        ),
+                        "thread_id": notification.params.get("threadId"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            continue
+        outcome = await flow.turns.on_notification(notification)
+        if outcome is not None:
+            print(
+                json.dumps(
+                    {
+                        "merger_turn": outcome.kind,
+                        "project_key": outcome.project_key,
+                        "issue_id": outcome.issue_id,
+                        "event_id": outcome.event_id,
+                        "reason": outcome.reason,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+
+
+async def _start_merge_flow(flow: MergeFlow, projects: Sequence[str]) -> bool:
+    """Start the App Server and re-verify each channel; fail closed to stderr."""
+
+    try:
+        await flow.rpc.start()
+    except Exception as error:
+        print(f"codex app-server unavailable: {error}", file=sys.stderr)
+        return False
+    for project_key in projects:
+        try:
+            await flow.merger.ensure_thread(project_key)
+        except Exception as error:
+            print(
+                f"merger channel for {project_key} unavailable: {error}",
+                file=sys.stderr,
+            )
+    return True
 
 
 async def _run_daemon(
@@ -91,6 +184,8 @@ async def _run_daemon(
     interval: int,
     dispatch: Dispatch | None = None,
     shutdown_event: asyncio.Event | None = None,
+    merge_flow: MergeFlow | None = None,
+    projects: Sequence[str] = (),
 ) -> Supervisor:
     supervisor = Supervisor(
         service,
@@ -100,6 +195,9 @@ async def _run_daemon(
     if once:
         await supervisor.run_once()
         return supervisor
+    listener: asyncio.Task[None] | None = None
+    if merge_flow is not None and await _start_merge_flow(merge_flow, projects):
+        listener = asyncio.create_task(_listen_for_merger_turns(merge_flow))
     stop = shutdown_event or asyncio.Event()
     registered_signals: list[signal.Signals] = []
     if shutdown_event is None:
@@ -119,7 +217,122 @@ async def _run_daemon(
             for shutdown_signal in registered_signals:
                 loop.remove_signal_handler(shutdown_signal)
         await supervisor.shutdown()
+        if listener is not None:
+            listener.cancel()
+            with suppress(asyncio.CancelledError):
+                await listener
+        if merge_flow is not None:
+            await merge_flow.rpc.close()
     return supervisor
+
+
+def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
+    """Compose the live merge flow on the CLI's already-open database."""
+
+    if runtime.merge_flow is not None:
+        return runtime.merge_flow
+    keychain = Keychain()
+    linear = build_linear_router(
+        settings, database=runtime.database, queue=runtime.queue, keychain=keychain
+    )
+    return build_merge_flow(
+        settings,
+        database=runtime.database,
+        events=EventStore(runtime.database),
+        queue=runtime.queue,
+        linear=linear,
+        keychain=keychain,
+        base_env=os.environ,
+    )
+
+
+async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
+    verification: list[tuple[str, str]] = []
+    for entry in args.verified:
+        command, separator, result = entry.partition("=")
+        if not separator or not command.strip() or not result.strip():
+            raise ValueError("--verified expects COMMAND=RESULT")
+        verification.append((command.strip(), result.strip()))
+    if not await _start_merge_flow(flow, [args.project]):
+        raise RuntimeError("codex app-server unavailable")
+    try:
+        emitted = await flow.emitter.emit(
+            args.project,
+            args.issue_id,
+            verification=tuple(verification),
+            blockers=tuple(args.blocker),
+            status=args.status,
+        )
+        thread_status: str | None = None
+        if emitted.delivery.thread_id is not None:
+            thread_status = await flow.merger.thread_status(emitted.delivery.thread_id)
+    finally:
+        await flow.rpc.close()
+    return {
+        # A notLoaded task holds the queued wake until it is opened once in
+        # Codex; nothing re-delivers or polls, the completed turn settles it.
+        "thread_status": thread_status,
+        "awaiting_load": thread_status == "notLoaded",
+        "event_id": emitted.event.event_id,
+        "status": emitted.event.status,
+        "issue_id": emitted.event.issue_id,
+        "candidate_sha": emitted.event.candidate_sha,
+        "base_sha": emitted.event.base_sha,
+        "manifest_path": str(emitted.manifest_path),
+        "reused_manifest": emitted.reused_manifest,
+        "delivered": emitted.delivery.delivered,
+        "delivery_reason": emitted.delivery.reason,
+        "attempts": emitted.delivery.attempts,
+    }
+
+
+async def _merger_turn(flow: MergeFlow, args: Any) -> dict[str, Any]:
+    if not await _start_merge_flow(flow, [args.project]):
+        raise RuntimeError("codex app-server unavailable")
+    try:
+        outcome = await flow.turns.handle_turn(args.project)
+    finally:
+        await flow.rpc.close()
+    return {
+        "kind": outcome.kind,
+        "project_key": outcome.project_key,
+        "issue_id": outcome.issue_id,
+        "event_id": outcome.event_id,
+        "review_id": outcome.review_id,
+        "merge_sha": outcome.merge_sha,
+        "reason": outcome.reason,
+    }
+
+
+def _hermes_handlers(
+    settings: Any, runtime: Runtime, outbox: LeadCorrectionOutbox
+) -> dict[str, Any]:
+    def pending_corrections(command: Any) -> dict[str, Any]:
+        items = outbox.pending(command.project_key)
+        return {"corrections": [item.as_dict() for item in items]}
+
+    def ack_correction(command: Any) -> dict[str, Any]:
+        return outbox.acknowledge(command.correction_id).as_dict()
+
+    def qa_reject(command: Any) -> dict[str, Any]:
+        flow = _open_merge_flow(settings, runtime)
+        outcome = asyncio.run(
+            flow.reviews.reject_from_qa(
+                command.issue_id, reason=command.reason, evidence=command.evidence
+            )
+        )
+        return {
+            "issue_id": outcome.issue_id,
+            "review_id": outcome.review_id,
+            "state": outcome.state,
+            "reason": outcome.reason,
+        }
+
+    return {
+        "pending_corrections": pending_corrections,
+        "ack_correction": ack_correction,
+        "qa_reject": qa_reject,
+    }
 
 
 def _issue_payload(issue: QueuedIssue) -> dict[str, Any]:
@@ -182,7 +395,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             except json.JSONDecodeError:
                 print("invalid JSON command", file=sys.stderr)
                 return 2
-            result = HermesCommandService(queue).execute(request)
+            events = EventStore(database)
+            outbox = LeadCorrectionOutbox(
+                database=database,
+                events=events,
+                project_for_issue=lambda issue_id: queue.get(issue_id).project_key,
+            )
+            result = HermesCommandService(
+                queue,
+                qa=QaRouter(database=database, events=events),
+                handlers=_hermes_handlers(settings, runtime, outbox),
+            ).execute(request)
             print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             rejected = {"invalid_command", "intent_not_allowed"}
             return 0 if result.code not in rejected else 1
@@ -194,6 +417,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     once=args.once,
                     interval=args.interval,
                     dispatch=runtime.dispatch,
+                    merge_flow=runtime.merge_flow,
+                    projects=tuple(settings.projects),
                 )
             )
             payload = {
@@ -261,6 +486,37 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 _issue_payload(issue),
                 json_output=args.json,
                 human=f"Completed {issue.issue_id}.",
+            )
+            return 0
+
+        if args.command == "candidate-ready":
+            try:
+                flow = _open_merge_flow(settings, runtime)
+                payload = asyncio.run(_candidate_ready(flow, args))
+            except (ValueError, RuntimeError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    f"Candidate {payload['candidate_sha'][:12]} for "
+                    f"{payload['issue_id']}: {payload['delivery_reason']}."
+                ),
+            )
+            return 0 if payload["delivered"] else 1
+
+        if args.command == "merger-turn":
+            try:
+                flow = _open_merge_flow(settings, runtime)
+                payload = asyncio.run(_merger_turn(flow, args))
+            except (ValueError, RuntimeError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print(
+                payload,
+                json_output=args.json,
+                human=f"Merger turn for {args.project}: {payload['kind']}.",
             )
             return 0
 

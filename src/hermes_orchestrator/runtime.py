@@ -22,6 +22,7 @@ from hermes_orchestrator.linear import (
     LinearGraphQLTransport,
     ProjectLinearRouter,
 )
+from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
     JsonCommand,
@@ -88,6 +89,7 @@ class Runtime:
     dispatch: Dispatch | None
     cells: ProjectCellService | None
     profile_health: tuple[ProfileHealth, ...]
+    merge_flow: MergeFlow | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -98,6 +100,39 @@ class Runtime:
         finally:
             if self._daemon_lock is not None:
                 self._daemon_lock.release()
+
+
+def build_linear_router(
+    settings: Settings,
+    *,
+    database: Database,
+    queue: QueueService,
+    keychain: KeychainReader,
+) -> ProjectLinearRouter:
+    """Build project-scoped Linear clients from validated routing config."""
+
+    linear_config = settings.linear
+    if linear_config is None:
+        raise ValueError("live runtime requires Linear routing")
+    token = keychain.read("hermes-orchestrator-linear", "default")
+    transport = LinearGraphQLTransport(token)
+    effects = ExternalEffectStore(database)
+    clients = {
+        project_key: LinearClient(
+            transport=transport,
+            effects=effects,
+            status_ids=linear_config.teams[
+                project.linear_team
+            ].status_ids.as_mapping(),
+            assignee_ids=linear_config.assignee_ids,
+            expected_team_id=linear_config.teams[project.linear_team].team_id,
+        )
+        for project_key, project in settings.projects.items()
+    }
+    return ProjectLinearRouter(
+        clients=clients,
+        project_for_issue=lambda issue_id: queue.get(issue_id).project_key,
+    )
 
 
 def open_runtime(
@@ -129,6 +164,7 @@ def open_runtime(
         queue = QueueService(database, events, settings.projects)
         cells: ProjectCellService | None = None
         dispatch: Dispatch | None = None
+        merge_flow: MergeFlow | None = None
         profile_health: tuple[ProfileHealth, ...] = ()
 
         if enable_live:
@@ -167,29 +203,18 @@ def open_runtime(
                 checked.append(health)
             profile_health = tuple(checked)
 
-            token = (keychain or Keychain()).read(
-                "hermes-orchestrator-linear",
-                "default",
+            reader = keychain or Keychain()
+            linear = build_linear_router(
+                settings, database=database, queue=queue, keychain=reader
             )
-            transport = LinearGraphQLTransport(token)
-            effects = ExternalEffectStore(database)
-            clients = {
-                project_key: LinearClient(
-                    transport=transport,
-                    effects=effects,
-                    status_ids=linear_config.teams[
-                        project.linear_team
-                    ].status_ids.as_mapping(),
-                    assignee_ids=linear_config.assignee_ids,
-                    expected_team_id=linear_config.teams[
-                        project.linear_team
-                    ].team_id,
-                )
-                for project_key, project in settings.projects.items()
-            }
-            linear = ProjectLinearRouter(
-                clients=clients,
-                project_for_issue=lambda issue_id: queue.get(issue_id).project_key,
+            merge_flow = build_merge_flow(
+                settings,
+                database=database,
+                events=events,
+                queue=queue,
+                linear=linear,
+                keychain=reader,
+                base_env=environment,
             )
             runner = ClaudeRunner(
                 registry,
@@ -239,6 +264,7 @@ def open_runtime(
             dispatch=dispatch,
             cells=cells,
             profile_health=profile_health,
+            merge_flow=merge_flow,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

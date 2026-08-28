@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 7
+    assert json.loads(result.stdout)["schema_version"] == 10
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -200,3 +200,24 @@ async def test_continuous_daemon_stops_cleanly_when_signaled() -> None:
         "workers.checkpoint_requested",
         "supervisor.stopped",
     ]
+
+
+def test_merge_flow_commands_are_registered() -> None:
+    from hermes_orchestrator.cli import _parser
+
+    args = _parser().parse_args(
+        [
+            "candidate-ready",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--verified",
+            "uv run pytest -q=564 passed",
+            "--json",
+        ]
+    )
+    assert args.command == "candidate-ready"
+    assert args.verified == ["uv run pytest -q=564 passed"]
+    assert args.status == "FABLE_READY"
+    turn = _parser().parse_args(["merger-turn", "--project", "demo"])
+    assert turn.command == "merger-turn"

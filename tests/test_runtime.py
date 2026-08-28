@@ -42,6 +42,7 @@ def active_repo(tmp_path: Path) -> tuple[Path, Path]:
     config = tmp_path / "config"
     config.mkdir()
     (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts/codex-merger.md").write_text("# merger\n", encoding="utf-8")
     (tmp_path / "prompts/claude-lead.md").write_text(
         "Work only on explicitly queued work.\n",
         encoding="utf-8",
@@ -110,7 +111,13 @@ def test_active_runtime_assembles_live_dispatch_without_identity_persistence(
         ]
         assert all(health.eligible for health in runtime.profile_health)
         assert len(profiles.config_dirs) == 4
-        assert keychain.reads == [("hermes-orchestrator-linear", "default")]
+        assert keychain.reads == [
+            ("hermes-orchestrator-linear", "default"),
+            ("hermes-orchestrator-github", "default"),
+            ("hermes-orchestrator-circleci", "default"),
+        ]
+        assert runtime.merge_flow is not None
+        assert (settings.state_dir / "manifests").is_dir()
         assert runtime.database.scalar("SELECT count(*) FROM profile_leases") == 0
     finally:
         runtime.close()

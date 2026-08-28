@@ -175,6 +175,50 @@ class QueueService:
                 )
         return self.get(issue_id)
 
+    def transition(
+        self,
+        issue_id: str,
+        state: IssueState,
+        *,
+        actor: str,
+        reason: str,
+    ) -> QueuedIssue:
+        """Record one review-flow lifecycle transition for an admitted issue."""
+
+        if not reason.strip():
+            raise ValueError("transition reason is required")
+        now = self._aware_now().isoformat()
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM admitted_issues WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(issue_id)
+            current = self._row_to_issue(row)
+            if current.state is state:
+                return current
+            connection.execute(
+                "UPDATE admitted_issues SET state = ?, updated_at = ? "
+                "WHERE issue_id = ?",
+                (state.value, now, issue_id),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="issue.transitioned",
+                    aggregate_type="issue",
+                    aggregate_id=issue_id,
+                    actor=actor,
+                    payload={
+                        "from": current.state.value,
+                        "to": state.value,
+                        "reason": reason,
+                    },
+                ),
+            )
+        return self.get(issue_id)
+
     def get(self, issue_id: str) -> QueuedIssue:
         """Read one admitted issue."""
 

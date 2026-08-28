@@ -286,16 +286,65 @@ async def test_existing_thread_is_resumed_not_recreated(
     assert rpc.methods == [
         "account/read",
         "thread/read",
-        "thread/resume",
         "thread/goal/set",
     ]
     assert rpc.request_for("thread/read")["params"] == {
         "threadId": "thr_stored"
     }
-    assert rpc.request_for("thread/resume")["params"] == {
-        "threadId": "thr_stored"
-    }
+    assert "thread/resume" not in rpc.methods
     assert thread.thread_id == "thr_stored"
+
+
+@pytest.mark.asyncio
+async def test_not_loaded_thread_is_loaded_then_readable(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    stored_thread(database)
+    rpc.respond_sequence(
+        "thread/read",
+        [
+            {"thread": {"id": "thr_stored", "status": {"type": "notLoaded"}}},
+            {"thread": {"id": "thr_stored", "status": {"type": "idle"}}},
+        ],
+    )
+
+    thread = await merger.ensure_thread("demo")
+
+    assert thread.thread_id == "thr_stored"
+    assert rpc.methods == [
+        "account/read",
+        "thread/read",
+        "thread/resume",
+        "thread/read",
+        "thread/goal/set",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rejected_resume_of_a_readable_thread_stays_ready(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    """Live: a fresh App Server reads the persisted task but rejects resume."""
+
+    stored_thread(database)
+    rpc.respond(
+        "thread/read", {"thread": {"id": "thr_stored", "status": {"type": "notLoaded"}}}
+    )
+    rpc.fail("thread/resume", CodexRequestFailed("thread/resume", -32600))
+
+    thread = await merger.ensure_thread("demo")
+
+    assert thread.thread_id == "thr_stored"
+    assert database.scalar(
+        "SELECT state FROM reviewer_channels WHERE project_key = 'demo'"
+    ) == "ready"
+    assert rpc.methods == [
+        "account/read",
+        "thread/read",
+        "thread/resume",
+        "thread/read",
+        "thread/goal/set",
+    ]
 
 
 @pytest.mark.asyncio
@@ -377,8 +426,20 @@ async def test_chatgpt_auth_is_eligible_without_identity(
 async def test_resume_failure_marks_thread_uncertain(
     merger: CodexMerger, rpc: FakeRpc, database: Database
 ) -> None:
+    """Only an unreadable thread is uncertain; a rejected resume alone is not."""
+
     stored_thread(database)
+    rpc.respond_sequence(
+        "thread/read",
+        [{"thread": {"id": "thr_stored", "status": {"type": "notLoaded"}}}],
+    )
     rpc.fail("thread/resume", CodexRequestFailed("thread/resume", -32600))
+
+    async def unreadable_after_resume(method: str) -> None:
+        if method == "thread/resume":
+            rpc.fail("thread/read", CodexRequestFailed("thread/read", -32600))
+
+    rpc.on_request = unreadable_after_resume
 
     with pytest.raises(MergerThreadUncertain, match="operator"):
         await merger.ensure_thread("demo")
@@ -664,7 +725,7 @@ async def test_replacement_during_resume_never_finalizes_the_old_thread(
 
     async def replace_on_first_resume(method: str) -> None:
         nonlocal fired
-        if method != "thread/resume" or fired:
+        if method != "thread/read" or fired:
             return
         fired = True
         merger.begin_replacement(
@@ -685,12 +746,12 @@ async def test_replacement_during_resume_never_finalizes_the_old_thread(
     thread = await merger.ensure_thread("demo")
 
     assert thread.thread_id == "thr_new"
-    resumed = [
+    read = [
         params["threadId"]
         for method, params in rpc.requests
-        if method == "thread/resume" and params is not None
+        if method == "thread/read" and params is not None
     ]
-    assert resumed == ["thr_stored", "thr_new"]
+    assert read == ["thr_stored", "thr_new"]
     goal_threads = [
         params["threadId"]
         for method, params in rpc.requests
@@ -708,7 +769,7 @@ async def test_persistent_replacement_during_resume_fails_closed(
 
     async def always_replace(method: str) -> None:
         nonlocal counter
-        if method != "thread/resume":
+        if method != "thread/read":
             return
         counter += 1
         channel = merger.read_channel("demo")
@@ -1036,7 +1097,8 @@ async def test_concurrent_creation_reserves_the_channel_durably(
         reused = await merger_b.ensure_thread("demo")
         assert reused.thread_id == "thr_demo"
         assert "thread/start" not in rpc_b.methods
-        assert "thread/resume" in rpc_b.methods
+        assert "thread/read" in rpc_b.methods
+        assert "thread/resume" not in rpc_b.methods
     finally:
         database_b.close()
 

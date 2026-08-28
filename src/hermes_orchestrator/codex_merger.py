@@ -563,6 +563,40 @@ class CodexMerger:
                     return outcome("pending_elsewhere")
                 if state in ("pending", "claimed"):
                     return outcome("pending_elsewhere")
+                if state == "deferred":
+                    # The owning wake spent its event-bound reconciliation on
+                    # a full window; adopt the fresh event onto the canonical
+                    # candidate row so the new boundary reconciles anew.
+                    connection.execute(
+                        "UPDATE wake_deliveries SET event_id = ?, "
+                        "issue_id = ?, base_sha = ?, branch = ?, "
+                        "manifest_path = ?, manifest_digest = ?, "
+                        "manifest_device = ?, manifest_inode = ?, "
+                        "manifest_size = ?, manifest_mtime_ns = ?, "
+                        "manifest_mode = ?, state = 'pending', "
+                        "thread_id = NULL, generation = NULL, "
+                        "claim_token = NULL, claim_expires_at = NULL, "
+                        "updated_at = ? WHERE project_key = ? "
+                        "AND event_id = ? AND state = 'deferred'",
+                        (
+                            event.event_id,
+                            event.issue_id,
+                            event.base_sha,
+                            manifest.manifest.branch,
+                            event.manifest_path,
+                            event.manifest_digest,
+                            identity.device,
+                            identity.inode,
+                            identity.size,
+                            identity.mtime_ns,
+                            identity.mode,
+                            stamp,
+                            project_key,
+                            str(owner["event_id"]),
+                        ),
+                    )
+                    arm_heartbeat()
+                    return outcome("pending", claim(event.event_id))
                 return outcome(state)
             arm_heartbeat()
             return outcome("pending", claim(event.event_id))
@@ -729,6 +763,32 @@ class CodexMerger:
             )
         return cursor.rowcount == 1
 
+    def release_delivered_wake(
+        self, project_key: str, event_id: str, *, outcome: str
+    ) -> bool:
+        """Settle a delivered wake whose candidate was not admitted.
+
+        ``deferred`` marks the wake as consumed by a full merge window: its
+        event-bound reconciliation is spent, so the same candidate must be
+        re-emitted as a new event, which :meth:`register_wake` adopts onto
+        this row. ``rejected`` is terminal for this candidate identity — a
+        corrected candidate arrives as a new SHA and a new event.
+        """
+
+        if outcome not in ("deferred", "rejected"):
+            raise ValueError(f"unknown wake release outcome {outcome!r}")
+        self._project(project_key)
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET state = ?, claim_token = NULL, "
+                "claim_expires_at = NULL, updated_at = ? "
+                "WHERE project_key = ? AND event_id = ? "
+                "AND state = 'delivered'",
+                (outcome, stamp, project_key, event_id),
+            )
+        return cursor.rowcount == 1
+
     def complete_admitted_wake(self, project_key: str, event_id: str) -> bool:
         """Release the single admitted slot once its review turn finished."""
 
@@ -859,12 +919,7 @@ class CodexMerger:
                 )
             thread_id = channel.thread_id
             try:
-                await self._rpc.request(
-                    "thread/read", {"threadId": thread_id}, self._timeout
-                )
-                await self._rpc.request(
-                    "thread/resume", {"threadId": thread_id}, self._timeout
-                )
+                await self._load_persisted_thread(thread_id)
             except CodexRequestFailed as error:
                 self._mark_uncertain(
                     project_key,
@@ -872,8 +927,8 @@ class CodexMerger:
                     generation=channel.generation,
                 )
                 raise MergerThreadUncertain(
-                    f"merger thread for {project_key} could not be read or "
-                    "resumed and requires operator reconciliation"
+                    f"merger thread for {project_key} could not be read "
+                    "and requires operator reconciliation"
                 ) from error
             if not self._channel_is_current(project_key, channel):
                 continue
@@ -885,6 +940,50 @@ class CodexMerger:
         raise StaleChannelError(
             f"reviewer channel for {project_key} was replaced while resuming"
         )
+
+    async def _load_persisted_thread(self, thread_id: str) -> str | None:
+        """Verify the persisted thread by reading it; load only if needed.
+
+        A readable persisted thread is authoritative: ``thread/read`` is the
+        only required call and its status is returned. Only a ``notLoaded``
+        thread is asked to load via ``thread/resume``; if the App Server
+        rejects that request (observed live as ``-32600`` for an
+        already-persisted readable task) the thread is re-read and stays
+        usable when still readable. Only an unreadable thread propagates
+        :class:`CodexRequestFailed`, which marks the channel uncertain.
+        """
+
+        status = await self.thread_status(thread_id)
+        if status != "notLoaded":
+            return status
+        try:
+            await self._rpc.request(
+                "thread/resume", {"threadId": thread_id}, self._timeout
+            )
+        except CodexRequestFailed:
+            return await self.thread_status(thread_id)
+        return await self.thread_status(thread_id)
+
+    async def thread_status(self, thread_id: str) -> str | None:
+        """Read one thread and return its runtime status type, if reported.
+
+        Raises :class:`CodexRequestFailed` when the thread is unreadable.
+        A newly created task reports ``notLoaded`` in a fresh App Server
+        process; a ``codex queue`` wake delivered to such a task is held by
+        Codex and consumed once the task is opened, so no re-delivery,
+        polling, or advisory wake is ever issued for it.
+        """
+
+        result = await self._rpc.request(
+            "thread/read", {"threadId": thread_id}, self._timeout
+        )
+        thread = result.get("thread")
+        if not isinstance(thread, dict):
+            return None
+        status = thread.get("status")
+        if isinstance(status, dict) and isinstance(status.get("type"), str):
+            return str(status["type"])
+        return None
 
     def _channel_is_current(
         self, project_key: str, channel: ReviewerChannel
@@ -1003,13 +1102,14 @@ class CodexMerger:
         )
         await self._set_goal(project_key, thread_id)
         stamp = self._now().isoformat()
+        project = self._project(project_key)
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE reviewer_channels SET generation = 1, "
-                "state = 'ready', updated_at = ? "
+                "state = 'ready', integration_branch = ?, updated_at = ? "
                 "WHERE project_key = ? AND state = 'configuring' "
                 "AND thread_id = ?",
-                (stamp, project_key, thread_id),
+                (project.integration_branch, stamp, project_key, thread_id),
             )
             if cursor.rowcount != 1:
                 raise StaleChannelError(

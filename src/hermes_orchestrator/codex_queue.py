@@ -169,6 +169,14 @@ class CodexQueueDelivery:
                 generation=None,
                 reason="duplicate_pending",
             )
+        if registration.state in ("deferred", "rejected"):
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason=f"candidate_{registration.state}",
+            )
         if registration.state == "in_flight":
             return QueueDeliveryResult(
                 delivered=False,

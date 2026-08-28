@@ -103,6 +103,7 @@ class FakeGitHub:
     full_pulls: dict[int, PullRequest] = field(default_factory=dict)
     merge_calls: list[dict[str, Any]] = field(default_factory=list)
     list_calls: list[tuple[str, str]] = field(default_factory=list)
+    on_list: Any = None
     get_calls: list[tuple[str, int]] = field(default_factory=list)
 
     def merge(
@@ -136,6 +137,8 @@ class FakeGitHub:
         self, repository: str, *, base: str
     ) -> tuple[PullRequestSummary, ...]:
         self.list_calls.append((repository, base))
+        if self.on_list is not None:
+            self.on_list(len(self.list_calls))
         return self.open_pulls
 
     def get_pull_request(self, repository: str, number: int) -> PullRequest:

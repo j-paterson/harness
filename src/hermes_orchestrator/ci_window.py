@@ -33,6 +33,14 @@ from hermes_orchestrator.verdicts import CorrectionPacket
 _TOKEN_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
+class ReworkAuthorizer(Protocol):
+    """Prove a FABLE_REWORK_READY candidate is bound to a failure's packet."""
+
+    def authorized_rework(
+        self, project_key: str, candidate: CandidateManifest, packet: CorrectionPacket
+    ) -> str | None: ...
+
+
 class CiStatusPort(Protocol):
     """The single-shot CI classification boundary the window depends on."""
 
@@ -248,6 +256,16 @@ class CiWindow:
                 raise ValueError(
                     "merge SHA is already recorded with a different identity"
                 ) from error
+
+    def has_capacity(self, project_key: str) -> bool:
+        """True when one more merged item fits the unresolved window.
+
+        Read-only: this never consults CI. It lets the merge step refuse to
+        create a third unresolved item even if a stale intake decision
+        slipped past a concurrent merge.
+        """
+
+        return len(self.unresolved_items(project_key)) < self._max_unresolved
 
     def unresolved_items(self, project_key: str) -> tuple[UnresolvedMerge, ...]:
         """List unresolved merged items in durable recording order."""
@@ -542,6 +560,70 @@ class CiWindow:
             kind="clear", resolved=tuple(resolved), unresolved=unresolved
         )
 
+    @property
+    def capacity(self) -> int:
+        return self._max_unresolved
+
+    def stored_failure(self, project_key: str) -> CorrectionPacket | None:
+        """The oldest durable CircleCI failure packet blocking intake, if any."""
+
+        return self._stored_failure(project_key)
+
+    def close_failure_for_rework(
+        self,
+        project_key: str,
+        *,
+        failed_candidate_sha: str,
+        rework: CandidateManifest,
+        correction_id: str,
+    ) -> bool:
+        """Durably close the failure that an admitted, authorized rework binds.
+
+        Called only after the FABLE_REWORK_READY candidate passed immutable
+        manifest, channel generation, branch head, base, issue, and pull
+        request validation and was admitted. Exactly the failed item with
+        the bound candidate SHA on the rework's branch transitions to
+        ``corrected``; the binding (event, rework SHA, correction id) is
+        recorded. Replaying the same event is idempotent; a different event
+        or item never changes another row. Never queries CI.
+        """
+
+        if rework.status != "FABLE_REWORK_READY":
+            raise ValueError("only a FABLE_REWORK_READY candidate can close a failure")
+        binding = {
+            "event_id": rework.event_id,
+            "rework_sha": rework.candidate_sha,
+            "correction_id": correction_id,
+            "issues": list(rework.linear_issues),
+        }
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE ci_merge_ledger SET state = 'corrected', "
+                "correction_json = ?, updated_at = ? "
+                "WHERE project_key = ? AND candidate_sha = ? "
+                "AND candidate_branch = ? AND state = 'failed'",
+                (
+                    json.dumps(binding, sort_keys=True, separators=(",", ":")),
+                    stamp,
+                    project_key,
+                    failed_candidate_sha,
+                    rework.branch,
+                ),
+            )
+            if cursor.rowcount == 1:
+                return True
+            row = connection.execute(
+                "SELECT state, correction_json FROM ci_merge_ledger "
+                "WHERE project_key = ? AND candidate_sha = ? "
+                "AND candidate_branch = ?",
+                (project_key, failed_candidate_sha, rework.branch),
+            ).fetchone()
+        if row is None or row["state"] != "corrected" or row["correction_json"] is None:
+            return False
+        recorded = json.loads(str(row["correction_json"]))
+        return recorded.get("event_id") == rework.event_id
+
     def mark_corrected(self, project_key: str, merge_sha: str) -> None:
         """Durably close a failed item once its correction is completed."""
 
@@ -681,8 +763,11 @@ class CircleCiIntakeGate:
     :class:`CandidateRejected` subclasses that carry the routing payload.
     """
 
-    def __init__(self, window: CiWindow) -> None:
+    def __init__(
+        self, window: CiWindow, *, corrections: ReworkAuthorizer | None = None
+    ) -> None:
         self._window = window
+        self._corrections = corrections
 
     def validate(
         self, project_key: str, candidate: CandidateManifest
@@ -698,6 +783,22 @@ class CircleCiIntakeGate:
             project_key, candidate.event_id, identity
         )
         if decision.kind == "blocked_prior_failure":
+            packet = decision.packet
+            if (
+                packet is not None
+                and self._corrections is not None
+                and self._corrections.authorized_rework(project_key, candidate, packet)
+                is not None
+            ):
+                # An explicitly authorized rework of the failed item may be
+                # admitted; the failure is closed only after full admission.
+                if len(decision.unresolved) >= self._window.capacity:
+                    raise MergeWindowExhausted(
+                        "the unresolved merged-candidate window is full; "
+                        "rework intake deferred until a prior pipeline resolves",
+                        unresolved=decision.unresolved,
+                    )
+                return
             raise PriorMergeFailed(
                 "a prior merged candidate failed CircleCI and must be "
                 "corrected before any new intake",

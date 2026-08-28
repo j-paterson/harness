@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -133,6 +134,7 @@ def window(database: Database, port: FakeStatusPort) -> CiWindow:
 
 def success() -> CiCheck:
     return CiCheck(outcome="success", reason="all workflows succeeded")
+
 
 def running() -> CiCheck:
     return CiCheck(outcome="nonterminal", reason="workflow build-test running")
@@ -375,9 +377,7 @@ def test_composite_gate_runs_ci_reconciliation_before_github(
             order.append("ci")
             super().validate(project_key, candidate)
 
-    composite = CompositeIntakeGate(
-        (RecordingCiGate(window), RecordingGithubGate())
-    )
+    composite = CompositeIntakeGate((RecordingCiGate(window), RecordingGithubGate()))
     composite.validate("demo", candidate_manifest())
     assert order == ["ci", "github"]
 
@@ -512,9 +512,7 @@ def test_no_intake_admits_past_a_durable_failure_across_connections(
     port = FakeStatusPort()
     port.results[MERGE_A] = failed()
     first_db = Database.open(db_path)
-    first = CiWindow(
-        database=first_db, status=port, max_unresolved=2, now=lambda: NOW
-    )
+    first = CiWindow(database=first_db, status=port, max_unresolved=2, now=lambda: NOW)
     first.record_merge(proven())
     decision_one = first.reconcile_event("demo", "evt-1", IDENTITY)
     assert decision_one.kind == "blocked_prior_failure"
@@ -562,9 +560,7 @@ def test_decision_derives_from_committed_state_not_local_observation(
             self.path = path
             self.calls = 0
 
-        def check(
-            self, project_slug: str, branch: str, merge_sha: str
-        ) -> CiCheck:
+        def check(self, project_slug: str, branch: str, merge_sha: str) -> CiCheck:
             self.calls += 1
             competing = sqlite3.connect(self.path)
             competing.execute(
@@ -578,9 +574,7 @@ def test_decision_derives_from_committed_state_not_local_observation(
             return success()
 
     port = CompetingPort(database.path)
-    window = CiWindow(
-        database=database, status=port, max_unresolved=2, now=lambda: NOW
-    )
+    window = CiWindow(database=database, status=port, max_unresolved=2, now=lambda: NOW)
     window.record_merge(proven())
     decision = window.reconcile_at_intake("demo")
     assert decision.kind == "blocked_prior_failure"
@@ -694,9 +688,7 @@ def test_expired_lease_allows_exactly_one_recovery_reconciliation(
     database = Database.open(db_path)
     port = FakeStatusPort()
     port.results[MERGE_A] = running()
-    window = CiWindow(
-        database=database, status=port, max_unresolved=2, now=clock.now
-    )
+    window = CiWindow(database=database, status=port, max_unresolved=2, now=clock.now)
     window.record_merge(proven())
     with database.transaction() as connection:
         connection.execute(
@@ -739,9 +731,9 @@ def test_two_connection_expired_lease_recovery_has_one_winner(
     seed = Database.open(db_path)
     port = FakeStatusPort()
     port.results[MERGE_A] = running()
-    CiWindow(
-        database=seed, status=port, max_unresolved=2, now=clock.now
-    ).record_merge(proven())
+    CiWindow(database=seed, status=port, max_unresolved=2, now=clock.now).record_merge(
+        proven()
+    )
     with seed.transaction() as connection:
         connection.execute(
             "INSERT INTO ci_reconciliation_claims("
@@ -770,9 +762,7 @@ def test_two_connection_expired_lease_recovery_has_one_winner(
         )
         barrier.wait()
         try:
-            results[name] = recovering.reconcile_event(
-                "demo", "evt-9", IDENTITY
-            ).kind
+            results[name] = recovering.reconcile_event("demo", "evt-9", IDENTITY).kind
         except ReconciliationPending:
             results[name] = "pending"
         finally:
@@ -871,16 +861,16 @@ def test_stale_owner_success_cannot_resolve_after_recovery(
     port_current = FakeStatusPort()
     port_current.results[MERGE_A] = failed()
     window_current = CiWindow(
-        database=db_current, status=port_current, max_unresolved=2,
+        database=db_current,
+        status=port_current,
+        max_unresolved=2,
         now=clock.now,
     )
     outcome: dict[str, Any] = {}
 
     def while_stale_is_suspended() -> None:
         clock.advance(301)
-        outcome["current"] = window_current.reconcile_event(
-            "demo", "evt-9", IDENTITY
-        )
+        outcome["current"] = window_current.reconcile_event("demo", "evt-9", IDENTITY)
 
     port_stale = InterleavingPort(success(), while_stale_is_suspended)
     window_stale = CiWindow(
@@ -914,16 +904,16 @@ def test_stale_owner_failure_cannot_persist_after_current_success(
     port_current = FakeStatusPort()
     port_current.results[MERGE_A] = success()
     window_current = CiWindow(
-        database=db_current, status=port_current, max_unresolved=2,
+        database=db_current,
+        status=port_current,
+        max_unresolved=2,
         now=clock.now,
     )
     outcome: dict[str, Any] = {}
 
     def while_stale_is_suspended() -> None:
         clock.advance(301)
-        outcome["current"] = window_current.reconcile_event(
-            "demo", "evt-9", IDENTITY
-        )
+        outcome["current"] = window_current.reconcile_event("demo", "evt-9", IDENTITY)
 
     port_stale = InterleavingPort(failed(), while_stale_is_suspended)
     window_stale = CiWindow(
@@ -1092,3 +1082,180 @@ def test_expired_claim_with_malformed_token_never_recovers(
     assert row["state"] == "claimed"
     assert row["owner_token"] == "not-a-generated-token"
     assert row["lease_expires_at"] == expired
+
+
+class FakeAuthorizer:
+    """Authorizes exactly the reworks it was told about."""
+
+    def __init__(self, bound: dict[tuple[str, str], str] | None = None) -> None:
+        self.bound = dict(bound or {})
+        self.calls: list[tuple[str, str]] = []
+
+    def authorized_rework(
+        self, project_key: str, candidate: CandidateManifest, packet: Any
+    ) -> str | None:
+        self.calls.append((candidate.status, candidate.candidate_sha))
+        if candidate.status != "FABLE_REWORK_READY":
+            return None
+        return self.bound.get((candidate.candidate_sha, packet.reviewed_sha))
+
+
+def rework_manifest(
+    candidate_sha: str = "7" * 40, event_id: str = "evt-rw"
+) -> CandidateManifest:
+    return replace(
+        candidate_manifest(),
+        status="FABLE_REWORK_READY",
+        candidate_sha=candidate_sha,
+        event_id=event_id,
+    )
+
+
+def failed_ledger_state(window: CiWindow, database: Database, merge_sha: str) -> str:
+    row = database.execute(
+        "SELECT state FROM ci_merge_ledger WHERE merge_sha = ?", (merge_sha,)
+    ).fetchone()
+    return str(row["state"])
+
+
+def fail_item_a(window: CiWindow, port: FakeStatusPort) -> None:
+    window.record_merge(proven(candidate_branch="feature/eng-10"))
+    port.results[MERGE_A] = failed()
+    window.reconcile_event("demo", "evt-fail", IDENTITY)
+
+
+def test_ordinary_ready_on_the_failed_branch_stays_blocked(
+    window: CiWindow, port: FakeStatusPort, database: Database
+) -> None:
+    fail_item_a(window, port)
+    authorizer = FakeAuthorizer({("7" * 40, CANDIDATE): "corr-1"})
+    gate = CircleCiIntakeGate(window, corrections=authorizer)
+    ordinary = replace(candidate_manifest(), candidate_sha="7" * 40, event_id="evt-o")
+    with pytest.raises(PriorMergeFailed):
+        gate.validate("demo", ordinary)
+    assert failed_ledger_state(window, database, MERGE_A) == "failed"
+    assert authorizer.calls == [("FABLE_READY", "7" * 40)]
+    with pytest.raises(PriorMergeFailed):
+        CircleCiIntakeGate(window).validate("demo", rework_manifest())
+    assert failed_ledger_state(window, database, MERGE_A) == "failed"
+
+
+def test_unbound_or_stale_rework_cannot_clear_the_failure(
+    window: CiWindow, port: FakeStatusPort, database: Database
+) -> None:
+    fail_item_a(window, port)
+    unbound = FakeAuthorizer({})
+    with pytest.raises(PriorMergeFailed):
+        CircleCiIntakeGate(window, corrections=unbound).validate(
+            "demo", rework_manifest()
+        )
+    assert failed_ledger_state(window, database, MERGE_A) == "failed"
+    # Closing is refused for the wrong branch, the wrong failed SHA, and a
+    # non-rework status, and never touches the ledger.
+    other_branch = replace(rework_manifest(), branch="feature/eng-11")
+    assert (
+        window.close_failure_for_rework(
+            "demo",
+            failed_candidate_sha=CANDIDATE,
+            rework=other_branch,
+            correction_id="corr-1",
+        )
+        is False
+    )
+    assert (
+        window.close_failure_for_rework(
+            "demo",
+            failed_candidate_sha="9" * 40,
+            rework=rework_manifest(),
+            correction_id="corr-1",
+        )
+        is False
+    )
+    with pytest.raises(ValueError, match="FABLE_REWORK_READY"):
+        window.close_failure_for_rework(
+            "demo",
+            failed_candidate_sha=CANDIDATE,
+            rework=candidate_manifest(),
+            correction_id="corr-1",
+        )
+    assert failed_ledger_state(window, database, MERGE_A) == "failed"
+
+
+def test_bound_rework_passes_intake_and_closes_exactly_that_failure(
+    window: CiWindow, port: FakeStatusPort, database: Database
+) -> None:
+    fail_item_a(window, port)
+    authorizer = FakeAuthorizer({("7" * 40, CANDIDATE): "corr-1"})
+    gate = CircleCiIntakeGate(window, corrections=authorizer)
+    port.calls.clear()
+    gate.validate("demo", rework_manifest())
+    # Passing the gate is not clearing: only post-admission closing is.
+    assert failed_ledger_state(window, database, MERGE_A) == "failed"
+    assert port.calls == []
+    assert (
+        window.close_failure_for_rework(
+            "demo",
+            failed_candidate_sha=CANDIDATE,
+            rework=rework_manifest(),
+            correction_id="corr-1",
+        )
+        is True
+    )
+    row = database.execute(
+        "SELECT state, correction_json FROM ci_merge_ledger WHERE merge_sha = ?",
+        (MERGE_A,),
+    ).fetchone()
+    assert row["state"] == "corrected"
+    assert json.loads(row["correction_json"]) == {
+        "event_id": "evt-rw",
+        "rework_sha": "7" * 40,
+        "correction_id": "corr-1",
+        "issues": ["ENG-10"],
+    }
+    assert window.stored_failure("demo") is None
+    assert window.reconcile_at_intake("demo").kind == "clear"
+
+
+def test_rework_close_replay_is_idempotent_and_scoped(
+    window: CiWindow, port: FakeStatusPort, database: Database
+) -> None:
+    fail_item_a(window, port)
+    assert window.close_failure_for_rework(
+        "demo",
+        failed_candidate_sha=CANDIDATE,
+        rework=rework_manifest(),
+        correction_id="c",
+    )
+    # A second failed item on another branch, failed after the first closed.
+    window.record_merge(
+        proven(
+            merge_sha=MERGE_B,
+            pr_number=15,
+            candidate_sha="8" * 40,
+            candidate_branch="feature/eng-11",
+        )
+    )
+    port.results[MERGE_B] = failed()
+    window.reconcile_event(
+        "demo", "evt-fail-b", replace(IDENTITY, event_id=None) if False else IDENTITY
+    )
+    assert failed_ledger_state(window, database, MERGE_B) == "failed"
+    # Replaying the first rework's close is idempotent for the same event...
+    assert window.close_failure_for_rework(
+        "demo",
+        failed_candidate_sha=CANDIDATE,
+        rework=rework_manifest(),
+        correction_id="c",
+    )
+    # ...refused for a different event, and never touches the other item.
+    assert (
+        window.close_failure_for_rework(
+            "demo",
+            failed_candidate_sha=CANDIDATE,
+            rework=rework_manifest(event_id="evt-rw-2"),
+            correction_id="c",
+        )
+        is False
+    )
+    assert failed_ledger_state(window, database, MERGE_B) == "failed"
+    assert failed_ledger_state(window, database, MERGE_A) == "corrected"
