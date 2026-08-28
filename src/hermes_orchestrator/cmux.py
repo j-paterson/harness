@@ -32,6 +32,11 @@ _UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
+# cmux 0.64.22 acknowledges a mutation with a short numeric ref such as
+# "OK workspace:14" instead of a UUID. Exactly this shape — and nothing
+# else — may be accepted as an intermediate response.
+_SHORT_WORKSPACE_ACK = re.compile(r"^OK\s+workspace:\d+$")
+
 # The complete cmux vocabulary this orchestrator may speak. Everything is
 # workspace/surface lifecycle or sanitized metadata display. Screen and
 # input commands (read-screen, capture-pane, send, send-key, pipe-pane)
@@ -93,6 +98,7 @@ class CmuxControlPort(Protocol):
         cwd: Path,
         command: str | None = None,
         env: Mapping[str, str] | None = None,
+        resolve_marker: str | None = None,
     ) -> CmuxSurfaceRef: ...
 
     async def live_workspace_uuids(self) -> frozenset[str]: ...
@@ -173,6 +179,7 @@ class CmuxCliAdapter:
         cwd: Path,
         command: str | None = None,
         env: Mapping[str, str] | None = None,
+        resolve_marker: str | None = None,
     ) -> CmuxSurfaceRef:
         arguments = [
             "new-workspace",
@@ -190,8 +197,8 @@ class CmuxCliAdapter:
         created = await self._run(*arguments)
         workspace_uuid = _first_uuid(created)
         if workspace_uuid is None:
-            raise CmuxProtocolError(
-                "cmux did not return a workspace identity"
+            workspace_uuid = await self._resolve_short_ack(
+                created, resolve_marker
             )
         listed = await self._run(
             "list-pane-surfaces", "--workspace", workspace_uuid
@@ -211,6 +218,39 @@ class CmuxCliAdapter:
         return CmuxSurfaceRef(
             workspace_uuid=workspace_uuid, surface_uuid=surface_uuid
         )
+
+    async def _resolve_short_ack(
+        self, output: str, resolve_marker: str | None
+    ) -> str:
+        """Resolve a short mutation acknowledgement to exactly one UUID.
+
+        Only the exact ``OK workspace:<n>`` shape is accepted, and only
+        as an intermediate response: the workspace identity itself comes
+        from the metadata listing through the caller's durable
+        activation marker — never from cwd, generic titles, list
+        position, substrings, or the focused workspace — and zero or
+        multiple exact marker matches fail closed. No terminal screen
+        content is ever read.
+        """
+
+        if not _SHORT_WORKSPACE_ACK.fullmatch(output.strip()):
+            raise CmuxProtocolError(
+                "cmux did not return a workspace identity"
+            )
+        if not resolve_marker:
+            raise CmuxProtocolError(
+                "cmux returned a short mutation acknowledgement and no "
+                "durable marker was provided to resolve it"
+            )
+        matches = await self.find_workspace_uuids(
+            title_marker=resolve_marker
+        )
+        if len(matches) != 1:
+            raise CmuxProtocolError(
+                f"the short acknowledgement resolved to {len(matches)} "
+                "durable marker matches; exactly one is required"
+            )
+        return next(iter(matches))
 
     async def live_workspace_uuids(self) -> frozenset[str]:
         output = await self._run("list-workspaces")

@@ -131,6 +131,7 @@ class FakePort:
         cwd: Path,
         command: str | None = None,
         env: dict[str, str] | None = None,
+        resolve_marker: str | None = None,
     ) -> CmuxSurfaceRef:
         self._maybe_fail("create_workspace")
         if self.on_create is not None:
@@ -138,7 +139,13 @@ class FakePort:
         if self.crash == "before_create":
             raise SimulatedCrash("process died before the external create")
         self.created.append(
-            {"title": title, "cwd": cwd, "command": command, "env": env}
+            {
+                "title": title,
+                "cwd": cwd,
+                "command": command,
+                "env": env,
+                "resolve_marker": resolve_marker,
+            }
         )
         ref = self.next_refs.pop(0)
         self.live.add(ref)
@@ -1140,6 +1147,9 @@ async def test_activation_intent_is_durable_before_the_external_create(
     assert pending[0].state == "pending"
     assert pending[0].title_marker in title
     assert title.startswith("demo lead")
+    # The same durable marker resolves a cmux short mutation
+    # acknowledgement to exactly one workspace inside the adapter.
+    assert port.created[0]["resolve_marker"] == pending[0].title_marker
     # Successful activation binds the returned identities to that exact
     # intent and drops the cosmetic marker from the visible title.
     bound = bindings.get_intent(pending[0].intent_id)

@@ -179,6 +179,112 @@ async def test_create_workspace_returns_typed_identities() -> None:
     assert create_argv[focus_at + 1] == "false"
 
 
+MARKER = "[hermes:op-1]"
+
+
+@pytest.mark.asyncio
+async def test_short_ack_resolves_through_the_durable_marker() -> None:
+    # cmux 0.64.22 acknowledges the mutation with a short workspace ref
+    # instead of a UUID; the adapter accepts it only as an intermediate
+    # response and resolves the exact workspace through the metadata
+    # listing and the durable activation marker.
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:14\n"),
+            FakeProcess(
+                stdout=f"{WORKSPACE} demo lead {MARKER}\n".encode()
+            ),
+            FakeProcess(
+                stdout=f"{WORKSPACE} pane surface {SURFACE}\n".encode()
+            ),
+        ]
+    )
+    port = adapter(factory)
+
+    ref = await port.create_workspace(
+        title=f"demo lead {MARKER}",
+        cwd=Path("/repos/demo"),
+        resolve_marker=MARKER,
+    )
+
+    assert ref == CmuxSurfaceRef(
+        workspace_uuid=WORKSPACE, surface_uuid=SURFACE
+    )
+    commands = [call[0][3] for call in factory.calls]
+    assert commands == [
+        "new-workspace",
+        "list-workspaces",
+        "list-pane-surfaces",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_short_ack_with_zero_marker_matches_fails_closed() -> None:
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:14\n"),
+            FakeProcess(stdout=f"{WORKSPACE} other lead\n".encode()),
+        ]
+    )
+
+    with pytest.raises(CmuxProtocolError, match="exactly one"):
+        await adapter(factory).create_workspace(
+            title=f"demo lead {MARKER}",
+            cwd=Path("/repos/demo"),
+            resolve_marker=MARKER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_ack_with_multiple_marker_matches_fails_closed() -> None:
+    other = "99999999-8888-4777-8666-555555555544"
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:14\n"),
+            FakeProcess(
+                stdout=(
+                    f"{WORKSPACE} demo lead {MARKER}\n"
+                    f"{other} demo lead {MARKER}\n"
+                ).encode()
+            ),
+        ]
+    )
+
+    with pytest.raises(CmuxProtocolError, match="exactly one"):
+        await adapter(factory).create_workspace(
+            title=f"demo lead {MARKER}",
+            cwd=Path("/repos/demo"),
+            resolve_marker=MARKER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_ack_without_a_marker_fails_closed() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"OK workspace:14\n")])
+
+    with pytest.raises(CmuxProtocolError, match="marker"):
+        await adapter(factory).create_workspace(
+            title="demo lead", cwd=Path("/repos/demo")
+        )
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_ack_text_is_never_treated_as_a_short_ref() -> None:
+    # Only the exact short mutation acknowledgement shape is accepted as
+    # an intermediate response; anything else stays a protocol failure
+    # even when a marker could have resolved it.
+    factory = FakeFactory(
+        results=[FakeProcess(stdout=b"workspace created just fine\n")]
+    )
+
+    with pytest.raises(CmuxProtocolError, match="workspace identity"):
+        await adapter(factory).create_workspace(
+            title=f"demo lead {MARKER}",
+            cwd=Path("/repos/demo"),
+            resolve_marker=MARKER,
+        )
+
+
 @pytest.mark.asyncio
 async def test_create_workspace_without_identities_fails_closed() -> None:
     factory = FakeFactory(results=[FakeProcess(stdout=b"created ok")])

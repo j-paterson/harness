@@ -1000,10 +1000,15 @@ async def _activate_lead_seat(
         session_id=session_id,
         profile_alias=profile_alias,
     )
+    # The marker resolves cmux 0.64.22's short mutation acknowledgement
+    # (``OK workspace:<n>``) to exactly one workspace through the
+    # metadata listing; zero or multiple matches fail closed inside the
+    # adapter.
     ref = await port.create_workspace(
         title=f"{title} {intent.title_marker}",
         cwd=cwd,
         env={"CLAUDE_CONFIG_DIR": str(config_dir)},
+        resolve_marker=intent.title_marker,
     )
     try:
         pending = bindings.bind_intent(intent.intent_id, ref=ref)
