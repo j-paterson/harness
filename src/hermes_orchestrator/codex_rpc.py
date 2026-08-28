@@ -30,6 +30,8 @@ _STABLE_METHODS = frozenset(
         "thread/metadata/update",
         "thread/goal/set",
         "thread/name/set",
+        "thread/section/move",
+        "threadSection/list",
         "thread/read",
         "thread/resume",
         "thread/start",
@@ -97,6 +99,22 @@ class CodexRateLimits:
     secondary_used_percent: int | None
     primary_resets_at: int | None
     reached: bool
+
+
+def parse_rate_limits(result: dict[str, Any]) -> CodexRateLimits:
+    """Build a redacted snapshot from an account/rateLimits/read result."""
+
+    snapshot = result.get("rateLimits")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    primary = snapshot.get("primary") or {}
+    secondary = snapshot.get("secondary") or {}
+    return CodexRateLimits(
+        primary_used_percent=primary.get("usedPercent"),
+        secondary_used_percent=secondary.get("usedPercent"),
+        primary_resets_at=primary.get("resetsAt"),
+        reached=snapshot.get("rateLimitReachedType") is not None,
+    )
 
 
 class CodexRpcClient:
@@ -234,17 +252,7 @@ class CodexRpcClient:
         """Read the ChatGPT rate-limit snapshot."""
 
         result = await self.request("account/rateLimits/read", None, timeout)
-        snapshot = result.get("rateLimits")
-        if not isinstance(snapshot, dict):
-            snapshot = {}
-        primary = snapshot.get("primary") or {}
-        secondary = snapshot.get("secondary") or {}
-        return CodexRateLimits(
-            primary_used_percent=primary.get("usedPercent"),
-            secondary_used_percent=secondary.get("usedPercent"),
-            primary_resets_at=primary.get("resetsAt"),
-            reached=snapshot.get("rateLimitReachedType") is not None,
-        )
+        return parse_rate_limits(result)
 
     async def interrupt(
         self, thread_id: str, turn_id: str, timeout: float = 10.0

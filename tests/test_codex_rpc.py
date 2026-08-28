@@ -378,6 +378,22 @@ async def test_request_timeout_discards_the_late_response(
 
 
 @pytest.mark.asyncio
+async def test_thread_section_methods_are_stable(
+    fake_server: FakeCodexServer,
+) -> None:
+    client = await started_client(fake_server)
+    try:
+        await client.request("threadSection/list", None, 5)
+        await client.request(
+            "thread/section/move",
+            {"sectionId": "sec_pinned", "threadId": "thr_a"},
+            5,
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_experimental_methods_are_rejected(
     fake_server: FakeCodexServer,
 ) -> None:
