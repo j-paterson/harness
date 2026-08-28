@@ -38,6 +38,7 @@ from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.resources import ResourceSampler
 from hermes_orchestrator.scheduler import Scheduler
 from hermes_orchestrator.service import OrchestratorService
+from hermes_orchestrator.stalls import ScheduledResets
 
 Dispatch = Callable[[str], Awaitable[DispatchResult]]
 
@@ -96,6 +97,7 @@ class Runtime:
     merge_flow: MergeFlow | None = None
     processes: ProcessRegistry | None = None
     checkpoints: CheckpointRequests | None = None
+    resets: ScheduledResets | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -170,6 +172,7 @@ def open_runtime(
         processes = ProcessRegistry(database, events)
         safety = CheckpointSafetyStore(database, events)
         checkpoints = CheckpointRequests(database, events)
+        resets = ScheduledResets(database, events)
         queue = QueueService(database, events, settings.projects)
         cells: ProjectCellService | None = None
         dispatch: Dispatch | None = None
@@ -281,6 +284,7 @@ def open_runtime(
             queue=queue,
             safety=safety,
             checkpoints=checkpoints,
+            resets=resets,
         )
         return Runtime(
             database=database,
@@ -292,6 +296,7 @@ def open_runtime(
             merge_flow=merge_flow,
             processes=processes,
             checkpoints=checkpoints,
+            resets=resets,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

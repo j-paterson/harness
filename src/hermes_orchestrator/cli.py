@@ -17,7 +17,7 @@ from typing import Any
 
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
 from hermes_orchestrator.config import load_settings
-from hermes_orchestrator.domain import AdmissionRequest, QueuedIssue
+from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain
@@ -33,6 +33,15 @@ from hermes_orchestrator.runtime import (
     open_runtime,
 )
 from hermes_orchestrator.service import OrchestratorService
+from hermes_orchestrator.stalls import (
+    PlaybookService,
+    Remedy,
+    RemedyExecutor,
+    ScheduledResets,
+    StallDetector,
+    StallDiagnosis,
+    StallEvidence,
+)
 from hermes_orchestrator.supervisor import Supervisor
 
 
@@ -318,6 +327,104 @@ async def _merger_turn(flow: MergeFlow, args: Any) -> dict[str, Any]:
     }
 
 
+def _remedy_executor(runtime: Runtime) -> RemedyExecutor:
+    """Wire the registered actions this runtime can actually perform.
+
+    Every handler and verifier operates on durable, restart-safe state and
+    fails closed on a missing or ambiguous target. Registered actions
+    without a wired handler fail at execution (recorded as a failure that
+    revokes automation); sensitive and unregistered actions are refused
+    before anything runs.
+    """
+
+    cells = runtime.cells
+    queue = runtime.queue
+    database = runtime.database
+    resets = runtime.resets or ScheduledResets(database, EventStore(database))
+    selected_issue: dict[str, str] = {}
+
+    def exact_target(diagnosis: StallDiagnosis) -> str:
+        """Exactly one in-flight issue for the project, else fail closed."""
+
+        rows = database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = ? "
+            "AND state IN ('in_development', 'review') ORDER BY issue_id",
+            (diagnosis.project_key,),
+        ).fetchall()
+        if not rows:
+            raise RuntimeError(
+                f"no in-flight issue for project {diagnosis.project_key}"
+            )
+        if len(rows) > 1:
+            raise RuntimeError(
+                f"ambiguous pause target: {len(rows)} in-flight issues for "
+                f"{diagnosis.project_key}"
+            )
+        return str(rows[0]["issue_id"])
+
+    async def request_handoff(diagnosis: StallDiagnosis, remedy: Remedy) -> None:
+        if cells is None:
+            raise RuntimeError("no project cells in this runtime")
+        rows = database.execute(
+            "SELECT cell_id FROM project_cells WHERE project_key = ? "
+            "AND state IN ('starting', 'active')",
+            (diagnosis.project_key,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise RuntimeError("no single active lead to hand off")
+        if not cells.request_checkpoint(
+            str(rows[0]["cell_id"]), f"stall:{diagnosis.reason}"
+        ):
+            raise RuntimeError("the active lead refused the checkpoint request")
+
+    async def pause_issue(diagnosis: StallDiagnosis, remedy: Remedy) -> None:
+        issue_id = exact_target(diagnosis)
+        queue.transition(
+            issue_id, IssueState.PAUSED, actor="orchestrator", reason=diagnosis.reason
+        )
+        selected_issue[diagnosis.predicate_key] = issue_id
+
+    async def wait_for_reset(diagnosis: StallDiagnosis, remedy: Remedy) -> None:
+        resets.schedule(
+            diagnosis.project_key,
+            diagnosis.predicate_key,
+            reason=diagnosis.reason,
+            delay_seconds=remedy.timeout_seconds,
+        )
+
+    async def handoff_requested(diagnosis: StallDiagnosis, remedy: Remedy) -> bool:
+        return (
+            database.scalar(
+                "SELECT count(*) FROM project_cells WHERE project_key = ? "
+                "AND state = 'handoff_required'",
+                (diagnosis.project_key,),
+            )
+            == 1
+        )
+
+    async def issue_paused(diagnosis: StallDiagnosis, remedy: Remedy) -> bool:
+        issue_id = selected_issue.get(diagnosis.predicate_key)
+        if issue_id is None:
+            return False
+        return queue.get(issue_id).state is IssueState.PAUSED
+
+    async def reset_scheduled(diagnosis: StallDiagnosis, remedy: Remedy) -> bool:
+        return bool(resets.pending(diagnosis.project_key, diagnosis.predicate_key))
+
+    return RemedyExecutor(
+        handlers={
+            "request_handoff": request_handoff,
+            "pause_issue": pause_issue,
+            "wait_for_reset": wait_for_reset,
+        },
+        verifiers={
+            "handoff_requested": handoff_requested,
+            "issue_paused": issue_paused,
+            "reset_scheduled": reset_scheduled,
+        },
+    )
+
+
 def _hermes_handlers(
     settings: Any, runtime: Runtime, outbox: LeadCorrectionOutbox
 ) -> dict[str, Any]:
@@ -342,10 +449,90 @@ def _hermes_handlers(
             "reason": outcome.reason,
         }
 
+    playbooks = PlaybookService(
+        runtime.database,
+        EventStore(runtime.database),
+        playbook_path=settings.repo_root / "config" / "playbooks.yaml",
+    )
+    detector = StallDetector()
+
+    executor = _remedy_executor(runtime)
+
+    def report_stall(command: Any) -> dict[str, Any]:
+        evidence = StallEvidence(
+            no_material_change_seconds=command.no_material_change_seconds,
+            process_alive=command.process_alive,
+            output_activity=command.output_activity,
+            resource_activity=command.resource_activity,
+            repeated_failure=command.repeated_failure,
+            blocked_request=command.blocked_request,
+            provider_error=command.provider_error,
+            external_failure=command.external_failure,
+            agent_report=command.agent_report,
+            resource_pressure=command.resource_pressure,
+            project_key=command.project_key,
+        )
+        diagnosis = detector.evaluate(evidence)
+        if diagnosis is None:
+            return {"stalled": False, "reason": None}
+        plan, outcome = asyncio.run(playbooks.resolve_and_execute(diagnosis, executor))
+        return {
+            "stalled": True,
+            "summary": diagnosis.summary,
+            **plan.as_dict(),
+            "execution": None if outcome is None else outcome.as_dict(),
+        }
+
+    def approve_playbook(command: Any) -> dict[str, Any]:
+        remedy = Remedy(
+            actions=tuple(command.actions),
+            verification=command.verification,
+            timeout_seconds=command.timeout_seconds,
+            rollback=command.rollback,
+        )
+        playbook = playbooks.record_operator_result(
+            command.consultation_id, remedy, approved=command.approved
+        )
+        return {
+            "consultation_id": command.consultation_id,
+            "approved": command.approved,
+            "playbook_hash": playbooks.current_hash() if playbook else None,
+            "approvals": None if playbook is None else playbook.approvals,
+            "version": None if playbook is None else playbook.version,
+        }
+
+    def pending_consultations(command: Any) -> dict[str, Any]:
+        return {
+            "consultations": [
+                item.as_dict() for item in playbooks.pending(command.project_key)
+            ]
+        }
+
+    def record_remedy_result(command: Any) -> dict[str, Any]:
+        diagnosis = StallDiagnosis(
+            reason=command.reason,
+            predicate={},
+            predicate_key=command.predicate_key,
+            project_key=command.project_key,
+            summary="operator-reported remedy result",
+        )
+        playbooks.record_execution(
+            diagnosis,
+            playbook_hash=command.playbook_hash,
+            mode=command.mode,
+            success=command.success,
+            detail=command.detail,
+        )
+        return {"recorded": True, "success": command.success}
+
     return {
         "pending_corrections": pending_corrections,
         "ack_correction": ack_correction,
         "qa_reject": qa_reject,
+        "report_stall": report_stall,
+        "approve_playbook": approve_playbook,
+        "pending_consultations": pending_consultations,
+        "record_remedy_result": record_remedy_result,
     }
 
 

@@ -80,6 +80,47 @@ class QaRejectCommand(_Command):
     evidence: NonEmptyText
 
 
+class ReportStallCommand(_Command):
+    intent: Literal["report_stall"]
+    project_key: NonEmptyText
+    no_material_change_seconds: int = Field(default=0, ge=0)
+    process_alive: bool = True
+    output_activity: bool = True
+    resource_activity: bool = True
+    repeated_failure: NonEmptyText | None = None
+    blocked_request: NonEmptyText | None = None
+    provider_error: NonEmptyText | None = None
+    external_failure: NonEmptyText | None = None
+    agent_report: NonEmptyText | None = None
+    resource_pressure: bool = False
+
+
+class ApprovePlaybookCommand(_Command):
+    intent: Literal["approve_playbook"]
+    consultation_id: NonEmptyText
+    actions: list[NonEmptyText] = Field(min_length=1)
+    verification: NonEmptyText
+    timeout_seconds: int = Field(gt=0)
+    rollback: NonEmptyText
+    approved: bool = True
+
+
+class PendingConsultationsCommand(_Command):
+    intent: Literal["pending_consultations"]
+    project_key: NonEmptyText | None = None
+
+
+class RecordRemedyResultCommand(_Command):
+    intent: Literal["record_remedy_result"]
+    project_key: NonEmptyText
+    predicate_key: NonEmptyText
+    reason: NonEmptyText
+    mode: Literal["automatic", "consulted"]
+    success: bool
+    playbook_hash: NonEmptyText | None = None
+    detail: str = ""
+
+
 class PendingCorrectionsCommand(_Command):
     intent: Literal["pending_corrections"]
     project_key: NonEmptyText | None = None
@@ -100,7 +141,11 @@ HermesCommand = Annotated[
     | ApproveHandoffCommand
     | QaRejectCommand
     | PendingCorrectionsCommand
-    | AckCorrectionCommand,
+    | AckCorrectionCommand
+    | ReportStallCommand
+    | ApprovePlaybookCommand
+    | PendingConsultationsCommand
+    | RecordRemedyResultCommand,
     Field(discriminator="intent"),
 ]
 
@@ -117,6 +162,10 @@ _ALLOWED_INTENTS = frozenset(
         "qa_reject",
         "pending_corrections",
         "ack_correction",
+        "report_stall",
+        "approve_playbook",
+        "pending_consultations",
+        "record_remedy_result",
     }
 )
 

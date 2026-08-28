@@ -153,3 +153,36 @@ def test_new_review_intents_route_to_handlers(database: Database) -> None:
     assert missing.code == "intent_unavailable"
     invalid = service.execute({"intent": "qa_reject", "issue_id": "ENG-9"})
     assert invalid.code == "invalid_command"
+
+
+def test_stall_intents_are_strict_and_routed(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def report(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"stalled": True, "mode": "ask_operator"}
+
+    service = HermesCommandService(queue, handlers={"report_stall": report})
+    result = service.execute(
+        {
+            "intent": "report_stall",
+            "project_key": "demo",
+            "repeated_failure": "uv run pytest -q",
+        }
+    )
+    assert result.code == "accepted" and result.state["mode"] == "ask_operator"
+    assert seen[0].repeated_failure == "uv run pytest -q"
+    invalid = service.execute(
+        {
+            "intent": "approve_playbook",
+            "consultation_id": "c",
+            "actions": [],
+            "verification": "v",
+            "timeout_seconds": 10,
+            "rollback": "r",
+        }
+    )
+    assert invalid.code == "invalid_command"
+    unavailable = service.execute({"intent": "pending_consultations"})
+    assert unavailable.code == "intent_unavailable"

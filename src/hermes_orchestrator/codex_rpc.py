@@ -18,7 +18,7 @@ _CLIENT_INFO = {
     "title": "Hermes Orchestrator",
     "version": "0.1.0",
 }
-_MAX_LINE_BYTES = 64 * 1024
+_MAX_LINE_BYTES = 1024 * 1024
 _SCRUBBED_ENVIRONMENT_KEYS = frozenset({"OPENAI_API_KEY"})
 _DEFAULT_NOTIFICATION_LIMIT = 256
 _METHOD_NOT_FOUND = -32601

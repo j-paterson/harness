@@ -25,6 +25,7 @@ from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.scheduler import PlannedAction, Scheduler
+from hermes_orchestrator.stalls import ScheduledResets
 
 
 class Sampler(Protocol):
@@ -70,7 +71,9 @@ class OrchestratorService:
         queue: QueueService | None = None,
         safety: CheckpointSafetyStore | None = None,
         checkpoints: CheckpointRequests | None = None,
+        resets: ScheduledResets | None = None,
     ) -> None:
+        self._resets = resets
         self._processes = processes
         self._admission = admission
         self._queue = queue
@@ -178,6 +181,8 @@ class OrchestratorService:
                 "DELETE FROM resource_samples WHERE sampled_at < ?",
                 (cutoff.isoformat(),),
             )
+        if self._resets is not None:
+            self._resets.consume_due(snapshot.sampled_at)
         resource_actions = self._govern(snapshot)
         return TickResult(
             snapshot=snapshot,

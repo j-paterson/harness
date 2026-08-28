@@ -1,0 +1,8 @@
+# Approved stall playbooks (INFRA-170). Written only by an explicit operator
+# approval through the orchestrator (approve_playbook); never edited by a
+# worker. Each entry binds a normalized reason and exact evidence predicate
+# to bounded actions, verification, timeout, and rollback. Automation is
+# permitted only after two approved consultations for the same predicate
+# and this file's exact content hash.
+version: 1
+playbooks: []

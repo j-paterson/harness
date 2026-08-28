@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 15
+    assert json.loads(result.stdout)["schema_version"] == 17
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -248,3 +248,231 @@ def test_subagent_gate_blocks_only_frozen_sessions(tmp_path: Path) -> None:
         assert main(["subagent-gate", "--freeze-dir", str(freeze_dir)]) == 2
     finally:
         _sys.stdin = stdin
+
+
+def test_hermes_stall_cycle_through_the_cli(tmp_path: Path) -> None:
+    import json as _json
+
+    from hermes_orchestrator.cli import main
+    from tests.conftest import configured_repo as _cr  # noqa: F401 - fixture doc
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text(
+        "projects:\n  demo:\n    linear_team: ENG\n"
+        f"    repo_path: {tmp_path}\n    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (config / "policies.yaml").write_text("mode: observe\n", encoding="utf-8")
+    (config / "playbooks.yaml").write_text("version: 1\nplaybooks: []\n")
+    state = tmp_path / "state"
+
+    def command(payload: dict[str, object]) -> dict[str, object]:
+        import io
+        import sys as _sys
+
+        out = io.StringIO()
+        stdout = _sys.stdout
+        _sys.stdout = out
+        try:
+            code = main(
+                [
+                    "--repo-root",
+                    str(tmp_path),
+                    "--state-dir",
+                    str(state),
+                    "hermes-command",
+                    "--json",
+                    _json.dumps(payload),
+                ]
+            )
+        finally:
+            _sys.stdout = stdout
+        assert code == 0, out.getvalue()
+        return _json.loads(out.getvalue().strip().splitlines()[-1])
+
+    stall = {
+        "intent": "report_stall",
+        "project_key": "demo",
+        "repeated_failure": "pytest",
+    }
+    first = command(stall)
+    assert first["state"]["mode"] == "ask_operator"
+    pending = command({"intent": "pending_consultations", "project_key": "demo"})
+    assert len(pending["state"]["consultations"]) == 1
+    remedy = {
+        "intent": "approve_playbook",
+        "consultation_id": first["state"]["consultation_id"],
+        "actions": ["wait_for_reset"],
+        "verification": "reset_scheduled",
+        "timeout_seconds": 300,
+        "rollback": "none",
+    }
+    approved = command(remedy)
+    assert approved["state"]["approvals"] == 1
+    second = command(stall)
+    assert second["state"]["mode"] == "ask_operator"
+    remedy["consultation_id"] = second["state"]["consultation_id"]
+    assert command(remedy)["state"]["approvals"] == 2
+    third = command(stall)
+    assert third["state"]["mode"] == "automatic"
+    assert third["state"]["actions"] == ["wait_for_reset"]
+    # The registered remedy actually executed and verified in this runtime.
+    assert third["state"]["execution"]["success"] is True
+    assert third["state"]["execution"]["actions_run"] == ["wait_for_reset"]
+    assert third["state"]["execution"]["verified"] is True
+    assert "playbooks:" in (config / "playbooks.yaml").read_text(encoding="utf-8")
+    recorded = command(
+        {
+            "intent": "record_remedy_result",
+            "project_key": "demo",
+            "predicate_key": third["state"]["predicate_key"],
+            "reason": "repeated_command_failure",
+            "mode": "automatic",
+            "success": False,
+            "playbook_hash": third["state"]["playbook_hash"],
+            "detail": "timeout",
+        }
+    )
+    assert recorded["state"]["recorded"] is True
+    assert command(stall)["state"]["mode"] == "ask_operator"
+
+
+def _runtime_like(tmp_path: Path) -> object:
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.queue import QueueService
+    from hermes_orchestrator.stalls import ScheduledResets
+
+    database = Database.open(tmp_path / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, {"demo"})
+    return SimpleNamespace(
+        database=database,
+        queue=queue,
+        cells=None,
+        resets=ScheduledResets(database, events),
+    )
+
+
+def _diagnosis(project: str = "demo") -> object:
+    from hermes_orchestrator.stalls import StallDetector, StallEvidence
+
+    found = StallDetector().evaluate(
+        StallEvidence(provider_error="limit", project_key=project)
+    )
+    assert found is not None
+    return found
+
+
+def _admit(runtime: object, issue_id: str, state: str) -> None:
+    from hermes_orchestrator.domain import AdmissionRequest
+
+    runtime.queue.admit(  # type: ignore[attr-defined]
+        AdmissionRequest(issue_id, "demo", 2, "operator", f"i-{issue_id}")
+    )
+    with runtime.database.transaction() as connection:  # type: ignore[attr-defined]
+        connection.execute(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            (state, issue_id),
+        )
+
+
+@pytest.mark.asyncio
+async def test_pause_issue_pauses_exactly_the_selected_issue(tmp_path: Path) -> None:
+    from hermes_orchestrator.cli import _remedy_executor
+    from hermes_orchestrator.domain import IssueState
+    from hermes_orchestrator.stalls import Remedy
+
+    runtime = _runtime_like(tmp_path)
+    try:
+        _admit(runtime, "ENG-1", "in_development")
+        _admit(runtime, "ENG-2", "queued")
+        executor = _remedy_executor(runtime)  # type: ignore[arg-type]
+        outcome = await executor.execute(
+            _diagnosis(),  # type: ignore[arg-type]
+            Remedy(("pause_issue",), "issue_paused", 5, "none"),
+        )
+        assert (outcome.success, outcome.verified, outcome.detail) == (
+            True,
+            True,
+            "verified",
+        )
+        assert runtime.queue.get("ENG-1").state is IssueState.PAUSED  # type: ignore[attr-defined]
+        assert runtime.queue.get("ENG-2").state is IssueState.QUEUED  # type: ignore[attr-defined]
+    finally:
+        runtime.database.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("states", "message"),
+    [
+        ([], "no in-flight issue"),
+        (["in_development", "review"], "ambiguous pause target"),
+    ],
+)
+async def test_pause_issue_fails_closed_for_missing_or_ambiguous_targets(
+    tmp_path: Path, states: list[str], message: str
+) -> None:
+    from hermes_orchestrator.cli import _remedy_executor
+    from hermes_orchestrator.domain import IssueState
+    from hermes_orchestrator.stalls import Remedy
+
+    runtime = _runtime_like(tmp_path)
+    try:
+        for index, state in enumerate(states):
+            _admit(runtime, f"ENG-{index}", state)
+        executor = _remedy_executor(runtime)  # type: ignore[arg-type]
+        outcome = await executor.execute(
+            _diagnosis(),  # type: ignore[arg-type]
+            Remedy(("pause_issue",), "issue_paused", 5, "none"),
+        )
+        assert outcome.success is False
+        assert outcome.detail == "execution failed: RuntimeError; no rollback"
+        assert outcome.actions_run == ()
+        for index in range(len(states)):
+            assert (
+                runtime.queue.get(f"ENG-{index}").state  # type: ignore[attr-defined]
+                is not IssueState.PAUSED
+            )
+    finally:
+        runtime.database.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_reset_schedules_durable_work_that_is_consumed(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from hermes_orchestrator.cli import _remedy_executor
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.stalls import Remedy, ScheduledResets
+
+    runtime = _runtime_like(tmp_path)
+    diagnosis = _diagnosis()
+    try:
+        executor = _remedy_executor(runtime)  # type: ignore[arg-type]
+        outcome = await executor.execute(
+            diagnosis,  # type: ignore[arg-type]
+            Remedy(("wait_for_reset",), "reset_scheduled", 120, "none"),
+        )
+        assert outcome.success is True
+    finally:
+        runtime.database.close()  # type: ignore[attr-defined]
+    # A fresh process sees the scheduled work and consumes it when due.
+    reopened = Database.open(tmp_path / "state.db")
+    try:
+        resets = ScheduledResets(reopened, EventStore(reopened))
+        pending = resets.pending("demo", diagnosis.predicate_key)  # type: ignore[attr-defined]
+        assert len(pending) == 1
+        assert resets.consume_due(datetime.now(UTC)) == []
+        consumed = resets.consume_due(datetime.now(UTC) + timedelta(seconds=121))
+        assert consumed == list(pending)
+    finally:
+        reopened.close()

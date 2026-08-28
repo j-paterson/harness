@@ -22,6 +22,9 @@ class Database:
 
         resolved = path.expanduser().resolve(strict=False)
         resolved.parent.mkdir(parents=True, exist_ok=True)
+        # The single connection is owned by the thread that opened it.
+        # SQLite's same-thread guard stays on: every durable effect, including
+        # remedy handlers, runs on the event-loop thread.
         connection = sqlite3.connect(resolved, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")

@@ -394,3 +394,30 @@ def test_stale_delivery_requires_fresh_red_then_next_eligible_works(
     nxt = service.tick()
     assert kinds(nxt) == [("stop_admission", None), ("request_checkpoint", "cell-2")]
     assert nxt.resource_actions[1].request_id is not None
+
+
+def test_tick_consumes_due_scheduled_resets(
+    database: Database, event_store: EventStore
+) -> None:
+    from hermes_orchestrator.stalls import ScheduledResets
+
+    resets = ScheduledResets(
+        database, event_store, now=lambda: datetime(2026, 8, 26, 11, 55, tzinfo=UTC)
+    )
+    reset_id = resets.schedule("demo", "pk", reason="provider_limit", delay_seconds=60)
+    queue = QueueService(database, event_store, {"demo"})
+    service = OrchestratorService(
+        database=database,
+        events=event_store,
+        sampler=FakeSampler(),  # samples at 12:00, after the 11:56 due time
+        scheduler=Scheduler(queue, mode="observe"),
+        policy=PolicyConfig(),
+        pid_exists=lambda _pid: False,
+        resets=resets,
+    )
+    service.start()
+    service.tick()
+    assert resets.pending("demo", "pk") == ()
+    assert database.scalar(
+        "SELECT state FROM scheduled_resets WHERE reset_id = ?", (reset_id,)
+    ) == "consumed"

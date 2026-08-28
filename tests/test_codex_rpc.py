@@ -342,8 +342,27 @@ async def test_malformed_json_line_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_accepts_a_large_persistent_thread_read_response(
+    fake_server: FakeCodexServer,
+) -> None:
+    history = "x" * 100_000
+    fake_server.add_rule(
+        {
+            "method": "thread/read",
+            "result": {"thread": {"id": "merger", "history": history}},
+        }
+    )
+    client = await started_client(fake_server)
+    try:
+        result = await client.request("thread/read", {"threadId": "merger"}, 5)
+        assert result == {"thread": {"id": "merger", "history": history}}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_oversized_line_fails_closed(fake_server: FakeCodexServer) -> None:
-    fake_server.add_rule({"method": "thread/read", "oversized": 70_000})
+    fake_server.add_rule({"method": "thread/read", "oversized": 1_100_000})
     client = await started_client(fake_server)
     try:
         with pytest.raises(CodexUnavailable, match="oversized"):
@@ -844,7 +863,7 @@ async def test_restart_after_protocol_violation(
     fake_server: FakeCodexServer,
 ) -> None:
     fake_server.add_rule(
-        {"method": "thread/read", "match": {"threadId": "a"}, "oversized": 70_000}
+        {"method": "thread/read", "match": {"threadId": "a"}, "oversized": 1_100_000}
     )
     client = await started_client(fake_server)
     try:
