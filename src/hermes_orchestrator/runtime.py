@@ -30,6 +30,7 @@ from hermes_orchestrator.github import (
 )
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.keychain import Keychain
+from hermes_orchestrator.lead_wakes import LeadTerminalWakes
 from hermes_orchestrator.linear import (
     ExternalEffectStore,
     LinearClient,
@@ -143,6 +144,7 @@ class Runtime:
     checkpoints: CheckpointRequests | None = None
     resets: ScheduledResets | None = None
     reconciliation: ReconciliationReport | None = None
+    lead_wakes: LeadTerminalWakes | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -219,6 +221,7 @@ def open_runtime(
         safety = CheckpointSafetyStore(database, events)
         checkpoints = CheckpointRequests(database, events)
         resets = ScheduledResets(database, events)
+        lead_wakes = LeadTerminalWakes(database=database, events=events)
         queue = QueueService(database, events, settings.projects)
         worktree_git = WorktreeGit()
         worktree_leases = WorktreeLeases(database, events)
@@ -378,6 +381,7 @@ def open_runtime(
                 context=ContextMonitor(database, events, policy=settings.policy),
                 active_time=ActiveTimeTracker(database),
                 context_window_tokens=settings.policy.context_window_tokens,
+                completion_sink=lead_wakes,
             )
             dispatch = cells.dispatch
 
@@ -425,6 +429,7 @@ def open_runtime(
             checkpoints=checkpoints,
             resets=resets,
             reconciliation=reconciliation,
+            lead_wakes=lead_wakes,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

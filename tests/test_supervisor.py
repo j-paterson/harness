@@ -212,3 +212,130 @@ async def test_supervisor_delivers_reserved_requests_through_the_dispatcher() ->
         ("ckpt:old", "delivered"),
         ("ckpt:a", "delivered"),
     ]
+
+
+class FakeWakeDelivery:
+    """Signal-bearing wake driver double mirroring LeadWakeDelivery."""
+
+    def __init__(self) -> None:
+        self.signal = asyncio.Event()
+        self.drains = 0
+        self.deliverable: list[str] = []
+
+    async def drain(self) -> tuple[str, ...]:
+        self.signal.clear()
+        self.drains += 1
+        delivered, self.deliverable = tuple(self.deliverable), []
+        return delivered
+
+
+@pytest.mark.asyncio
+async def test_wake_signal_wakes_the_loop_before_the_interval() -> None:
+    service = FakeService()
+    delivery = FakeWakeDelivery()
+    supervisor = Supervisor(
+        service,
+        wake_delivery=delivery,
+        interval_seconds=60,
+    )
+
+    await supervisor.start()
+    try:
+        await asyncio.sleep(0.05)
+        assert service.ticks == 1
+        delivery.signal.set()
+        await asyncio.sleep(0.1)
+        # The committed wake woke the loop immediately instead of waiting
+        # out the 60-second interval.
+        assert service.ticks == 2
+    finally:
+        await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_once_drains_wake_deliveries() -> None:
+    delivery = FakeWakeDelivery()
+    delivery.deliverable = ["wake-1"]
+    supervisor = Supervisor(FakeService(), wake_delivery=delivery)
+
+    await supervisor.run_once()
+
+    assert delivery.drains == 1
+    assert supervisor.wake_deliveries == ["wake-1"]
+
+
+@pytest.mark.asyncio
+async def test_wake_drain_runs_every_tick() -> None:
+    delivery = FakeWakeDelivery()
+    supervisor = Supervisor(FakeService(), wake_delivery=delivery)
+
+    await supervisor.run_once()
+    await supervisor.run_once()
+
+    # A row the transport left pending retries on the next tick: the
+    # interval itself is the retry backoff.
+    assert delivery.drains == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_transport_retries_on_interval_without_polling(
+    tmp_path: object,
+) -> None:
+    from datetime import UTC, datetime
+    from pathlib import Path
+    from uuid import UUID
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_wakes import (
+        LeadTerminalWakes,
+        LeadWakeDelivery,
+        TerminalWakeInput,
+    )
+
+    database = Database.open(Path(str(tmp_path)) / "state.db")
+    try:
+        wakes = LeadTerminalWakes(
+            database=database,
+            events=EventStore(database),
+            now=lambda: datetime(2026, 8, 28, tzinfo=UTC),
+        )
+        outcomes = [False, True]
+        delivered: list[str] = []
+
+        async def flaky_transport(wake: object) -> bool:
+            accepted = outcomes.pop(0)
+            if accepted:
+                delivered.append(wake.wake_id)  # type: ignore[attr-defined]
+            return accepted
+
+        delivery = LeadWakeDelivery(wakes, transport=flaky_transport)
+        supervisor = Supervisor(FakeService(), wake_delivery=delivery)
+        wake = wakes.commit(
+            TerminalWakeInput(
+                project_key="demo",
+                issue_id="INFRA-181",
+                cell_id="cell-demo",
+                session_id=UUID("11111111-1111-4111-8111-111111111111"),
+                profile_alias="max-a",
+                turn_key="evt-1",
+                kind="completed",
+                reason="turn_completed",
+            )
+        )
+
+        # First tick: the consumer rejects, the row stays pending, and no
+        # Hermes polling is required to keep it alive.
+        await supervisor.run_once()
+        assert supervisor.wake_deliveries == []
+        assert [row.wake_id for row in wakes.pending()] == [wake.wake_id]
+
+        # Next interval tick: the same row is pushed again and acknowledged
+        # only after acceptance.
+        await supervisor.run_once()
+        assert supervisor.wake_deliveries == [wake.wake_id]
+        assert delivered == [wake.wake_id]
+        assert wakes.pending() == ()
+        assert wakes.get(wake.wake_id).state == "delivered"
+    finally:
+        database.close()

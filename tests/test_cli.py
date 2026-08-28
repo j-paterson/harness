@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 22
+    assert json.loads(result.stdout)["schema_version"] == 24
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -476,3 +476,242 @@ async def test_wait_for_reset_schedules_durable_work_that_is_consumed(
         assert consumed == list(pending)
     finally:
         reopened.close()
+
+
+def test_hermes_command_lists_and_acks_lead_wakes(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    from uuid import uuid4
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_wakes import LeadTerminalWakes, TerminalWakeInput
+
+    _repo_root, state_dir = configured_repo
+    database = Database.open(state_dir / "state.db")
+    try:
+        wake = LeadTerminalWakes(
+            database=database, events=EventStore(database)
+        ).commit(
+            TerminalWakeInput(
+                project_key="demo",
+                issue_id="ENG-9",
+                cell_id="cell-1",
+                session_id=uuid4(),
+                profile_alias="max-a",
+                turn_key="evt-1",
+                kind="completed",
+                reason="turn_completed",
+            )
+        )
+    finally:
+        database.close()
+
+    listed = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "pending_wakes"}),
+        ]
+    )
+    assert listed.exit_code == 0
+    payload = json.loads(listed.stdout)
+    assert payload["code"] == "accepted"
+    assert [item["wake_id"] for item in payload["state"]["wakes"]] == [
+        wake.wake_id
+    ]
+
+    acked = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "ack_wake", "wake_id": wake.wake_id}),
+        ]
+    )
+    assert acked.exit_code == 0
+    assert json.loads(acked.stdout)["state"]["state"] == "delivered"
+
+    relisted = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "pending_wakes"}),
+        ]
+    )
+    assert json.loads(relisted.stdout)["state"]["wakes"] == []
+
+
+def _recording_hermes_config(tmp_path: Path, *, exit_code: int = 0) -> Path:
+    """Configure a real recording Hermes consumer command for the daemon."""
+
+    record = tmp_path / "hermes-recorded.jsonl"
+    script = tmp_path / "hermes-notify.sh"
+    script.write_text(
+        f"#!/bin/sh\ncat >> {record}\nprintf '\\n' >> {record}\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config" / "hermes.yaml").write_text(
+        f"wake_command:\n  - /bin/sh\n  - {script}\n",
+        encoding="utf-8",
+    )
+    return record
+
+
+def _seed_wake(state_dir: Path) -> str:
+    from uuid import uuid4
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_wakes import (
+        LeadTerminalWakes,
+        TerminalWakeInput,
+    )
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        wake = LeadTerminalWakes(
+            database=database, events=EventStore(database)
+        ).commit(
+            TerminalWakeInput(
+                project_key="demo",
+                issue_id="ENG-9",
+                cell_id="cell-1",
+                session_id=uuid4(),
+                profile_alias="max-a",
+                turn_key="evt-1",
+                kind="completed",
+                reason="turn_completed",
+            )
+        )
+    finally:
+        database.close()
+    return wake.wake_id
+
+
+def _wake_states(state_dir: Path) -> dict[str, str]:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        return {
+            str(row["wake_id"]): str(row["state"])
+            for row in database.execute(
+                "SELECT wake_id, state FROM lead_terminal_wakes"
+            ).fetchall()
+        }
+    finally:
+        database.close()
+
+
+def test_daemon_pushes_committed_wake_to_hermes_without_polling(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    repo_root, state_dir = configured_repo
+    record = _recording_hermes_config(repo_root)
+    # The wake was committed before this daemon start: startup replay must
+    # push it through the configured transport, not wait for pending_wakes.
+    wake_id = _seed_wake(state_dir)
+
+    result = invoke([*base_arguments(configured_repo), "daemon", "--once"])
+
+    assert result.exit_code == 0
+    recorded = [
+        json.loads(line)
+        for line in record.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [item["wake_id"] for item in recorded] == [wake_id]
+    assert recorded[0]["kind"] == "completed"
+    assert recorded[0]["issue_id"] == "ENG-9"
+    # Acknowledged only after the consumer accepted; no pending_wakes or
+    # ack_wake intent was involved.
+    assert _wake_states(state_dir) == {wake_id: "delivered"}
+
+
+def test_daemon_keeps_wake_pending_until_hermes_accepts(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    repo_root, state_dir = configured_repo
+    record = _recording_hermes_config(repo_root, exit_code=1)
+    wake_id = _seed_wake(state_dir)
+
+    result = invoke([*base_arguments(configured_repo), "daemon", "--once"])
+
+    assert result.exit_code == 0
+    # The push was attempted, but a rejecting consumer never acknowledges
+    # the row: it stays pending for the next interval retry.
+    assert record.read_text(encoding="utf-8").strip() != ""
+    assert _wake_states(state_dir) == {wake_id: "pending"}
+
+
+def test_daemon_reconstructs_lost_wake_from_terminal_evidence(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventInput, EventStore
+
+    repo_root, state_dir = configured_repo
+    record = _recording_hermes_config(repo_root)
+    session_id = "33333333-3333-4333-8333-333333333333"
+
+    # Seed the durable aftermath of a crash between the terminal handoff
+    # transition and the wake outbox insert: evidence, but no wake row.
+    database = Database.open(state_dir / "state.db")
+    try:
+        events = EventStore(database)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) VALUES (?, 'demo', "
+                "'handoff_required', 'max-a', ?, ?, ?)",
+                ("cell-1", session_id, "2026-08-28T00:00:00+00:00",
+                 "2026-08-28T00:00:00+00:00"),
+            )
+            events.append(
+                connection,
+                EventInput(
+                    event_type="issue.started",
+                    aggregate_type="issue",
+                    aggregate_id="ENG-9",
+                    payload={"cell_id": "cell-1"},
+                ),
+            )
+            events.append(
+                connection,
+                EventInput(
+                    event_type="project_cell.handoff_required",
+                    aggregate_type="project_cell",
+                    aggregate_id="cell-1",
+                    payload={
+                        "reason": "context_rotation",
+                        "session_id": session_id,
+                    },
+                ),
+            )
+    finally:
+        database.close()
+
+    result = invoke([*base_arguments(configured_repo), "daemon", "--once"])
+
+    assert result.exit_code == 0
+    recorded = [
+        json.loads(line)
+        for line in record.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [item["kind"] for item in recorded] == ["handoff_required"]
+    assert recorded[0]["issue_id"] == "ENG-9"
+    assert recorded[0]["cell_id"] == "cell-1"
+    assert recorded[0]["session_id"] == session_id
+    assert recorded[0]["turn_key"].startswith("handoff:")
+    assert list(_wake_states(state_dir).values()) == ["delivered"]
+
+    # A second daemon start neither re-manufactures nor re-delivers it.
+    again = invoke([*base_arguments(configured_repo), "daemon", "--once"])
+    assert again.exit_code == 0
+    assert len(_wake_states(state_dir)) == 1

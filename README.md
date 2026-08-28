@@ -66,7 +66,9 @@ uv run hermes-orchestrator hermes-command --json \
   '{"intent":"queue_issue","issue_id":"ENG-7","project_key":"PROJECT_ALIAS","priority":2,"operator_instruction_id":"CHAT_INSTRUCTION_ID"}'
 ```
 
-The boundary accepts only `queue_issue`, `status`, `pause`, `resume`, `retry`, `reprioritize`, `approve_handoff`, `qa_reject`, `pending_corrections`, and `ack_correction`. It has no command for discovering or claiming Linear work.
+The boundary accepts only `queue_issue`, `status`, `pause`, `resume`, `retry`, `reprioritize`, `approve_handoff`, `qa_reject`, `pending_corrections`, `ack_correction`, `pending_wakes`, and `ack_wake`. It has no command for discovering or claiming Linear work.
+
+A lead turn's terminal boundary — completed, provider capped, blocked, or handoff required — commits exactly one deduplicated, metadata-only wake row. When `config/hermes.yaml` supplies a `wake_command`, the daemon pushes each committed wake directly to that consumer command with the wake's JSON on stdin and `wake_id` as the idempotency key, acknowledging the row only after the command exits zero; a rejecting, failing, or hanging consumer leaves the row pending and the supervisor interval is the retry backoff. `pending_wakes`/`ack_wake` remain the operational fallback surface — Hermes never polls lead progress. Every terminal boundary — including a turn that finds its issue already completed — journals identity-complete durable evidence at the transition, and daemon startup deterministically reconstructs any wake lost between that evidence and the outbox insert into the same deduplicated identity, bounded by a migration-recorded floor so upgraded databases never manufacture historical wakes.
 
 For Hermes chat intake, trust this repository once with:
 

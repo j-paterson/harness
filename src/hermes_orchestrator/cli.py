@@ -25,6 +25,11 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+from hermes_orchestrator.lead_wakes import (
+    CommandWakeTransport,
+    LeadWakeDelivery,
+    LeadWakeReconciler,
+)
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
@@ -263,6 +268,8 @@ async def _run_daemon(
     projects: Sequence[str] = (),
     request_checkpoint: Callable[[str, str], Awaitable[object]] | None = None,
     checkpoint_dispatcher: CheckpointDispatcher | None = None,
+    wake_delivery: LeadWakeDelivery | None = None,
+    wake_reconciler: LeadWakeReconciler | None = None,
 ) -> Supervisor:
     supervisor = Supervisor(
         service,
@@ -270,7 +277,17 @@ async def _run_daemon(
         request_checkpoint=request_checkpoint,
         checkpoint_dispatcher=checkpoint_dispatcher,
         interval_seconds=interval,
+        wake_delivery=wake_delivery,
     )
+    if wake_reconciler is not None:
+        # Deterministic repair before replay: a wake lost between a
+        # terminal commit and its outbox insert is reconstructed from
+        # durable terminal evidence into the same deduplicated identity.
+        wake_reconciler.reconcile()
+    if wake_delivery is not None:
+        # Idempotent startup replay: wakes committed before a crash or
+        # restart re-arm the event-driven loop exactly once.
+        wake_delivery.replay_startup()
     if once:
         await supervisor.run_once()
         return supervisor
@@ -494,6 +511,17 @@ def _hermes_handlers(
     def ack_correction(command: Any) -> dict[str, Any]:
         return outbox.acknowledge(command.correction_id).as_dict()
 
+    def pending_wakes(command: Any) -> dict[str, Any]:
+        if runtime.lead_wakes is None:
+            raise ValueError("lead terminal wakes are unavailable")
+        items = runtime.lead_wakes.pending(command.project_key)
+        return {"wakes": [item.as_dict() for item in items]}
+
+    def ack_wake(command: Any) -> dict[str, Any]:
+        if runtime.lead_wakes is None:
+            raise ValueError("lead terminal wakes are unavailable")
+        return runtime.lead_wakes.mark_delivered(command.wake_id).as_dict()
+
     def qa_reject(command: Any) -> dict[str, Any]:
         flow = _open_merge_flow(settings, runtime)
         outcome = asyncio.run(
@@ -587,6 +615,8 @@ def _hermes_handlers(
     return {
         "pending_corrections": pending_corrections,
         "ack_correction": ack_correction,
+        "pending_wakes": pending_wakes,
+        "ack_wake": ack_wake,
         "qa_reject": qa_reject,
         "report_stall": report_stall,
         "approve_playbook": approve_playbook,
@@ -932,6 +962,34 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             runtime.checkpoints,
                             callback=runtime.cells.request_checkpoint,
                             current_session=runtime.cells.current_session,
+                        )
+                    ),
+                    wake_delivery=(
+                        None
+                        if runtime.lead_wakes is None
+                        else LeadWakeDelivery(
+                            runtime.lead_wakes,
+                            # Direct production delivery: each committed
+                            # wake is pushed to the configured Hermes
+                            # consumer with wake_id as the idempotency
+                            # key; pending_wakes/ack_wake stays as the
+                            # metadata-only operational fallback.
+                            transport=(
+                                None
+                                if settings.hermes is None
+                                else CommandWakeTransport(
+                                    settings.hermes.wake_command
+                                )
+                            ),
+                        )
+                    ),
+                    wake_reconciler=(
+                        None
+                        if runtime.lead_wakes is None
+                        else LeadWakeReconciler(
+                            database=runtime.database,
+                            events=EventStore(runtime.database),
+                            wakes=runtime.lead_wakes,
                         )
                     ),
                 )

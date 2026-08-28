@@ -6,6 +6,7 @@ import asyncio
 import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor, Conte
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.profiles import ProfilePool
 from hermes_orchestrator.queue import QueueService
@@ -73,6 +75,17 @@ class HandoffPort(Protocol):
         session_id: UUID,
         restated_next_action: str,
     ) -> object: ...
+
+
+class LeadCompletionSink(Protocol):
+    """Durable terminal-wake publication boundary used by project cells.
+
+    Transport-agnostic by design: the sink owns persistence, deduplication
+    by turn identity, and any in-process signalling. Cells only report
+    that one lead turn reached a terminal boundary.
+    """
+
+    def commit(self, wake: TerminalWakeInput) -> object: ...
 
 
 class RotationBlocked(RuntimeError):
@@ -132,6 +145,7 @@ class ProjectCellService:
         active_time: ActiveTimeTracker | None = None,
         context_window_tokens: int = 200_000,
         replacement_session_ids: Callable[[], UUID] = uuid.uuid4,
+        completion_sink: LeadCompletionSink | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -150,6 +164,7 @@ class ProjectCellService:
         self._active_time = active_time
         self._context_window_tokens = context_window_tokens
         self._replacement_session_ids = replacement_session_ids
+        self._completion_sink = completion_sink
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
@@ -218,6 +233,7 @@ class ProjectCellService:
         handoff_required = False
         issue_completed = False
         start_capped = False
+        limit_kind: str | None = None
         # New work starts: any prior safe-boundary proof is no longer current.
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason=f"dispatch:{issue_id}")
@@ -264,7 +280,12 @@ class ProjectCellService:
                             issue_completed = (
                                 self._queue.get(issue_id).state == IssueState.DONE
                             )
+                            if issue_completed:
+                                self._record_issue_already_completed(
+                                    cell, issue_id
+                                )
                     elif event.kind == "provider.limit":
+                        limit_kind = event.limit_kind
                         if session_confirmed:
                             handoff_required = True
                             self._require_handoff(cell, "subscription_limit")
@@ -277,11 +298,18 @@ class ProjectCellService:
                     self._active_time.idle(self._worker_key(cell), self._aware_now())
         except BaseException:
             if created and not session_confirmed:
-                self._fail_unconfirmed_start(cell)
+                self._fail_unconfirmed_start(
+                    cell, issue_id=issue_id, already_completed=issue_completed
+                )
             raise
 
         if created and not session_confirmed and not handoff_required:
-            self._fail_unconfirmed_start(cell, capped=start_capped)
+            self._fail_unconfirmed_start(
+                cell,
+                issue_id=issue_id,
+                capped=start_capped,
+                already_completed=issue_completed,
+            )
 
         if issue_completed:
             status = "already_completed"
@@ -301,6 +329,38 @@ class ProjectCellService:
                 status = "handoff_required"
         else:
             status = "start_unconfirmed"
+        if self._completion_sink is not None:
+            try:
+                self._publish_terminal_wake(
+                    cell,
+                    issue_id,
+                    status=status,
+                    provider_capped=handoff_required or start_capped,
+                    limit_kind=limit_kind,
+                    # Terminal transitions rebind this to their own durable
+                    # evidence event; the fresh fallback key covers only a
+                    # turn that left no evidence at all, so repeated failures
+                    # still each wake Hermes instead of deduplicating into
+                    # the first one.
+                    turn_key=last_event_id or f"start:{uuid.uuid4().hex}",
+                )
+            except Exception:
+                # Publication is a side effect of an already-durable terminal
+                # state; a sink failure must not destroy the turn's result.
+                # The row is reconstructible from the journal and the Hermes
+                # pending_wakes surface tolerates its absence.
+                with suppress(Exception), (
+                    self._database.transaction()
+                ) as connection:
+                    self._events.append(
+                        connection,
+                        EventInput(
+                            event_type="lead_wake.publish_failed",
+                            aggregate_type="project_cell",
+                            aggregate_id=cell.cell_id,
+                            payload={"issue_id": issue_id, "status": status},
+                        ),
+                    )
         return DispatchResult(
             status=status,
             issue_id=issue_id,
@@ -308,6 +368,124 @@ class ProjectCellService:
             session_id=cell.session_id,
             profile_alias=cell.profile_alias,
         )
+
+    def _publish_terminal_wake(
+        self,
+        cell: ProjectCell,
+        issue_id: str,
+        *,
+        status: str,
+        provider_capped: bool,
+        limit_kind: str | None,
+        turn_key: str,
+    ) -> None:
+        """Publish exactly one durable wake for this turn's terminal boundary.
+
+        The sink deduplicates by project/cell/session/turn/kind, so a
+        repeated publication of the same terminal state is a no-op. A
+        provider cap's reset metadata is read back from the durable profile
+        lease rather than recomputed, so the wake and the cooldown can
+        never disagree.
+        """
+
+        assert self._completion_sink is not None
+        if status == "working":
+            kind, reason = "completed", "turn_completed"
+        elif status == "already_completed":
+            kind, reason = "completed", "issue_already_completed"
+        elif provider_capped:
+            kind = "provider_capped"
+            reason = (
+                "subscription_limit"
+                if limit_kind is None
+                else f"subscription_limit:{limit_kind}"
+            )
+        elif status == "handoff_required":
+            kind, reason = "handoff_required", "context_rotation"
+        else:
+            kind, reason = "blocked", "start_unconfirmed"
+        # A terminal transition binds the wake to its own durable evidence
+        # event: the same identity a repair pass derives, so a wake lost
+        # between the transition and this insert reconstructs into exactly
+        # one deduplicated row.
+        if status == "handoff_required":
+            evidence = self._latest_terminal_evidence_id(
+                cell.cell_id, "project_cell.handoff_required"
+            )
+            if evidence is not None:
+                turn_key = f"handoff:{evidence}"
+        elif status == "already_completed":
+            evidence = self._latest_terminal_evidence_id(
+                cell.cell_id, "project_cell.issue_already_completed"
+            )
+            if evidence is not None:
+                turn_key = f"already_completed:{evidence}"
+        elif status == "start_unconfirmed":
+            evidence = self._latest_terminal_evidence_id(
+                cell.cell_id, "project_cell.start_failed"
+            )
+            if evidence is not None:
+                turn_key = f"start_failed:{evidence}"
+        reset_at: str | None = None
+        if kind == "provider_capped":
+            row = self._database.execute(
+                "SELECT cooldown_until FROM profile_leases "
+                "WHERE profile_alias = ?",
+                (cell.profile_alias,),
+            ).fetchone()
+            if row is not None and row["cooldown_until"]:
+                reset_at = str(row["cooldown_until"])
+        self._completion_sink.commit(
+            TerminalWakeInput(
+                project_key=cell.project_key,
+                issue_id=issue_id,
+                cell_id=cell.cell_id,
+                session_id=cell.session_id,
+                profile_alias=cell.profile_alias,
+                turn_key=turn_key,
+                kind=kind,
+                reason=reason,
+                reset_at=reset_at,
+            )
+        )
+
+    def _record_issue_already_completed(
+        self, cell: ProjectCell, issue_id: str
+    ) -> None:
+        """Journal identity-complete already_completed terminal evidence.
+
+        The direct wake binds its turn key to this event, and startup
+        repair derives the identical project/issue/cell/session/turn/kind/
+        reason from it, so a wake lost before its outbox insert is
+        deterministically reconstructible without a redispatch.
+        """
+
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="project_cell.issue_already_completed",
+                    aggregate_type="project_cell",
+                    aggregate_id=cell.cell_id,
+                    payload={
+                        "project_key": cell.project_key,
+                        "profile_alias": cell.profile_alias,
+                        "issue_id": issue_id,
+                        "session_id": str(cell.session_id),
+                    },
+                ),
+            )
+
+    def _latest_terminal_evidence_id(
+        self, cell_id: str, event_type: str
+    ) -> str | None:
+        row = self._database.execute(
+            "SELECT event_id FROM events "
+            "WHERE aggregate_type = 'project_cell' AND aggregate_id = ? "
+            "AND event_type = ? ORDER BY sequence DESC LIMIT 1",
+            (cell_id, event_type),
+        ).fetchone()
+        return None if row is None else str(row["event_id"])
 
     def record(self, cell: ProjectCell, event: ClaudeEvent) -> str:
         """Journal a sanitized Claude event and any child worker observation.
@@ -332,6 +510,7 @@ class ProjectCellService:
                         "parent_tool_use_id": event.parent_tool_use_id,
                         "usage": event.usage,
                         "error_code": event.error_code,
+                        "limit_kind": event.limit_kind,
                     },
                 ),
             )
@@ -558,7 +737,9 @@ class ProjectCellService:
         self,
         cell: ProjectCell,
         *,
+        issue_id: str,
         capped: bool = False,
+        already_completed: bool = False,
     ) -> bool:
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason="start_failed")
@@ -599,10 +780,25 @@ class ProjectCellService:
                     event_type="project_cell.start_failed",
                     aggregate_type="project_cell",
                     aggregate_id=cell.cell_id,
+                    # The full wake identity rides on the terminal evidence,
+                    # so a wake lost after this commit is reconstructible.
                     payload={
                         "project_key": cell.project_key,
                         "profile_alias": cell.profile_alias,
-                        "reason": "subscription_limit" if capped else "unconfirmed",
+                        "issue_id": issue_id,
+                        "session_id": str(cell.session_id),
+                        # An already-completed issue owns this turn's wake
+                        # through its dedicated terminal evidence; tagging
+                        # the start failure keeps repair from also deriving
+                        # a blocked or capped wake the direct path never
+                        # published.
+                        "reason": (
+                            "issue_already_completed"
+                            if already_completed
+                            else "subscription_limit"
+                            if capped
+                            else "unconfirmed"
+                        ),
                     },
                 ),
             )
@@ -937,7 +1133,12 @@ class ProjectCellService:
                     event_type="project_cell.handoff_required",
                     aggregate_type="project_cell",
                     aggregate_id=cell.cell_id,
-                    payload={"reason": reason},
+                    # The session binding makes this terminal evidence
+                    # reconstructible into exactly this epoch's wake.
+                    payload={
+                        "reason": reason,
+                        "session_id": str(cell.session_id),
+                    },
                 ),
             )
         self._profiles.set_cooldown(cell.profile_alias, cooldown_until)

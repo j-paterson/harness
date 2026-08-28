@@ -146,6 +146,16 @@ class AckCorrectionCommand(_Command):
     correction_id: NonEmptyText
 
 
+class PendingWakesCommand(_Command):
+    intent: Literal["pending_wakes"]
+    project_key: NonEmptyText | None = None
+
+
+class AckWakeCommand(_Command):
+    intent: Literal["ack_wake"]
+    wake_id: NonEmptyText
+
+
 HermesCommand = Annotated[
     QueueIssueCommand
     | StatusCommand
@@ -163,7 +173,9 @@ HermesCommand = Annotated[
     | ReportStallCommand
     | ApprovePlaybookCommand
     | PendingConsultationsCommand
-    | RecordRemedyResultCommand,
+    | RecordRemedyResultCommand
+    | PendingWakesCommand
+    | AckWakeCommand,
     Field(discriminator="intent"),
 ]
 
@@ -189,6 +201,8 @@ _ALLOWED_INTENTS = frozenset(
         "approve_playbook",
         "pending_consultations",
         "record_remedy_result",
+        "pending_wakes",
+        "ack_wake",
     }
 )
 

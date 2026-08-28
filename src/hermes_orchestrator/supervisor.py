@@ -14,6 +14,14 @@ class SupervisorService(Protocol):
     def tick(self) -> object: ...
 
 
+class WakeDeliveryDriver(Protocol):
+    """Event-driven lead terminal wake driver used by the loop."""
+
+    signal: asyncio.Event
+
+    async def drain(self) -> tuple[str, ...]: ...
+
+
 AsyncAction = Callable[[], Awaitable[None]]
 Dispatcher = Callable[[str], Awaitable[object]]
 
@@ -35,6 +43,7 @@ class Supervisor:
         checkpoint_workers: AsyncAction = _nothing,
         interval_seconds: float = 30.0,
         checkpoint_timeout: float = 30.0,
+        wake_delivery: WakeDeliveryDriver | None = None,
     ) -> None:
         if interval_seconds <= 0 or checkpoint_timeout <= 0:
             raise ValueError("supervisor intervals must be positive")
@@ -43,8 +52,10 @@ class Supervisor:
         self._request_checkpoint = request_checkpoint
         self._checkpoint_dispatcher = checkpoint_dispatcher
         self._checkpoint_workers = checkpoint_workers
+        self._wake_delivery = wake_delivery
         self.checkpoint_requests: list[tuple[str, str]] = []
         self.checkpoint_deliveries: list[tuple[str, str]] = []
+        self.wake_deliveries: list[str] = []
         self._interval_seconds = interval_seconds
         self._checkpoint_timeout = checkpoint_timeout
         self._closing = asyncio.Event()
@@ -71,6 +82,11 @@ class Supervisor:
         result = self._service.tick()
         self.ticks += 1
         self.events.append("supervisor.ticked")
+        # Lead terminal wakes are event-driven: forward-progress commits end
+        # the interval wait early, and each tick's drain retries anything the
+        # transport left pending — the interval is the retry backoff.
+        if self._wake_delivery is not None:
+            self.wake_deliveries.extend(await self._wake_delivery.drain())
         # Red pressure: exactly one checkpoint request per tick; the next
         # tick re-samples and continues only while red persists. Every
         # reserved request is delivered through the dispatcher, which
@@ -130,10 +146,20 @@ class Supervisor:
     async def _loop(self) -> None:
         while not self._closing.is_set():
             await self.run_once()
-            try:
-                await asyncio.wait_for(
-                    self._closing.wait(),
-                    timeout=self._interval_seconds,
+            # A committed lead wake ends the wait immediately; otherwise the
+            # interval tick continues token-free local resource sampling.
+            waiters = [asyncio.create_task(self._closing.wait())]
+            if self._wake_delivery is not None:
+                waiters.append(
+                    asyncio.create_task(self._wake_delivery.signal.wait())
                 )
-            except TimeoutError:
-                continue
+            try:
+                await asyncio.wait(
+                    waiters,
+                    timeout=self._interval_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for waiter in waiters:
+                    waiter.cancel()
+                await asyncio.gather(*waiters, return_exceptions=True)

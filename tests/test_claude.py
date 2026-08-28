@@ -110,6 +110,7 @@ def test_parser_extracts_session_subagent_and_limit_events() -> None:
     assert events[2].error_code is None
     assert events[3].parent_tool_use_id is None
     assert events[3].error_code == "subscription_limit"
+    assert events[3].limit_kind == "fable"
 
 
 def test_parser_recognizes_reached_fable_limit_message() -> None:
@@ -137,6 +138,7 @@ def test_parser_recognizes_reached_fable_limit_message() -> None:
 
     assert event.kind == "provider.limit"
     assert event.error_code == "subscription_limit"
+    assert event.limit_kind == "fable"
 
 
 def test_parser_recognizes_terminal_usage_cap_error() -> None:
@@ -153,6 +155,150 @@ def test_parser_recognizes_terminal_usage_cap_error() -> None:
 
     assert event.kind == "provider.limit"
     assert event.error_code == "subscription_limit"
+    assert event.limit_kind == "session"
+
+
+def test_parser_recognizes_session_limit_message() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": None,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've hit your session limit. "
+                            "Please wait for it to reset.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
+    assert event.limit_kind == "session"
+
+
+def test_parser_recognizes_monthly_spend_limit_message() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": None,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've reached your monthly spend "
+                            "limit. Manage usage credits to continue.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
+    assert event.limit_kind == "monthly_spend"
+
+
+def test_parser_recognizes_monthly_spend_cap_message() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": None,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've hit your monthly spend cap. "
+                            "Manage usage credits to continue.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
+    assert event.limit_kind == "monthly_spend"
+
+
+def test_parser_recognizes_terminal_monthly_spend_cap_error() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "errors": ["You've reached your monthly spend cap; "
+                           "retry after reset."],
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
+    assert event.limit_kind == "monthly_spend"
+
+
+def test_parser_limit_kind_is_none_on_ordinary_assistant_event() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Working on it."}],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.limit_kind is None
+
+
+def test_parser_ignores_near_miss_usage_limit_mid_sentence() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've almost hit your usage limit, "
+                            "so plan accordingly.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+    assert event.limit_kind is None
 
 
 def test_parser_ignores_result_prose_with_limit_language() -> None:
@@ -213,6 +359,7 @@ def test_parser_ignores_top_level_disk_usage_cap_error() -> None:
 
     assert event.kind == "stream.result"
     assert event.error_code is None
+    assert event.limit_kind is None
 
 
 def test_parser_ignores_mathematical_limit_prose() -> None:

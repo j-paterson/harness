@@ -317,3 +317,37 @@ def test_circleci_token_is_read_only_when_a_project_uses_circleci(
         assert runtime.merge_flow is not None
     finally:
         runtime.close()
+
+
+def test_active_runtime_wires_lead_terminal_wakes_as_completion_sink(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        assert runtime.lead_wakes is not None
+        assert runtime.cells is not None
+        assert runtime.cells._completion_sink is runtime.lead_wakes
+    finally:
+        runtime.close()
+
+
+def test_observation_runtime_still_exposes_lead_wakes(tmp_path: Path) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        # The Hermes pending_wakes surface works even without a live lead.
+        assert runtime.lead_wakes is not None
+        assert runtime.lead_wakes.pending() == ()
+    finally:
+        runtime.close()

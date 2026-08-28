@@ -225,6 +225,57 @@ def test_remote_capability_intents_without_handlers_are_unavailable(
         assert result.code == "intent_unavailable", intent
 
 
+def test_pending_wakes_and_ack_wake_are_strict_and_routed(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    calls: list[tuple[str, object]] = []
+
+    def pending(command: object) -> dict[str, object]:
+        calls.append(("pending", command))
+        return {"wakes": []}
+
+    def ack(command: object) -> dict[str, object]:
+        calls.append(("ack", command))
+        return {"acknowledged": True}
+
+    service = HermesCommandService(
+        queue, handlers={"pending_wakes": pending, "ack_wake": ack}
+    )
+    listed = service.execute({"intent": "pending_wakes"})
+    assert listed.code == "accepted"
+    assert listed.state == {"wakes": []}
+    assert calls[0][1].project_key is None
+
+    acked = service.execute({"intent": "ack_wake", "wake_id": "w-1"})
+    assert acked.code == "accepted"
+    assert acked.state == {"acknowledged": True}
+    assert calls[1][1].wake_id == "w-1"
+
+    invalid = service.execute({"intent": "ack_wake"})
+    assert invalid.code == "invalid_command"
+
+
+def test_pending_wakes_and_ack_wake_without_handlers_are_unavailable(
+    command_service: HermesCommandService,
+) -> None:
+    missing_pending = command_service.execute({"intent": "pending_wakes"})
+    assert missing_pending.code == "intent_unavailable"
+    missing_ack = command_service.execute({"intent": "ack_wake", "wake_id": "w-1"})
+    assert missing_ack.code == "intent_unavailable"
+
+
+def test_supports_reflects_pending_wakes_and_ack_wake(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    bare = HermesCommandService(queue)
+    assert not bare.supports("pending_wakes")
+    assert not bare.supports("ack_wake")
+
+    wired = HermesCommandService(
+        queue, handlers={"pending_wakes": lambda c: {}, "ack_wake": lambda c: {}}
+    )
+    assert wired.supports("pending_wakes")
+    assert wired.supports("ack_wake")
+
+
 def test_supports_reflects_inline_and_wired_intents(database: Database) -> None:
     queue = QueueService(database, EventStore(database), {"demo"})
     bare = HermesCommandService(queue)

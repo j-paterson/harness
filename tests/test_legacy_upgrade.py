@@ -89,7 +89,7 @@ def test_legacy_database_upgrades_to_current_schema(tmp_path: Path) -> None:
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 22
+        assert database.schema_version() == 24
         names = tables(database)
         assert "reviewer_channels" in names
         assert "merger_threads" not in names
@@ -148,7 +148,7 @@ def test_upgrade_never_replaces_an_existing_current_channel(tmp_path: Path) -> N
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 22
+        assert database.schema_version() == 24
         row = database.execute(
             "SELECT thread_id, generation, state FROM reviewer_channels"
         ).fetchone()
@@ -168,7 +168,7 @@ def test_upgrade_is_idempotent_across_reopen(tmp_path: Path) -> None:
     Database.open(path).close()
     reopened = Database.open(path)
     try:
-        assert reopened.schema_version() == 22
+        assert reopened.schema_version() == 24
         assert reopened.scalar("SELECT count(*) FROM reviewer_channels") == 1
     finally:
         reopened.close()
@@ -250,7 +250,7 @@ def test_pending_commands_survive_the_claim_state_recreate(tmp_path: Path) -> No
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 22
+        assert database.schema_version() == 24
         row = database.execute(
             "SELECT * FROM remote_pending_commands WHERE confirmation_id = 'c-1'"
         ).fetchone()
@@ -267,5 +267,60 @@ def test_pending_commands_survive_the_claim_state_recreate(tmp_path: Path) -> No
         ).fetchone()
         assert result["code"] == "accepted"
         assert database.scalar("PRAGMA integrity_check") == "ok"
+    finally:
+        database.close()
+
+
+def test_wake_repair_floor_excludes_pre_upgrade_terminal_evidence(
+    tmp_path: Path,
+) -> None:
+    """Upgrading a lived-in database never manufactures historical wakes."""
+
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_wakes import (
+        LeadTerminalWakes,
+        LeadWakeReconciler,
+    )
+
+    path = tmp_path / "legacy.db"
+    build_legacy_database(path)
+
+    # Terminal evidence journaled long before the wake outbox existed.
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at) VALUES ('cell-old', 'demo', "
+            "'handoff_required', 'max-a', "
+            "'44444444-4444-4444-8444-444444444444', 't0', 't0')"
+        )
+        connection.execute(
+            "INSERT INTO events(event_id, occurred_at, event_type, "
+            "aggregate_type, aggregate_id, correlation_id, actor, "
+            "payload_json) VALUES ('evt-old', 't0', "
+            "'project_cell.handoff_required', 'project_cell', 'cell-old', "
+            "NULL, 'orchestrator', '{\"reason\": \"context_rotation\", "
+            "\"session_id\": \"44444444-4444-4444-8444-444444444444\"}')"
+        )
+    finally:
+        connection.close()
+
+    database = Database.open(path)
+    try:
+        floor = database.scalar(
+            "SELECT floor_sequence FROM lead_wake_repair WHERE id = 1"
+        )
+        assert int(floor) >= 1
+        wakes = LeadTerminalWakes(
+            database=database, events=EventStore(database)
+        )
+        reconciler = LeadWakeReconciler(
+            database=database, events=EventStore(database), wakes=wakes
+        )
+        assert reconciler.reconcile() == ()
+        assert database.scalar(
+            "SELECT count(*) FROM lead_terminal_wakes"
+        ) == 0
     finally:
         database.close()

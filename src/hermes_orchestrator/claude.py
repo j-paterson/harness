@@ -26,9 +26,23 @@ _CONTEXT_ERROR_TEXT = re.compile(
     r"context window|prompt is too long|input length|context length exceeded"
 )
 _LIMIT_RESULT_SUBTYPES = frozenset({"error_during_execution"})
-_SUBSCRIPTION_LIMIT_TEXT = re.compile(
-    "^you['\u2019]ve (?:reached|hit) your "
-    r"(?:fable \d+(?:\.\d+)? limit|usage limit)\b"
+# Each family shares the same "you've reached/hit your ..." prefix and word
+# boundary discipline as the original subscription-limit match; only the
+# trailing cap phrase differs per family.
+_LIMIT_PREFIX = "^you['\u2019]ve (?:reached|hit) your "
+_LIMIT_KIND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "fable",
+        re.compile(_LIMIT_PREFIX + r"fable \d+(?:\.\d+)? limit\b"),
+    ),
+    (
+        "session",
+        re.compile(_LIMIT_PREFIX + r"(?:usage|session) limit\b"),
+    ),
+    (
+        "monthly_spend",
+        re.compile(_LIMIT_PREFIX + r"monthly spend (?:limit|cap)\b"),
+    ),
 )
 
 
@@ -57,6 +71,7 @@ class ClaudeEvent:
     usage: dict[str, int]
     error_code: str | None = None
     restated_next_action: str | None = None
+    limit_kind: str | None = None
 
 
 class ClaudeStreamError(ValueError):
@@ -94,6 +109,7 @@ class ClaudeEventParser:
         kind = f"stream.{original_type}"
         error_code = None
         restated_next_action = None
+        limit_kind = None
         if original_type == "system" and subtype == "init":
             kind = "session.started"
         elif original_type == "system" and subtype in _COMPACTION_SUBTYPES:
@@ -106,9 +122,10 @@ class ClaudeEventParser:
         elif action := self._handoff_acknowledgement(value):
             kind = "handoff.acknowledged"
             restated_next_action = action
-        elif self._is_subscription_limit(value):
+        elif found := self._subscription_limit_kind(value):
             kind = "provider.limit"
             error_code = "subscription_limit"
+            limit_kind = found
 
         return ClaudeEvent(
             kind=kind,
@@ -119,6 +136,7 @@ class ClaudeEventParser:
             usage=usage,
             error_code=error_code,
             restated_next_action=restated_next_action,
+            limit_kind=limit_kind,
         )
 
     @staticmethod
@@ -170,48 +188,53 @@ class ClaudeEventParser:
         )
 
     @classmethod
-    def _is_subscription_limit(cls, value: dict[str, Any]) -> bool:
-        """Match only authoritative top-level CLI subscription-limit shapes.
+    def _subscription_limit_kind(cls, value: dict[str, Any]) -> str | None:
+        """Classify only authoritative top-level CLI subscription-limit shapes.
 
         A live cap is either a synthetic assistant message (the CLI's
         ``"model": "<synthetic>"`` discriminator) or a terminal result error,
         and in both cases only the exact observed subscription wording
         counts. Child-agent records, rate-limit telemetry, generic cap prose
         such as concurrency or disk limits, and limit language in prompts,
-        tool results, or result prose must never count as exhaustion.
+        tool results, or result prose must never count as exhaustion. The
+        Fable, session, and monthly-spend cap families all normalize to
+        kind="provider.limit"/error_code="subscription_limit"; the returned
+        string only distinguishes which family fired.
         """
 
         if value.get("parent_tool_use_id") is not None:
-            return False
+            return None
         record_type = value.get("type")
         if record_type == "result":
             if value.get("subtype") not in _LIMIT_RESULT_SUBTYPES:
-                return False
+                return None
             errors = value.get("errors")
             if not isinstance(errors, list):
-                return False
-            return any(
-                isinstance(item, str) and cls._is_limit_text(item)
-                for item in errors
-            )
+                return None
+            for item in errors:
+                if isinstance(item, str) and (kind := cls._limit_kind(item)):
+                    return kind
+            return None
         if record_type == "assistant":
             message = value.get("message")
             if (
                 not isinstance(message, dict)
                 or message.get("model") != _SYNTHETIC_MODEL
             ):
-                return False
+                return None
             content = message.get("content")
             if not isinstance(content, list):
-                return False
-            return any(
-                isinstance(block, dict)
-                and block.get("type") == "text"
-                and isinstance(block.get("text"), str)
-                and cls._is_limit_text(block["text"])
-                for block in content
-            )
-        return False
+                return None
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and (kind := cls._limit_kind(block["text"]))
+                ):
+                    return kind
+            return None
+        return None
 
     @staticmethod
     def _is_context_error(value: dict[str, Any]) -> bool:
@@ -230,8 +253,14 @@ class ClaudeEventParser:
         )
 
     @staticmethod
-    def _is_limit_text(value: str) -> bool:
-        return _SUBSCRIPTION_LIMIT_TEXT.match(value.strip().lower()) is not None
+    def _limit_kind(value: str) -> str | None:
+        """Classify one text string against the known cap families, once."""
+
+        normalized = value.strip().lower()
+        for kind, pattern in _LIMIT_KIND_PATTERNS:
+            if pattern.match(normalized):
+                return kind
+        return None
 
     @staticmethod
     def _handoff_acknowledgement(value: dict[str, Any]) -> str | None:

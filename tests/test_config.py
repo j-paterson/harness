@@ -207,3 +207,55 @@ def test_project_ci_policy_is_explicit_and_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError):
         load_settings(tmp_path, tmp_path / "state")
+
+
+def _write_minimal_config(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        "    repo_path: /tmp/demo\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\n", encoding="utf-8"
+    )
+
+
+def test_hermes_wake_command_loads_from_config(tmp_path: Path) -> None:
+    _write_minimal_config(tmp_path)
+    (tmp_path / "config/hermes.yaml").write_text(
+        "wake_command:\n  - /usr/local/bin/hermes-notify\n  - --wake\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.hermes is not None
+    assert settings.hermes.wake_command == [
+        "/usr/local/bin/hermes-notify",
+        "--wake",
+    ]
+
+
+def test_absent_hermes_config_leaves_direct_delivery_off(
+    tmp_path: Path,
+) -> None:
+    _write_minimal_config(tmp_path)
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.hermes is None
+
+
+def test_hermes_wake_command_must_not_be_empty(tmp_path: Path) -> None:
+    _write_minimal_config(tmp_path)
+    (tmp_path / "config/hermes.yaml").write_text(
+        "wake_command: []\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, tmp_path / "state")

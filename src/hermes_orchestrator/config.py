@@ -77,6 +77,21 @@ class LinearRuntimeConfig(BaseModel):
     teams: dict[str, LinearTeamConfig] = Field(min_length=1)
 
 
+class HermesRuntimeConfig(BaseModel):
+    """Direct Hermes wake delivery for the production daemon.
+
+    ``wake_command`` is executed once per committed lead terminal wake with
+    the wake's orchestration metadata as JSON on stdin; ``wake_id`` is the
+    consumer's idempotency key and exit status zero is the only acceptance
+    signal. Without this file the daemon leaves wakes on the
+    ``pending_wakes``/``ack_wake`` fallback surface.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    wake_command: list[NonEmptyId] = Field(min_length=1)
+
+
 class ResourcePolicy(BaseModel):
     """Resource thresholds; null values keep admission observation-only."""
 
@@ -120,6 +135,7 @@ class Settings(BaseModel):
     projects: dict[str, ProjectConfig]
     policy: PolicyConfig
     linear: LinearRuntimeConfig | None = None
+    hermes: HermesRuntimeConfig | None = None
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -167,6 +183,13 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
         policy_document.update(_read_yaml(local_policy_path))
     policy = PolicyConfig.model_validate(policy_document)
 
+    hermes_path = config_dir / "hermes.yaml"
+    hermes = (
+        HermesRuntimeConfig.model_validate(_read_yaml(hermes_path))
+        if hermes_path.exists()
+        else None
+    )
+
     linear_path = config_dir / "linear.yaml"
     linear = (
         LinearRuntimeConfig.model_validate(_read_yaml(linear_path))
@@ -213,4 +236,5 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
         projects=projects,
         policy=policy,
         linear=linear,
+        hermes=hermes,
     )

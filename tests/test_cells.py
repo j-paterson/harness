@@ -19,6 +19,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
+from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.profiles import (
     ProfileHealth,
@@ -1382,6 +1383,7 @@ def context_cells(
     runner: ContextRunner,
     *,
     clock: list[datetime],
+    completion_sink: object | None = None,
 ) -> tuple[ProjectCellService, HandoffService]:
     from hermes_orchestrator.config import PolicyConfig
     from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
@@ -1403,6 +1405,7 @@ def context_cells(
         active_time=ActiveTimeTracker(database),
         context_window_tokens=100_000,
         now=lambda: clock[-1],
+        completion_sink=completion_sink,
     )
     return cells, handoffs
 
@@ -1965,3 +1968,827 @@ async def test_top_level_subagent_start_usage_still_counts(
     assert result.status == "handoff_required"
     assert handoff_reasons(database) == ["context_rotation"]
     assert _context_evidence(database)[1] == 86.0
+
+
+class RecordingSink:
+    """Collects committed terminal wakes without any transport."""
+
+    def __init__(self) -> None:
+        self.wakes: list[TerminalWakeInput] = []
+
+    def commit(self, wake: TerminalWakeInput) -> TerminalWakeInput:
+        self.wakes.append(wake)
+        return wake
+
+
+def sink_cells(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+    *,
+    cell_ids: object | None = None,
+    completion_sink: object | None = None,
+) -> tuple[ProjectCellService, RecordingSink]:
+    sink = completion_sink if completion_sink is not None else RecordingSink()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=cell_ids or (lambda: "cell-demo"),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        completion_sink=sink,
+    )
+    return service, sink
+
+
+def last_cell_event_id(database: Database) -> str:
+    row = database.execute(
+        "SELECT event_id FROM events WHERE aggregate_type = 'project_cell' "
+        "ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    return str(row["event_id"])
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_commits_one_completed_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    service, sink = sink_cells(database, queue, profiles, runner, linear, tmp_path)
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    assert len(sink.wakes) == 1
+    wake = sink.wakes[0]
+    assert wake.kind == "completed"
+    assert wake.reason == "turn_completed"
+    assert wake.project_key == "demo"
+    assert wake.issue_id == "ENG-9"
+    assert wake.cell_id == "cell-demo"
+    assert wake.session_id == SESSION_ID
+    assert wake.profile_alias == "max-a"
+    assert wake.reset_at is None
+    # The wake binds the turn's terminal evidence event.
+    assert wake.turn_key == last_cell_event_id(database)
+
+
+@pytest.mark.asyncio
+async def test_each_turn_commits_a_distinct_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+    service, sink = sink_cells(database, queue, profiles, runner, linear, tmp_path)
+
+    await service.dispatch("ENG-9")
+    await service.dispatch("ENG-10")
+
+    assert [wake.kind for wake in sink.wakes] == ["completed", "completed"]
+    assert sink.wakes[0].turn_key != sink.wakes[1].turn_key
+
+
+@pytest.mark.asyncio
+async def test_provider_limit_commits_provider_capped_wake_with_reset(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_limit = True
+    service, sink = sink_cells(database, queue, profiles, runner, linear, tmp_path)
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "handoff_required"
+    assert len(sink.wakes) == 1
+    wake = sink.wakes[0]
+    assert wake.kind == "provider_capped"
+    assert wake.reason == "subscription_limit"
+    # The reset metadata is the durable lease cooldown, not a recomputation.
+    assert wake.reset_at == "2026-08-26T01:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_start_capped_commits_provider_capped_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_session_started = False
+    runner.emit_limit = True
+    service, sink = sink_cells(database, queue, profiles, runner, linear, tmp_path)
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "start_unconfirmed"
+    assert [wake.kind for wake in sink.wakes] == ["provider_capped"]
+    assert sink.wakes[0].reason == "subscription_limit"
+    assert sink.wakes[0].reset_at == "2026-08-26T01:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_start_commits_blocked_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_session_started = False
+    service, sink = sink_cells(database, queue, profiles, runner, linear, tmp_path)
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "start_unconfirmed"
+    assert [wake.kind for wake in sink.wakes] == ["blocked"]
+    assert sink.wakes[0].reason == "start_unconfirmed"
+    assert sink.wakes[0].reset_at is None
+    # The wake binds the durable start-failure evidence event, so a lost
+    # wake reconstructs into exactly this identity.
+    assert sink.wakes[0].turn_key == f"start_failed:{last_cell_event_id(database)}"
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_starts_each_commit_a_distinct_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_session_started = False
+    counter = iter(range(1, 10))
+    service, sink = sink_cells(
+        database,
+        queue,
+        profiles,
+        runner,
+        linear,
+        tmp_path,
+        cell_ids=lambda: f"cell-{next(counter)}",
+    )
+
+    await service.dispatch("ENG-9")
+    await service.dispatch("ENG-9")
+
+    # Every stuck attempt must wake Hermes; a constant fallback key would
+    # deduplicate the second failure into invisibility.
+    assert [wake.kind for wake in sink.wakes] == ["blocked", "blocked"]
+    assert sink.wakes[0].turn_key != sink.wakes[1].turn_key
+
+
+@pytest.mark.asyncio
+async def test_sink_failure_does_not_destroy_the_turn_result(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    class ExplodingSink:
+        def commit(self, wake: TerminalWakeInput) -> TerminalWakeInput:
+            raise RuntimeError("outbox is unavailable")
+
+    admit(queue, "ENG-9")
+    service, _ = sink_cells(
+        database,
+        queue,
+        profiles,
+        runner,
+        linear,
+        tmp_path,
+        completion_sink=ExplodingSink(),
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    failures = database.execute(
+        "SELECT aggregate_id FROM events "
+        "WHERE event_type = 'lead_wake.publish_failed'"
+    ).fetchall()
+    assert [str(row["aggregate_id"]) for row in failures] == ["cell-demo"]
+
+
+@pytest.mark.asyncio
+async def test_issue_completed_during_turn_commits_completed_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+
+    class CompletingProjection(RecordingLinear):
+        async def project(
+            self,
+            issue_id: str,
+            target: LinearProjection,
+            effect_id: str,
+        ) -> object:
+            result = await super().project(issue_id, target, effect_id)
+            # An explicit terminal reconciliation wins the race mid-turn.
+            with database.transaction() as connection:
+                connection.execute(
+                    "UPDATE admitted_issues SET state = 'done' "
+                    "WHERE issue_id = ?",
+                    (issue_id,),
+                )
+            return result
+
+    service, sink = sink_cells(
+        database, queue, profiles, runner, CompletingProjection(), tmp_path
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "already_completed"
+    assert [wake.kind for wake in sink.wakes] == ["completed"]
+    assert sink.wakes[0].reason == "issue_already_completed"
+
+
+@pytest.mark.asyncio
+async def test_issue_completed_during_validation_commits_no_wake(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+
+    class CompletingLinear(RecordingLinear):
+        async def validate(self, project_key: str, issue_id: str) -> object:
+            result = await super().validate(project_key, issue_id)
+            queue.complete(
+                issue_id,
+                reason="linear_completed",
+                evidence="https://linear.example/ENG-9",
+            )
+            return result
+
+    service, sink = sink_cells(
+        database, queue, profiles, runner, CompletingLinear(), tmp_path
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    # No lead turn ran, so there is no terminal boundary to wake on.
+    assert result.status == "already_completed"
+    assert sink.wakes == []
+
+
+@pytest.mark.asyncio
+async def test_context_rotation_commits_handoff_required_wake(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ContextRunner()
+    runner.usage_tokens = [85_000]
+    admit(queue, "ENG-9")
+    sink = RecordingSink()
+    cells, _ = context_cells(
+        database, queue, profiles, runner, clock=clock, completion_sink=sink
+    )
+
+    result = await cells.dispatch("ENG-9")
+
+    assert result.status == "handoff_required"
+    assert [wake.kind for wake in sink.wakes] == ["handoff_required"]
+    assert sink.wakes[0].reason == "context_rotation"
+    assert sink.wakes[0].reset_at is None
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_persists_one_durable_deduplicated_wake_row(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.lead_wakes import LeadTerminalWakes
+
+    admit(queue, "ENG-9")
+    events = EventStore(database)
+    wakes = LeadTerminalWakes(database=database, events=events)
+    service = ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        completion_sink=wakes,
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    pending = wakes.pending("demo")
+    assert len(pending) == 1
+    assert pending[0].kind == "completed"
+    assert pending[0].session_id == str(SESSION_ID)
+    assert pending[0].state == "pending"
+
+
+class CrashingSink:
+    """Simulates losing the wake insert after the terminal state committed."""
+
+    def commit(self, wake: TerminalWakeInput) -> TerminalWakeInput:
+        raise RuntimeError("crashed before the outbox insert")
+
+
+def repair_cells(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+    *,
+    sink: object,
+) -> ProjectCellService:
+    from hermes_orchestrator.checkpoints import CheckpointSafetyStore
+
+    events = EventStore(database)
+    return ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        safety=CheckpointSafetyStore(database, events),
+        completion_sink=sink,
+    )
+
+
+def repair_pair(database: Database) -> tuple[object, object]:
+    from hermes_orchestrator.lead_wakes import (
+        LeadTerminalWakes,
+        LeadWakeReconciler,
+    )
+
+    wakes = LeadTerminalWakes(database=database, events=EventStore(database))
+    reconciler = LeadWakeReconciler(
+        database=database, events=EventStore(database), wakes=wakes
+    )
+    return reconciler, wakes
+
+
+def wake_rows(database: Database) -> list[dict[str, object]]:
+    return [
+        dict(row)
+        for row in database.execute(
+            "SELECT * FROM lead_terminal_wakes ORDER BY created_at, rowid"
+        ).fetchall()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lost_completed_wake_reconstructs_from_safety_evidence(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    service = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=CrashingSink()
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    # The wake insert failed, but the terminal result survived durably.
+    assert result.status == "working"
+    reconciler, wakes = repair_pair(database)
+    assert wakes.pending() == ()
+
+    reconstructed = reconciler.reconcile()
+
+    assert [wake.kind for wake in reconstructed] == ["completed"]
+    wake = reconstructed[0]
+    evidence = database.execute(
+        "SELECT evidence_id, session_id FROM checkpoint_safety "
+        "WHERE cell_id = 'cell-demo'"
+    ).fetchone()
+    assert wake.turn_key == str(evidence["evidence_id"])
+    assert wake.reason == "turn_completed"
+    assert wake.project_key == "demo"
+    assert wake.issue_id == "ENG-9"
+    assert wake.cell_id == "cell-demo"
+    assert wake.session_id == str(SESSION_ID)
+    assert wake.profile_alias == "max-a"
+    assert wake.state == "pending"
+    # Repeated repair stays deduplicated on the same turn identity.
+    assert reconciler.reconcile() == ()
+    assert len(wake_rows(database)) == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_before_wake_insert_recovers_exactly_once_on_restart(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.lead_wakes import LeadWakeDelivery
+
+    class CrashingRunner(RecordingRunner):
+        async def _events(
+            self, request: LeadTurnRequest
+        ) -> AsyncIterator[ClaudeEvent]:
+            async for event in super()._events(request):
+                yield event
+            raise RuntimeError("lead process crashed")
+
+    runner = CrashingRunner()
+    runner.emit_limit = True
+    admit(queue, "ENG-9")
+    _, wakes = repair_pair(database)
+    service = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=wakes
+    )
+
+    with pytest.raises(RuntimeError, match="lead process crashed"):
+        await service.dispatch("ENG-9")
+
+    # The terminal transition committed; the wake never reached the outbox.
+    assert database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "handoff_required"
+    assert wake_rows(database) == []
+
+    # Restart: a fresh runtime reconstructs and delivers exactly one wake.
+    reopened = Database.open(tmp_path / "state.db")
+    try:
+        restart_reconciler, restart_wakes = repair_pair(reopened)
+        reconstructed = restart_reconciler.reconcile()
+        assert [wake.kind for wake in reconstructed] == ["provider_capped"]
+        wake = reconstructed[0]
+        evidence = reopened.execute(
+            "SELECT event_id FROM events "
+            "WHERE event_type = 'project_cell.handoff_required'"
+        ).fetchone()
+        assert wake.turn_key == f"handoff:{evidence['event_id']}"
+        assert wake.reason == "subscription_limit"
+        assert wake.reset_at == "2026-08-26T01:00:00+00:00"
+        assert wake.issue_id == "ENG-9"
+
+        transport = _RecordingWakeTransport()
+        delivery = LeadWakeDelivery(restart_wakes, transport=transport)
+        assert delivery.replay_startup() == 1
+        assert await delivery.drain() == (wake.wake_id,)
+        assert transport.delivered == [wake.wake_id]
+        # Repeated repair and replay after delivery stay deduplicated.
+        assert restart_reconciler.reconcile() == ()
+        assert delivery.replay_startup() == 0
+        assert len(wake_rows(reopened)) == 1
+    finally:
+        reopened.close()
+
+
+class _RecordingWakeTransport:
+    def __init__(self) -> None:
+        self.delivered: list[str] = []
+
+    async def __call__(self, wake: object) -> bool:
+        self.delivered.append(wake.wake_id)  # type: ignore[attr-defined]
+        return True
+
+
+@pytest.mark.asyncio
+async def test_lost_blocked_wake_reconstructs_from_start_failure_evidence(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_session_started = False
+    service = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=CrashingSink()
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "start_unconfirmed"
+    reconciler, _ = repair_pair(database)
+
+    reconstructed = reconciler.reconcile()
+
+    assert [wake.kind for wake in reconstructed] == ["blocked"]
+    wake = reconstructed[0]
+    evidence = database.execute(
+        "SELECT event_id FROM events "
+        "WHERE event_type = 'project_cell.start_failed'"
+    ).fetchone()
+    assert wake.turn_key == f"start_failed:{evidence['event_id']}"
+    assert wake.reason == "start_unconfirmed"
+    assert wake.issue_id == "ENG-9"
+    assert wake.session_id == str(SESSION_ID)
+    assert reconciler.reconcile() == ()
+    assert len(wake_rows(database)) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_after_direct_commit_is_a_stable_noop(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    reconciler, wakes = repair_pair(database)
+    service = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=wakes
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    assert len(wake_rows(database)) == 1
+    # The direct path already published this boundary; repair must derive
+    # the same turn identity and deduplicate into the existing row.
+    assert reconciler.reconcile() == ()
+    assert reconciler.reconcile() == ()
+    assert len(wake_rows(database)) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_evidence_from_a_rotated_session(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_limit = True
+    service = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=CrashingSink()
+    )
+    result = await service.dispatch("ENG-9")
+    assert result.status == "handoff_required"
+
+    # The consumer already drove a rotation past this boundary: the cell
+    # carries a replacement session, so the lost wake must stay lost.
+    database.execute(
+        "UPDATE project_cells SET state = 'active', "
+        "session_id = '22222222-2222-4222-8222-222222222222' "
+        "WHERE cell_id = 'cell-demo'"
+    )
+    reconciler, _ = repair_pair(database)
+
+    assert reconciler.reconcile() == ()
+    assert wake_rows(database) == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_resurrects_evidence_below_the_floor(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_limit = True
+    service = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=CrashingSink()
+    )
+    await service.dispatch("ENG-9")
+
+    # Evidence journaled before the repair schema existed sits below the
+    # migration-recorded floor and is never manufactured into a wake.
+    database.execute(
+        "UPDATE lead_wake_repair SET floor_sequence = "
+        "(SELECT coalesce(max(sequence), 0) FROM events)"
+    )
+    reconciler, _ = repair_pair(database)
+
+    assert reconciler.reconcile() == ()
+    assert wake_rows(database) == []
+
+
+class _CompletingProjection(RecordingLinear):
+    """Completes the issue mid-turn, after dispatch admitted the lead."""
+
+    def __init__(self, database: Database) -> None:
+        super().__init__()
+        self._database = database
+
+    async def project(
+        self,
+        issue_id: str,
+        target: LinearProjection,
+        effect_id: str,
+    ) -> object:
+        result = await super().project(issue_id, target, effect_id)
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE admitted_issues SET state = 'done' WHERE issue_id = ?",
+                (issue_id,),
+            )
+        return result
+
+
+def already_completed_evidence_key(database: Database) -> str:
+    row = database.execute(
+        "SELECT event_id FROM events "
+        "WHERE event_type = 'project_cell.issue_already_completed' "
+        "ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None, "already_completed terminal evidence was journaled"
+    return f"already_completed:{row['event_id']}"
+
+
+@pytest.mark.asyncio
+async def test_lost_already_completed_wake_reconstructs_and_pushes_on_restart(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.lead_wakes import LeadWakeDelivery
+
+    admit(queue, "ENG-9")
+    service = repair_cells(
+        database,
+        queue,
+        profiles,
+        runner,
+        _CompletingProjection(database),
+        tmp_path,
+        sink=CrashingSink(),
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    # The already_completed result is authoritative; only the wake was lost.
+    assert result.status == "already_completed"
+    assert wake_rows(database) == []
+
+    # Restart: repair derives the wake from durable terminal evidence alone,
+    # without any redispatch, and pushes exactly one completed wake.
+    reopened = Database.open(tmp_path / "state.db")
+    try:
+        restart_reconciler, restart_wakes = repair_pair(reopened)
+        reconstructed = restart_reconciler.reconcile()
+        assert [wake.kind for wake in reconstructed] == ["completed"]
+        wake = reconstructed[0]
+        assert wake.reason == "issue_already_completed"
+        assert wake.turn_key == already_completed_evidence_key(reopened)
+        assert wake.project_key == "demo"
+        assert wake.issue_id == "ENG-9"
+        assert wake.cell_id == "cell-demo"
+        assert wake.session_id == str(SESSION_ID)
+        assert wake.profile_alias == "max-a"
+        assert wake.state == "pending"
+
+        transport = _RecordingWakeTransport()
+        delivery = LeadWakeDelivery(restart_wakes, transport=transport)
+        assert delivery.replay_startup() == 1
+        assert await delivery.drain() == (wake.wake_id,)
+        assert transport.delivered == [wake.wake_id]
+        # Repeated repair and replay after acknowledgement neither
+        # duplicate the wake nor redeliver it.
+        assert restart_reconciler.reconcile() == ()
+        assert delivery.replay_startup() == 0
+        assert await delivery.drain() == ()
+        assert transport.delivered == [wake.wake_id]
+        assert len(wake_rows(reopened)) == 1
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_already_completed_wake_matches_reconstruction_identity(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    reconciler, wakes = repair_pair(database)
+    service = repair_cells(
+        database,
+        queue,
+        profiles,
+        runner,
+        _CompletingProjection(database),
+        tmp_path,
+        sink=wakes,
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "already_completed"
+    rows = wake_rows(database)
+    assert [str(row["kind"]) for row in rows] == ["completed"]
+    assert str(rows[0]["reason"]) == "issue_already_completed"
+    # The direct wake binds the same durable evidence identity repair
+    # derives, so the two paths deduplicate into one row.
+    assert str(rows[0]["turn_key"]) == already_completed_evidence_key(database)
+    assert reconciler.reconcile() == ()
+    assert reconciler.reconcile() == ()
+    assert len(wake_rows(database)) == 1
+
+
+@pytest.mark.asyncio
+async def test_resumed_cell_already_completed_wake_reconstructs_after_crash(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    reconciler, wakes = repair_pair(database)
+    first = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=wakes
+    )
+    assert (await first.dispatch("ENG-9")).status == "working"
+    assert [str(row["kind"]) for row in wake_rows(database)] == ["completed"]
+    queue.complete(
+        "ENG-9",
+        reason="linear_completed",
+        evidence="https://linear.example/ENG-9",
+    )
+
+    second = repair_cells(
+        database, queue, profiles, runner, linear, tmp_path, sink=CrashingSink()
+    )
+    result = await second.dispatch("ENG-9")
+
+    # The resumed turn observed the completed issue but lost its wake.
+    assert result.status == "already_completed"
+    assert len(wake_rows(database)) == 1
+
+    reconstructed = reconciler.reconcile()
+
+    assert [wake.kind for wake in reconstructed] == ["completed"]
+    wake = reconstructed[0]
+    assert wake.reason == "issue_already_completed"
+    assert wake.turn_key == already_completed_evidence_key(database)
+    assert wake.issue_id == "ENG-9"
+    assert wake.session_id == str(SESSION_ID)
+    # The first turn's delivered boundary stays deduplicated; only the
+    # lost already_completed wake is reconstructed.
+    assert reconciler.reconcile() == ()
+    assert len(wake_rows(database)) == 2
