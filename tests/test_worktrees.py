@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -42,6 +42,9 @@ class FakeGit:
     remote_contains_result: bool = True
     fetch_error: GitError | None = None
     remove_error: GitError | None = None
+    push_error: Exception | None = None
+    prune_error: GitError | None = None
+    head_message_value: str = "initial"
     worktree_paths: list[str] = field(default_factory=lambda: [REPO, WORKTREE])
     commands: list[tuple[str, ...]] = field(default_factory=list)
     commit_messages: list[str] = field(default_factory=list)
@@ -66,9 +69,17 @@ class FakeGit:
         self.commit_messages.append(message)
         self.status = WorktreeStatus(modified=(), untracked=())
         self.head = SHA_B
+        self.head_message_value = message
         return self.head
 
+    def head_message(self, path: Path) -> str:
+        return self.head_message_value
+
     def push(self, path: Path, remote: str, branch: str) -> None:
+        if self.push_error is not None:
+            error = self.push_error
+            self.push_error = None
+            raise error
         self.commands.append(("push", remote, branch))
 
     def fetch(self, path: Path, remote: str, branch: str) -> None:
@@ -88,6 +99,8 @@ class FakeGit:
         self.worktree_paths = [p for p in self.worktree_paths if p != str(path)]
 
     def worktree_prune(self, repo_path: Path) -> None:
+        if self.prune_error is not None:
+            raise self.prune_error
         self.commands.append(("worktree", "prune"))
 
     def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
@@ -470,9 +483,12 @@ def test_failed_worktree_remove_blocks_and_keeps_lease(
     assert ("worktree", "prune") not in fake_git.commands
 
 
-def test_reclaim_fails_closed_when_path_survives_prune(
+def test_reclaim_keeps_claim_when_path_survives_prune(
     custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
 ) -> None:
+    """Past an apparently-successful remove, the claim is never released:
+    the worktree may be half-removed, so only reconciliation may proceed."""
+
     lease_id = register(leases)
     proof = checkpointed_proof(custodian, lease_id)
 
@@ -482,7 +498,7 @@ def test_reclaim_fails_closed_when_path_survives_prune(
     fake_git.worktree_remove = keep_path  # type: ignore[method-assign]
     with pytest.raises(CleanupBlocked, match="still registered"):
         custodian.reclaim(lease_id, proof)
-    assert leases.get(lease_id).state == "checkpointed"
+    assert leases.get(lease_id).state == "reclaiming"
 
 
 def test_reclaim_of_reclaimed_lease_is_blocked(
@@ -787,6 +803,316 @@ def test_stale_cleanup_claim_is_reconciled_after_restart(
     # Recovery: prove the checkpoint on the remote again, then reclaim.
     fresh = custodian.verify_remote(custodian.checkpoint(lease_id, "ENG-431"))
     assert custodian.reclaim(lease_id, fresh).removed is True
+
+
+# -- crash reconciliation (INFRA-172) --------------------------------------
+
+
+class FakeCrash(RuntimeError):
+    """Simulates the process dying mid-pipeline; nothing may handle it."""
+
+
+WIP_MESSAGE = "wip(ENG-431): checkpoint before resource cleanup"
+
+
+def _never(path: Path) -> WorktreeStatus:
+    raise AssertionError("a removed worktree path must never be inspected")
+
+
+def make_stack(
+    database: Database,
+    fake_git: FakeGit,
+    registry: FakeRegistry,
+    clock: dict[str, datetime],
+    **custodian_options: float,
+) -> tuple[WorktreeLeases, WorktreeCustodian]:
+    ids = iter(f"wt-{n}" for n in range(1, 20))
+    leases = WorktreeLeases(
+        database,
+        EventStore(database),
+        now=lambda: clock["now"],
+        ids=lambda: next(ids),
+    )
+    custodian = WorktreeCustodian(
+        leases, registry, fake_git, now=lambda: clock["now"], **custodian_options
+    )
+    return leases, custodian
+
+
+def test_crash_between_commit_and_push_resumes_without_second_commit(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    fake_git.push_error = FakeCrash("crashed before push")
+    with pytest.raises(FakeCrash):
+        custodian.checkpoint(lease_id, "ENG-431")
+    assert leases.get(lease_id).state == "active"
+    assert fake_git.commit_messages == [WIP_MESSAGE]
+
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    # The already-committed WIP is recognized, never committed twice.
+    assert fake_git.commit_messages == [WIP_MESSAGE]
+    assert checkpoint.commit_message == WIP_MESSAGE
+    assert checkpoint.sha == SHA_B
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.checkpoint_message == WIP_MESSAGE
+
+
+def test_crash_between_push_and_record_mints_identity_exactly_once(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+    original = leases.record_checkpoint
+    crashes = iter([FakeCrash("crashed before the durable record")])
+
+    def crash_once(*args: object, **kwargs: object) -> None:
+        crash = next(crashes, None)
+        if crash is not None:
+            raise crash
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    leases.record_checkpoint = crash_once  # type: ignore[method-assign]
+    with pytest.raises(FakeCrash):
+        custodian.checkpoint(lease_id, "ENG-431")
+    assert leases.get(lease_id).state == "active"
+
+    checkpoint = custodian.checkpoint(lease_id, "ENG-431")
+    assert fake_git.commit_messages == [WIP_MESSAGE]
+    # The push is repeat-safe and repeated; the identity is minted once.
+    pushes = [c for c in fake_git.commands if c[0] == "push"]
+    assert pushes == [("push", "origin", "feature/eng-431")] * 2
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.checkpoint_id == checkpoint.checkpoint_id
+    assert lease.checkpoint_sha == SHA_B
+    assert lease.checkpoint_message == WIP_MESSAGE
+
+
+def test_checkpoint_reuses_recorded_identity_when_nothing_changed(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+    first = custodian.checkpoint(lease_id, "ENG-431")
+    proof = custodian.verify_remote(first)
+
+    again = custodian.checkpoint(lease_id, "ENG-431")
+    assert again.checkpoint_id == first.checkpoint_id
+    assert again.sha == first.sha
+    # No second push, no re-record: the durable verification survives.
+    assert [c for c in fake_git.commands if c[0] == "push"] == [
+        ("push", "origin", "feature/eng-431")
+    ]
+    assert leases.get(lease_id).remote_verified_at == NOW.isoformat()
+    assert custodian.reclaim(lease_id, proof).removed is True
+
+
+def test_checkpoint_on_cleanup_claimed_lease_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="cleanup-1")
+    with pytest.raises(CleanupBlocked, match="cleanup"):
+        custodian.checkpoint(lease_id, "ENG-431")
+
+
+def test_crash_after_removal_is_converged_without_second_removal(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        database, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    # The crashed custodian removed the worktree but never recorded it.
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+    fake_git.worktree_paths = [REPO]
+    fake_git.status_of = _never  # type: ignore[method-assign]
+    fake_git.head_sha = _never  # type: ignore[method-assign]
+
+    clock["now"] = NOW + timedelta(seconds=120)
+    result = custodian.reconcile(lease_id)
+    assert result.removed is True
+    assert result.stopped_process_leases == ()
+    assert leases.get(lease_id).state == "reclaimed"
+    assert all(c[:2] != ("worktree", "remove") for c in fake_git.commands)
+    assert ("worktree", "prune") in fake_git.commands
+
+
+def test_reconcile_resumes_expired_claim_and_finishes_cleanup(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        database, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    registry.leases.append(FakeProcessLease("proc-1", cwd=WORKTREE))
+    checkpointed_proof(custodian, lease_id)
+    recorded = leases.get(lease_id).checkpoint_id
+    assert recorded is not None
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+
+    clock["now"] = NOW + timedelta(seconds=120)
+    result = custodian.reconcile(lease_id)
+    # The stop reuses the recorded checkpoint id; nothing is re-derived.
+    assert registry.stop_calls == [("proc-1", recorded)]
+    assert result.removed is True
+    assert leases.get(lease_id).state == "reclaimed"
+    events = [
+        row["event_type"]
+        for row in database.execute(
+            "SELECT event_type FROM events WHERE aggregate_id = ? "
+            "ORDER BY sequence",
+            (lease_id,),
+        ).fetchall()
+    ]
+    # The claim is taken over, never released to 'checkpointed' mid-resume,
+    # so the registry's attachment refusal holds throughout.
+    assert "worktree.cleanup_recovered" in events
+    assert "worktree.cleanup_released" not in events
+    assert events[-1] == "worktree.reclaimed"
+
+
+def test_reconcile_blocked_while_claim_is_live(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="live-custodian")
+    with pytest.raises(CleanupBlocked, match="claimed"):
+        custodian.reconcile(lease_id)
+    lease = leases.get(lease_id)
+    assert lease.state == "reclaiming"
+    assert lease.cleanup_owner == "live-custodian"
+
+
+def test_reconcile_of_unclaimed_lease_is_blocked(
+    custodian: WorktreeCustodian, leases: WorktreeLeases
+) -> None:
+    lease_id = register(leases)
+    with pytest.raises(CleanupBlocked, match="not claimed"):
+        custodian.reconcile(lease_id)
+
+
+def test_reconcile_releases_claim_when_durable_proof_is_stale(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        database, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+
+    clock["now"] = NOW + timedelta(seconds=2000)
+    # Stale proof is never grandfathered: the resume releases and demands
+    # a fresh verification.
+    with pytest.raises(CleanupBlocked, match="stale"):
+        custodian.reconcile(lease_id)
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.cleanup_owner is None
+    fresh = custodian.verify_remote(custodian.checkpoint(lease_id, "ENG-431"))
+    assert custodian.reclaim(lease_id, fresh).removed is True
+
+
+def test_reconcile_releases_claim_when_new_work_appeared(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        database, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+    fake_git.status = WorktreeStatus(modified=("src/a.py",), untracked=())
+
+    clock["now"] = NOW + timedelta(seconds=120)
+    with pytest.raises(CleanupBlocked, match="dirty"):
+        custodian.reconcile(lease_id)
+    lease = leases.get(lease_id)
+    assert lease.state == "checkpointed"
+    assert lease.cleanup_owner is None
+
+
+def test_prune_failure_after_removal_keeps_claim_for_reconciliation(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        database, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    fake_git.prune_error = GitError("disk went away")
+    with pytest.raises(CleanupBlocked, match="halted after removal"):
+        custodian.reclaim(lease_id, proof)
+    lease = leases.get(lease_id)
+    assert lease.state == "reclaiming"
+    assert WORKTREE not in fake_git.worktree_paths
+
+    fake_git.prune_error = None
+    clock["now"] = NOW + timedelta(seconds=120)
+    result = custodian.reconcile(lease_id)
+    assert result.removed is True
+    assert leases.get(lease_id).state == "reclaimed"
+    removes = [c for c in fake_git.commands if c[:2] == ("worktree", "remove")]
+    assert removes == [("worktree", "remove", WORKTREE)]
+
+
+def test_reclaim_on_crashed_claim_with_removed_path_converges(
+    database: Database, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        database, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    proof = checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+    fake_git.worktree_paths = [REPO]
+
+    clock["now"] = NOW + timedelta(seconds=120)
+    result = custodian.reclaim(lease_id, proof)
+    assert result.removed is True
+    assert leases.get(lease_id).state == "reclaimed"
+    assert all(c[:2] != ("worktree", "remove") for c in fake_git.commands)
+
+
+def test_crash_after_removal_survives_restart_and_reconciles(
+    tmp_path: Path, fake_git: FakeGit, registry: FakeRegistry
+) -> None:
+    db_path = tmp_path / "restart.db"
+    first = Database.open(db_path)
+    clock = {"now": NOW}
+    leases, custodian = make_stack(
+        first, fake_git, registry, clock, cleanup_claim_ttl_seconds=60.0
+    )
+    lease_id = register(leases)
+    checkpointed_proof(custodian, lease_id)
+    leases.claim_cleanup(lease_id, owner="crashed-custodian")
+    fake_git.worktree_paths = [REPO]
+    first.close()
+
+    reopened = Database.open(db_path)
+    try:
+        clock2 = {"now": NOW + timedelta(seconds=120)}
+        leases2, custodian2 = make_stack(
+            reopened, fake_git, registry, clock2, cleanup_claim_ttl_seconds=60.0
+        )
+        result = custodian2.reconcile(lease_id)
+        assert result.removed is True
+        assert leases2.get(lease_id).state == "reclaimed"
+        assert all(c[:2] != ("worktree", "remove") for c in fake_git.commands)
+    finally:
+        reopened.close()
 
 
 # -- inspection ------------------------------------------------------------

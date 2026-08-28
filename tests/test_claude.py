@@ -566,6 +566,33 @@ class CappedProcessFactory:
         )
 
 
+class LargeLineProcessFactory:
+    async def __call__(
+        self,
+        *command: str,
+        **kwargs: Any,
+    ) -> asyncio.subprocess.Process:
+        del command
+        child_code = (
+            "import json;"
+            "print(json.dumps({'type':'system','subtype':'init',"
+            "'session_id':'11111111-1111-4111-8111-111111111111'}),flush=True);"
+            "print(json.dumps({'type':'assistant','session_id':"
+            "'11111111-1111-4111-8111-111111111111','message':{"
+            "'role':'assistant','content':[{'type':'text','text':'x'*100000}]}}),"
+            "flush=True)"
+        )
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            child_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            limit=kwargs.get("limit", 64 * 1024),
+        )
+
+
 @pytest.mark.asyncio
 async def test_closing_stream_kills_hung_process_group(
     registry: ProfileRegistry,
@@ -608,6 +635,26 @@ async def test_verbose_stderr_cannot_block_stdout_events(
     await stream.aclose()
 
     assert event.kind == "session.started"
+
+
+@pytest.mark.asyncio
+async def test_large_forwarded_subagent_record_is_consumed(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=tmp_path / "claude-lead.md",
+        base_env={"PATH": os.environ["PATH"]},
+        process_factory=LargeLineProcessFactory(),
+    )
+
+    events = [event async for event in runner.start_lead(new_request(tmp_path))]
+
+    assert [event.kind for event in events] == [
+        "session.started",
+        "stream.assistant",
+    ]
 
 
 @pytest.mark.asyncio

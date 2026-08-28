@@ -4,28 +4,45 @@ from __future__ import annotations
 
 import fcntl
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO
 
 from hermes_orchestrator.admission import AdmissionController, PressureClassifier
 from hermes_orchestrator.cells import DispatchResult, ProjectCellService
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
+from hermes_orchestrator.circleci import (
+    CircleCiClient,
+    CircleCiStatusAdapter,
+    HttpxCircleCiTransport,
+)
 from hermes_orchestrator.claude import ClaudeRunner
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.git import WorktreeGit
+from hermes_orchestrator.github import (
+    GitHubClient,
+    HttpxGitHubTransport,
+    MergeEffectJournal,
+)
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.keychain import Keychain
 from hermes_orchestrator.linear import (
     ExternalEffectStore,
     LinearClient,
     LinearGraphQLTransport,
+    LinearIssueReader,
     ProjectLinearRouter,
 )
-from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.merge_flow import (
+    CIRCLECI_KEYCHAIN_SERVICE,
+    GITHUB_KEYCHAIN_SERVICE,
+    MergeFlow,
+    build_merge_flow,
+)
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -35,10 +52,18 @@ from hermes_orchestrator.profiles import (
     ProfileRegistry,
 )
 from hermes_orchestrator.queue import QueueService
+from hermes_orchestrator.reconcile import (
+    CircleCiKnownState,
+    LinearExpectations,
+    ManagedProcessScanner,
+    Reconciler,
+    ReconciliationReport,
+)
 from hermes_orchestrator.resources import ResourceSampler
 from hermes_orchestrator.scheduler import Scheduler
 from hermes_orchestrator.service import OrchestratorService
 from hermes_orchestrator.stalls import ScheduledResets
+from hermes_orchestrator.worktrees import WorktreeCustodian, WorktreeLeases
 
 Dispatch = Callable[[str], Awaitable[DispatchResult]]
 
@@ -84,6 +109,25 @@ class KeychainReader(Protocol):
     def read(self, service: str, account: str) -> str: ...
 
 
+class _CachingKeychain:
+    """Read each credential exactly once during one runtime assembly.
+
+    The startup reconciler and the merge flow share the same tokens; the
+    cache keeps every credential read single and in its documented order
+    regardless of which component asks first.
+    """
+
+    def __init__(self, inner: KeychainReader) -> None:
+        self._inner = inner
+        self._cache: dict[tuple[str, str], str] = {}
+
+    def read(self, service: str, account: str) -> str:
+        key = (service, account)
+        if key not in self._cache:
+            self._cache[key] = self._inner.read(service, account)
+        return self._cache[key]
+
+
 @dataclass(slots=True)
 class Runtime:
     """Owned runtime graph and its single database lifecycle."""
@@ -98,6 +142,7 @@ class Runtime:
     processes: ProcessRegistry | None = None
     checkpoints: CheckpointRequests | None = None
     resets: ScheduledResets | None = None
+    reconciliation: ReconciliationReport | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -150,6 +195,7 @@ def open_runtime(
     profile_command: JsonCommand | None = None,
     keychain: KeychainReader | None = None,
     base_env: Mapping[str, str] | None = None,
+    process_iter: Callable[[], Iterable[Any]] | None = None,
 ) -> Runtime:
     """Build a runtime, loading credentials only for explicitly active operation."""
 
@@ -174,11 +220,12 @@ def open_runtime(
         checkpoints = CheckpointRequests(database, events)
         resets = ScheduledResets(database, events)
         queue = QueueService(database, events, settings.projects)
-        cells: ProjectCellService | None = None
-        dispatch: Dispatch | None = None
-        merge_flow: MergeFlow | None = None
-        profile_health: tuple[ProfileHealth, ...] = ()
+        worktree_git = WorktreeGit()
+        worktree_leases = WorktreeLeases(database, events)
+        custodian = WorktreeCustodian(worktree_leases, processes, worktree_git)
 
+        reader: KeychainReader | None = None
+        reconciler_ports: dict[str, Any] = {}
         if enable_live:
             linear_config = settings.linear
             if linear_config is None:
@@ -200,6 +247,85 @@ def open_runtime(
                     + ", ".join(missing_repositories)
                 )
 
+            # The reconciler owns its own bounded read-only external
+            # ports; credentials are cached so every keychain item is
+            # still read exactly once per assembly, in order.
+            reader = _CachingKeychain(
+                keychain if keychain is not None else Keychain()
+            )
+            linear_token = reader.read("hermes-orchestrator-linear", "default")
+            github_token = reader.read(GITHUB_KEYCHAIN_SERVICE, "default")
+            ci_states: CircleCiKnownState | None = None
+            if any(
+                project.ci == "circleci"
+                for project in settings.projects.values()
+            ):
+                circleci_token = reader.read(
+                    CIRCLECI_KEYCHAIN_SERVICE, "default"
+                )
+                ci_states = CircleCiKnownState(
+                    CircleCiStatusAdapter(
+                        CircleCiClient(
+                            transport=HttpxCircleCiTransport(circleci_token)
+                        )
+                    )
+                )
+            reconciler_ports = {
+                "unknown_processes": ManagedProcessScanner(
+                    database,
+                    roots=tuple(
+                        project.repo_path
+                        for project in settings.projects.values()
+                    ),
+                    iter_processes=process_iter,
+                ),
+                "github_reads": GitHubClient(
+                    transport=HttpxGitHubTransport(github_token),
+                    journal=MergeEffectJournal(database),
+                ),
+                "linear_reads": LinearIssueReader(linear_token),
+                "linear_expectations": LinearExpectations(
+                    team_ids={
+                        alias: linear_config.teams[project.linear_team].team_id
+                        for alias, project in settings.projects.items()
+                    },
+                    status_ids={
+                        alias: dict(
+                            linear_config.teams[
+                                project.linear_team
+                            ].status_ids.as_mapping()
+                        )
+                        for alias, project in settings.projects.items()
+                    },
+                    assignee_ids=dict(linear_config.assignee_ids),
+                ),
+                "ci_states": ci_states,
+            }
+
+        reconciler = Reconciler(
+            database,
+            events,
+            projects=settings.projects,
+            processes=processes,
+            worktrees=worktree_leases,
+            custodian=custodian,
+            git=worktree_git,
+            **reconciler_ports,
+        )
+        reconciliation: ReconciliationReport | None = None
+        cells: ProjectCellService | None = None
+        dispatch: Dispatch | None = None
+        merge_flow: MergeFlow | None = None
+        profile_health: tuple[ProfileHealth, ...] = ()
+
+        if enable_live:
+            assert reader is not None
+
+            # The ordered startup reconciliation completes before any
+            # profile probe runs and before scheduling can begin; its
+            # report alone decides whether admission may open.
+            reconciliation = reconciler.run()
+
             environment = dict(os.environ if base_env is None else base_env)
             registry = ProfileRegistry.load(profile_path)
             pool = ProfilePool(registry)
@@ -215,7 +341,6 @@ def open_runtime(
                 checked.append(health)
             profile_health = tuple(checked)
 
-            reader = keychain or Keychain()
             linear = build_linear_router(
                 settings, database=database, queue=queue, keychain=reader
             )
@@ -285,6 +410,8 @@ def open_runtime(
             safety=safety,
             checkpoints=checkpoints,
             resets=resets,
+            reconciler=reconciler,
+            startup_report=reconciliation,
         )
         return Runtime(
             database=database,
@@ -297,6 +424,7 @@ def open_runtime(
             processes=processes,
             checkpoints=checkpoints,
             resets=resets,
+            reconciliation=reconciliation,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

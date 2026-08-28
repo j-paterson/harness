@@ -23,6 +23,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.queue import QueueService
+from hermes_orchestrator.reconcile import Reconciler, ReconciliationReport
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.scheduler import PlannedAction, Scheduler
 from hermes_orchestrator.stalls import ScheduledResets
@@ -39,6 +40,7 @@ class ReconciliationResult:
     completed: bool
     findings: tuple[str, ...]
     admission_open: bool
+    report: ReconciliationReport | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +74,11 @@ class OrchestratorService:
         safety: CheckpointSafetyStore | None = None,
         checkpoints: CheckpointRequests | None = None,
         resets: ScheduledResets | None = None,
+        reconciler: Reconciler | None = None,
+        startup_report: ReconciliationReport | None = None,
     ) -> None:
+        self._reconciler = reconciler
+        self._startup_report = startup_report
         self._resets = resets
         self._processes = processes
         self._admission = admission
@@ -90,7 +96,32 @@ class OrchestratorService:
         self._started = False
 
     def start(self) -> ReconciliationResult:
-        """Reconcile durable state before allowing any scheduling tick."""
+        """Reconcile durable state before allowing any scheduling tick.
+
+        With an ordered :class:`Reconciler` (INFRA-172) the full
+        cross-system pass supplies the structured report — either already
+        completed at process startup, before profile probes, or run here
+        — and admission opens only when that report is clean. Without one
+        the legacy worker/process/integrity pass below remains in force.
+        """
+
+        if self._startup_report is not None or self._reconciler is not None:
+            report = self._startup_report
+            if report is None:
+                assert self._reconciler is not None
+                report = self._reconciler.run()
+            self.admission_open = bool(
+                report.safe_to_open_admission and self._policy.mode != "observe"
+            )
+            self._started = report.completed
+            return ReconciliationResult(
+                completed=report.completed,
+                findings=tuple(
+                    finding.label for finding in report.findings
+                ),
+                admission_open=self.admission_open,
+                report=report,
+            )
 
         run_id = str(uuid.uuid4())
         started_at = self._now().astimezone(UTC).isoformat()

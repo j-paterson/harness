@@ -13,6 +13,7 @@ import signal
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -257,6 +258,97 @@ def test_cleanup_claim_blocks_new_process_attachment(harness: Harness) -> None:
     assert harness.registry.active() == ()
     harness.leases.release_cleanup(lease_id, owner="cleanup-1", reason="test")
     assert harness.lease_process()
+
+
+class FakeCrash(RuntimeError):
+    """Simulates the custodian process dying mid-pipeline."""
+
+
+class CrashOnceGit(WorktreeGit):
+    """Real git adapter that dies once at a chosen pipeline boundary."""
+
+    def __init__(self, runner: SubprocessGitRunner, method: str) -> None:
+        super().__init__(runner=runner)
+        self._pending = {method}
+
+    def push(self, path: Path, remote: str, branch: str) -> None:
+        if "push" in self._pending:
+            self._pending.discard("push")
+            raise FakeCrash("crashed before push")
+        super().push(path, remote, branch)
+
+    def worktree_prune(self, repo_path: Path) -> None:
+        if "worktree_prune" in self._pending:
+            self._pending.discard("worktree_prune")
+            raise FakeCrash("crashed after removal, before prune")
+        super().worktree_prune(repo_path)
+
+
+def test_crash_between_commit_and_push_recovers_single_wip_commit(
+    harness: Harness,
+) -> None:
+    lease_id = harness.lease_worktree()
+    (harness.worktree / "README.md").write_text("work in progress\n", "utf-8")
+    crashing = WorktreeCustodian(
+        harness.leases,
+        harness.registry,
+        CrashOnceGit(SubprocessGitRunner(env=harness.env), "push"),
+    )
+    with pytest.raises(FakeCrash):
+        crashing.checkpoint(lease_id, "ENG-431")
+    assert harness.leases.get(lease_id).state == "active"
+
+    checkpoint = harness.custodian.checkpoint(lease_id, "ENG-431")
+    assert checkpoint.commit_message == (
+        "wip(ENG-431): checkpoint before resource cleanup"
+    )
+    # Exactly one WIP commit ahead of main: never committed twice.
+    count = harness.git(
+        "rev-list", "--count", "main..feature/eng-431", cwd=harness.repo
+    ).strip()
+    assert count == "1"
+    remote_tip = harness.git(
+        "rev-parse", "refs/heads/feature/eng-431", cwd=harness.origin
+    ).strip()
+    assert remote_tip == checkpoint.sha
+    proof = harness.custodian.verify_remote(checkpoint)
+    assert harness.custodian.reclaim(lease_id, proof).removed is True
+
+
+def test_crash_after_removal_is_reconciled_without_duplicate_action(
+    harness: Harness,
+) -> None:
+    lease_id = harness.lease_worktree()
+    (harness.worktree / "README.md").write_text("work in progress\n", "utf-8")
+    checkpoint = harness.custodian.checkpoint(lease_id, "ENG-431")
+    proof = harness.custodian.verify_remote(checkpoint)
+    crashing = WorktreeCustodian(
+        harness.leases,
+        harness.registry,
+        CrashOnceGit(SubprocessGitRunner(env=harness.env), "worktree_prune"),
+    )
+    with pytest.raises(FakeCrash):
+        crashing.reclaim(lease_id, proof)
+    assert not harness.worktree.exists()
+    assert harness.leases.get(lease_id).state == "reclaiming"
+    # The crashed claim still refuses new managed attachments.
+    with pytest.raises(ValueError, match="cleanup"):
+        harness.lease_process()
+
+    def later() -> datetime:
+        return datetime.now(UTC) + timedelta(hours=1)
+
+    resumed = WorktreeCustodian(
+        harness.leases,
+        harness.registry,
+        WorktreeGit(runner=SubprocessGitRunner(env=harness.env)),
+        now=later,
+    )
+    result = resumed.reconcile(lease_id)
+    assert result.removed is True
+    assert harness.leases.get(lease_id).state == "reclaimed"
+    listing = harness.git("worktree", "list", "--porcelain", cwd=harness.repo)
+    assert str(harness.worktree) not in listing
 
 
 def test_unstoppable_process_blocks_reclaim_and_keeps_worktree(

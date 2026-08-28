@@ -20,6 +20,7 @@ from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 from hermes_orchestrator.profiles import ProfileRegistry
 
 _SYNTHETIC_MODEL = "<synthetic>"
+_MAX_STREAM_LINE_BYTES = 1024 * 1024
 _COMPACTION_SUBTYPES = frozenset({"compact_boundary", "compaction", "compact"})
 _CONTEXT_ERROR_TEXT = re.compile(
     r"context window|prompt is too long|input length|context length exceeded"
@@ -413,6 +414,7 @@ class ClaudeRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            limit=_MAX_STREAM_LINE_BYTES,
         )
         if process.stdout is None:
             await self._terminate(process)

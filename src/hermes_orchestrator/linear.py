@@ -151,14 +151,83 @@ class LinearGraphQLTransport:
         finally:
             if owns_client:
                 await client.aclose()
-        if not isinstance(payload, dict):
-            raise ValueError("Linear returned a non-object response")
-        if payload.get("errors"):
-            raise RuntimeError("Linear GraphQL operation failed")
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise ValueError("Linear response is missing data")
-        return data
+        return _graphql_data(payload)
+
+
+def _graphql_data(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Linear returned a non-object response")
+    if payload.get("errors"):
+        raise RuntimeError("Linear GraphQL operation failed")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("Linear response is missing data")
+    return data
+
+
+def _parse_issue(issue_id: str, data: dict[str, Any]) -> LinearIssue:
+    issue = data.get("issue")
+    if not isinstance(issue, dict):
+        raise ValueError(f"Linear issue not found: {issue_id}")
+    state = issue.get("state")
+    assignee = issue.get("assignee")
+    team = issue.get("team")
+    if not isinstance(state, dict):
+        raise ValueError("Linear issue is missing state")
+    if not isinstance(team, dict):
+        raise ValueError("Linear issue is missing team")
+    return LinearIssue(
+        issue_id=str(issue["identifier"]),
+        linear_id=str(issue["id"]),
+        status=str(state["name"]),
+        state_id=str(state["id"]),
+        assignee_id=(str(assignee["id"]) if isinstance(assignee, dict) else None),
+        team_id=str(team["id"]),
+        revision=str(issue["updatedAt"]),
+    )
+
+
+class LinearIssueReader:
+    """Bounded synchronous read-only issue reads for startup reconciliation.
+
+    Runs the same strict ``Issue`` query as the projection client but over
+    a plain synchronous transport, so the startup reconciler can project
+    pending effects without an event loop. It can only read; there is no
+    mutation surface here at all.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        client: httpx.Client | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        if not token:
+            raise ValueError("Linear token is required")
+        self._token = token
+        self._client = client
+        self._timeout = timeout
+
+    def get_issue(self, issue_id: str) -> LinearIssue:
+        owns_client = self._client is None
+        client = self._client or httpx.Client(timeout=self._timeout)
+        try:
+            response = client.post(
+                "https://api.linear.app/graphql",
+                headers={"Authorization": self._token},
+                json={
+                    "operationName": "Issue",
+                    "query": _ISSUE_QUERY,
+                    "variables": {"id": issue_id},
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        finally:
+            if owns_client:
+                client.close()
+        return _parse_issue(issue_id, _graphql_data(payload))
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,25 +341,7 @@ class LinearClient:
             _ISSUE_QUERY,
             {"id": issue_id},
         )
-        issue = data.get("issue")
-        if not isinstance(issue, dict):
-            raise ValueError(f"Linear issue not found: {issue_id}")
-        state = issue.get("state")
-        assignee = issue.get("assignee")
-        team = issue.get("team")
-        if not isinstance(state, dict):
-            raise ValueError("Linear issue is missing state")
-        if not isinstance(team, dict):
-            raise ValueError("Linear issue is missing team")
-        return LinearIssue(
-            issue_id=str(issue["identifier"]),
-            linear_id=str(issue["id"]),
-            status=str(state["name"]),
-            state_id=str(state["id"]),
-            assignee_id=(str(assignee["id"]) if isinstance(assignee, dict) else None),
-            team_id=str(team["id"]),
-            revision=str(issue["updatedAt"]),
-        )
+        return _parse_issue(issue_id, data)
 
     async def validate_issue(self, issue_id: str) -> LinearIssue:
         """Read an issue and fail closed when it belongs to another team."""

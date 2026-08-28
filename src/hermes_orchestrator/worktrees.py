@@ -9,6 +9,23 @@ is ever signaled by name or path. Removal is ``git worktree remove``
 (never ``--force``) followed by ``git worktree prune`` and a verification
 that the path is no longer registered; ``rm`` is never invoked. There is
 no retention delay: a proven checkpoint makes reclaim immediate.
+
+Crash reconciliation (INFRA-172): every step with an external effect is
+either repeat-safe (push, fetch, prune) or guarded by durable evidence
+before it can repeat (an already-committed WIP is recognized by its HEAD
+message, a recorded checkpoint identity is reused instead of re-minted,
+a removal is proven complete via ``git worktree list`` before it could
+run again, and signals stay behind the registry's journaled claims). A
+cleanup claim whose owner crashed is taken over in place once its TTL
+expires — the lease never leaves ``reclaiming`` mid-resume, so the
+registry keeps refusing new attachments — and ``reconcile`` drives the
+lease to convergence: converging an already-removed path, resuming a
+still-authorized removal, or releasing the claim when the durable proof
+went stale or new work appeared. A checkpointed lease whose worktree
+vanished out of band is converged by ``converge_missing`` only after its
+durable verified identity is re-proven reachable on the remote right
+now; absent that fresh proof the lease is left untouched for the startup
+Reconciler to report as suspected lost work.
 """
 
 from __future__ import annotations
@@ -47,6 +64,8 @@ class GitPort(Protocol):
     def head_sha(self, path: Path) -> str: ...
 
     def branch(self, path: Path) -> str | None: ...
+
+    def head_message(self, path: Path) -> str: ...
 
     def ahead(self, path: Path) -> int | None: ...
 
@@ -378,27 +397,46 @@ class WorktreeLeases:
                 ),
             )
 
-    def reconcile_cleanup(self, lease_id: str, *, stale_before: str) -> bool:
-        """Release a crashed cleanup's claim once it has provably expired."""
+    def recover_cleanup(
+        self, lease_id: str, *, owner: str, stale_before: str
+    ) -> bool:
+        """Take over a crashed cleanup's claim once it has provably expired.
 
+        The lease stays 'reclaiming' throughout — new attachments remain
+        refused — and only the owner token and claim time change, inside
+        one compare-and-swap against the expired claim.
+        """
+
+        if not owner.strip():
+            raise ValueError("a cleanup recovery requires an owner token")
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT cleanup_owner FROM worktree_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
             cursor = connection.execute(
-                "UPDATE worktree_leases SET state = 'checkpointed', "
-                "cleanup_owner = NULL, cleanup_claimed_at = NULL, "
-                "updated_at = ? WHERE lease_id = ? AND state = 'reclaiming' "
+                "UPDATE worktree_leases SET cleanup_owner = ?, "
+                "cleanup_claimed_at = ?, updated_at = ? "
+                "WHERE lease_id = ? AND state = 'reclaiming' "
                 "AND cleanup_claimed_at <= ?",
-                (stamp, lease_id, stale_before),
+                (owner, stamp, stamp, lease_id, stale_before),
             )
             if cursor.rowcount != 1:
                 return False
             self._events.append(
                 connection,
                 EventInput(
-                    event_type="worktree.cleanup_reconciled",
+                    event_type="worktree.cleanup_recovered",
                     aggregate_type="worktree_lease",
                     aggregate_id=lease_id,
-                    payload={"stale_before": stale_before},
+                    payload={
+                        "owner": owner,
+                        "recovered_from": (
+                            row["cleanup_owner"] if row is not None else None
+                        ),
+                        "stale_before": stale_before,
+                    },
                 ),
             )
         return True
@@ -470,20 +508,55 @@ class WorktreeCustodian:
         )
 
     def checkpoint(self, lease_id: str, issue_id: str) -> Checkpoint:
+        """Checkpoint the worktree; safe to repeat after any crash.
+
+        A clean tree whose HEAD is already the durably recorded checkpoint
+        returns that recorded identity — no second push, no new id, and
+        an existing remote verification survives. A clean tree whose HEAD
+        commit carries this issue's WIP message is a checkpoint whose push
+        or record crashed: the commit is recognized, never repeated, and
+        the repeat-safe push and record run again.
+        """
+
         lease = self._leases.get(lease_id)
         if lease.state == "reclaimed":
             raise CleanupBlocked(f"worktree lease {lease_id} is reclaimed")
+        if lease.state == "reclaiming":
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} is claimed for cleanup"
+            )
         if _ISSUE_PATTERN.match(issue_id) is None:
             raise ValueError(
                 "issue id must be an identifier like ENG-431"
             )
         path = Path(lease.path)
         status = self._git.status_of(path)
+        wip_message = WIP_MESSAGE_TEMPLATE.format(issue=issue_id)
         if status.clean:
-            message = None
             sha = self._git.head_sha(path)
+            if (
+                lease.state == "checkpointed"
+                and lease.checkpoint_id is not None
+                and lease.checkpoint_sha == sha
+            ):
+                return Checkpoint(
+                    checkpoint_id=lease.checkpoint_id,
+                    lease_id=lease_id,
+                    issue_id=issue_id,
+                    path=lease.path,
+                    branch=lease.branch,
+                    remote=lease.remote,
+                    sha=sha,
+                    commit_message=lease.checkpoint_message,
+                    created_at=lease.checkpointed_at or self._now().isoformat(),
+                )
+            message = (
+                wip_message
+                if self._git.head_message(path).strip() == wip_message
+                else None
+            )
         else:
-            message = WIP_MESSAGE_TEMPLATE.format(issue=issue_id)
+            message = wip_message
             self._git.add_all(path)
             sha = self._git.commit(path, message)
         self._git.push(path, lease.remote, lease.branch)
@@ -546,17 +619,10 @@ class WorktreeCustodian:
         if lease.state == "reclaimed":
             raise CleanupBlocked(f"worktree lease {lease_id} is reclaimed")
         if lease.state == "reclaiming":
-            stale_before = (
-                self._now() - timedelta(seconds=self._cleanup_claim_ttl)
-            ).isoformat()
-            if not self._leases.reconcile_cleanup(
-                lease_id, stale_before=stale_before
-            ):
-                raise CleanupBlocked(
-                    f"worktree lease {lease_id} is claimed for cleanup "
-                    f"by {lease.cleanup_owner}"
-                )
-            lease = self._leases.get(lease_id)
+            # A claim whose owner crashed is resumed in place; the caller's
+            # proof object stays routing-only and the durable record alone
+            # authorizes whatever the resume still has to do.
+            return self._resume_cleanup(lease)
         path = Path(lease.path)
         status = self._git.status_of(path)
         if not status.clean:
@@ -593,6 +659,58 @@ class WorktreeCustodian:
             )
         # Authorization comes only from the durable verification record
         # written by verify_remote; the caller's proof object is routing.
+        self._authorize_durable(lease)
+        head = self._git.head_sha(path)
+        if head != lease.checkpoint_sha:
+            raise CleanupBlocked(
+                f"HEAD moved after the remote proof "
+                f"({head[:12]} != {lease.checkpoint_sha[:12]})"
+            )
+        owner = self._ids()
+        self._leases.claim_cleanup(lease_id, owner=owner)
+        return self._finish_cleanup(lease, owner)
+
+    def reconcile(self, lease_id: str) -> CleanupResult:
+        """Drive a crashed cleanup to convergence with no repeated effect.
+
+        Only a 'reclaiming' lease whose claim TTL has expired is touched.
+        An already-removed path is converged (prune, then the durable
+        reclaimed record); a still-present path resumes the full safety
+        chain under the recorded checkpoint; a stale durable proof or new
+        work releases the claim back to 'checkpointed' instead.
+        """
+
+        lease = self._leases.get(lease_id)
+        if lease.state != "reclaiming":
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} is {lease.state}, "
+                f"not claimed for cleanup"
+            )
+        return self._resume_cleanup(lease)
+
+    def converge_missing(self, lease_id: str) -> CleanupResult:
+        """Converge a checkpointed lease whose worktree vanished out of band.
+
+        Authorization never grandfathers the stored proof timestamp: the
+        recorded checkpoint must carry its durable verified identity and
+        must be re-proven reachable on the leased remote branch right now,
+        fetched through the parent repository. Only then is the lease
+        claimed and converged through the same journaled transitions as a
+        crashed cleanup — nothing is removed, and no process is signaled.
+        A lease that fails any check is left exactly as found.
+        """
+
+        lease = self._leases.get(lease_id)
+        if lease.state != "checkpointed":
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} is {lease.state}, not checkpointed"
+            )
+        repo_path = Path(lease.repo_path)
+        if lease.path in self._git.worktree_list(repo_path):
+            raise CleanupBlocked(
+                f"worktree {lease.path} is still registered; reclaim it "
+                f"through the checkpointed path instead"
+            )
         if (
             lease.remote_verified_at is None
             or lease.verified_checkpoint_id != lease.checkpoint_id
@@ -601,7 +719,52 @@ class WorktreeCustodian:
             or lease.verified_branch != lease.branch
         ):
             raise CleanupBlocked(
-                f"worktree lease {lease_id} has no durable remote "
+                f"worktree {lease.path} is missing without a durable remote "
+                f"verification for its recorded checkpoint"
+            )
+        assert lease.checkpoint_sha is not None
+        try:
+            self._git.fetch(repo_path, lease.remote, lease.branch)
+        except GitError as error:
+            raise CleanupBlocked(
+                f"fetch of {lease.remote}/{lease.branch} failed: {error}"
+            ) from error
+        if not self._git.remote_contains(
+            repo_path, lease.checkpoint_sha, lease.remote, lease.branch
+        ):
+            raise CleanupBlocked(
+                f"commit {lease.checkpoint_sha[:12]} is no longer reachable "
+                f"on {lease.remote}/{lease.branch}"
+            )
+        lingering = self._bound_processes(Path(lease.path))
+        if lingering:
+            names = ", ".join(item.lease_id for item in lingering)
+            raise CleanupBlocked(
+                f"process leases still bound to missing worktree "
+                f"{lease.path}: {names}"
+            )
+        owner = self._ids()
+        self._leases.claim_cleanup(lease_id, owner=owner)
+        try:
+            return self._converge_removed(lease, owner)
+        except BaseException as error:
+            self._leases.release_cleanup(
+                lease_id, owner=owner, reason=type(error).__name__
+            )
+            raise
+
+    def _authorize_durable(self, lease: WorktreeLease) -> None:
+        """Require a fresh durable verification for the recorded checkpoint."""
+
+        if (
+            lease.remote_verified_at is None
+            or lease.verified_checkpoint_id != lease.checkpoint_id
+            or lease.verified_sha != lease.checkpoint_sha
+            or lease.verified_remote != lease.remote
+            or lease.verified_branch != lease.branch
+        ):
+            raise CleanupBlocked(
+                f"worktree lease {lease.lease_id} has no durable remote "
                 f"verification for its recorded checkpoint"
             )
         now = self._now()
@@ -616,15 +779,89 @@ class WorktreeCustodian:
             raise CleanupBlocked(
                 f"remote proof is stale ({age:.0f}s old)"
             )
-        head = self._git.head_sha(path)
-        if head != lease.checkpoint_sha:
-            raise CleanupBlocked(
-                f"HEAD moved after the remote proof "
-                f"({head[:12]} != {lease.checkpoint_sha[:12]})"
-            )
-        checkpoint_id = lease.checkpoint_id
+
+    def _resume_cleanup(self, lease: WorktreeLease) -> CleanupResult:
+        lease_id = lease.lease_id
+        stale_before = (
+            self._now() - timedelta(seconds=self._cleanup_claim_ttl)
+        ).isoformat()
         owner = self._ids()
-        self._leases.claim_cleanup(lease_id, owner=owner)
+        if not self._leases.recover_cleanup(
+            lease_id, owner=owner, stale_before=stale_before
+        ):
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} is claimed for cleanup "
+                f"by {lease.cleanup_owner}"
+            )
+        lease = self._leases.get(lease_id)
+        repo_path = Path(lease.repo_path)
+        if lease.path not in self._git.worktree_list(repo_path):
+            # The crashed cleanup already removed the worktree; converge
+            # without inspecting or removing the vanished path again.
+            return self._converge_removed(lease, owner)
+        try:
+            status = self._git.status_of(Path(lease.path))
+            if not status.clean:
+                raise CleanupBlocked(
+                    f"worktree {lease.path} is dirty "
+                    f"({len(status.modified)} modified, "
+                    f"{len(status.untracked)} untracked); checkpoint it first"
+                )
+            # Never grandfather stale proof: the resume re-checks the age
+            # limit and releases so the caller re-verifies from scratch.
+            self._authorize_durable(lease)
+            head = self._git.head_sha(Path(lease.path))
+            if head != lease.checkpoint_sha:
+                raise CleanupBlocked(
+                    f"HEAD moved after the remote proof "
+                    f"({head[:12]} != {lease.checkpoint_sha[:12]})"
+                )
+        except BaseException as error:
+            self._leases.release_cleanup(
+                lease_id, owner=owner, reason=type(error).__name__
+            )
+            raise
+        return self._finish_cleanup(lease, owner)
+
+    def _converge_removed(
+        self, lease: WorktreeLease, owner: str
+    ) -> CleanupResult:
+        repo_path = Path(lease.repo_path)
+        try:
+            self._git.worktree_prune(repo_path)
+            still = lease.path in self._git.worktree_list(repo_path)
+        except GitError as error:
+            raise CleanupBlocked(
+                f"cleanup of {lease.path} halted after removal: {error}"
+            ) from error
+        if still:
+            raise CleanupBlocked(
+                f"worktree {lease.path} is still registered after prune"
+            )
+        self._leases.record_reclaimed(lease.lease_id, owner=owner)
+        return CleanupResult(
+            lease_id=lease.lease_id,
+            path=lease.path,
+            removed=True,
+            pruned=True,
+            stopped_process_leases=(),
+        )
+
+    def _finish_cleanup(
+        self, lease: WorktreeLease, owner: str
+    ) -> CleanupResult:
+        """Stop, remove, prune, and record under a held cleanup claim.
+
+        Before ``git worktree remove`` succeeds any failure releases the
+        claim; past that point of no return the claim is kept so only
+        ``reconcile`` can converge the possibly half-removed worktree.
+        """
+
+        lease_id = lease.lease_id
+        checkpoint_id = lease.checkpoint_id
+        assert checkpoint_id is not None
+        path = Path(lease.path)
+        removed = False
         try:
             stopped: list[str] = []
             for process_lease in self._bound_processes(path):
@@ -651,15 +888,23 @@ class WorktreeCustodian:
                 raise CleanupBlocked(
                     f"git worktree remove refused {lease.path}: {error}"
                 ) from error
-            self._git.worktree_prune(repo_path)
-            if lease.path in self._git.worktree_list(repo_path):
+            removed = True
+            try:
+                self._git.worktree_prune(repo_path)
+                still = lease.path in self._git.worktree_list(repo_path)
+            except GitError as error:
+                raise CleanupBlocked(
+                    f"cleanup of {lease.path} halted after removal: {error}"
+                ) from error
+            if still:
                 raise CleanupBlocked(
                     f"worktree {lease.path} is still registered after prune"
                 )
         except BaseException as error:
-            self._leases.release_cleanup(
-                lease_id, owner=owner, reason=type(error).__name__
-            )
+            if not removed:
+                self._leases.release_cleanup(
+                    lease_id, owner=owner, reason=type(error).__name__
+                )
             raise
         self._leases.record_reclaimed(lease_id, owner=owner)
         return CleanupResult(

@@ -175,6 +175,10 @@ class WorktreeGit:
         name = result.stdout.strip()
         return name if name else None
 
+    def head_message(self, path: Path) -> str:
+        result = self._run(("git", "log", "-1", "--format=%B"), path)
+        return result.stdout.strip()
+
     def ahead(self, path: Path) -> int | None:
         """Commits ahead of the upstream, or None when none is configured."""
 
