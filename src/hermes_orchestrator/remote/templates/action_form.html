@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block heading %}{{ action.title }}{% endblock %}
+{% block content %}
+<form method="post" action="/console/actions/{{ action.slug }}/prepare">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="target">{{ action.target_label }}</label>
+<input type="text" id="target" name="target" required>
+{% for field in action.fields %}
+<label for="{{ field.name }}">{{ field.label }}</label>
+<input type="{{ field.input_type }}" id="{{ field.name }}" name="{{ field.name }}" required>
+{% endfor %}
+<button type="submit">Continue</button>
+</form>
+<p><a href="/console">Back to status</a></p>
+{% endblock %}

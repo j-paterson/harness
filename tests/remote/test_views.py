@@ -57,6 +57,18 @@ FORBIDDEN_TERMS = (
 )
 
 
+# The per-project repositories the tests configure for review-link
+# provenance; each alias's canonical PR URL is the only value _guard_pr_url
+# may accept for that alias. Deliberately not this project's real
+# repository: provenance must be config-driven, per project.
+CONFIGURED_GITHUB_REPOS = {
+    "project-1": "acme/widgets",
+    "project-2": "beta/rockets",
+}
+CANONICAL_PR_URL = "https://github.com/acme/widgets/pull/19"
+SECOND_CANONICAL_PR_URL = "https://github.com/beta/rockets/pull/23"
+
+
 class FakeAuditSink:
     def __init__(self) -> None:
         self.events: list[EventInput] = []
@@ -142,7 +154,7 @@ def _benign_source() -> FakeStatusSource:
                 issue_alias="issue-99",
                 project_alias="project-1",
                 state="awaiting_verdict",
-                pr_url="https://github.example/org/repo/pull/19",
+                pr_url=CANONICAL_PR_URL,
                 ci_status="none",
                 age_seconds=900,
             )
@@ -166,6 +178,7 @@ def _service(
     return StatusViewService(
         source=source or _benign_source(),
         audit=sink or FakeAuditSink(),
+        github_repos=CONFIGURED_GITHUB_REPOS,
     )
 
 
@@ -183,7 +196,7 @@ def test_summary_renders_benign_content() -> None:
     assert summary.queue[0].issue_alias == "issue-101"
     assert summary.resources is not None
     assert summary.resources.band == ResourceBand.GREEN
-    assert summary.reviews[0].pr_url == "https://github.example/org/repo/pull/19"
+    assert summary.reviews[0].pr_url == CANONICAL_PR_URL
     assert summary.stalls[0].checkpoint_eligible is True
 
 
@@ -354,6 +367,175 @@ def test_suspect_pr_url_fails_closed() -> None:
     with pytest.raises(RedactionError):
         _service(source, sink).summary()
     assert [event.event_type for event in sink.events] == ["redaction_failure"]
+
+
+def _review_source(
+    pr_url: str, project_alias: str = "project-1"
+) -> FakeStatusSource:
+    source = _benign_source()
+    source._reviews = [
+        ReviewInput(
+            issue_alias="issue-99",
+            project_alias=project_alias,
+            state="awaiting_verdict",
+            pr_url=pr_url,
+            ci_status="none",
+            age_seconds=900,
+        )
+    ]
+    return source
+
+
+def test_canonical_pr_url_for_the_configured_repository_renders() -> None:
+    sink = FakeAuditSink()
+    summary = _service(_review_source(CANONICAL_PR_URL), sink).summary()
+    assert summary.reviews[0].pr_url == CANONICAL_PR_URL
+    assert sink.events == []
+
+
+def test_each_alias_canonical_pr_url_renders_for_its_own_project() -> None:
+    sink = FakeAuditSink()
+    source = _benign_source()
+    source._reviews = [
+        ReviewInput(
+            issue_alias="issue-99",
+            project_alias="project-1",
+            state="awaiting_verdict",
+            pr_url=CANONICAL_PR_URL,
+            ci_status="none",
+            age_seconds=900,
+        ),
+        ReviewInput(
+            issue_alias="issue-23",
+            project_alias="project-2",
+            state="awaiting_verdict",
+            pr_url=SECOND_CANONICAL_PR_URL,
+            ci_status="none",
+            age_seconds=300,
+        ),
+    ]
+    summary = _service(source, sink).summary()
+    assert [review.pr_url for review in summary.reviews] == [
+        CANONICAL_PR_URL,
+        SECOND_CANONICAL_PR_URL,
+    ]
+    assert sink.events == []
+
+
+@pytest.mark.parametrize(
+    ("project_alias", "pr_url", "reason"),
+    [
+        # Cross-project: each alias carrying the OTHER project's canonical
+        # URL must fail even though the URL is canonical somewhere.
+        ("project-2", CANONICAL_PR_URL, "unverified_pr_link"),
+        ("project-1", SECOND_CANONICAL_PR_URL, "unverified_pr_link"),
+        # Unknown or unmapped aliases fail closed even with canonical-looking
+        # URLs for configured repositories.
+        ("project-3", CANONICAL_PR_URL, "unmapped_project"),
+        ("project-3", SECOND_CANONICAL_PR_URL, "unmapped_project"),
+        ("", CANONICAL_PR_URL, "unmapped_project"),
+    ],
+)
+def test_pr_url_not_bound_to_its_project_fails_closed(
+    project_alias: str, pr_url: str, reason: str
+) -> None:
+    sink = FakeAuditSink()
+    service = _service(_review_source(pr_url, project_alias), sink)
+    with pytest.raises(RedactionError) as excinfo:
+        service.summary()
+    # Neither the URL nor the alias leaks: not in the error, not in the event.
+    assert pr_url not in str(excinfo.value)
+    if project_alias:
+        assert project_alias not in str(excinfo.value)
+    assert len(sink.events) == 1
+    event = sink.events[0]
+    assert event.event_type == "redaction_failure"
+    assert event.aggregate_type == "remote_view"
+    assert event.payload == {
+        "view": "review",
+        "field": "pr_url",
+        "reason": reason,
+    }
+    serialized = json.dumps(event.payload)
+    assert pr_url not in serialized
+    if project_alias:
+        assert project_alias not in serialized
+
+
+def test_repository_mapping_is_copied_at_construction() -> None:
+    mapping = dict(CONFIGURED_GITHUB_REPOS)
+    sink = FakeAuditSink()
+    service = _service(_review_source(CANONICAL_PR_URL), sink)
+    hostile_service = StatusViewService(
+        source=_review_source(CANONICAL_PR_URL),
+        audit=sink,
+        github_repos=mapping,
+    )
+    # Mutating the caller's mapping after construction must not redirect
+    # validation: the service holds its own immutable copy.
+    mapping["project-1"] = "mallory/widgets"
+    mapping.pop("project-2")
+    assert service.summary().reviews[0].pr_url == CANONICAL_PR_URL
+    assert hostile_service.summary().reviews[0].pr_url == CANONICAL_PR_URL
+    assert sink.events == []
+
+
+@pytest.mark.parametrize(
+    "pr_url",
+    [
+        # Foreign and lookalike hosts.
+        "https://phishing.example/acme/widgets/pull/19",
+        "https://github.com.evil.test/acme/widgets/pull/19",
+        "https://gíthub.com/acme/widgets/pull/19",
+        "https://GitHub.com/acme/widgets/pull/19",
+        # Scheme and authority tricks.
+        "//github.com/acme/widgets/pull/19",
+        "http://github.com/acme/widgets/pull/19",
+        "HTTPS://github.com/acme/widgets/pull/19",
+        "javascript:alert(1)",
+        "data:text/html,unverified",
+        "https://user@github.com/acme/widgets/pull/19",
+        "https://github.com:443/acme/widgets/pull/19",
+        "https://github.com\\acme/widgets/pull/19",
+        # Wrong repository.
+        "https://github.com/mallory/widgets/pull/19",
+        "https://github.com/acme/gadgets/pull/19",
+        # Unexpected path components.
+        "https://github.com/acme/widgets/pull/19/files",
+        "https://github.com/acme/widgets/pull/19/",
+        "https://github.com/acme/widgets/pulls/19",
+        "https://github.com/acme/widgets/pull/%31%39",
+        "https://github.com/acme/widgets/pull/19?tab=diff",
+        "https://github.com/acme/widgets/pull/19#top",
+        # Malformed pull numbers.
+        "https://github.com/acme/widgets/pull/0",
+        "https://github.com/acme/widgets/pull/019",
+        "https://github.com/acme/widgets/pull/-19",
+        "https://github.com/acme/widgets/pull/nineteen",
+        "https://github.com/acme/widgets/pull/١٩",
+        "https://github.com/acme/widgets/pull/",
+        # Not a URL at all.
+        "not a url",
+        "",
+    ],
+)
+def test_unverified_pr_url_fails_closed_without_leaking(pr_url: str) -> None:
+    sink = FakeAuditSink()
+    service = _service(_review_source(pr_url), sink)
+    with pytest.raises(RedactionError) as excinfo:
+        service.summary()
+    # The rejected value never leaks: not in the error, not in the event.
+    if pr_url:
+        assert pr_url not in str(excinfo.value)
+    assert len(sink.events) == 1
+    event = sink.events[0]
+    assert event.event_type == "redaction_failure"
+    assert event.aggregate_type == "remote_view"
+    assert event.payload["view"] == "review"
+    assert event.payload["field"] == "pr_url"
+    assert event.payload["reason"] == "unverified_pr_link"
+    if pr_url:
+        assert pr_url not in json.dumps(event.payload)
 
 
 def test_suspect_alias_fails_closed_case_insensitively() -> None:

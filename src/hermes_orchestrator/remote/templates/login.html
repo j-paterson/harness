@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block heading %}Sign in{% endblock %}
+{% block content %}
+{% if failed %}
+<p>Sign-in failed.</p>
+{% endif %}
+<form method="post" action="/login">
+<label for="passcode">Access code</label>
+<input type="password" id="passcode" name="passcode"
+ autocomplete="current-password" autocapitalize="none" spellcheck="false"
+ required>
+<button type="submit">Sign in</button>
+</form>
+{% endblock %}

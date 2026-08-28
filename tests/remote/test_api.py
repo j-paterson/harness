@@ -26,6 +26,8 @@ from hermes_orchestrator.remote.auth import (
     REMOTE_SERVICE,
     SESSION_COOKIE_NAME,
     CsrfService,
+    LoginRateLimiter,
+    RemoteCredentialService,
     SessionService,
 )
 from hermes_orchestrator.remote.commands import ConfirmationService
@@ -154,6 +156,8 @@ def harness(tmp_path: Path):
         policy=RemotePolicy(),
         status=FakeStatus(),
         confirmations=confirmations,
+        credentials=RemoteCredentialService(keychain=keychain),
+        login_limiter=LoginRateLimiter(now=clock.now),
     )
     built = Harness(
         app=create_operations_app(dependencies),
@@ -306,6 +310,10 @@ def test_non_loopback_bind_hosts_are_rejected_at_startup(harness: Harness) -> No
                     policy=RemotePolicy(),
                     status=FakeStatus(),
                     confirmations=None,
+                    credentials=RemoteCredentialService(
+                        keychain=FakeKeychain()
+                    ),
+                    login_limiter=LoginRateLimiter(),
                     bind_host=bad_host,
                 )
             )

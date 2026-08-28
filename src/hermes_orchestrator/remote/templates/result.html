@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block heading %}Command result{% endblock %}
+{% block content %}
+<p>Result: <strong>{{ code }}</strong></p>
+<p>Correlation id: {{ correlation_id }}</p>
+<p><a href="/console">Back to status</a></p>
+{% endblock %}

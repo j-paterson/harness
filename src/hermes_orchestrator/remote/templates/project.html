@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block heading %}Project {{ project.project_alias }}{% endblock %}
+{% block content %}
+<section>
+<h2>State</h2>
+<p>{{ project.state }} ({{ project.age_seconds }}s)</p>
+</section>
+<section>
+<h2>Workers</h2>
+<ul>
+{% for item in workers %}
+<li>{{ item.worker_alias }} · {{ item.profile_alias }}
+— {{ item.state }} · context {{ item.context_band }}</li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Queue</h2>
+<ul>
+{% for item in queue %}
+<li>{{ item.issue_alias }} — {{ item.state }} ({{ item.age_seconds }}s)</li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Reviews</h2>
+<ul>
+{% for item in reviews %}
+<li>{{ item.issue_alias }} — {{ item.state }} · CI {{ item.ci_status }}
+· <a href="{{ item.pr_url }}">{{ item.pr_url }}</a></li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Stalls</h2>
+<ul>
+{% for item in stalls %}
+<li>{{ item.worker_alias }} — {{ item.stall_summary }}
+{%- if item.checkpoint_eligible %} · checkpoint eligible{% endif %}</li>
+{% endfor %}
+</ul>
+</section>
+<p><a href="/console">Back to status</a></p>
+{% endblock %}

@@ -23,7 +23,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from hermes_orchestrator.remote.auth import (
     SESSION_COOKIE_NAME,
     CsrfService,
+    LoginRateLimiter,
     RemoteAuthError,
+    RemoteCredentialService,
     SessionClaims,
     SessionService,
 )
@@ -42,6 +44,7 @@ from hermes_orchestrator.remote.commands import (
     UnknownTarget,
     UnsupportedIntent,
 )
+from hermes_orchestrator.remote.console import build_console_router
 from hermes_orchestrator.remote.policy import RemoteIntent, RemotePolicy
 from hermes_orchestrator.remote.views import OperationsSummary, RedactionError
 
@@ -104,6 +107,8 @@ class RemoteDependencies:
     policy: RemotePolicy
     status: StatusProvider
     confirmations: ConfirmationService
+    credentials: RemoteCredentialService
+    login_limiter: LoginRateLimiter
     bind_host: str = LOOPBACK_HOST
 
 
@@ -232,5 +237,17 @@ def create_operations_app(dependencies: RemoteDependencies) -> FastAPI:
             "correlation_id": result.correlation_id,
             "state": result.state,
         }
+
+    app.include_router(
+        build_console_router(
+            sessions=dependencies.sessions,
+            csrf=dependencies.csrf,
+            policy=dependencies.policy,
+            status=dependencies.status,
+            confirmations=dependencies.confirmations,
+            credentials=dependencies.credentials,
+            login_limiter=dependencies.login_limiter,
+        )
+    )
 
     return app

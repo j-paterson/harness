@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<nav>
+<ul>
+{% for action in actions %}
+<li><a href="/console/actions/{{ action.slug }}">{{ action.title }}</a></li>
+{% endfor %}
+</ul>
+</nav>
+<section>
+<h2>Projects</h2>
+<ul>
+{% for item in summary.projects %}
+<li><a href="/projects/{{ item.project_alias }}">{{ item.project_alias }}</a>
+— {{ item.state }} ({{ item.age_seconds }}s)</li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Workers</h2>
+<ul>
+{% for item in summary.workers %}
+<li>{{ item.worker_alias }} · {{ item.profile_alias }} · {{ item.project_alias }}
+— {{ item.state }} · context {{ item.context_band }}</li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Queue</h2>
+<ul>
+{% for item in summary.queue %}
+<li>{{ item.issue_alias }} · {{ item.project_alias }} — {{ item.state }}
+({{ item.age_seconds }}s)</li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Resources</h2>
+{% if summary.resources %}
+<ul>
+<li>band {{ summary.resources.band }}</li>
+<li>memory {{ summary.resources.available_memory_gib }}
+of {{ summary.resources.total_memory_gib }} GiB free</li>
+<li>load {{ summary.resources.load_one }}
+on {{ summary.resources.logical_cpus }} CPUs</li>
+<li>disk {{ summary.resources.disk_free_gib }} GiB free</li>
+</ul>
+{% else %}
+<p>No resource data.</p>
+{% endif %}
+</section>
+<section>
+<h2>Reviews</h2>
+<ul>
+{% for item in summary.reviews %}
+<li>{{ item.issue_alias }} · {{ item.project_alias }} — {{ item.state }}
+· CI {{ item.ci_status }} · <a href="{{ item.pr_url }}">{{ item.pr_url }}</a></li>
+{% endfor %}
+</ul>
+</section>
+<section>
+<h2>Stalls</h2>
+<ul>
+{% for item in summary.stalls %}
+<li>{{ item.worker_alias }} · {{ item.project_alias }} — {{ item.stall_summary }}
+{%- if item.checkpoint_eligible %} · checkpoint eligible{% endif %}</li>
+{% endfor %}
+</ul>
+</section>
+<form method="post" action="/logout">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Sign out</button>
+</form>
+{% endblock %}

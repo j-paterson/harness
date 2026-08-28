@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block heading %}Confirm: {{ action.title }}{% endblock %}
+{% block content %}
+<p>{{ impact }}</p>
+<p>This confirmation expires at {{ expires_at }}.</p>
+<p>Type the exact phrase <strong>{{ phrase }}</strong> to proceed.</p>
+<form method="post" action="/console/actions/{{ action.slug }}/confirm"
+ class="confirm-controls">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="confirmation_id" value="{{ confirmation_id }}">
+<input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+<label for="confirmation_phrase">Confirmation phrase</label>
+<input type="text" id="confirmation_phrase" name="confirmation_phrase" required
+autocomplete="off" autocapitalize="characters" spellcheck="false">
+<button type="submit">Execute</button>
+</form>
+<p><a href="/console">Cancel</a></p>
+{% endblock %}
