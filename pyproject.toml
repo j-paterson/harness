@@ -13,6 +13,10 @@ dependencies = [
   "PyYAML==6.0.3",
   "psutil==7.2.2",
   "httpx==0.28.1",
+  "fastapi==0.133.1",
+  "uvicorn==0.41.0",
+  "jinja2==3.1.6",
+  "python-multipart==0.0.32",
 ]
 
 [project.scripts]

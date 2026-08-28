@@ -20,11 +20,17 @@ from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
-from hermes_orchestrator.keychain import Keychain
+from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
+from hermes_orchestrator.remote.auth import (
+    CredentialConflict,
+    CredentialExists,
+    CredentialStateUnreadable,
+    RemoteCredentialService,
+)
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.runtime import (
     Dispatch,
@@ -127,6 +133,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Claude Code PreToolUse hook: block subagents while frozen",
     )
     gate.add_argument("--freeze-dir", type=Path, required=True)
+
+    commands.add_parser(
+        "remote-auth-init",
+        help="create remote console credentials and display the token once",
+    )
 
     hermes_command = commands.add_parser(
         "hermes-command",
@@ -602,6 +613,58 @@ def subagent_gate(freeze_dir: Path, payload: str) -> tuple[int, str]:
     return 0, ""
 
 
+def _remote_auth_init() -> int:
+    """Initialize remote console credentials, displaying the token exactly once."""
+
+    credentials = RemoteCredentialService(keychain=Keychain())
+    try:
+        token = credentials.initialize()
+    except CredentialExists:
+        print(
+            "remote credential already exists; refusing to overwrite",
+            file=sys.stderr,
+        )
+        _print_remote_auth_diagnostic(credentials)
+        return 1
+    except CredentialConflict:
+        print(
+            "remote credential state is unproven; "
+            "refusing to display or overwrite it",
+            file=sys.stderr,
+        )
+        _print_remote_auth_diagnostic(credentials)
+        return 1
+    except CredentialStateUnreadable:
+        print(
+            "remote credential initialization failed: keychain state unreadable",
+            file=sys.stderr,
+        )
+        _print_remote_auth_diagnostic(credentials)
+        return 1
+    except KeychainWriteError:
+        print(
+            "remote credential initialization failed: keychain write refused",
+            file=sys.stderr,
+        )
+        _print_remote_auth_diagnostic(credentials)
+        return 1
+    print("Remote application token (displayed once; stored only in Keychain):")
+    print(token)
+    return 0
+
+
+def _print_remote_auth_diagnostic(credentials: RemoteCredentialService) -> None:
+    """Print bounded account-presence lines; account names only, no values."""
+
+    presence = credentials.account_presence()
+    for account in sorted(presence):
+        print(f"keychain account '{account}': {presence[account]}", file=sys.stderr)
+    print(
+        "no stored values were displayed; rerun remote-auth-init to recover",
+        file=sys.stderr,
+    )
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one CLI command and return its process exit code."""
 
@@ -611,6 +674,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if message:
             print(message, file=sys.stderr)
         return code
+    if args.command == "remote-auth-init":
+        return _remote_auth_init()
     settings = load_settings(args.repo_root, args.state_dir)
     enable_live = args.command == "daemon" and settings.policy.mode == "active"
     runtime = open_runtime(settings, enable_live=enable_live)
