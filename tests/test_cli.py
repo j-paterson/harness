@@ -827,3 +827,128 @@ def test_cmux_focus_fails_closed_from_binding_to_socket(
     # binding is untouched; only the error type is ever printed.
     assert denied.exit_code == 1
     assert json.loads(denied.stdout)["error"] == "CmuxUnavailable"
+
+
+def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:
+    result = invoke(
+        [
+            "migration-env",
+            "provision",
+            "--target-repo",
+            str(tmp_path),
+            "--slug",
+            "infra-189",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["executed"] is False
+    run = next(s for s in payload["plan"] if s["code"] == "container_run")
+    # The disposable container may only ever publish on loopback.
+    assert "127.0.0.1:5439:5432" in run["argv"]
+
+
+def test_migration_env_gate_preview_lists_deterministic_checks(
+    tmp_path: Path,
+) -> None:
+    result = invoke(
+        [
+            "migration-env",
+            "gate",
+            "--target-repo",
+            str(tmp_path),
+            "--slug",
+            "infra-189",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["executed"] is False
+    assert payload["checks"][0] == "repo_head_resolved"
+    assert payload["checks"][-1] == "repo_head_stable"
+    assert "corpus_synthetic_seed" in payload["checks"]
+    assert "historical_schema_authority" in payload["checks"]
+
+
+def test_migration_env_gate_execute_requires_a_verdict_path(
+    tmp_path: Path,
+) -> None:
+    result = invoke(
+        [
+            "migration-env",
+            "gate",
+            "--target-repo",
+            str(tmp_path),
+            "--slug",
+            "infra-189",
+            "--execute",
+        ]
+    )
+
+    assert result.exit_code == 2
+    assert "requires --out" in result.stderr
+
+
+def test_migration_env_handoff_names_env_vars_but_never_values(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "handoff.md"
+    result = invoke(
+        [
+            "migration-env",
+            "handoff",
+            "--target-repo",
+            str(tmp_path / "worktree"),
+            "--slug",
+            "infra-189",
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert result.exit_code == 0
+    text = out.read_text()
+    assert "jo_local_fable_infra_189_source" in text
+    assert "DATABASE_URL_READ_ONLY_STAGE" in text
+    assert "reset-staging" in text
+    # Env var names only: no connection string ever lands in the doc.
+    assert "postgresql://" not in text
+
+
+def test_migration_env_mark_stamps_only_a_linked_worktree(
+    tmp_path: Path,
+) -> None:
+    from tests.test_migration_env import make_linked_worktree
+
+    primary, worktree = make_linked_worktree(tmp_path)
+
+    refused = invoke(
+        [
+            "migration-env",
+            "mark",
+            "--target-repo",
+            str(primary),
+            "--slug",
+            "infra-189",
+        ]
+    )
+    assert refused.exit_code == 1
+    assert "primary checkout" in refused.stderr
+    assert not (primary / ".fable-isolated-worktree").exists()
+
+    result = invoke(
+        [
+            "migration-env",
+            "mark",
+            "--target-repo",
+            str(worktree),
+            "--slug",
+            "infra-189",
+        ]
+    )
+    assert result.exit_code == 0
+    marker = (worktree / ".fable-isolated-worktree").read_text()
+    assert "slug=infra_189" in marker
+    assert "repository=" in marker

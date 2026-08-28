@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from hermes_orchestrator import migration_env as migration_env_module
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
@@ -36,6 +37,12 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.migration_gate import (
+    MigrationGate,
+    jo_loans_commands,
+    load_verdict,
+    render_handoff,
+)
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
 from hermes_orchestrator.remote.auth import (
@@ -211,6 +218,29 @@ def _parser() -> argparse.ArgumentParser:
     )
     serve_console.add_argument("--host", default="127.0.0.1")
     serve_console.add_argument("--port", type=int, required=True)
+
+    migration_env = commands.add_parser(
+        "migration-env",
+        help=(
+            "plan (or with --execute run) the disposable loopback "
+            "migration environment and its fail-closed gate"
+        ),
+    )
+    migration_env.add_argument(
+        "action",
+        choices=("provision", "mark", "gate", "handoff", "teardown"),
+    )
+    migration_env.add_argument("--target-repo", type=Path, required=True)
+    migration_env.add_argument("--slug", required=True)
+    migration_env.add_argument(
+        "--container", default=migration_env_module.DEFAULT_CONTAINER
+    )
+    migration_env.add_argument(
+        "--port", type=int, default=migration_env_module.DEFAULT_PORT
+    )
+    migration_env.add_argument("--out", type=Path)
+    migration_env.add_argument("--verdict", type=Path)
+    migration_env.add_argument("--execute", action="store_true")
     return parser
 
 
@@ -877,6 +907,138 @@ def _deploy_status(
     return _run_deploy_plan(args, steps, runner)
 
 
+def _migration_env(
+    args: argparse.Namespace,
+    runner: migration_env_module.EnvCommandRunner | None = None,
+) -> int:
+    """Plan or drive the disposable migration environment.
+
+    Every action is a dry plan unless ``--execute`` is passed; the gate
+    additionally refuses to execute without a verdict output path, so a
+    run can never happen without leaving its durable artifact.
+    """
+
+    config = migration_env_module.MigrationEnvConfig(
+        repo_path=args.target_repo,
+        slug=args.slug,
+        container=args.container,
+        port=args.port,
+    )
+    if args.action == "mark":
+        try:
+            marker = migration_env_module.mark_isolated_worktree(
+                args.target_repo, slug=args.slug
+            )
+        except migration_env_module.MigrationEnvRefusal as refusal:
+            print(json.dumps({"error": str(refusal)}), file=sys.stderr)
+            return 1
+        print(json.dumps({"marked": str(marker)}))
+        return 0
+    if args.action == "handoff":
+        if args.out is None:
+            print("handoff requires --out", file=sys.stderr)
+            return 2
+        verdict = None
+        if args.verdict is not None and args.verdict.exists():
+            verdict = load_verdict(args.verdict)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            render_handoff(
+                config=config,
+                commands=jo_loans_commands(),
+                verdict=verdict,
+            )
+        )
+        print(json.dumps({"handoff": str(args.out)}))
+        return 0
+    if args.action == "gate":
+        commands = jo_loans_commands()
+        if not args.execute:
+            codes = [
+                "repo_head_resolved",
+                "isolated_worktree",
+                "container_identity",
+                "loopback_bindings",
+                "disposable_naming",
+                "pending_before",
+                "migrate_deploy",
+                "pending_after",
+                "deploy_idempotent",
+                *(f"corpus_{code}" for code, _ in commands.corpus),
+                *(f"historical_{code}" for code, _ in commands.historical),
+                "generation_first",
+                "generation_byte_clean",
+                "container_identity_stable",
+                "repo_head_stable",
+            ]
+            print(json.dumps({"executed": False, "checks": codes}))
+            return 0
+        if args.out is None:
+            print("gate --execute requires --out", file=sys.stderr)
+            return 2
+        verdict = MigrationGate(
+            config=config,
+            commands=commands,
+            runner=runner or migration_env_module.EnvSubprocessRunner(),
+            verdict_path=args.out,
+        ).run()
+        print(
+            json.dumps(
+                {
+                    "executed": True,
+                    "green": verdict.green,
+                    "verdict": str(args.out),
+                    "failed": [
+                        f.code
+                        for f in verdict.findings
+                        if f.status == "fail"
+                    ],
+                }
+            )
+        )
+        return 0 if verdict.green else 1
+    steps = (
+        migration_env_module.plan_provision(config)
+        if args.action == "provision"
+        else migration_env_module.plan_teardown(config)
+    )
+    if not args.execute:
+        print(
+            json.dumps(
+                {
+                    "executed": False,
+                    "plan": [
+                        {
+                            "argv": list(step.argv),
+                            "kind": step.kind,
+                            "code": step.code,
+                        }
+                        for step in steps
+                    ],
+                }
+            )
+        )
+        return 0
+    active_runner = runner or migration_env_module.EnvSubprocessRunner()
+    report = (
+        migration_env_module.provision_disposable(config, active_runner)
+        if args.action == "provision"
+        else migration_env_module.teardown_disposable(config, active_runner)
+    )
+    print(
+        json.dumps(
+            {
+                "executed": True,
+                "completed": report.completed,
+                "refusal_code": report.refusal_code,
+                "records": [list(record) for record in report.records],
+                "container_id": report.container_id,
+            }
+        )
+    )
+    return 0 if report.completed else 1
+
+
 def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
     """Serve the operations console over the durable state database.
 
@@ -926,6 +1088,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _deploy_serve_enable(args)
     if args.command == "deploy-status":
         return _deploy_status(args)
+    if args.command == "migration-env":
+        return _migration_env(args)
     settings = load_settings(args.repo_root, args.state_dir)
     if args.command == "serve-console":
         return _serve_console(args, settings)
