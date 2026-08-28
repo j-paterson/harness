@@ -1,0 +1,3 @@
+{"method": "account/read", "result": {"account": {"type": "chatgpt", "email": "merger@example.com", "planType": "pro"}, "requiresOpenaiAuth": false}}
+{"method": "account/rateLimits/read", "result": {"rateLimits": {"primary": {"usedPercent": 25, "resetsAt": 1767225600, "windowDurationMins": 300}, "secondary": {"usedPercent": 10}, "rateLimitReachedType": null}}}
+{"method": "turn/interrupt", "result": {}}
