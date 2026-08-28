@@ -23,6 +23,7 @@ from hermes_orchestrator.linear import (
     ProjectLinearRouter,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
     JsonCommand,
@@ -90,6 +91,7 @@ class Runtime:
     cells: ProjectCellService | None
     profile_health: tuple[ProfileHealth, ...]
     merge_flow: MergeFlow | None = None
+    processes: ProcessRegistry | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -161,6 +163,7 @@ def open_runtime(
         raise
     try:
         events = EventStore(database)
+        processes = ProcessRegistry(database, events)
         queue = QueueService(database, events, settings.projects)
         cells: ProjectCellService | None = None
         dispatch: Dispatch | None = None
@@ -215,11 +218,13 @@ def open_runtime(
                 linear=linear,
                 keychain=reader,
                 base_env=environment,
+                processes=processes,
             )
             runner = ClaudeRunner(
                 registry,
                 prompt_file=prompt_path,
                 base_env=environment,
+                processes=processes,
             )
             cells = ProjectCellService(
                 database=database,
@@ -249,6 +254,7 @@ def open_runtime(
         sampler = ResourceSampler(
             policy=settings.policy,
             repository_paths=repository_paths,
+            managed_rss=processes.managed_rss_bytes,
         )
         service = OrchestratorService(
             database=database,
@@ -256,6 +262,7 @@ def open_runtime(
             sampler=sampler,
             scheduler=scheduler,
             policy=settings.policy,
+            processes=processes,
         )
         return Runtime(
             database=database,
@@ -265,6 +272,7 @@ def open_runtime(
             cells=cells,
             profile_health=profile_health,
             merge_flow=merge_flow,
+            processes=processes,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

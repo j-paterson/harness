@@ -14,6 +14,7 @@ import psutil
 from hermes_orchestrator.config import PolicyConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.scheduler import PlannedAction, Scheduler
 
@@ -55,7 +56,9 @@ class OrchestratorService:
         policy: PolicyConfig,
         pid_exists: Callable[[int], bool] = psutil.pid_exists,
         now: Callable[[], datetime] = _utc_now,
+        processes: ProcessRegistry | None = None,
     ) -> None:
+        self._processes = processes
         self._database = database
         self._events = events
         self._sampler = sampler
@@ -88,6 +91,7 @@ class OrchestratorService:
             )
 
         findings = self._reconcile_worker_leases()
+        findings.extend(self._reconcile_process_leases())
         integrity_ok = self._database.scalar("PRAGMA integrity_check") == "ok"
         if not integrity_ok:
             findings.append("sqlite_integrity_failed")
@@ -161,6 +165,34 @@ class OrchestratorService:
             snapshot=snapshot,
             planned_actions=tuple(self._scheduler.plan(snapshot)),
         )
+
+    def _reconcile_process_leases(self) -> list[str]:
+        """Expire dead process leases; report surviving managed processes.
+
+        Orphans — live, identity-valid managed processes that no launcher
+        in this daemon owns — are findings that keep admission closed until
+        an explicit, checkpoint-backed stop reclaims them. Nothing is
+        signaled here.
+        """
+
+        if self._processes is None:
+            return []
+        expired = self._processes.expire_dead()
+        with self._database.transaction() as connection:
+            for lease_id in expired:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="process_lease.expired",
+                        aggregate_type="process_lease",
+                        aggregate_id=lease_id,
+                        payload={"reason": "reconciliation"},
+                    ),
+                )
+        return [
+            f"orphan_process:{lease.lease_id}"
+            for lease in self._processes.find_orphans()
+        ]
 
     def _reconcile_worker_leases(self) -> list[str]:
         rows = self._database.execute(

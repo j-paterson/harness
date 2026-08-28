@@ -89,7 +89,7 @@ def test_legacy_database_upgrades_to_current_schema(tmp_path: Path) -> None:
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 10
+        assert database.schema_version() == 12
         names = tables(database)
         assert "reviewer_channels" in names
         assert "merger_threads" not in names
@@ -148,7 +148,7 @@ def test_upgrade_never_replaces_an_existing_current_channel(tmp_path: Path) -> N
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 10
+        assert database.schema_version() == 12
         row = database.execute(
             "SELECT thread_id, generation, state FROM reviewer_channels"
         ).fetchone()
@@ -168,7 +168,7 @@ def test_upgrade_is_idempotent_across_reopen(tmp_path: Path) -> None:
     Database.open(path).close()
     reopened = Database.open(path)
     try:
-        assert reopened.schema_version() == 10
+        assert reopened.schema_version() == 12
         assert reopened.scalar("SELECT count(*) FROM reviewer_channels") == 1
     finally:
         reopened.close()

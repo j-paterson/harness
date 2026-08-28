@@ -11,6 +11,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
+from hermes_orchestrator.processes import ProcessRegistry, register_spawned
+
 _CLIENT_INFO = {
     "name": "hermes_orchestrator",
     "title": "Hermes Orchestrator",
@@ -20,6 +22,7 @@ _MAX_LINE_BYTES = 64 * 1024
 _SCRUBBED_ENVIRONMENT_KEYS = frozenset({"OPENAI_API_KEY"})
 _DEFAULT_NOTIFICATION_LIMIT = 256
 _METHOD_NOT_FOUND = -32601
+
 _STABLE_METHODS = frozenset(
     {
         "account/read",
@@ -41,6 +44,7 @@ _STABLE_METHODS = frozenset(
     }
 )
 _CLOSED = object()
+
 
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
@@ -129,6 +133,8 @@ class CodexRpcClient:
         handshake_timeout: float = 10.0,
         termination_timeout: float = 5.0,
         notification_limit: int = _DEFAULT_NOTIFICATION_LIMIT,
+        processes: ProcessRegistry | None = None,
+        project_key: str = "merger",
     ) -> None:
         if not command:
             raise ValueError("codex command must not be empty")
@@ -155,6 +161,9 @@ class CodexRpcClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._kill_task: asyncio.Task[None] | None = None
+        self._processes = processes
+        self._project_key = project_key
+        self._lease_id: str | None = None
 
     @property
     def dropped_notifications(self) -> int:
@@ -192,6 +201,14 @@ class CodexRpcClient:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             await self._terminate(process)
             raise RuntimeError("codex app-server pipes are unavailable")
+        self._lease_id = await register_spawned(
+            self._processes,
+            process,
+            project_key=self._project_key,
+            kind="codex_app_server",
+            executable=self._command[0],
+            terminate=self._terminate,
+        )
         self._process = process
         self._pending = {}
         self._next_id = 0
@@ -282,7 +299,16 @@ class CodexRpcClient:
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 await process.wait()
+        self._release_lease(process)
         await self._reap_tasks()
+
+    def _release_lease(self, process: asyncio.subprocess.Process | None) -> None:
+        if self._lease_id is None or self._processes is None:
+            return
+        exit_code = process.returncode if process is not None else None
+        with suppress(Exception):  # lease may already be settled elsewhere
+            self._processes.mark_exited(self._lease_id, exit_code=exit_code)
+        self._lease_id = None
 
     async def _roundtrip(
         self, method: str, params: dict[str, Any] | None, timeout: float

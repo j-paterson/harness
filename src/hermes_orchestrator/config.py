@@ -22,6 +22,13 @@ class ProjectConfig(BaseModel):
     repo_path: Path
     integration_branch: str = Field(min_length=1)
     github_repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")
+    # Explicit CI policy. ``circleci`` reconciles merged candidates against
+    # CircleCI at intake boundaries and treats every non-success (including
+    # a 404 for an unconfigured project) as ambiguous, fail-closed. ``none``
+    # declares that the repository has no CI: merged items are resolved
+    # durably as ``ci_not_configured`` with zero CircleCI calls. A CI 404
+    # is never inferred as ``none``.
+    ci: Literal["circleci", "none"] = "circleci"
 
 
 class LinearStatusIds(BaseModel):

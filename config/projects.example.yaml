@@ -4,3 +4,8 @@ projects:
     repo_path: .
     integration_branch: main
     github_repo: j-paterson/hermes-orchestrator
+    # CI policy: "circleci" (default, fail-closed: any non-success, including a
+    # 404 for an unconfigured CircleCI project, stays ambiguous) or "none"
+    # (the repository has no CI; merged items resolve as ci_not_configured
+    # with zero CircleCI calls). Never inferred from a CI response.
+    ci: none

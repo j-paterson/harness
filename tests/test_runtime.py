@@ -286,3 +286,34 @@ def test_active_runtime_fails_closed_without_lead_contract(tmp_path: Path) -> No
             keychain=FakeKeychain(),
             base_env={},
         )
+
+
+def test_circleci_token_is_read_only_when_a_project_uses_circleci(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    projects = repo_root / "config" / "projects.yaml"
+    projects.write_text(
+        projects.read_text(encoding="utf-8").replace(
+            "    github_repo:", "    ci: none\n    github_repo:"
+        ),
+        encoding="utf-8",
+    )
+    settings = load_settings(repo_root, state_dir)
+    assert all(project.ci == "none" for project in settings.projects.values())
+    keychain = FakeKeychain()
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=keychain,
+        base_env={},
+    )
+    try:
+        assert keychain.reads == [
+            ("hermes-orchestrator-linear", "default"),
+            ("hermes-orchestrator-github", "default"),
+        ]
+        assert runtime.merge_flow is not None
+    finally:
+        runtime.close()

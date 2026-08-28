@@ -181,3 +181,29 @@ def test_linear_team_without_qa_state_loads_non_qa_routing(tmp_path: Path) -> No
         "Review": "state-review",
         "Done": "state-done",
     }
+
+
+def test_project_ci_policy_is_explicit_and_closed(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n", encoding="utf-8"
+    )
+    base = (
+        "    linear_team: ENG\n"
+        "    repo_path: /tmp/x\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/x\n"
+    )
+    (tmp_path / "config/projects.yaml").write_text(
+        f"projects:\n  quiet:\n{base}    ci: none\n  strict:\n{base}",
+        encoding="utf-8",
+    )
+    settings = load_settings(tmp_path, tmp_path / "state")
+    assert settings.projects["quiet"].ci == "none"
+    assert settings.projects["strict"].ci == "circleci"
+
+    (tmp_path / "config/projects.yaml").write_text(
+        f"projects:\n  odd:\n{base}    ci: github\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, tmp_path / "state")

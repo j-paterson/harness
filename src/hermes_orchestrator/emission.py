@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from hermes_orchestrator.ci_window import MergeWindowExhausted, PriorMergeFailed
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.git import GitError, GitRunner
@@ -32,6 +33,8 @@ from hermes_orchestrator.manifests import (
     wake_event_for,
     write_manifest,
 )
+from hermes_orchestrator.review_intake import CandidateRejected
+from hermes_orchestrator.verdicts import CorrectionPacket
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -42,6 +45,20 @@ class WakeDeliverer(Protocol):
     async def deliver(
         self, project_key: str, event: WakeEvent
     ) -> QueueDeliveryResult: ...
+
+
+class IntakeGatePort(Protocol):
+    def validate(self, project_key: str, candidate: CandidateManifest) -> None: ...
+
+
+class CorrectionSinkPort(Protocol):
+    def deliver(
+        self,
+        issue_id: str,
+        packets: tuple[CorrectionPacket, ...],
+        *,
+        source: str = ...,
+    ) -> object: ...
 
 
 class EmissionBlocked(RuntimeError):
@@ -56,6 +73,8 @@ class EmissionResult:
     manifest_path: Path
     delivery: QueueDeliveryResult
     reused_manifest: bool
+    intake: str = "clear"
+    intake_reason: str = ""
 
 
 class CandidateEmitter:
@@ -69,12 +88,18 @@ class CandidateEmitter:
         manifest_root: Path,
         delivery: WakeDeliverer,
         now: Callable[[], datetime] | None = None,
+        intake_gate: IntakeGatePort | None = None,
+        lead: CorrectionSinkPort | None = None,
+        issue_for_failure: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
         self._manifest_root = manifest_root
         self._delivery = delivery
         self._now = now or (lambda: datetime.now(UTC))
+        self._intake_gate = intake_gate
+        self._lead = lead
+        self._issue_for_failure = issue_for_failure
 
     async def emit(
         self,
@@ -158,6 +183,26 @@ class CandidateEmitter:
             reused = True
         event = wake_event_for(manifest, path)
         assert event.manifest_digest == manifest_digest_for(manifest)
+        # The durable intake boundary runs BEFORE the Merger is woken: CI
+        # reconciliation is bound to this event, so the turn-time gate
+        # replays the same decision with zero CI calls, and a deferred or
+        # blocked candidate never triggers a review turn.
+        intake, intake_reason = self._intake(project_key, issue_id, manifest)
+        if intake != "clear":
+            return EmissionResult(
+                event=event,
+                manifest_path=path,
+                delivery=QueueDeliveryResult(
+                    delivered=False,
+                    attempts=0,
+                    thread_id=None,
+                    generation=None,
+                    reason=f"intake_{intake}",
+                ),
+                reused_manifest=reused,
+                intake=intake,
+                intake_reason=intake_reason,
+            )
         delivery = await self._delivery.deliver(project_key, event)
         return EmissionResult(
             event=event,
@@ -165,6 +210,27 @@ class CandidateEmitter:
             delivery=delivery,
             reused_manifest=reused,
         )
+
+    def _intake(
+        self, project_key: str, issue_id: str, manifest: CandidateManifest
+    ) -> tuple[str, str]:
+        if self._intake_gate is None:
+            return "clear", ""
+        try:
+            self._intake_gate.validate(project_key, manifest)
+        except PriorMergeFailed as blocked:
+            packet = blocked.packet
+            if self._lead is not None:
+                owner = None
+                if self._issue_for_failure is not None:
+                    owner = self._issue_for_failure(project_key, packet.reviewed_sha)
+                self._lead.deliver(owner or issue_id, (packet,), source="ci_failure")
+            return "blocked_prior_failure", str(blocked)
+        except MergeWindowExhausted as deferred:
+            return "deferred", str(deferred)
+        except CandidateRejected as rejected:
+            return "rejected", str(rejected)
+        return "clear", ""
 
     def _run(self, repo: Path, *args: str) -> str:
         try:

@@ -23,6 +23,7 @@ from hermes_orchestrator.manifests import (
 from hermes_orchestrator.manifests import (
     WakeEvent as WakeEvent,
 )
+from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 
 CODEX_QUEUE_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
 
@@ -90,9 +91,11 @@ class CodexQueueDelivery:
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
         timeout: float = 10.0,
         termination_timeout: float = 5.0,
+        processes: ProcessRegistry | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("delivery timeout must be positive")
+        self._processes = processes
         if termination_timeout <= 0:
             raise ValueError("termination timeout must be positive")
         self._channels = channels
@@ -206,7 +209,7 @@ class CodexQueueDelivery:
         for _ in range(2):
             attempts += 1
             failure = await self._invoke(
-                thread_id, event.render(generation)
+                thread_id, event.render(generation), project_key=project_key
             )
             if failure is None:
                 recorded = self._channels.record_wake_delivery_success(
@@ -255,7 +258,9 @@ class CodexQueueDelivery:
             return None
         return channel
 
-    async def _invoke(self, thread_id: str, message: str) -> str | None:
+    async def _invoke(
+        self, thread_id: str, message: str, *, project_key: str = "merger"
+    ) -> str | None:
         try:
             process = await self._process_factory(
                 self._binary,
@@ -272,16 +277,36 @@ class CodexQueueDelivery:
         except OSError:
             return "spawn_failed"
         try:
+            lease_id = await register_spawned(
+                self._processes,
+                process,
+                project_key=project_key,
+                kind="codex_queue",
+                worker_id=thread_id,
+                executable=self._binary,
+                terminate=self._terminate_group,
+            )
+        except RuntimeError:
+            return "registration_failed"
+        try:
             returncode = await asyncio.wait_for(
                 process.wait(), timeout=self._timeout
             )
         except TimeoutError:
             await self._terminate_group(process)
+            returncode = process.returncode
+            self._settle(lease_id, returncode)
             return "delivery_timeout"
         except asyncio.CancelledError:
             await self._terminate_group(process)
+            self._settle(lease_id, process.returncode)
             raise
+        self._settle(lease_id, returncode)
         return None if returncode == 0 else "queue_cli_failed"
+
+    def _settle(self, lease_id: str | None, returncode: int | None) -> None:
+        if lease_id is not None and self._processes is not None:
+            self._processes.mark_exited(lease_id, exit_code=returncode)
 
     async def _terminate_group(
         self, process: asyncio.subprocess.Process

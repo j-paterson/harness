@@ -195,6 +195,7 @@ class CiWindow:
         max_unresolved: int = 2,
         now: Callable[[], datetime] | None = None,
         claim_lease_seconds: float = 300.0,
+        ci_policy: Callable[[str], str] | None = None,
     ) -> None:
         if max_unresolved < 1:
             raise ValueError("max_unresolved must be positive")
@@ -207,6 +208,9 @@ class CiWindow:
         self._max_unresolved = max_unresolved
         self._now = now if now is not None else lambda: datetime.now(UTC)
         self._claim_lease_seconds = claim_lease_seconds
+        # Explicit per-project policy; unknown projects are fail-closed
+        # ``circleci``. ``none`` is never inferred from a CI response.
+        self._ci_policy = ci_policy if ci_policy is not None else (lambda _: "circleci")
 
     def record_merge(self, merge: ProvenMerge) -> None:
         """Durably record one proven merge as unresolved; never query CI.
@@ -501,7 +505,25 @@ class CiWindow:
         if stored is not None:
             return self._blocked(project_key, stored, resolved=())
         resolved: list[str] = []
+        policy = self._ci_policy(project_key)
+        if policy not in ("circleci", "none"):
+            raise ValueError(f"unknown CI policy {policy!r} for {project_key}")
         for item in self.unresolved_items(project_key):
+            if policy == "none":
+                # Declared no-CI project: resolve durably and auditable with
+                # zero CircleCI calls; the window reopens at this boundary.
+                if self._transition(
+                    project_key,
+                    item.merge_sha,
+                    "resolved",
+                    "ci_not_configured",
+                    None,
+                    guard=guard,
+                ):
+                    resolved.append(item.merge_sha)
+                else:
+                    self._require_ownership(guard)
+                continue
             slug = f"gh/{item.repository}"
             try:
                 check = self._status.check(

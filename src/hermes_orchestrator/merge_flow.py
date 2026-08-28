@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from hermes_orchestrator.ci_window import CircleCiIntakeGate, CiWindow
+from hermes_orchestrator.ci_window import CircleCiIntakeGate, CiStatusPort, CiWindow
 from hermes_orchestrator.circleci import (
+    CiCheck,
     CircleCiClient,
+    CircleCiError,
     CircleCiStatusAdapter,
     HttpxCircleCiTransport,
 )
@@ -36,6 +38,7 @@ from hermes_orchestrator.github import (
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.merge import GitHubIntakeGate, IntegrationMerge
 from hermes_orchestrator.merger_turns import CodexThreadReports, MergerTurnService
+from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.review_intake import (
@@ -72,6 +75,17 @@ def merger_contract_path(
     raise ValueError("live merge flow requires prompts/codex-merger.md")
 
 
+class NoCiStatusPort:
+    """Status port for deployments with no CircleCI project at all.
+
+    Installed only when every configured project declares ``ci: none``;
+    any call is a contract violation and fails closed.
+    """
+
+    def check(self, project_slug: str, branch: str, merge_sha: str) -> CiCheck:
+        raise CircleCiError("no configured project uses CircleCI")
+
+
 class KeychainReader(Protocol):
     def read(self, service: str, account: str) -> str: ...
 
@@ -104,6 +118,7 @@ def build_merge_flow(
     base_env: Mapping[str, str],
     git_runner: GitRunner | None = None,
     queue_process_factory: Callable[..., Any] | None = None,
+    processes: ProcessRegistry | None = None,
 ) -> MergeFlow:
     """Wire the production merge flow; fails closed on missing inputs."""
 
@@ -113,55 +128,57 @@ def build_merge_flow(
     runner = git_runner if git_runner is not None else SubprocessGitRunner()
 
     github_token = keychain.read(GITHUB_KEYCHAIN_SERVICE, "default")
-    circleci_token = keychain.read(CIRCLECI_KEYCHAIN_SERVICE, "default")
     github = GitHubClient(
         transport=HttpxGitHubTransport(github_token),
         journal=MergeEffectJournal(database),
     )
-    circleci = CircleCiStatusAdapter(
-        CircleCiClient(transport=HttpxCircleCiTransport(circleci_token))
-    )
+    circleci: CiStatusPort
+    if any(project.ci == "circleci" for project in settings.projects.values()):
+        circleci_token = keychain.read(CIRCLECI_KEYCHAIN_SERVICE, "default")
+        circleci = CircleCiStatusAdapter(
+            CircleCiClient(transport=HttpxCircleCiTransport(circleci_token))
+        )
+    else:
+        circleci = NoCiStatusPort()
 
-    rpc = CodexRpcClient(app_server_command(), base_env=base_env)
+    rpc = CodexRpcClient(
+        app_server_command(), base_env=base_env, processes=processes
+    )
     merger = CodexMerger(
         rpc=rpc,
         database=database,
         projects=settings.projects,
         prompt_file=prompt_path,
     )
-    delivery_kwargs: dict[str, Any] = {}
+    delivery_kwargs: dict[str, Any] = {"processes": processes}
     if queue_process_factory is not None:
         delivery_kwargs["process_factory"] = queue_process_factory
     delivery = CodexQueueDelivery(
         channels=merger, manifest_root=manifest_root, **delivery_kwargs
     )
-    emitter = CandidateEmitter(
-        projects=settings.projects,
-        git=runner,
-        manifest_root=manifest_root,
-        delivery=delivery,
-    )
     window = CiWindow(
         database=database,
         status=circleci,
         max_unresolved=settings.policy.max_unresolved_ci_merges,
+        ci_policy=lambda project_key: settings.projects[project_key].ci,
     )
     outbox = LeadCorrectionOutbox(
         database=database,
         events=events,
         project_for_issue=lambda issue_id: queue.get(issue_id).project_key,
     )
+    intake_gate = CompositeIntakeGate(
+        (
+            CircleCiIntakeGate(window, corrections=outbox),
+            GitHubIntakeGate(projects=settings.projects, github=github),
+        )
+    )
     admission = CandidateAdmission(
         channels=merger,
         manifest_root=manifest_root,
         branch_head=_branch_head(settings, github),
         base_policy=_base_policy(settings, GitVerifier(runner=runner)),
-        intake_gate=CompositeIntakeGate(
-            (
-                CircleCiIntakeGate(window, corrections=outbox),
-                GitHubIntakeGate(projects=settings.projects, github=github),
-            )
-        ),
+        intake_gate=intake_gate,
     )
     qa = QaRouter(database=database, events=events)
     reviews = ReviewService(
@@ -179,6 +196,15 @@ def build_merge_flow(
         linear=linear,
         qa=qa,
         lead=outbox,
+    )
+    emitter = CandidateEmitter(
+        projects=settings.projects,
+        git=runner,
+        manifest_root=manifest_root,
+        delivery=delivery,
+        intake_gate=intake_gate,
+        lead=outbox,
+        issue_for_failure=reviews.issue_for_candidate,
     )
     turns = MergerTurnService(
         database=database,

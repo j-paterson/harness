@@ -160,3 +160,122 @@ async def test_git_failure_and_missing_verification_fail_closed(
     with pytest.raises(EmissionBlocked, match="unknown project"):
         await emitter.emit("nope", "ENG-9", verification=(("pytest", "ok"),))
     assert deliverer.events == []
+
+
+# --- pre-delivery intake boundary -------------------------------------------
+
+
+class GateRaising:
+    def __init__(self, error: Exception | None) -> None:
+        self.error = error
+        self.calls: list[str] = []
+
+    def validate(self, project_key: str, candidate: object) -> None:
+        self.calls.append(getattr(candidate, "event_id", ""))
+        if self.error is not None:
+            raise self.error
+
+
+class RecordingLead:
+    def __init__(self) -> None:
+        self.deliveries: list[tuple[str, str]] = []
+
+    def deliver(self, issue_id: str, packets: tuple, *, source: str = "x") -> None:
+        self.deliveries.append((issue_id, source))
+
+
+def gated_emitter(
+    tmp_path: Path, gate: GateRaising, lead: RecordingLead | None = None
+) -> tuple[CandidateEmitter, FakeDeliverer]:
+    deliverer = FakeDeliverer()
+    root = tmp_path / "manifests"
+    root.mkdir(exist_ok=True)
+    emitter = CandidateEmitter(
+        projects={
+            "demo": ProjectConfig(
+                linear_team="infrastructure",
+                repo_path=tmp_path,
+                integration_branch="main",
+                github_repo="j-paterson/demo",
+            )
+        },
+        git=clean_git(),
+        manifest_root=root,
+        delivery=deliverer,
+        now=lambda: NOW,
+        intake_gate=gate,
+        lead=lead,
+        issue_for_failure=lambda project_key, sha: "ENG-1",
+    )
+    return emitter, deliverer
+
+
+@pytest.mark.asyncio
+async def test_intake_gate_runs_before_the_merger_is_woken(tmp_path: Path) -> None:
+    from hermes_orchestrator.ci_window import MergeWindowExhausted
+
+    gate = GateRaising(MergeWindowExhausted("full", unresolved=("m1", "m2")))
+    emitter, deliverer = gated_emitter(tmp_path, gate)
+    result = await emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    assert result.intake == "deferred"
+    assert result.intake_reason == "full"
+    assert (result.delivery.delivered, result.delivery.reason) == (
+        False,
+        "intake_deferred",
+    )
+    assert deliverer.events == []
+    assert gate.calls == [result.event.event_id]
+
+
+@pytest.mark.asyncio
+async def test_prior_failure_at_emission_returns_packet_without_waking(
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.ci_window import PriorMergeFailed
+    from hermes_orchestrator.verdicts import CorrectionPacket
+
+    packet = CorrectionPacket(
+        severity="Critical",
+        repository="j-paterson/demo",
+        branch="feature/eng-1",
+        pr_number=3,
+        reviewed_sha="9" * 40,
+        evidence="ci failed",
+        acceptance_criterion="ci green",
+        required_correction="fix",
+        required_tests=(),
+    )
+    lead = RecordingLead()
+    gate = GateRaising(PriorMergeFailed("blocked", packet=packet))
+    emitter, deliverer = gated_emitter(tmp_path, gate, lead)
+    result = await emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    assert result.intake == "blocked_prior_failure"
+    assert deliverer.events == []
+    assert lead.deliveries == [("ENG-1", "ci_failure")]
+
+
+@pytest.mark.asyncio
+async def test_clear_intake_delivers(tmp_path: Path) -> None:
+    gate = GateRaising(None)
+    emitter, deliverer = gated_emitter(tmp_path, gate)
+    result = await emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    assert result.intake == "clear"
+    assert result.delivery.delivered is True
+    assert len(deliverer.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_intake_reports_the_bounded_reason(tmp_path: Path) -> None:
+    from hermes_orchestrator.review_intake import CandidateRejected
+
+    gate = GateRaising(
+        CandidateRejected("the open pull request is not proven cleanly mergeable")
+    )
+    emitter, deliverer = gated_emitter(tmp_path, gate)
+    result = await emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    assert result.intake == "rejected"
+    assert result.intake_reason == (
+        "the open pull request is not proven cleanly mergeable"
+    )
+    assert result.delivery.reason == "intake_rejected"
+    assert deliverer.events == []

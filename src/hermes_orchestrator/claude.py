@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 from hermes_orchestrator.profiles import ProfileRegistry
 
 _SYNTHETIC_MODEL = "<synthetic>"
@@ -34,6 +35,7 @@ class LeadTurnRequest:
     profile_alias: str
     resume: bool = False
     output_schema: dict[str, Any] | None = None
+    project_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,10 +233,12 @@ class ClaudeRunner:
         executable: str = "claude",
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
         termination_timeout: float = 5.0,
+        processes: ProcessRegistry | None = None,
     ) -> None:
         if termination_timeout <= 0:
             raise ValueError("termination_timeout must be positive")
         self._registry = registry
+        self._processes = processes
         self._prompt_file = prompt_file
         self._base_env = base_env
         self._executable = executable
@@ -328,6 +332,16 @@ class ClaudeRunner:
         if process.stderr is None:
             await self._terminate(process)
             raise RuntimeError("Claude stderr pipe was not created")
+        lease_id = await register_spawned(
+            self._processes,
+            process,
+            project_key=request.project_key or "unassigned",
+            kind="claude_lead",
+            worker_id=str(request.session_id),
+            executable=self._executable,
+            cwd=str(request.cwd),
+            terminate=self._terminate,
+        )
 
         parser = ClaudeEventParser()
         saw_subscription_limit = False
@@ -347,6 +361,8 @@ class ClaudeRunner:
             if process.returncode is None:
                 await self._terminate(process)
             await stderr_task
+            if lease_id is not None and self._processes is not None:
+                self._processes.mark_exited(lease_id, exit_code=process.returncode)
 
     @staticmethod
     async def _drain(stream: asyncio.StreamReader) -> None:

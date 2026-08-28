@@ -1259,3 +1259,136 @@ def test_rework_close_replay_is_idempotent_and_scoped(
     )
     assert failed_ledger_state(window, database, MERGE_B) == "failed"
     assert failed_ledger_state(window, database, MERGE_A) == "corrected"
+
+
+# --- explicit per-project CI policy ------------------------------------------
+
+
+def policy_window(
+    database: Database, port: FakeStatusPort, policies: dict[str, str]
+) -> CiWindow:
+    return CiWindow(
+        database=database,
+        status=port,
+        max_unresolved=2,
+        now=lambda: NOW,
+        ci_policy=lambda project_key: policies.get(project_key, "circleci"),
+    )
+
+
+def quiet_proven(merge_sha: str, pr_number: int) -> ProvenMerge:
+    return replace(
+        proven(merge_sha=merge_sha, pr_number=pr_number), project_key="quiet"
+    )
+
+
+def test_no_ci_project_resolves_durably_with_zero_calls(
+    database: Database, port: FakeStatusPort
+) -> None:
+    window = policy_window(database, port, {"quiet": "none"})
+    window.record_merge(quiet_proven(MERGE_A, 14))
+    window.record_merge(quiet_proven(MERGE_B, 15))
+    assert len(window.unresolved_items("quiet")) == 2
+
+    decision = window.reconcile_event("quiet", "evt-q1", IDENTITY)
+
+    assert decision.kind == "clear"
+    assert decision.resolved == (MERGE_A, MERGE_B)
+    assert port.calls == []
+    rows = database.execute(
+        "SELECT merge_sha, state, reason FROM ci_merge_ledger "
+        "WHERE project_key = 'quiet' ORDER BY recorded_at, rowid"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (MERGE_A, "resolved", "ci_not_configured"),
+        (MERGE_B, "resolved", "ci_not_configured"),
+    ]
+    assert window.unresolved_items("quiet") == ()
+    assert window.has_capacity("quiet") is True
+
+
+def test_existing_unresolved_rows_reopen_a_full_window_for_no_ci(
+    database: Database, port: FakeStatusPort
+) -> None:
+    """Rows recorded while the policy was circleci reopen once declared none."""
+
+    before = policy_window(database, port, {})
+    before.record_merge(proven(merge_sha=MERGE_A))
+    before.record_merge(proven(merge_sha=MERGE_B, pr_number=15))
+    port.results[MERGE_A] = CircleCiError("CircleCI request returned status 404")
+    port.results[MERGE_B] = CircleCiError("CircleCI request returned status 404")
+    assert before.reconcile_event("demo", "evt-1", IDENTITY).kind == (
+        "deferred_window_full"
+    )
+    assert port.calls == [(SLUG, "main", MERGE_A), (SLUG, "main", MERGE_B)]
+    port.calls.clear()
+
+    declared = policy_window(database, port, {"demo": "none"})
+    decision = declared.reconcile_event("demo", "evt-2", IDENTITY)
+    assert decision.kind == "clear"
+    assert decision.resolved == (MERGE_A, MERGE_B)
+    assert port.calls == []
+    gate = CircleCiIntakeGate(declared)
+    gate.validate("demo", candidate_manifest())
+    assert port.calls == []
+
+
+def test_circleci_404_stays_unresolved_for_circleci_projects(
+    database: Database, port: FakeStatusPort
+) -> None:
+    window = policy_window(database, port, {"demo": "circleci"})
+    window.record_merge(proven(merge_sha=MERGE_A))
+    port.results[MERGE_A] = CircleCiError("CircleCI request returned status 404")
+    decision = window.reconcile_event("demo", "evt-1", IDENTITY)
+    assert decision.kind == "clear"
+    assert decision.resolved == ()
+    assert [item.merge_sha for item in window.unresolved_items("demo")] == [MERGE_A]
+    assert port.calls == [(SLUG, "main", MERGE_A)]
+
+
+def test_mixed_projects_are_isolated_by_policy(
+    database: Database, port: FakeStatusPort
+) -> None:
+    window = policy_window(database, port, {"demo": "circleci", "quiet": "none"})
+    window.record_merge(proven(merge_sha=MERGE_A))
+    window.record_merge(quiet_proven(MERGE_B, 15))
+    port.results[MERGE_A] = CircleCiError("CircleCI request returned status 404")
+
+    assert window.reconcile_event("quiet", "evt-q", IDENTITY).resolved == (MERGE_B,)
+    assert port.calls == []
+    demo = window.reconcile_event("demo", "evt-d", IDENTITY)
+    assert demo.resolved == ()
+    assert port.calls == [(SLUG, "main", MERGE_A)]
+    assert [item.merge_sha for item in window.unresolved_items("demo")] == [MERGE_A]
+    assert window.unresolved_items("quiet") == ()
+
+
+def test_no_ci_replay_is_idempotent_and_silent(
+    database: Database, port: FakeStatusPort
+) -> None:
+    window = policy_window(database, port, {"quiet": "none"})
+    window.record_merge(quiet_proven(MERGE_A, 14))
+    first = window.reconcile_event("quiet", "evt-q1", IDENTITY)
+    replay = window.reconcile_event("quiet", "evt-q1", IDENTITY)
+    assert (first.kind, replay.kind) == ("clear", "clear")
+    assert port.calls == []
+    assert database.scalar(
+        "SELECT count(*) FROM ci_merge_ledger WHERE state = 'resolved'"
+    ) == 1
+    # A later merge on the no-CI project is resolved at the next boundary,
+    # so the window is never permanently consumed.
+    window.record_merge(quiet_proven(MERGE_B, 15))
+    window.record_merge(quiet_proven(MERGE_C, 16))
+    assert window.has_capacity("quiet") is False
+    assert window.reconcile_event("quiet", "evt-q2", IDENTITY).kind == "clear"
+    assert window.has_capacity("quiet") is True
+
+
+def test_unknown_ci_policy_fails_closed(
+    database: Database, port: FakeStatusPort
+) -> None:
+    window = policy_window(database, port, {"demo": "github"})
+    window.record_merge(proven(merge_sha=MERGE_A))
+    with pytest.raises(ValueError, match="CI policy"):
+        window.reconcile_event("demo", "evt-1", IDENTITY)
+    assert port.calls == []

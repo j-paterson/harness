@@ -200,6 +200,7 @@ class ProjectCellService:
             ),
             profile_alias=cell.profile_alias,
             resume=not created,
+            project_key=issue.project_key,
         )
         session_confirmed = False
         handoff_required = False

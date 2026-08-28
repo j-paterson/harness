@@ -243,6 +243,7 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
         linear=linear,
         keychain=keychain,
         base_env=os.environ,
+        processes=runtime.processes,
     )
 
 
@@ -273,6 +274,8 @@ async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
         # Codex; nothing re-delivers or polls, the completed turn settles it.
         "thread_status": thread_status,
         "awaiting_load": thread_status == "notLoaded",
+        "intake": emitted.intake,
+        "intake_reason": emitted.intake_reason,
         "event_id": emitted.event.event_id,
         "status": emitted.event.status,
         "issue_id": emitted.event.issue_id,
