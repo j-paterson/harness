@@ -88,6 +88,7 @@ class ProvenMerge:
     repository: str
     pr_number: int
     candidate_sha: str
+    candidate_branch: str
     merge_sha: str
     integration_branch: str
     relation: str
@@ -153,6 +154,7 @@ class IntegrationMerge:
             repository=project.github_repo,
             pr_number=verdict.pr_number,
             candidate_sha=verdict.reviewed_sha,
+            candidate_branch=verdict.branch,
             merge_sha=result.merge_sha,
             integration_branch=project.integration_branch,
             relation=relation,

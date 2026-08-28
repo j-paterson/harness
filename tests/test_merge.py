@@ -235,6 +235,7 @@ def test_proven_merge_fetches_before_ancestry(
     outcome = executor.merge_approved("demo", approved_verdict(), effect_id="e-1")
     assert isinstance(outcome, ProvenMerge)
     assert outcome.merge_sha == MERGE_SHA
+    assert outcome.candidate_branch == "feature/eng-9"
     assert outcome.relation == "candidate_reachable"
     assert git.calls == [
         ("fetch", str(REPO_PATH), "origin", "main"),

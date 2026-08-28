@@ -54,6 +54,27 @@ class CandidateRejected(RuntimeError):
     """Raised with a bounded diagnostic; no review turn, no state change."""
 
 
+class CompositeIntakeGate:
+    """Run ordered intake gates; the first fail-closed gate stops the intake.
+
+    Ordering is contractual: the CircleCI reconciliation gate (INFRA-165)
+    runs before the GitHub pull-request gate (INFRA-164) so every prior
+    merged item is reconciled before the new candidate is considered.
+    """
+
+    def __init__(self, gates: tuple[IntakeGate, ...]) -> None:
+        if not gates:
+            raise ValueError("at least one intake gate is required")
+        for gate in gates:
+            if not hasattr(gate, "validate"):
+                raise ValueError("every intake gate must expose validate")
+        self._gates = tuple(gates)
+
+    def validate(self, project_key: str, candidate: CandidateManifest) -> None:
+        for gate in self._gates:
+            gate.validate(project_key, candidate)
+
+
 @dataclass(frozen=True, slots=True)
 class AdmittedCandidate:
     """One immutable candidate admitted for exactly one review turn."""
