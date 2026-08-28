@@ -233,6 +233,17 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
                     )
                 }
             )
+        if (validated.repo_path / ".git").is_file():
+            # A linked git worktree keeps `.git` as a file pointing at
+            # the primary repository; that is exactly the checkout that
+            # issue cleanup later removes. Every durable consumer of
+            # this path — lead cwd, cmux workspace cwd, process-lease
+            # cwd, resource sampling — must stay anchored to the stable
+            # primary checkout, so a worktree path fails closed here.
+            raise ValueError(
+                f"project {alias!r} repo_path resolves to a linked git "
+                "worktree; configure the stable primary checkout"
+            )
         projects[alias] = validated
     if linear is not None:
         missing_teams = sorted(

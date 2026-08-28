@@ -65,3 +65,24 @@ def test_calibrated_policy_classifies_red_memory(tmp_path: Path) -> None:
 
     assert snapshot.pressure is PressureLevel.RED
     assert snapshot.can_admit is False
+
+
+def test_vanished_sampling_target_degrades_to_zero_free(tmp_path: Path) -> None:
+    # A leased worktree removed by cleanup must not crash the
+    # long-running daemon's sampling tick; the vanished target reports
+    # zero free bytes, so calibrated admission fails closed instead.
+    def disk_usage(path: Path) -> Disk:
+        if path.name == "gone":
+            raise FileNotFoundError(path)
+        return Disk(100, 60, 40)
+
+    sampler = ResourceSampler(
+        psutil_module=FakePsutil(),
+        policy=PolicyConfig(),
+        repository_paths={"demo": tmp_path, "gone": tmp_path / "gone"},
+        disk_usage=disk_usage,
+    )
+
+    snapshot = sampler.sample()
+
+    assert snapshot.disk_free_bytes == {"demo": 40, "gone": 0}

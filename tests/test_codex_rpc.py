@@ -17,6 +17,7 @@ from hermes_orchestrator.codex_rpc import (
     CodexTimeout,
     CodexUnavailable,
     RpcNotification,
+    app_server_command,
 )
 
 _SERVER_SCRIPT = '''
@@ -968,3 +969,23 @@ async def test_request_before_start_is_unavailable(
     client = CodexRpcClient(fake_server.command)
     with pytest.raises(CodexUnavailable, match="not started"):
         await client.request("thread/read", {"threadId": "a"}, 5)
+
+
+def test_app_server_command_defaults_to_the_installed_absolute_binary() -> None:
+    command = app_server_command()
+
+    assert command == [
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "app-server",
+        "--listen",
+        "stdio://",
+    ]
+
+
+def test_app_server_command_refuses_path_dependent_executables() -> None:
+    # A bare or relative name resolves through PATH; under cmux's
+    # minimal shell environment that reproduces the observed exit-127
+    # launch failure, so only validated absolute paths are accepted.
+    for path_dependent in ("codex", "bin/codex", ""):
+        with pytest.raises(ValueError, match="absolute"):
+            app_server_command(path_dependent)

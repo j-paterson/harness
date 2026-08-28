@@ -219,6 +219,40 @@ async def test_short_ack_resolves_through_the_durable_marker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_short_ack_resolution_matches_the_live_cmux_output_shapes() -> None:
+    # Byte-shapes captured verbatim from the installed cmux (0.64.20)
+    # during live characterization: uppercase UUIDs, leading spaces in
+    # the workspace listing, and a starred [selected] surface line.
+    live_workspace = "F4414CAE-4FBD-447A-AF99-48F1E85C3E63"
+    live_surface = "F2D6008C-7D5F-4E7A-9E23-F3938A0FFD91"
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:17\n"),
+            FakeProcess(
+                stdout=(
+                    f"  {live_workspace}  hermes-probe {MARKER}\n"
+                ).encode()
+            ),
+            FakeProcess(
+                stdout=(
+                    f"* {live_surface}  /tmp  [selected]\n"
+                ).encode()
+            ),
+        ]
+    )
+
+    ref = await adapter(factory).create_workspace(
+        title=f"hermes-probe {MARKER}",
+        cwd=Path("/tmp"),
+        resolve_marker=MARKER,
+    )
+
+    assert ref == CmuxSurfaceRef(
+        workspace_uuid=live_workspace, surface_uuid=live_surface
+    )
+
+
+@pytest.mark.asyncio
 async def test_short_ack_with_zero_marker_matches_fails_closed() -> None:
     factory = FakeFactory(
         results=[
