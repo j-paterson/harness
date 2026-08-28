@@ -101,12 +101,15 @@ def test_parser_extracts_session_subagent_and_limit_events() -> None:
     assert [event.kind for event in events] == [
         "session.started",
         "subagent.started",
+        "stream.result",
         "provider.limit",
     ]
     assert events[1].session_id == UUID("11111111-1111-4111-8111-111111111111")
     assert events[1].usage == {"input_tokens": 120, "output_tokens": 8}
     assert events[2].parent_tool_use_id == "toolu-agent-1"
-    assert events[2].error_code == "subscription_limit"
+    assert events[2].error_code is None
+    assert events[3].parent_tool_use_id is None
+    assert events[3].error_code == "subscription_limit"
 
 
 def test_parser_recognizes_reached_fable_limit_message() -> None:
@@ -118,6 +121,7 @@ def test_parser_recognizes_reached_fable_limit_message() -> None:
                 "message": {
                     "type": "message",
                     "role": "assistant",
+                    "model": "<synthetic>",
                     "content": [
                         {
                             "type": "text",
@@ -133,6 +137,323 @@ def test_parser_recognizes_reached_fable_limit_message() -> None:
 
     assert event.kind == "provider.limit"
     assert event.error_code == "subscription_limit"
+
+
+def test_parser_recognizes_terminal_usage_cap_error() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "errors": ["You've hit your usage limit; retry after reset."],
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
+
+
+def test_parser_ignores_result_prose_with_limit_language() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "result": "You've reached your Fable 5 limit. Switch to "
+                "another model, or manage usage credits to continue.",
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.result"
+    assert event.error_code is None
+
+
+def test_parser_ignores_top_level_concurrent_agent_cap() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-fable-5",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've hit your concurrent agents "
+                            "limit. Wait for a free subagent slot.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+
+
+def test_parser_ignores_top_level_disk_usage_cap_error() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "errors": [
+                    "You've reached your disk usage limit for this workspace."
+                ],
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.result"
+    assert event.error_code is None
+
+
+def test_parser_ignores_mathematical_limit_prose() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-fable-5",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've reached your limit of the "
+                            "partial sums: the series converges to 1.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+
+
+_NON_SUBSCRIPTION_FABLE_CAPS = [
+    "You've reached your Fable concurrent agents limit. Wait for a free slot.",
+    "You've reached your Fable disk usage limit for this workspace.",
+    "You've reached your Fable sandbox limit.",
+    "You've reached your Fable tool concurrency limit.",
+]
+
+
+@pytest.mark.parametrize("text", _NON_SUBSCRIPTION_FABLE_CAPS)
+def test_parser_ignores_synthetic_non_subscription_fable_caps(
+    text: str,
+) -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": text}],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+
+
+@pytest.mark.parametrize("text", _NON_SUBSCRIPTION_FABLE_CAPS)
+def test_parser_ignores_terminal_non_subscription_fable_caps(
+    text: str,
+) -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "errors": [text],
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.result"
+    assert event.error_code is None
+
+
+def test_parser_recognizes_numeric_fable_model_versions() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've reached your Fable 4.5 limit. "
+                            "Switch to another model, or manage usage "
+                            "credits to continue.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "provider.limit"
+    assert event.error_code == "subscription_limit"
+
+
+def test_parser_requires_synthetic_model_for_limit_message() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-fable-5",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've reached your Fable 5 limit. "
+                            "Switch to another model, or manage usage "
+                            "credits to continue.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+
+
+def test_parser_ignores_rate_limit_telemetry() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "rate_limit_event",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "rate_limit": {
+                    "status": "allowed_warning",
+                    "summary": "You've reached your weekly limit for Fable 5.",
+                    "resetsAt": 1767225600,
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.rate_limit_event"
+    assert event.error_code is None
+
+
+def test_parser_ignores_tool_results_with_limit_language() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "user",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu-1",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "ERROR: You've hit your usage "
+                                    "limit for this sandbox.",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.user"
+    assert event.error_code is None
+
+
+def test_parser_ignores_assistant_text_quoting_limit_language() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "The worker reported: You've hit your "
+                            "usage limit, but the lead continues normally.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+
+
+def test_parser_ignores_child_agent_cap_messages() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "parent_tool_use_id": "toolu-child-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've hit your concurrent agents "
+                            "limit. Wait for a free subagent slot.",
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.assistant"
+    assert event.error_code is None
+
+
+def test_parser_ignores_child_agent_terminal_limit_result() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "parent_tool_use_id": "toolu-child-1",
+                "errors": ["You've hit your usage limit; retry after reset."],
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.result"
+    assert event.error_code is None
 
 
 def test_handoff_schema_is_passed_and_acknowledgement_is_parsed(

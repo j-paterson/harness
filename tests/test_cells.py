@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,7 +10,11 @@ from uuid import UUID
 import pytest
 
 from hermes_orchestrator.cells import ProjectCellService
-from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
+from hermes_orchestrator.claude import (
+    ClaudeEvent,
+    ClaudeEventParser,
+    LeadTurnRequest,
+)
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
@@ -860,6 +865,193 @@ async def test_provider_limit_explicitly_closes_the_lead_stream(
 
     assert result.status == "start_unconfirmed"
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_false_limit_records_do_not_cool_down_or_hand_off(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    admit(queue, "ENG-9")
+    false_records = [
+        {
+            "type": "rate_limit_event",
+            "session_id": str(SESSION_ID),
+            "rate_limit": {
+                "status": "allowed_warning",
+                "summary": "You've reached your weekly limit for Fable 5.",
+                "resetsAt": 1767225600,
+            },
+        },
+        {
+            "type": "user",
+            "session_id": str(SESSION_ID),
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-1",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "You've hit your usage limit "
+                                "for this sandbox.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "session_id": str(SESSION_ID),
+            "parent_tool_use_id": "toolu-child-1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You've hit your concurrent agents limit. "
+                        "Wait for a free subagent slot.",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "session_id": str(SESSION_ID),
+            "parent_tool_use_id": "toolu-child-1",
+            "errors": ["You've hit your usage limit; retry after reset."],
+        },
+        {
+            "type": "assistant",
+            "session_id": str(SESSION_ID),
+            "message": {
+                "role": "assistant",
+                "model": "claude-fable-5",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You've hit your concurrent agents limit. "
+                        "Wait for a free subagent slot.",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "session_id": str(SESSION_ID),
+            "errors": [
+                "You've reached your disk usage limit for this workspace."
+            ],
+        },
+        {
+            "type": "assistant",
+            "session_id": str(SESSION_ID),
+            "message": {
+                "role": "assistant",
+                "model": "claude-fable-5",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You've reached your limit of the partial "
+                        "sums: the series converges to 1.",
+                    }
+                ],
+            },
+        },
+    ]
+    non_subscription_caps = [
+        "You've reached your Fable concurrent agents limit. "
+        "Wait for a free slot.",
+        "You've reached your Fable disk usage limit for this workspace.",
+        "You've reached your Fable sandbox limit.",
+        "You've reached your Fable tool concurrency limit.",
+    ]
+    for cap_text in non_subscription_caps:
+        false_records.append(
+            {
+                "type": "assistant",
+                "session_id": str(SESSION_ID),
+                "message": {
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{"type": "text", "text": cap_text}],
+                },
+            }
+        )
+        false_records.append(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": str(SESSION_ID),
+                "errors": [cap_text],
+            }
+        )
+
+    class FalseLimitRunner(RecordingRunner):
+        async def _events(
+            self,
+            request: LeadTurnRequest,
+        ) -> AsyncIterator[ClaudeEvent]:
+            yield ClaudeEvent(
+                kind="session.started",
+                original_type="system",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:00:00Z",
+                usage={},
+            )
+            parser = ClaudeEventParser()
+            for record in false_records:
+                yield parser.feed(json.dumps(record).encode())
+
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=FalseLimitRunner(),
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "working"
+    assert (
+        database.scalar("SELECT state FROM project_cells WHERE cell_id = 'cell-demo'")
+        == "active"
+    )
+    assert (
+        database.scalar(
+            "SELECT state FROM profile_leases WHERE profile_alias = 'max-a'"
+        )
+        == "active"
+    )
+    assert (
+        database.scalar(
+            "SELECT cooldown_until FROM profile_leases WHERE profile_alias = 'max-a'"
+        )
+        is None
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events "
+            "WHERE event_type IN "
+            "('provider.limit', 'project_cell.handoff_required')"
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

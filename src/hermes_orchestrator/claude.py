@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
@@ -14,6 +15,13 @@ from typing import Any
 from uuid import UUID
 
 from hermes_orchestrator.profiles import ProfileRegistry
+
+_SYNTHETIC_MODEL = "<synthetic>"
+_LIMIT_RESULT_SUBTYPES = frozenset({"error_during_execution"})
+_SUBSCRIPTION_LIMIT_TEXT = re.compile(
+    "^you['\u2019]ve (?:reached|hit) your "
+    r"(?:fable \d+(?:\.\d+)? limit|usage limit)\b"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,17 +156,52 @@ class ClaudeEventParser:
         )
 
     @classmethod
-    def _is_subscription_limit(cls, value: object) -> bool:
-        if isinstance(value, str):
-            normalized = value.lower()
-            return (
-                "hit your" in normalized or "reached your" in normalized
-            ) and "limit" in normalized
-        if isinstance(value, list):
-            return any(cls._is_subscription_limit(item) for item in value)
-        if isinstance(value, dict):
-            return any(cls._is_subscription_limit(item) for item in value.values())
+    def _is_subscription_limit(cls, value: dict[str, Any]) -> bool:
+        """Match only authoritative top-level CLI subscription-limit shapes.
+
+        A live cap is either a synthetic assistant message (the CLI's
+        ``"model": "<synthetic>"`` discriminator) or a terminal result error,
+        and in both cases only the exact observed subscription wording
+        counts. Child-agent records, rate-limit telemetry, generic cap prose
+        such as concurrency or disk limits, and limit language in prompts,
+        tool results, or result prose must never count as exhaustion.
+        """
+
+        if value.get("parent_tool_use_id") is not None:
+            return False
+        record_type = value.get("type")
+        if record_type == "result":
+            if value.get("subtype") not in _LIMIT_RESULT_SUBTYPES:
+                return False
+            errors = value.get("errors")
+            if not isinstance(errors, list):
+                return False
+            return any(
+                isinstance(item, str) and cls._is_limit_text(item)
+                for item in errors
+            )
+        if record_type == "assistant":
+            message = value.get("message")
+            if (
+                not isinstance(message, dict)
+                or message.get("model") != _SYNTHETIC_MODEL
+            ):
+                return False
+            content = message.get("content")
+            if not isinstance(content, list):
+                return False
+            return any(
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+                and cls._is_limit_text(block["text"])
+                for block in content
+            )
         return False
+
+    @staticmethod
+    def _is_limit_text(value: str) -> bool:
+        return _SUBSCRIPTION_LIMIT_TEXT.match(value.strip().lower()) is not None
 
     @staticmethod
     def _handoff_acknowledgement(value: dict[str, Any]) -> str | None:
