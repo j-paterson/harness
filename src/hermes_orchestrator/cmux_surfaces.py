@@ -14,6 +14,7 @@ cell, lease, and checkpoint-safety evidence.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -52,6 +53,34 @@ _TRANSITION_SOURCES: Mapping[str, tuple[str, ...]] = {
 
 class CmuxBindingConflict(RuntimeError):
     """A live binding already owns this seat; replacement must be explicit."""
+
+
+class SeatAuthRefused(RuntimeError):
+    """The leased profile's auth probe did not prove the intended
+    first-party Max account; no seat is created and no lead may start."""
+
+
+# The complete grammar of a classic in-pane lead command: the native
+# interactive Claude TUI addressing exactly one session — never a
+# prompt, flag soup, or credential.
+_CLASSIC_COMMAND = re.compile(
+    r"^claude --(resume|session-id) "
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def classic_resume_command(session_id: str, *, resume: bool) -> str:
+    """The sanitized native command that runs the classic TUI in-pane.
+
+    ``--resume`` reattaches an existing session; ``--session-id`` starts
+    a new one under the exact preassigned identity. The session id must
+    parse as a UUID, so nothing else can ever ride along.
+    """
+
+    canonical = str(uuid.UUID(str(session_id)))
+    flag = "--resume" if resume else "--session-id"
+    return f"claude {flag} {canonical}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +560,29 @@ class CmuxSurfaceBindings:
             ),
         )
 
+    def record_classic(self, binding_id: str, session_id: str) -> None:
+        """Durably record that this seat runs the classic TUI in-pane.
+
+        The lead-intake transport refuses any surface without this
+        evidence, so envelopes can never be typed into a pane that is
+        not the classic interactive lead.
+        """
+
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO cmux_classic_seats("
+                "binding_id, session_id, recorded_at) VALUES (?, ?, ?)",
+                (binding_id, session_id, self._now().isoformat()),
+            )
+
+    def is_classic(self, binding_id: str, session_id: str) -> bool:
+        row = self._database.execute(
+            "SELECT 1 FROM cmux_classic_seats "
+            "WHERE binding_id = ? AND session_id = ?",
+            (binding_id, session_id),
+        ).fetchone()
+        return row is not None
+
     def active(self) -> tuple[CmuxBinding, ...]:
         rows = self._database.execute(
             "SELECT * FROM cmux_surface_bindings WHERE state = 'active' "
@@ -976,6 +1028,7 @@ async def _activate_lead_seat(
     profile_alias: str,
     replacing: str | None = None,
     replace_reason: str | None = None,
+    command: str | None = None,
 ) -> CmuxBinding:
     """Create, prepare, and durably bind one lead seat as a write-ahead
     compensated activation from durable identity alone.
@@ -1007,6 +1060,7 @@ async def _activate_lead_seat(
     ref = await port.create_workspace(
         title=f"{title} {intent.title_marker}",
         cwd=cwd,
+        command=command,
         env={"CLAUDE_CONFIG_DIR": str(config_dir)},
         resolve_marker=intent.title_marker,
     )
@@ -1162,11 +1216,13 @@ class CmuxLeadSeater:
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
         profile_dirs: ProfileDirectory,
+        auth_probe: Callable[[str], bool] | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
         self._profile_dirs = profile_dirs
+        self._auth_probe = auth_probe
 
     async def ensure(
         self,
@@ -1176,7 +1232,30 @@ class CmuxLeadSeater:
         session_id: str,
         profile_alias: str,
         issue_id: str | None = None,
+        classic_command: str | None = None,
     ) -> CmuxBinding | None:
+        # The pane runs exactly the sanitized native TUI command for
+        # this exact session; anything else is refused before any
+        # workspace exists.
+        if classic_command is not None and (
+            _CLASSIC_COMMAND.fullmatch(classic_command) is None
+            or session_id not in classic_command
+        ):
+            raise CmuxBindingConflict(
+                "only the sanitized classic command for this exact "
+                "session may run in a lead seat"
+            )
+        if self._auth_probe is not None and not self._auth_probe(
+            profile_alias
+        ):
+            # The probe is a read-only `claude auth status` under the
+            # leased profile's exact CLAUDE_CONFIG_DIR: it never starts
+            # an OAuth flow, and anything short of a logged-in
+            # first-party Max account refuses the seat before creation.
+            raise SeatAuthRefused(
+                f"profile {profile_alias!r} did not prove the intended "
+                "first-party Max account"
+            )
         existing = self._bindings.active_lead(cell_id)
         if existing is not None:
             if existing.session_id == session_id:
@@ -1218,7 +1297,10 @@ class CmuxLeadSeater:
             cell_id=cell_id,
             session_id=session_id,
             profile_alias=profile_alias,
+            command=classic_command,
         )
+        if classic_command is not None:
+            self._bindings.record_classic(bound.binding_id, session_id)
         await self._show_issue(bound, issue_id)
         return bound
 

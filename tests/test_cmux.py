@@ -433,3 +433,55 @@ async def test_metadata_commands_build_expected_argv() -> None:
     resume_argv = factory.calls[4][0]
     assert resume_argv[-1] == "claude --resume abc"
     assert SURFACE in resume_argv
+
+
+@pytest.mark.asyncio
+async def test_intake_envelope_types_the_id_and_submits_return() -> None:
+    factory = FakeFactory(results=[FakeProcess(), FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+    envelope = f"HERMES_WORK_READY {'a' * 32}"
+
+    await port.deliver_intake_envelope(ref, envelope)
+
+    send_argv, key_argv = (call[0] for call in factory.calls)
+    assert send_argv[3:] == (
+        "send",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        envelope,
+    )
+    assert key_argv[3:] == (
+        "send-key",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        "Return",
+    )
+
+
+@pytest.mark.asyncio
+async def test_only_the_exact_envelope_grammar_can_ever_be_typed() -> None:
+    port = adapter(FakeFactory())
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    for rejected in (
+        "rm -rf /",
+        "HERMES_WORK_READY",
+        "HERMES_WORK_READY deadbeef",
+        f"HERMES_WORK_READY {'a' * 32} && echo pwn",
+        f"hermes_work_ready {'a' * 32}",
+        f"HERMES_SOMETHING_ELSE {'a' * 32}",
+        f"HERMES_WORK_READY {'A' * 32}",
+        f"HERMES_WORK_READY {'a' * 32}\n",
+    ):
+        with pytest.raises(ValueError, match="schema-validated"):
+            await port.deliver_intake_envelope(ref, rejected)
+
+    # And the general vocabulary still rejects raw injection commands.
+    for forbidden in ("send", "send-key"):
+        with pytest.raises(ValueError, match="not allow-listed"):
+            await port._run(forbidden)

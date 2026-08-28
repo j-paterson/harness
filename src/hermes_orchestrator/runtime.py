@@ -425,6 +425,11 @@ def open_runtime(
                     port=cmux_port,
                     project_paths=cmux_project_paths,
                     profile_dirs=cmux_profile_dirs,
+                    # The read-only auth-status probe under the leased
+                    # profile's exact CLAUDE_CONFIG_DIR: a seat is
+                    # refused before creation unless the account is a
+                    # logged-in first-party Max subscription.
+                    auth_probe=lambda alias: probe.check(alias).eligible,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,
@@ -466,6 +471,11 @@ def open_runtime(
                 context_window_tokens=settings.policy.context_window_tokens,
                 completion_sink=lead_wakes,
                 surfaces=cmux_seater,
+                classic_seats=(
+                    settings.cmux is not None
+                    and settings.cmux.classic_leads
+                    and cmux_seater is not None
+                ),
             )
             dispatch = cells.dispatch
 

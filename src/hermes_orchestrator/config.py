@@ -105,6 +105,10 @@ class CmuxRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cli: list[NonEmptyId] = Field(min_length=1)
+    # Classic seats run each lead as the native interactive Claude TUI
+    # inside its own cmux surface; the daemon then launches no
+    # -p/stream-JSON shadow process for it.
+    classic_leads: bool = True
 
 
 class ResourcePolicy(BaseModel):

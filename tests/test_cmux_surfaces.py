@@ -1455,3 +1455,91 @@ def test_intent_binds_only_once_and_never_revives(
             workspace_uuids=(LEAD.workspace_uuid,),
             reason="late",
         )
+
+
+class TestClassicSeats:
+    def test_classic_resume_command_is_sanitized(self) -> None:
+        from hermes_orchestrator.cmux_surfaces import classic_resume_command
+
+        assert classic_resume_command(SESSION, resume=True) == (
+            f"claude --resume {SESSION}"
+        )
+        assert classic_resume_command(SESSION, resume=False) == (
+            f"claude --session-id {SESSION}"
+        )
+        with pytest.raises(ValueError):
+            classic_resume_command("nonsense; rm -rf /", resume=True)
+
+    @pytest.mark.asyncio
+    async def test_classic_seat_runs_the_tui_and_records_evidence(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+
+        seat = await seater(bindings, port).ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION}",
+        )
+
+        assert seat is not None
+        [created] = port.created
+        # The pane runs exactly the sanitized native TUI command.
+        assert created["command"] == f"claude --session-id {SESSION}"
+        assert bindings.is_classic(seat.binding_id, SESSION) is True
+        # The restore path still carries the sanitized resume command.
+        assert port.resumes == [(LEAD, f"claude --resume {SESSION}")]
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_classic_commands_are_refused_before_create(
+        self, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+        rogue = "88888888-8888-4888-8888-888888888888"
+
+        for command in (
+            "claude --resume abc; rm -rf /",
+            "claude -p --output-format=stream-json",
+            f"claude --resume {rogue}",
+            f"bash -c 'claude --resume {SESSION}'",
+        ):
+            with pytest.raises(CmuxBindingConflict):
+                await seater(bindings, port).ensure(
+                    **demo_seat(), classic_command=command
+                )
+        assert port.created == []
+
+    @pytest.mark.asyncio
+    async def test_failed_auth_probe_refuses_the_seat_before_create(
+        self, bindings: CmuxSurfaceBindings
+    ) -> None:
+        from hermes_orchestrator.cmux_surfaces import (
+            CmuxLeadSeater,
+            SeatAuthRefused,
+        )
+
+        port = FakePort(next_refs=[LEAD])
+        probed: list[str] = []
+
+        def probe(alias: str) -> bool:
+            probed.append(alias)
+            return False
+
+        ensure = CmuxLeadSeater(
+            bindings=bindings,
+            port=port,
+            project_paths={"demo": Path("/repos/demo")},
+            profile_dirs=FakeProfileDirs({"max-a": Path("/profiles/max-a")}),
+            auth_probe=probe,
+        )
+
+        with pytest.raises(SeatAuthRefused):
+            await ensure.ensure(
+                **demo_seat(),
+                classic_command=f"claude --session-id {SESSION}",
+            )
+
+        # The read-only probe ran under the leased profile and nothing
+        # was created or launched for the unproven account.
+        assert probed == ["max-a"]
+        assert port.created == []
+        assert bindings.active_lead("cell-demo") is None
