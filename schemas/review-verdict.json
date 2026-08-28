@@ -1,0 +1,22 @@
+{
+ "$schema": "http://json-schema.org/draft-07/schema#",
+ "title": "ReviewVerdict",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "verdict",
+  "repository",
+  "branch",
+  "pr_number",
+  "reviewed_sha",
+  "packets"
+ ],
+ "properties": {
+  "verdict": {"enum": ["approved", "corrections_required"]},
+  "repository": {"type": "string", "minLength": 1},
+  "branch": {"type": "string", "minLength": 1},
+  "pr_number": {"type": "integer", "minimum": 1},
+  "reviewed_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+  "packets": {"type": "array", "items": {"$ref": "correction-packet.json"}}
+ }
+}

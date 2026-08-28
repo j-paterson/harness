@@ -1041,6 +1041,164 @@ async def test_concurrent_creation_reserves_the_channel_durably(
         database_b.close()
 
 
+def wake_fixture(root: Path) -> Any:
+    from hermes_orchestrator.manifests import (
+        MANIFEST_VERSION,
+        CandidateManifest,
+        wake_event_for,
+        write_manifest,
+    )
+
+    root.mkdir(exist_ok=True)
+    manifest = CandidateManifest(
+        manifest_version=MANIFEST_VERSION,
+        event_id="evt-1",
+        status="FABLE_READY",
+        candidate_sha="1" * 40,
+        base_sha="2" * 40,
+        branch="feature/eng-9",
+        linear_issues=("ENG-9",),
+        changed_files=("src/app.py",),
+        verification=(("uv run pytest -q", "142 passed"),),
+        blockers=(),
+        created_at="2026-08-27T12:00:00+00:00",
+    )
+    path = root / "evt-1.json"
+    if not path.exists():
+        write_manifest(root, manifest, head_sha="1" * 40)
+    return wake_event_for(manifest, path)
+
+
+@pytest.mark.asyncio
+async def test_channel_activation_recomputes_heartbeat_for_early_wakes(
+    merger: CodexMerger, rpc: FakeRpc, database: Database, tmp_path: Path
+) -> None:
+    from hermes_orchestrator.codex_queue import CodexQueueDelivery
+
+    root = tmp_path / "wake-manifests"
+    event = wake_fixture(root)
+    spawned: list[tuple[str, ...]] = []
+
+    async def forbidden_factory(*command: str, **kwargs: Any) -> Any:
+        spawned.append(command)
+        raise AssertionError("no process may spawn before fallback")
+
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=root,
+        process_factory=forbidden_factory,
+    )
+
+    early = await delivery.deliver("demo", event)
+    assert early.delivered is False
+    assert early.reason == "channel_unavailable"
+    assert spawned == []
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) == "pending"
+    assert merger.pending_heartbeat_wakes("demo", manifest_root=root) == []
+
+    await merger.ensure_thread("demo")
+
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.state == "ready"
+    assert channel.heartbeat_enabled is True
+    assert merger.pending_heartbeat_wakes("demo", manifest_root=root) == [
+        event
+    ]
+    assert spawned == []
+
+    restarted_db = Database.open(tmp_path / "state.db")
+    try:
+        restarted = CodexMerger(
+            rpc=FakeRpc(),
+            database=restarted_db,
+            projects={
+                "demo": ProjectConfig(
+                    linear_team="infrastructure",
+                    repo_path=Path("/repo/demo"),
+                    integration_branch="main",
+                    github_repo="j-paterson/demo",
+                )
+            },
+            prompt_file=PROMPT_PATH,
+            now=lambda: datetime(2026, 8, 27, tzinfo=UTC),
+        )
+        rechannel = restarted.read_channel("demo")
+        assert rechannel is not None
+        assert rechannel.heartbeat_enabled is True
+        assert restarted.pending_heartbeat_wakes(
+            "demo", manifest_root=root
+        ) == [event]
+    finally:
+        restarted_db.close()
+
+
+def test_replacement_preserves_heartbeat_for_outstanding_wakes(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    from hermes_orchestrator.manifests import read_manifest_snapshot
+
+    stored_thread(database)
+    root = tmp_path / "wake-manifests"
+    event = wake_fixture(root)
+    snapshot = read_manifest_snapshot(
+        Path(event.manifest_path),
+        root=root,
+        expected_digest=event.manifest_digest,
+    )
+    registration = merger.register_wake("demo", event, manifest=snapshot)
+    assert registration.claim_token is not None
+    merger.record_wake_attempt_failed(
+        "demo", event.event_id, claim_token=registration.claim_token
+    )
+
+    merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        reason="thread lost",
+    )
+    merger.complete_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        new_thread_id="thr_new",
+    )
+
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.heartbeat_enabled is True
+    assert merger.pending_heartbeat_wakes("demo", manifest_root=root) == [
+        event
+    ]
+
+
+def test_replacement_without_outstanding_wakes_clears_heartbeat(
+    merger: CodexMerger, database: Database
+) -> None:
+    stored_thread(database)
+    merger.record_delivery_failure("demo", thread_id="thr_stored", generation=1)
+
+    merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        reason="thread lost",
+    )
+    merger.complete_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        new_thread_id="thr_new",
+    )
+
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.heartbeat_enabled is False
+
+
 def test_prompt_contract_exists_and_is_read_only() -> None:
     text = PROMPT_PATH.read_text(encoding="utf-8").lower()
     for clause in (

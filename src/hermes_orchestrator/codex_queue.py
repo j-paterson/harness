@@ -8,14 +8,23 @@ import signal
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
-from hermes_orchestrator.codex_merger import ReviewerChannel
+from hermes_orchestrator.codex_merger import ReviewerChannel, WakeRegistration
+from hermes_orchestrator.manifests import (
+    WAKE_STATUSES as WAKE_STATUSES,
+)
+from hermes_orchestrator.manifests import (
+    ManifestError,
+    ManifestSnapshot,
+    read_manifest_snapshot,
+)
+from hermes_orchestrator.manifests import (
+    WakeEvent as WakeEvent,
+)
 
 CODEX_QUEUE_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
-WAKE_STATUSES = frozenset(
-    {"FABLE_READY", "FABLE_REWORK_READY", "FABLE_BLOCKED", "FABLE_COMPLETE"}
-)
 
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
@@ -25,54 +34,32 @@ class ChannelStore(Protocol):
 
     def read_channel(self, project_key: str) -> ReviewerChannel | None: ...
 
-    def record_delivery_success(
+    def record_delivery_failure(
+        self, project_key: str, *, thread_id: str, generation: int
+    ) -> bool: ...
+
+    def register_wake(
+        self,
+        project_key: str,
+        event: WakeEvent,
+        *,
+        manifest: ManifestSnapshot,
+    ) -> WakeRegistration: ...
+
+    def record_wake_delivery_success(
         self,
         project_key: str,
         *,
         thread_id: str,
         generation: int,
-        event_id: str | None = None,
+        event_id: str,
+        claim_token: str,
         candidate_sha: str | None = None,
     ) -> bool: ...
 
-    def record_delivery_failure(
-        self, project_key: str, *, thread_id: str, generation: int
-    ) -> bool: ...
-
-
-@dataclass(frozen=True, slots=True)
-class WakeEvent:
-    """One validated explicit Fable wake; the only shape that can be queued."""
-
-    status: str
-    issue_id: str
-    candidate_sha: str
-    base_sha: str
-    manifest_path: str
-    event_id: str
-
-    def __post_init__(self) -> None:
-        if self.status not in WAKE_STATUSES:
-            raise ValueError(f"unknown wake status {self.status}")
-        for name in (
-            "issue_id",
-            "candidate_sha",
-            "base_sha",
-            "manifest_path",
-            "event_id",
-        ):
-            if not getattr(self, name):
-                raise ValueError(f"wake event {name} must not be empty")
-
-    def render(self, generation: int) -> str:
-        """Render the wake envelope for the exact channel generation invoked."""
-
-        return (
-            f"{self.status} issue={self.issue_id} "
-            f"candidate={self.candidate_sha} base={self.base_sha} "
-            f"manifest={self.manifest_path} event={self.event_id} "
-            f"generation={generation}"
-        )
+    def record_wake_attempt_failed(
+        self, project_key: str, event_id: str, *, claim_token: str
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +85,7 @@ class CodexQueueDelivery:
         self,
         *,
         channels: ChannelStore,
+        manifest_root: Path,
         binary: str = CODEX_QUEUE_BINARY,
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
         timeout: float = 10.0,
@@ -108,6 +96,7 @@ class CodexQueueDelivery:
         if termination_timeout <= 0:
             raise ValueError("termination timeout must be positive")
         self._channels = channels
+        self._manifest_root = manifest_root
         self._binary = binary
         self._process_factory = process_factory
         self._timeout = timeout
@@ -124,8 +113,76 @@ class CodexQueueDelivery:
         thread is never claimed on the new channel.
         """
 
-        channel = self._ready_channel(project_key)
-        if channel is None:
+        try:
+            snapshot = read_manifest_snapshot(
+                Path(event.manifest_path),
+                root=self._manifest_root,
+                expected_digest=event.manifest_digest,
+            )
+        except ManifestError:
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason="manifest_invalid",
+            )
+        manifest = snapshot.manifest
+        if (
+            manifest.event_id != event.event_id
+            or manifest.status != event.status
+            or manifest.candidate_sha != event.candidate_sha
+            or manifest.base_sha != event.base_sha
+            or event.issue_id not in manifest.linear_issues
+        ):
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason="manifest_invalid",
+            )
+        registration = self._channels.register_wake(
+            project_key, event, manifest=snapshot
+        )
+        if registration.state == "conflict":
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason="event_conflict",
+            )
+        if registration.state in ("delivered", "admitted", "completed"):
+            return QueueDeliveryResult(
+                delivered=True,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason=f"duplicate_{registration.state}",
+            )
+        if registration.state == "pending_elsewhere":
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason="duplicate_pending",
+            )
+        if registration.state == "in_flight":
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason="delivery_in_flight",
+            )
+        if (
+            registration.channel_state != "ready"
+            or registration.thread_id is None
+            or registration.generation is None
+            or registration.claim_token is None
+        ):
             return QueueDeliveryResult(
                 delivered=False,
                 attempts=0,
@@ -133,46 +190,54 @@ class CodexQueueDelivery:
                 generation=None,
                 reason="channel_unavailable",
             )
+        thread_id = registration.thread_id
+        generation = registration.generation
+        claim_token = registration.claim_token
         attempts = 0
         reason = "queue_cli_failed"
         for _ in range(2):
             attempts += 1
             failure = await self._invoke(
-                channel.thread_id, event.render(channel.generation)
+                thread_id, event.render(generation)
             )
             if failure is None:
-                recorded = self._channels.record_delivery_success(
+                recorded = self._channels.record_wake_delivery_success(
                     project_key,
-                    thread_id=channel.thread_id,
-                    generation=channel.generation,
+                    thread_id=thread_id,
+                    generation=generation,
                     event_id=event.event_id,
+                    claim_token=claim_token,
                     candidate_sha=event.candidate_sha,
                 )
                 if recorded:
                     return QueueDeliveryResult(
                         delivered=True,
                         attempts=attempts,
-                        thread_id=channel.thread_id,
-                        generation=channel.generation,
+                        thread_id=thread_id,
+                        generation=generation,
                         reason="delivered",
                     )
                 reason = "redelivery_required"
             else:
                 reason = failure
             reloaded = self._ready_channel(project_key)
-            if reloaded is None or reloaded.generation == channel.generation:
+            if reloaded is None or reloaded.generation == generation:
                 break
-            channel = reloaded
+            thread_id = reloaded.thread_id
+            generation = reloaded.generation
         self._channels.record_delivery_failure(
             project_key,
-            thread_id=channel.thread_id,
-            generation=channel.generation,
+            thread_id=thread_id,
+            generation=generation,
+        )
+        self._channels.record_wake_attempt_failed(
+            project_key, event.event_id, claim_token=claim_token
         )
         return QueueDeliveryResult(
             delivered=False,
             attempts=attempts,
-            thread_id=channel.thread_id,
-            generation=channel.generation,
+            thread_id=thread_id,
+            generation=generation,
             reason=reason,
         )
 

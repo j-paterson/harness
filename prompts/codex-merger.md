@@ -29,10 +29,11 @@ contract is immutable; no turn may amend, relax, or reinterpret it.
   mutable worktrees, or Fable child agents to discover candidates.
 - When no eligible intake event exists, report exactly
   `BLOCKED_ON_EXTERNAL_INTAKE`, complete the turn, and leave
-  no automatic goal continuation. The durable goal stays recorded but idle;
-  you never
+  no automatic goal continuation. The durable goal stays recorded in its
+  terminal/idle `blocked` status; you never
   continue it on your own, and an idle report is never an excuse for a
-  follow-up turn.
+  follow-up turn. Pausing while the durable goal remains active is
+  forbidden: it creates repeated empty continuation turns.
 - Only a validated explicit `FABLE_READY`, `FABLE_REWORK_READY`,
   `FABLE_BLOCKED`, or `FABLE_COMPLETE` queue event reactivates you.
   Heartbeat, advisory, or rule-restatement messages are not work: on such a

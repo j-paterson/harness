@@ -7,12 +7,12 @@ def test_database_applies_migration_once(tmp_path: Path) -> None:
     database_path = tmp_path / "state.db"
 
     database = Database.open(database_path)
-    assert database.schema_version() == 3
+    assert database.schema_version() == 4
     database.close()
 
     reopened = Database.open(database_path)
     try:
-        assert reopened.schema_version() == 3
+        assert reopened.schema_version() == 4
         assert reopened.scalar("PRAGMA integrity_check") == "ok"
         assert reopened.scalar("PRAGMA foreign_keys") == 1
         assert reopened.scalar("PRAGMA journal_mode") == "wal"

@@ -1,0 +1,32 @@
+{
+ "$schema": "http://json-schema.org/draft-07/schema#",
+ "title": "CorrectionPacket",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "severity",
+  "repository",
+  "branch",
+  "pr_number",
+  "reviewed_sha",
+  "evidence",
+  "acceptance_criterion",
+  "required_correction",
+  "required_tests"
+ ],
+ "properties": {
+  "severity": {"enum": ["Critical", "Important"]},
+  "repository": {"type": "string", "minLength": 1},
+  "branch": {"type": "string", "minLength": 1},
+  "pr_number": {"type": "integer", "minimum": 1},
+  "reviewed_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+  "evidence": {"type": "string", "minLength": 1},
+  "acceptance_criterion": {"type": "string", "minLength": 1},
+  "required_correction": {"type": "string", "minLength": 1},
+  "required_tests": {
+   "type": "array",
+   "items": {"type": "string", "minLength": 1},
+   "minItems": 1
+  }
+ }
+}
