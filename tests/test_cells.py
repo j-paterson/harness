@@ -18,6 +18,7 @@ from hermes_orchestrator.claude import (
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.profiles import (
     ProfileHealth,
@@ -1324,3 +1325,418 @@ async def test_turn_completion_records_session_bound_safe_boundary(
     await cells.dispatch("ENG-10")
     assert seen and not any(seen)
     assert safety.current("cell-demo", str(SESSION_ID)) is not None
+
+
+class ContextRunner(RecordingRunner):
+    """Emits usage-bearing assistant events and optional context signals."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.usage_tokens: list[int] = []
+        self.compact = False
+        self.context_error = False
+
+    async def _events(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+        yield ClaudeEvent(
+            kind="session.started",
+            original_type="system",
+            session_id=request.session_id,
+            parent_tool_use_id=None,
+            timestamp="2026-08-26T12:00:00Z",
+            usage={},
+        )
+        for tokens in self.usage_tokens:
+            yield ClaudeEvent(
+                kind="stream.assistant",
+                original_type="assistant",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:00:01Z",
+                usage={"input_tokens": tokens},
+            )
+        if self.compact:
+            yield ClaudeEvent(
+                kind="context.compacted",
+                original_type="system",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:00:02Z",
+                usage={},
+            )
+        if self.context_error:
+            yield ClaudeEvent(
+                kind="context.error",
+                original_type="result",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:00:03Z",
+                usage={},
+                error_code="context_window",
+            )
+
+
+def context_cells(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: ContextRunner,
+    *,
+    clock: list[datetime],
+) -> tuple[ProjectCellService, HandoffService]:
+    from hermes_orchestrator.config import PolicyConfig
+    from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
+
+    events = EventStore(database)
+    handoffs = HandoffService(database, request_ids=lambda: f"req-{len(clock)}")
+    cells = ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=RecordingLinear(),
+        project_paths={"demo": Path("/tmp/demo")},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        context=ContextMonitor(database, events, policy=PolicyConfig()),
+        active_time=ActiveTimeTracker(database),
+        context_window_tokens=100_000,
+        now=lambda: clock[-1],
+    )
+    return cells, handoffs
+
+
+def handoff_reasons(database: Database) -> list[str]:
+    return [
+        str(row["reason"])
+        for row in database.execute(
+            "SELECT reason FROM handoff_requests ORDER BY requested_at, rowid"
+        ).fetchall()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_context_prepare_requests_a_draft_without_stopping_work(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ContextRunner()
+    runner.usage_tokens = [72_000]  # 72% of a 100k window
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == ["context_prepare"]
+    assert database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "active"
+
+
+@pytest.mark.asyncio
+async def test_rotation_pending_waits_for_the_turn_boundary_then_rotates(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ContextRunner()
+    runner.usage_tokens = [85_000]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    # The turn completed normally: that is the safe boundary.
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == ["context_rotation"]
+    assert database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "handoff_required"
+
+
+@pytest.mark.asyncio
+async def test_context_error_requires_an_emergency_handoff(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ContextRunner()
+    runner.context_error = True
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == ["context_error"]
+
+
+@pytest.mark.asyncio
+async def test_six_active_hours_counts_execution_not_wall_time(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    from hermes_orchestrator.context import ActiveTimeTracker
+
+    clock = [datetime(2026, 8, 26, 8, tzinfo=UTC)]
+    runner = ContextRunner()
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    # Simulate 5.5 active hours of earlier turns for this session, then a
+    # 10-hour idle gap that must not count.
+    tracker = ActiveTimeTracker(database)
+    tracker.open(f"cell-demo:{SESSION_ID}", clock[0])
+    tracker.idle(f"cell-demo:{SESSION_ID}", clock[0] + timedelta(hours=5, minutes=30))
+    clock.append(clock[0] + timedelta(hours=15, minutes=30))
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == []
+    # A further turn pushes active time past six hours; rotation waits for
+    # the turn boundary and then requires the handoff.
+    clock.append(clock[-1] + timedelta(minutes=40))
+    admit(queue, "ENG-10")
+    tracker.open(f"cell-demo:{SESSION_ID}", clock[-2])
+    tracker.idle(f"cell-demo:{SESSION_ID}", clock[-1])
+    result = await cells.dispatch("ENG-10")
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == ["context_rotation"]
+
+
+class FreezingContextRunner(ContextRunner):
+    """Crosses the rotate threshold mid-turn, then tries to start subwork."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.freezes: list[tuple[UUID, str]] = []
+        self.thaws: list[UUID] = []
+        self.markers: set[UUID] = set()
+        self.subagents_after: int = 1
+        self.frozen_at_first_event: list[bool] = []
+
+    def freeze_assignments(self, session_id: UUID, reason: str) -> None:
+        self.freezes.append((session_id, reason))
+        self.markers.add(session_id)
+
+    def thaw_assignments(self, session_id: UUID) -> None:
+        self.thaws.append(session_id)
+        self.markers.discard(session_id)
+
+    def assignments_frozen(self, session_id: UUID) -> bool:
+        return session_id in self.markers
+
+    async def _events(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+        self.frozen_at_first_event.append(request.session_id in self.markers)
+        yield ClaudeEvent(
+            kind="session.started",
+            original_type="system",
+            session_id=request.session_id,
+            parent_tool_use_id=None,
+            timestamp="2026-08-26T12:00:00Z",
+            usage={},
+        )
+        yield ClaudeEvent(
+            kind="subagent.started",
+            original_type="assistant",
+            session_id=request.session_id,
+            parent_tool_use_id="toolu-before",
+            timestamp="2026-08-26T12:00:01Z",
+            usage={"input_tokens": 40_000},
+        )
+        for tokens in self.usage_tokens:
+            yield ClaudeEvent(
+                kind="stream.assistant",
+                original_type="assistant",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:00:02Z",
+                usage={"input_tokens": tokens},
+            )
+        for index in range(self.subagents_after):
+            yield ClaudeEvent(
+                kind="subagent.started",
+                original_type="assistant",
+                session_id=request.session_id,
+                parent_tool_use_id=f"toolu-after-{index}",
+                timestamp="2026-08-26T12:00:03Z",
+                usage={"input_tokens": 86_000},
+            )
+        if self.emit_handoff_ack:
+            yield ClaudeEvent(
+                kind="handoff.acknowledged",
+                original_type="result",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:02:00Z",
+                usage={},
+                restated_next_action="Run the failing unit test and correct ENG-9.",
+            )
+
+
+@pytest.mark.asyncio
+async def test_rotation_pending_freezes_new_subwork_until_the_boundary(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = FreezingContextRunner()
+    runner.usage_tokens = [85_000]  # crosses 80% of the 100k window mid-turn
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+
+    result = await cells.dispatch("ENG-9")
+
+    # The subagent that started before the threshold is leased; the one
+    # attempted after the transition is refused and gets no lease.
+    leases = [
+        str(row["lease_id"])
+        for row in database.execute(
+            "SELECT lease_id FROM worker_leases ORDER BY acquired_at, rowid"
+        ).fetchall()
+    ]
+    assert leases == ["toolu-before"]
+    rejected = database.execute(
+        "SELECT payload_json FROM events WHERE event_type = 'subagent.rejected'"
+    ).fetchall()
+    assert len(rejected) == 1
+    assert "toolu-after-0" in str(rejected[0]["payload_json"])
+    # The runner's control path was told to freeze this exact session, once.
+    assert [session for session, _ in runner.freezes] == [SESSION_ID]
+    assert runner.freezes[0][1].startswith("rotation_pending:")
+    frozen_events = database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'assignments.frozen'"
+    )
+    assert frozen_events == 1
+    # Existing work reached its safe boundary (the turn completed), so the
+    # acknowledged handoff flow is invoked.
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == ["context_rotation"]
+    assert database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "handoff_required"
+
+
+@pytest.mark.asyncio
+async def test_rotation_thaws_the_retired_session(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    from hermes_orchestrator.handoffs import HandoffDocument, HandoffTest
+
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = FreezingContextRunner()
+    runner.usage_tokens = [85_000]
+    admit(queue, "ENG-9")
+    cells, handoffs = context_cells(database, queue, profiles, runner, clock=clock)
+    assert (await cells.dispatch("ENG-9")).status == "handoff_required"
+    document = HandoffDocument(
+        cell_id="cell-demo",
+        objective="o",
+        status="s",
+        decisions=["d"],
+        branch="b",
+        commits=["c"],
+        pull_request="pr",
+        modified_files=["f"],
+        tests=[HandoffTest(command="t", outcome="ok")],
+        blockers=[],
+        remaining_steps=["r"],
+        commands=["cmd"],
+        environment_notes=["e"],
+        risks=[],
+        next_action="n",
+    )
+    record = handoffs.submit(document)
+    runner.emit_handoff_ack = True
+    runner.usage_tokens = []
+    runner.subagents_after = 0
+    rotated = await cells.rotate("cell-demo", record.handoff_id)
+    assert rotated.session_id != SESSION_ID
+    assert runner.thaws == [SESSION_ID]
+
+
+def event_count(database: Database, event_type: str) -> int:
+    return int(
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = ?", (event_type,)
+        )  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_reconstructs_the_freeze_marker_before_any_assignment(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    """Durable rotation_pending with a missing marker is restored on resume."""
+
+    from hermes_orchestrator.config import PolicyConfig
+    from hermes_orchestrator.context import ContextMonitor, ContextSignal
+
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = FreezingContextRunner()
+    runner.usage_tokens = []
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    # A prior process persisted rotation_pending for this session and
+    # stopped before the marker was written: no marker, no freeze event.
+    monitor = ContextMonitor(database, EventStore(database), policy=PolicyConfig())
+    decision = monitor.record(
+        ContextSignal(
+            worker_id=f"cell-demo:{SESSION_ID}", at=clock[0], percent=85.0
+        )
+    )
+    assert decision.state == "rotation_pending"
+    assert runner.markers == set()
+    assert event_count(database, "assignments.frozen") == 0
+
+    result = await cells.dispatch("ENG-9")
+
+    # The marker existed before the lead emitted its first event, so the
+    # PreToolUse gate blocks Agent calls from the very start; the
+    # subagent attempted afterwards is refused with no lease.
+    assert runner.frozen_at_first_event == [True]
+    assert [session for session, _ in runner.freezes] == [SESSION_ID]
+    assert runner.freezes[0][1].startswith("rotation_pending:")
+    leases = [
+        str(row["lease_id"])
+        for row in database.execute("SELECT lease_id FROM worker_leases").fetchall()
+    ]
+    assert leases == []
+    assert event_count(database, "subagent.rejected") == 2
+    assert event_count(database, "assignments.frozen") == 1
+    # Existing work still reaches its safe boundary, then hands off.
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == ["context_rotation"]
+
+
+@pytest.mark.asyncio
+async def test_freeze_reconciliation_is_idempotent(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    from hermes_orchestrator.cells import ProjectCell
+    from hermes_orchestrator.config import PolicyConfig
+    from hermes_orchestrator.context import ContextMonitor, ContextSignal
+
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = FreezingContextRunner()
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    cell = ProjectCell(
+        cell_id="cell-demo",
+        project_key="demo",
+        state="active",
+        profile_alias="max-a",
+        session_id=SESSION_ID,
+    )
+    # Healthy sessions are never frozen by reconciliation.
+    assert cells.reconcile_freeze(cell) is False
+    assert runner.freezes == []
+    monitor = ContextMonitor(database, EventStore(database), policy=PolicyConfig())
+    monitor.record(
+        ContextSignal(worker_id=f"cell-demo:{SESSION_ID}", at=clock[0], percent=85.0)
+    )
+    for _ in range(3):
+        assert cells.reconcile_freeze(cell) is True
+    assert len(runner.freezes) == 1
+    assert event_count(database, "assignments.frozen") == 1
+    assert event_count(database, "context.rotation_pending") == 1
+    assert handoff_reasons(database) == []
+    # A lost marker is restored exactly once more, again without duplicating
+    # transition events or handoff requests.
+    runner.markers.clear()
+    assert cells.reconcile_freeze(cell) is True
+    assert cells.reconcile_freeze(cell) is True
+    assert len(runner.freezes) == 2
+    assert event_count(database, "assignments.frozen") == 2
+    assert event_count(database, "context.rotation_pending") == 1
+    assert handoff_reasons(database) == []

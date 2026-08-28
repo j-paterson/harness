@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+import sys
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -18,6 +20,10 @@ from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 from hermes_orchestrator.profiles import ProfileRegistry
 
 _SYNTHETIC_MODEL = "<synthetic>"
+_COMPACTION_SUBTYPES = frozenset({"compact_boundary", "compaction", "compact"})
+_CONTEXT_ERROR_TEXT = re.compile(
+    r"context window|prompt is too long|input length|context length exceeded"
+)
 _LIMIT_RESULT_SUBTYPES = frozenset({"error_during_execution"})
 _SUBSCRIPTION_LIMIT_TEXT = re.compile(
     "^you['\u2019]ve (?:reached|hit) your "
@@ -89,6 +95,11 @@ class ClaudeEventParser:
         restated_next_action = None
         if original_type == "system" and subtype == "init":
             kind = "session.started"
+        elif original_type == "system" and subtype in _COMPACTION_SUBTYPES:
+            kind = "context.compacted"
+        elif self._is_context_error(value):
+            kind = "context.error"
+            error_code = "context_window"
         elif self._starts_subagent(value):
             kind = "subagent.started"
         elif action := self._handoff_acknowledgement(value):
@@ -202,6 +213,22 @@ class ClaudeEventParser:
         return False
 
     @staticmethod
+    def _is_context_error(value: dict[str, Any]) -> bool:
+        """Top-level terminal errors naming the context window only."""
+
+        if value.get("parent_tool_use_id") is not None:
+            return False
+        if value.get("type") != "result":
+            return False
+        errors = value.get("errors")
+        if not isinstance(errors, list):
+            return False
+        return any(
+            isinstance(item, str) and _CONTEXT_ERROR_TEXT.search(item.lower())
+            for item in errors
+        )
+
+    @staticmethod
     def _is_limit_text(value: str) -> bool:
         return _SUBSCRIPTION_LIMIT_TEXT.match(value.strip().lower()) is not None
 
@@ -234,11 +261,22 @@ class ClaudeRunner:
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
         termination_timeout: float = 5.0,
         processes: ProcessRegistry | None = None,
+        freeze_dir: Path | None = None,
+        gate_command: Sequence[str] | None = None,
     ) -> None:
         if termination_timeout <= 0:
             raise ValueError("termination_timeout must be positive")
         self._registry = registry
         self._processes = processes
+        # Explicit lead control path: a PreToolUse hook on the Agent tool
+        # consults a durable per-session freeze marker and blocks new
+        # subagent assignments while a rotation is pending.
+        self._freeze_dir = freeze_dir
+        self._gate_command = (
+            tuple(gate_command)
+            if gate_command is not None
+            else (sys.executable, "-m", "hermes_orchestrator.cli", "subagent-gate")
+        )
         self._prompt_file = prompt_file
         self._base_env = base_env
         self._executable = executable
@@ -259,6 +297,8 @@ class ClaudeRunner:
             "--effort",
             "high",
         ]
+        if self._freeze_dir is not None:
+            command.extend(["--settings", self.hook_settings()])
         if request.resume:
             command.extend(["--resume", str(request.session_id)])
         else:
@@ -292,6 +332,54 @@ class ClaudeRunner:
         return (
             command,
             self._registry.launch_env(request.profile_alias, self._base_env),
+        )
+
+    def hook_settings(self) -> str:
+        """Claude Code settings JSON installing the subagent gate hook."""
+
+        assert self._freeze_dir is not None
+        gate = [*self._gate_command, "--freeze-dir", str(self._freeze_dir)]
+        return json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Agent",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": shlex.join(gate),
+                                    "timeout": 10,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def freeze_assignments(self, session_id: UUID, reason: str) -> Path | None:
+        """Durably freeze new subagent assignments for one exact session."""
+
+        if self._freeze_dir is None:
+            return None
+        self._freeze_dir.mkdir(parents=True, exist_ok=True)
+        marker = self._freeze_dir / f"{session_id}.frozen"
+        marker.write_text(reason.strip() + "\n", encoding="utf-8")
+        return marker
+
+    def thaw_assignments(self, session_id: UUID) -> None:
+        if self._freeze_dir is None:
+            return
+        with suppress(FileNotFoundError):
+            (self._freeze_dir / f"{session_id}.frozen").unlink()
+
+    def assignments_frozen(self, session_id: UUID) -> bool:
+        return (
+            self._freeze_dir is not None
+            and (self._freeze_dir / f"{session_id}.frozen").exists()
         )
 
     def start_lead(

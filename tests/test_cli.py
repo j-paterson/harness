@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 14
+    assert json.loads(result.stdout)["schema_version"] == 15
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -221,3 +221,30 @@ def test_merge_flow_commands_are_registered() -> None:
     assert args.status == "FABLE_READY"
     turn = _parser().parse_args(["merger-turn", "--project", "demo"])
     assert turn.command == "merger-turn"
+
+
+def test_subagent_gate_blocks_only_frozen_sessions(tmp_path: Path) -> None:
+    import json as _json
+
+    from hermes_orchestrator.cli import main, subagent_gate
+
+    freeze_dir = tmp_path / "freezes"
+    freeze_dir.mkdir()
+    payload = _json.dumps({"session_id": "s-1", "tool_name": "Agent"})
+    assert subagent_gate(freeze_dir, payload) == (0, "")
+    (freeze_dir / "s-1.frozen").write_text("rotation_pending: 85%\n")
+    code, message = subagent_gate(freeze_dir, payload)
+    assert code == 2 and "frozen" in message and "85%" in message
+    assert subagent_gate(freeze_dir, _json.dumps({"session_id": "s-2"})) == (0, "")
+    assert subagent_gate(freeze_dir, "{not json")[0] == 2
+    assert subagent_gate(freeze_dir, "{}") == (0, "")
+    # The subcommand needs no configuration or database.
+    import io
+    import sys as _sys
+
+    stdin = _sys.stdin
+    _sys.stdin = io.StringIO(payload)
+    try:
+        assert main(["subagent-gate", "--freeze-dir", str(freeze_dir)]) == 2
+    finally:
+        _sys.stdin = stdin

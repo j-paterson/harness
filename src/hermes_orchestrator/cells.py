@@ -14,6 +14,7 @@ from uuid import UUID
 
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
+from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor, ContextSignal
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
@@ -127,6 +128,9 @@ class ProjectCellService:
         handoffs: HandoffPort | None = None,
         safety: CheckpointSafetyStore | None = None,
         checkpoints: CheckpointRequests | None = None,
+        context: ContextMonitor | None = None,
+        active_time: ActiveTimeTracker | None = None,
+        context_window_tokens: int = 200_000,
         replacement_session_ids: Callable[[], UUID] = uuid.uuid4,
     ) -> None:
         self._database = database
@@ -142,6 +146,9 @@ class ProjectCellService:
         self._handoffs = handoffs
         self._safety = safety
         self._checkpoints = checkpoints
+        self._context = context
+        self._active_time = active_time
+        self._context_window_tokens = context_window_tokens
         self._replacement_session_ids = replacement_session_ids
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
@@ -215,6 +222,11 @@ class ProjectCellService:
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason=f"dispatch:{issue_id}")
         last_event_id: str | None = None
+        # Durable context state is the truth: a session already at
+        # rotation_pending/rotate_now must be operationally frozen before the
+        # lead can run and admit any Agent assignment, even if the process
+        # stopped between the durable transition and the marker write.
+        self.reconcile_freeze(cell)
         try:
             stream = (
                 self._runner.start_lead(request)
@@ -223,6 +235,11 @@ class ProjectCellService:
             )
             try:
                 async for event in stream:
+                    # Context is observed before any worker lease can be
+                    # created, so a threshold crossed by this very event
+                    # already freezes new assignments.
+                    if session_confirmed or event.kind == "session.started":
+                        self._observe_context(cell, event, safe_boundary=False)
                     last_event_id = self.record(cell, event)
                     if event.kind == "session.started":
                         if event.session_id != cell.session_id:
@@ -239,6 +256,10 @@ class ProjectCellService:
                         )
                         if self._activate_issue(cell, issue_id):
                             session_confirmed = True
+                            if self._active_time is not None:
+                                self._active_time.open(
+                                    self._worker_key(cell), self._aware_now()
+                                )
                         else:
                             issue_completed = (
                                 self._queue.get(issue_id).state == IssueState.DONE
@@ -252,6 +273,8 @@ class ProjectCellService:
                             break
             finally:
                 await stream.aclose()
+                if self._active_time is not None and session_confirmed:
+                    self._active_time.idle(self._worker_key(cell), self._aware_now())
         except BaseException:
             if created and not session_confirmed:
                 self._fail_unconfirmed_start(cell)
@@ -274,6 +297,8 @@ class ProjectCellService:
                     boundary_kind="turn_completed",
                     evidence_id=last_event_id,
                 )
+            if self._observe_context(cell, None, safe_boundary=True):
+                status = "handoff_required"
         else:
             status = "start_unconfirmed"
         return DispatchResult(
@@ -310,7 +335,20 @@ class ProjectCellService:
                     },
                 ),
             )
-            if event.kind == "subagent.started":
+            if event.kind == "subagent.started" and self._assignments_frozen(cell):
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="subagent.rejected",
+                        aggregate_type="project_cell",
+                        aggregate_id=cell.cell_id,
+                        payload={
+                            "parent_tool_use_id": event.parent_tool_use_id,
+                            "reason": "rotation_pending: new subwork is frozen",
+                        },
+                    ),
+                )
+            elif event.kind == "subagent.started":
                 lease_id = event.parent_tool_use_id or str(uuid.uuid4())
                 connection.execute(
                     "INSERT OR IGNORE INTO worker_leases("
@@ -448,6 +486,11 @@ class ProjectCellService:
         )
         if self._safety is not None:
             self._safety.invalidate(rotated.cell_id, reason="session_rotated")
+        if self._context is not None:
+            self._context.reset(self._worker_key(current), reason="rotated")
+        thaw = getattr(self._runner, "thaw_assignments", None)
+        if thaw is not None:
+            thaw(current.session_id)
         if self._checkpoints is not None:
             self._checkpoints.resolve_for_cell(
                 rotated.cell_id, outcome="completed", detail=f"handoff:{handoff_id}"
@@ -698,6 +741,140 @@ class ProjectCellService:
                 ),
             )
         return True
+
+    def _worker_key(self, cell: ProjectCell) -> str:
+        return f"{cell.cell_id}:{cell.session_id}"
+
+    def _observe_context(
+        self, cell: ProjectCell, event: ClaudeEvent | None, *, safe_boundary: bool
+    ) -> bool:
+        """Feed one durable context signal; True when rotation is now required.
+
+        Mid-turn signals never claim a safe boundary; a completed turn does.
+        ``prepare`` requests a handoff draft without stopping assigned work,
+        ``rotation_pending`` stops new subwork and waits, ``rotate_now``
+        invokes the acknowledged handoff flow. A context error is an
+        emergency: the handoff is required immediately.
+        """
+
+        if self._context is None:
+            return False
+        worker = self._worker_key(cell)
+        now = self._aware_now()
+        percent = None
+        compaction = False
+        context_error = False
+        if event is not None:
+            if event.kind == "context.compacted":
+                compaction = True
+            elif event.kind == "context.error":
+                context_error = True
+            elif event.parent_tool_use_id is None and event.usage:
+                occupied = (
+                    event.usage.get("input_tokens", 0)
+                    + event.usage.get("cache_read_input_tokens", 0)
+                    + event.usage.get("cache_creation_input_tokens", 0)
+                )
+                if occupied > 0:
+                    percent = 100.0 * occupied / self._context_window_tokens
+        previous = self._context.state(worker)
+        rapid_refill = False
+        if percent is not None and previous in ("prepare", "rotation_pending"):
+            row = self._database.execute(
+                "SELECT compactions, last_percent FROM context_evidence "
+                "WHERE worker_id = ?",
+                (worker,),
+            ).fetchone()
+            if (
+                row is not None
+                and int(row["compactions"]) > 0
+                and row["last_percent"] is not None
+                and percent >= float(row["last_percent"]) + 20.0
+            ):
+                rapid_refill = True
+        active_hours = None
+        if self._active_time is not None:
+            active_hours = (
+                self._active_time.total(worker, now).total_seconds() / 3600.0
+            )
+        decision = self._context.record(
+            ContextSignal(
+                worker_id=worker,
+                at=now,
+                percent=percent,
+                compaction=compaction,
+                rapid_refill=rapid_refill,
+                context_error=context_error,
+                active_hours=active_hours,
+                safe_boundary=safe_boundary,
+            )
+        )
+        if decision.state == previous:
+            return decision.state == "rotate_now"
+        if decision.state == "prepare" and self._handoffs is not None and hasattr(
+            self._handoffs, "request"
+        ):
+            self._handoffs.request(cell.cell_id, "context_prepare")
+        if decision.state in ("rotation_pending", "rotate_now"):
+            # Operational freeze reconciled from durable state: idempotent,
+            # so the transition and any later replay converge on one marker.
+            self.reconcile_freeze(cell, reasons=decision.reasons)
+        if decision.state == "rotate_now":
+            reason = "context_error" if context_error else "context_rotation"
+            self._require_handoff(cell, reason)
+            if self._handoffs is not None and hasattr(self._handoffs, "request"):
+                self._handoffs.request(cell.cell_id, reason)
+            return True
+        return False
+
+    def reconcile_freeze(
+        self, cell: ProjectCell, *, reasons: tuple[str, ...] = ()
+    ) -> bool:
+        """Make the runner freeze marker match durable context state.
+
+        Idempotent: when the session is durably at rotation_pending or
+        rotate_now and the runner reports no marker, the marker is written
+        and one ``assignments.frozen`` event is journaled; an existing
+        marker is left alone and nothing is journaled. Returns True when
+        the session is frozen after reconciliation.
+        """
+
+        if not self._assignments_frozen(cell):
+            return False
+        freeze = getattr(self._runner, "freeze_assignments", None)
+        frozen_check = getattr(self._runner, "assignments_frozen", None)
+        if freeze is None:
+            return True
+        if frozen_check is not None and frozen_check(cell.session_id):
+            return True
+        state = self._context.state(self._worker_key(cell))  # type: ignore[union-attr]
+        reason = reasons[0] if reasons else "reconstructed from durable context state"
+        freeze(cell.session_id, f"{state}: {reason}")
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="assignments.frozen",
+                    aggregate_type="project_cell",
+                    aggregate_id=cell.cell_id,
+                    payload={
+                        "session_id": str(cell.session_id),
+                        "state": state,
+                        "reasons": list(reasons) or [reason],
+                    },
+                ),
+            )
+        return True
+
+    def _assignments_frozen(self, cell: ProjectCell) -> bool:
+        """Durable truth: the session's context decision has reached pending."""
+
+        if self._context is None:
+            return False
+        return self._context.state(self._worker_key(cell)) in (
+            "rotation_pending",
+            "rotate_now",
+        )
 
     def current_session(self, cell_id: str) -> str | None:
         """The session id of an active cell, else None (durable read)."""

@@ -644,3 +644,78 @@ async def test_subscription_limit_does_not_hide_another_process_failure(
 
     with pytest.raises(ClaudeProcessError, match="status 2"):
         _ = [event async for event in runner.start_lead(new_request(tmp_path))]
+
+
+def test_parser_classifies_compaction_and_context_errors() -> None:
+    import json as _json
+
+    from hermes_orchestrator.claude import ClaudeEventParser
+
+    parser = ClaudeEventParser()
+    compacted = parser.feed(
+        _json.dumps({"type": "system", "subtype": "compact_boundary"}).encode()
+    )
+    assert compacted.kind == "context.compacted"
+    error = parser.feed(
+        _json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "errors": ["Prompt is too long: context window exceeded"],
+            }
+        ).encode()
+    )
+    assert (error.kind, error.error_code) == ("context.error", "context_window")
+    child = parser.feed(
+        _json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "parent_tool_use_id": "toolu-1",
+                "errors": ["context window exceeded"],
+            }
+        ).encode()
+    )
+    assert child.kind == "stream.result"
+
+
+def test_runner_installs_the_subagent_gate_hook_and_freeze_markers(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    import json as _json
+    from uuid import UUID as _UUID
+
+    freeze_dir = tmp_path / "freezes"
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=tmp_path / "lead.md",
+        base_env={},
+        freeze_dir=freeze_dir,
+        gate_command=("hermes-orchestrator", "subagent-gate"),
+    )
+    command, _ = runner.build_command(new_request(tmp_path))
+    settings = _json.loads(command[command.index("--settings") + 1])
+    hook = settings["hooks"]["PreToolUse"][0]
+    assert hook["matcher"] == "Agent"
+    assert hook["hooks"][0]["command"] == (
+        f"hermes-orchestrator subagent-gate --freeze-dir {freeze_dir}"
+    )
+    session = _UUID("11111111-1111-4111-8111-111111111111")
+    assert runner.assignments_frozen(session) is False
+    marker = runner.freeze_assignments(session, "rotation_pending: 85%")
+    assert marker is not None and marker.read_text() == "rotation_pending: 85%\n"
+    assert runner.assignments_frozen(session) is True
+    runner.thaw_assignments(session)
+    assert runner.assignments_frozen(session) is False
+    runner.thaw_assignments(session)  # idempotent
+
+
+def test_runner_without_freeze_dir_installs_no_hook(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    runner = ClaudeRunner(registry, prompt_file=tmp_path / "lead.md", base_env={})
+    command, _ = runner.build_command(new_request(tmp_path))
+    assert "--settings" not in command
+    assert runner.freeze_assignments(
+        __import__("uuid").UUID("11111111-1111-4111-8111-111111111111"), "x"
+    ) is None

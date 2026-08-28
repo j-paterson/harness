@@ -14,6 +14,7 @@ from hermes_orchestrator.cells import DispatchResult, ProjectCellService
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.claude import ClaudeRunner
 from hermes_orchestrator.config import Settings
+from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
@@ -230,6 +231,7 @@ def open_runtime(
                 prompt_file=prompt_path,
                 base_env=environment,
                 processes=processes,
+                freeze_dir=settings.state_dir / "freezes",
             )
             cells = ProjectCellService(
                 database=database,
@@ -245,6 +247,9 @@ def open_runtime(
                 handoffs=HandoffService(database),
                 safety=safety,
                 checkpoints=checkpoints,
+                context=ContextMonitor(database, events, policy=settings.policy),
+                active_time=ActiveTimeTracker(database),
+                context_window_tokens=settings.policy.context_window_tokens,
             )
             dispatch = cells.dispatch
 

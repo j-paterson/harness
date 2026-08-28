@@ -113,6 +113,12 @@ def _parser() -> argparse.ArgumentParser:
     merger_turn.add_argument("--project", required=True)
     merger_turn.add_argument("--json", action="store_true")
 
+    gate = commands.add_parser(
+        "subagent-gate",
+        help="Claude Code PreToolUse hook: block subagents while frozen",
+    )
+    gate.add_argument("--freeze-dir", type=Path, required=True)
+
     hermes_command = commands.add_parser(
         "hermes-command",
         help="execute one strict Hermes JSON command",
@@ -384,10 +390,40 @@ def _print(payload: Any, *, json_output: bool, human: str) -> None:
         print(human)
 
 
+def subagent_gate(freeze_dir: Path, payload: str) -> tuple[int, str]:
+    """PreToolUse hook: block Agent tool use while the session is frozen.
+
+    Exit 2 blocks the tool call in Claude Code and returns the message to
+    the lead; exit 0 allows it. Malformed input never blocks silently: it
+    fails closed with exit 2 only when a freeze marker cannot be ruled out.
+    """
+
+    try:
+        document = json.loads(payload or "{}")
+    except json.JSONDecodeError:
+        return 2, "subagent gate: unreadable hook input; assignment refused"
+    session_id = document.get("session_id") if isinstance(document, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        return 0, ""
+    marker = freeze_dir / f"{session_id}.frozen"
+    if marker.exists():
+        reason = marker.read_text(encoding="utf-8").strip() or "rotation_pending"
+        return 2, (
+            "subagent gate: new subwork is frozen for this session "
+            f"({reason}); finish current work to a safe boundary and hand off"
+        )
+    return 0, ""
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one CLI command and return its process exit code."""
 
     args = _parser().parse_args(arguments)
+    if args.command == "subagent-gate":
+        code, message = subagent_gate(args.freeze_dir, sys.stdin.read())
+        if message:
+            print(message, file=sys.stderr)
+        return code
     settings = load_settings(args.repo_root, args.state_dir)
     enable_live = args.command == "daemon" and settings.policy.mode == "active"
     runtime = open_runtime(settings, enable_live=enable_live)

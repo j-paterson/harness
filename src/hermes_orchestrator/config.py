@@ -102,6 +102,9 @@ class PolicyConfig(BaseModel):
     context_prepare_percent: int = Field(default=70, ge=1, le=100)
     context_rotate_percent: int = Field(default=80, ge=1, le=100)
     max_active_session_hours: int = Field(default=6, ge=1)
+    # Context window used to derive the context percentage from the latest
+    # assistant usage (input + cache read + cache creation tokens).
+    context_window_tokens: int = Field(default=200_000, ge=1_000)
     stall_consultations_before_automation: Literal[2] = 2
     resource_sample_retention_hours: int = Field(default=24, ge=1, le=168)
     resource_thresholds: ResourcePolicy = Field(default_factory=ResourcePolicy)
