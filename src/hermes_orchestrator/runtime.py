@@ -467,10 +467,6 @@ def open_runtime(
                         database=database,
                         bindings=cmux_bindings,
                         port=cmux_port,
-                        # The lead-owned prompt-boundary proof: the same
-                        # checkpoint-safety evidence the hibernation
-                        # gate trusts.
-                        safety=safety,
                     ),
                 )
 

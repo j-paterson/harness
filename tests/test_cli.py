@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 29
+    assert json.loads(result.stdout)["schema_version"] == 30
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -996,10 +996,50 @@ async def test_daemon_starts_when_intake_probes_fail(
         # packets stayed pending for the next pass.
         assert service.ticks == 1
         assert supervisor is not None
-        assert port.envelopes == []
+        assert port.notifications == []
         pending = database.scalar(
             "SELECT count(*) FROM lead_corrections WHERE state = 'pending'"
         )
         assert int(pending) == 1
     finally:
         database.close()
+
+
+def test_intake_poll_hands_out_one_envelope_via_hook_json(
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import (
+        SESSION,
+        seed_active_cell,
+        seed_packets,
+    )
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    database = Database.open(state_dir / "state.db")
+    try:
+        seed_packets(database)
+        seed_active_cell(database)
+    finally:
+        database.close()
+    arguments = [
+        "--state-dir",
+        str(state_dir),
+        "intake-poll",
+        "--session",
+        SESSION,
+    ]
+
+    first = invoke(arguments)
+    second = invoke(arguments)
+    third = invoke(arguments)
+
+    # One envelope per handshake through hook JSON — the application
+    # layer, never a terminal buffer; an empty queue is a silent no-op.
+    assert first.exit_code == 0
+    payload = json.loads(first.stdout)
+    assert payload["decision"] == "block"
+    assert "HERMES_" in payload["reason"]
+    assert second.exit_code == 0 and json.loads(second.stdout)["reason"]
+    assert third.exit_code == 0 and third.stdout == ""

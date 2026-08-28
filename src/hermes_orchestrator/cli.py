@@ -176,6 +176,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     hermes_command.add_argument("--json", dest="request_json", required=True)
 
+    intake_poll = commands.add_parser(
+        "intake-poll",
+        help=(
+            "lead-owned intake handshake: hand out the next pending "
+            "envelope through the application layer (Claude Code hook)"
+        ),
+    )
+    intake_poll.add_argument("--session", default=None)
+
     def _deploy_spec_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--binary", type=PurePosixPath, required=True)
         subparser.add_argument("--config-repo", type=PurePosixPath, required=True)
@@ -927,6 +936,54 @@ def _deploy_status(
     return _run_deploy_plan(args, steps, runner)
 
 
+def _intake_poll(args: argparse.Namespace) -> int:
+    """Hand the calling lead its next pending envelope, if any.
+
+    Invoked from the lead's own Claude Code hook: the session id comes
+    from the hook payload on stdin (or --session), and the envelope is
+    returned as hook JSON — through the application layer, never any
+    terminal buffer. No envelope means empty output and exit 0, so the
+    hook is a no-op.
+    """
+
+    from hermes_orchestrator.lead_intake import LeadIntakePoll
+
+    session = args.session
+    if session is None:
+        with suppress(Exception):
+            payload = json.loads(sys.stdin.read() or "{}")
+            session = payload.get("session_id")
+    if not session:
+        return 0
+    state_dir = (
+        args.state_dir
+        if args.state_dir is not None
+        else Path.home() / ".local" / "share" / "hermes-orchestrator"
+    )
+    database = Database.open(Path(state_dir) / "state.db")
+    try:
+        envelope = LeadIntakePoll(database=database).next_envelope(
+            str(session)
+        )
+    finally:
+        database.close()
+    if envelope is None:
+        return 0
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": (
+                    f"{envelope} — Hermes intake: retrieve this packet "
+                    "from durable state (pending_corrections or the "
+                    "wake tables) by its id and act on it now."
+                ),
+            }
+        )
+    )
+    return 0
+
+
 def _migration_env(
     args: argparse.Namespace,
     runner: migration_env_module.EnvCommandRunner | None = None,
@@ -1110,6 +1167,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _deploy_status(args)
     if args.command == "migration-env":
         return _migration_env(args)
+    if args.command == "intake-poll":
+        return _intake_poll(args)
     settings = load_settings(args.repo_root, args.state_dir)
     if args.command == "serve-console":
         return _serve_console(args, settings)

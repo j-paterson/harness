@@ -37,14 +37,6 @@ _UUID_PATTERN = re.compile(
 # else — may be accepted as an intermediate response.
 _SHORT_WORKSPACE_ACK = re.compile(r"^OK\s+workspace:\d+$")
 
-# The complete grammar of the lead-intake transport: one envelope kind
-# and one 32-hex durable packet id. This is the only text that may ever
-# reach a surface, so arbitrary text and keystroke injection remain
-# structurally impossible; the lead retrieves the actual packet from
-# durable state by its id.
-INTAKE_ENVELOPE_PATTERN = re.compile(
-    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY) [0-9a-f]{32}$"
-)
 
 # The complete cmux vocabulary this orchestrator may speak. Everything is
 # workspace/surface lifecycle or sanitized metadata display. Screen and
@@ -116,8 +108,6 @@ class CmuxControlPort(Protocol):
         self, *, title_marker: str
     ) -> frozenset[str]: ...
 
-    async def focused_workspace_uuid(self) -> str | None: ...
-
     async def surface_alive(self, ref: CmuxSurfaceRef) -> bool: ...
 
     async def close_workspace(self, workspace_uuid: str) -> None: ...
@@ -145,10 +135,6 @@ class CmuxControlPort(Protocol):
     async def focus_workspace(self, workspace_uuid: str) -> None: ...
 
     async def set_hibernation(self, enabled: bool) -> None: ...
-
-    async def deliver_intake_envelope(
-        self, ref: CmuxSurfaceRef, envelope: str
-    ) -> None: ...
 
 
 ProcessFactory = Callable[..., "asyncio.Future[asyncio.subprocess.Process]"]
@@ -271,21 +257,6 @@ class CmuxCliAdapter:
         output = await self._run("list-workspaces")
         return frozenset(_UUID_PATTERN.findall(output))
 
-    async def focused_workspace_uuid(self) -> str | None:
-        """The currently focused workspace, from listing metadata only.
-
-        The listing marks the selected workspace with a leading ``*``;
-        keyboard input reaches only the focused surface, so this is the
-        content-free signal the intake transport uses to prove it is
-        not delivering into a pane the operator is interacting with.
-        """
-
-        output = await self._run("list-workspaces")
-        for line in output.splitlines():
-            if line.startswith("*"):
-                return _first_uuid(line)
-        return None
-
     async def find_workspace_uuids(
         self, *, title_marker: str
     ) -> frozenset[str]:
@@ -383,41 +354,6 @@ class CmuxCliAdapter:
 
     async def set_hibernation(self, enabled: bool) -> None:
         await self._run("agent-hibernation", "on" if enabled else "off")
-
-    async def deliver_intake_envelope(
-        self, ref: CmuxSurfaceRef, envelope: str
-    ) -> None:
-        """Type one schema-validated intake envelope and submit Return.
-
-        This is deliberately NOT part of the general allow-listed
-        vocabulary: ``send``/``send-key`` stay rejected by :meth:`_run`,
-        and this dedicated path accepts only the exact envelope grammar
-        (`HERMES_CORRECTION_READY`/`HERMES_WORK_READY` plus one 32-hex
-        packet id) addressed to one exact workspace and surface. The
-        target surface is never focused, no screen content is read, and
-        nothing else can ever be typed through it.
-
-        The sequence is strictly non-destructive: it types the envelope
-        and submits Return, and nothing else — no clearing, editing, or
-        cursor keystrokes that could alter operator-authored input. The
-        caller must hold a safe-delivery boundary proof before invoking
-        this (unfocused target plus a current lead-owned prompt
-        boundary), and recovery after an uncertain partial waits for a
-        fresh boundary instead of emitting destructive keystrokes.
-        """
-
-        if INTAKE_ENVELOPE_PATTERN.fullmatch(envelope) is None:
-            raise ValueError(
-                "only a schema-validated intake envelope may be delivered"
-            )
-        target = (
-            "--workspace",
-            ref.workspace_uuid,
-            "--surface",
-            ref.surface_uuid,
-        )
-        await self._execute("send", *target, envelope)
-        await self._execute("send-key", *target, "Return")
 
     async def _run(self, command: str, *arguments: str) -> str:
         if command not in _ALLOWED_COMMANDS:

@@ -436,57 +436,14 @@ async def test_metadata_commands_build_expected_argv() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intake_envelope_is_strictly_non_destructive() -> None:
-    factory = FakeFactory(results=[FakeProcess(), FakeProcess()])
-    port = adapter(factory)
-    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
-    envelope = f"HERMES_WORK_READY {'a' * 32}"
-
-    await port.deliver_intake_envelope(ref, envelope)
-
-    send_argv, key_argv = (call[0] for call in factory.calls)
-    target = ("--workspace", WORKSPACE, "--surface", SURFACE)
-    # Exactly two operations — the envelope and Return. No clearing,
-    # editing, or cursor keystroke can ever touch operator-authored
-    # input.
-    assert send_argv[3:] == ("send", *target, envelope)
-    assert key_argv[3:] == ("send-key", *target, "Return")
-    assert len(factory.calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_focused_workspace_is_read_from_listing_metadata() -> None:
-    listing = (
-        f"  {WORKSPACE}  Fable lead\n"
-        f"* {SURFACE}  Orchestrator  [selected]\n"
-    )
-    factory = FakeFactory(results=[FakeProcess(stdout=listing.encode())])
-
-    focused = await adapter(factory).focused_workspace_uuid()
-
-    assert focused == SURFACE
-    assert factory.calls[0][0][3] == "list-workspaces"
-
-
-@pytest.mark.asyncio
-async def test_only_the_exact_envelope_grammar_can_ever_be_typed() -> None:
+async def test_the_adapter_has_no_typing_channel_at_all() -> None:
+    # Keystroke injection is structurally impossible: the adapter
+    # exposes no delivery or focus-typing method, and the general
+    # vocabulary rejects every input command outright — so no code path
+    # can ever write into any terminal buffer, drafted or empty.
     port = adapter(FakeFactory())
-    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
 
-    for rejected in (
-        "rm -rf /",
-        "HERMES_WORK_READY",
-        "HERMES_WORK_READY deadbeef",
-        f"HERMES_WORK_READY {'a' * 32} && echo pwn",
-        f"hermes_work_ready {'a' * 32}",
-        f"HERMES_SOMETHING_ELSE {'a' * 32}",
-        f"HERMES_WORK_READY {'A' * 32}",
-        f"HERMES_WORK_READY {'a' * 32}\n",
-    ):
-        with pytest.raises(ValueError, match="schema-validated"):
-            await port.deliver_intake_envelope(ref, rejected)
-
-    # And the general vocabulary still rejects raw injection commands.
-    for forbidden in ("send", "send-key"):
+    assert not hasattr(port, "deliver_intake_envelope")
+    for forbidden in ("send", "send-key", "send-panel", "paste-buffer"):
         with pytest.raises(ValueError, match="not allow-listed"):
             await port._run(forbidden)
