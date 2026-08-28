@@ -73,6 +73,21 @@ class ApproveHandoffCommand(_Command):
     handoff_id: NonEmptyText
 
 
+class ApproveStallCommand(_Command):
+    intent: Literal["approve_stall"]
+    project_key: NonEmptyText
+
+
+class RequestCheckpointCommand(_Command):
+    intent: Literal["request_checkpoint"]
+    project_key: NonEmptyText
+
+
+class RequestCleanupCommand(_Command):
+    intent: Literal["request_cleanup"]
+    project_key: NonEmptyText
+
+
 class QaRejectCommand(_Command):
     intent: Literal["qa_reject"]
     issue_id: NonEmptyText
@@ -139,6 +154,9 @@ HermesCommand = Annotated[
     | RetryCommand
     | ReprioritizeCommand
     | ApproveHandoffCommand
+    | ApproveStallCommand
+    | RequestCheckpointCommand
+    | RequestCleanupCommand
     | QaRejectCommand
     | PendingCorrectionsCommand
     | AckCorrectionCommand
@@ -150,6 +168,8 @@ HermesCommand = Annotated[
 ]
 
 _COMMAND_ADAPTER = TypeAdapter(HermesCommand)
+# Intents execute() serves without a registered handler.
+_INLINE_INTENTS = frozenset({"queue_issue", "status", "reprioritize"})
 _ALLOWED_INTENTS = frozenset(
     {
         "queue_issue",
@@ -159,6 +179,9 @@ _ALLOWED_INTENTS = frozenset(
         "retry",
         "reprioritize",
         "approve_handoff",
+        "approve_stall",
+        "request_checkpoint",
+        "request_cleanup",
         "qa_reject",
         "pending_corrections",
         "ack_correction",
@@ -204,6 +227,17 @@ class HermesCommandService:
         self._qa = qa
         self._handlers = dict(handlers or {})
         self._correlation_ids = correlation_ids or (lambda: str(uuid.uuid4()))
+
+    def supports(self, intent: str) -> bool:
+        """True when the intent reaches real code instead of failing.
+
+        A remote surface must not prepare a confirmation for an intent
+        this service would only answer with ``intent_unavailable``.
+        """
+
+        if intent not in _ALLOWED_INTENTS:
+            return False
+        return intent in _INLINE_INTENTS or intent in self._handlers
 
     def execute(self, raw: object) -> HermesCommandResult:
         """Validate and execute one strict JSON command."""

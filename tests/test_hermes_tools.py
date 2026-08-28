@@ -186,3 +186,55 @@ def test_stall_intents_are_strict_and_routed(database: Database) -> None:
     assert invalid.code == "invalid_command"
     unavailable = service.execute({"intent": "pending_consultations"})
     assert unavailable.code == "intent_unavailable"
+
+
+def test_remote_capability_intents_are_strict_and_routed(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def record(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"handled": True}
+
+    service = HermesCommandService(
+        queue,
+        handlers={
+            "approve_stall": record,
+            "request_checkpoint": record,
+            "request_cleanup": record,
+        },
+    )
+    for intent in ("approve_stall", "request_checkpoint", "request_cleanup"):
+        result = service.execute({"intent": intent, "project_key": "demo"})
+        assert result.code == "accepted", intent
+        assert result.state == {"handled": True}
+        invalid = service.execute(
+            {"intent": intent, "project_key": "demo", "extra": "field"}
+        )
+        assert invalid.code == "invalid_command", intent
+        missing = service.execute({"intent": intent})
+        assert missing.code == "invalid_command", intent
+    assert [command.project_key for command in seen] == ["demo", "demo", "demo"]
+
+
+def test_remote_capability_intents_without_handlers_are_unavailable(
+    command_service: HermesCommandService,
+) -> None:
+    for intent in ("approve_stall", "request_checkpoint", "request_cleanup"):
+        result = command_service.execute({"intent": intent, "project_key": "demo"})
+        assert result.code == "intent_unavailable", intent
+
+
+def test_supports_reflects_inline_and_wired_intents(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    bare = HermesCommandService(queue)
+    assert bare.supports("queue_issue")
+    assert bare.supports("status")
+    assert bare.supports("reprioritize")
+    assert not bare.supports("approve_stall")
+    assert not bare.supports("shell")
+    assert not bare.supports("scan_linear")
+
+    wired = HermesCommandService(queue, handlers={"approve_stall": lambda c: {}})
+    assert wired.supports("approve_stall")
+    assert not wired.supports("request_cleanup")

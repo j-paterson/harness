@@ -89,7 +89,7 @@ def test_legacy_database_upgrades_to_current_schema(tmp_path: Path) -> None:
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 19
+        assert database.schema_version() == 22
         names = tables(database)
         assert "reviewer_channels" in names
         assert "merger_threads" not in names
@@ -148,7 +148,7 @@ def test_upgrade_never_replaces_an_existing_current_channel(tmp_path: Path) -> N
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 19
+        assert database.schema_version() == 22
         row = database.execute(
             "SELECT thread_id, generation, state FROM reviewer_channels"
         ).fetchone()
@@ -168,7 +168,7 @@ def test_upgrade_is_idempotent_across_reopen(tmp_path: Path) -> None:
     Database.open(path).close()
     reopened = Database.open(path)
     try:
-        assert reopened.schema_version() == 19
+        assert reopened.schema_version() == 22
         assert reopened.scalar("SELECT count(*) FROM reviewer_channels") == 1
     finally:
         reopened.close()
@@ -218,5 +218,54 @@ async def test_legacy_channel_requires_live_reverification(tmp_path: Path) -> No
         assert rpc.request_for("thread/name/set")["params"]["threadId"] == (
             "thr_legacy"
         )
+    finally:
+        database.close()
+
+
+def test_pending_commands_survive_the_claim_state_recreate(tmp_path: Path) -> None:
+    """Migration 0021 recreates remote_pending_commands; rows must survive."""
+
+    path = tmp_path / "schema20.db"
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        for migration in sorted(MIGRATIONS.glob("[0-9]*.sql")):
+            if int(migration.name.split("_", maxsplit=1)[0]) > 20:
+                continue
+            connection.executescript(migration.read_text())
+        connection.execute(
+            "INSERT INTO remote_pending_commands("
+            "confirmation_id, session_id, intent, target, confirmation_phrase, "
+            "impact_summary, prepared_at, expires_at, state"
+            ") VALUES ('c-1', 's-1', 'pause', 'project:demo', 'PAUSE DEMO', "
+            "'impact', 't0', 't1', 'executed')"
+        )
+        connection.execute(
+            "INSERT INTO remote_command_results("
+            "idempotency_key, session_id, confirmation_id, code, "
+            "correlation_id, state_json, executed_at"
+            ") VALUES ('k-1', 's-1', 'c-1', 'accepted', 'corr-1', '{}', 't1')"
+        )
+    finally:
+        connection.close()
+
+    database = Database.open(path)
+    try:
+        assert database.schema_version() == 22
+        row = database.execute(
+            "SELECT * FROM remote_pending_commands WHERE confirmation_id = 'c-1'"
+        ).fetchone()
+        assert row["state"] == "executed"
+        assert row["confirmation_phrase"] == "PAUSE DEMO"
+        assert row["claimed_at"] is None
+        assert row["idempotency_key"] is None
+        assert row["parameters_json"] == "{}"
+        database.execute(
+            "SELECT 1 FROM remote_pending_commands WHERE state = 'claimed'"
+        ).fetchone()
+        result = database.execute(
+            "SELECT code FROM remote_command_results WHERE idempotency_key = 'k-1'"
+        ).fetchone()
+        assert result["code"] == "accepted"
+        assert database.scalar("PRAGMA integrity_check") == "ok"
     finally:
         database.close()
