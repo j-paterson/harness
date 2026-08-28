@@ -769,7 +769,19 @@ class ProjectCellService:
                 compaction = True
             elif event.kind == "context.error":
                 context_error = True
-            elif event.parent_tool_use_id is None and event.usage:
+            elif (
+                event.original_type == "assistant"
+                and event.kind != "provider.limit"
+                and event.parent_tool_use_id is None
+                and event.usage
+            ):
+                # Only an individual top-level assistant invocation reports
+                # this session's live context occupancy. A result record's
+                # usage is the cumulative run total (all invocations plus
+                # children), a user/tool-result record can forward a child
+                # worker's usage, and a synthetic limit notice is not an
+                # invocation at all: any of them would poison the sticky
+                # monitor into a false rotation.
                 occupied = (
                     event.usage.get("input_tokens", 0)
                     + event.usage.get("cache_read_input_tokens", 0)

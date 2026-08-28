@@ -1740,3 +1740,228 @@ async def test_freeze_reconciliation_is_idempotent(
     assert event_count(database, "assignments.frozen") == 2
     assert event_count(database, "context.rotation_pending") == 1
     assert handoff_reasons(database) == []
+
+
+# INFRA-188: only the latest eligible individual assistant invocation may
+# drive the context percentage — never a cumulative top-level result and
+# never forwarded child usage. A false percent poisons the sticky monitor
+# into a false rotation, so eligibility must be structural.
+
+
+class ScriptedContextRunner(ContextRunner):
+    """Emits session.started, then an exact scripted event sequence."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.script: list[ClaudeEvent] = []
+
+    async def _events(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+        yield ClaudeEvent(
+            kind="session.started",
+            original_type="system",
+            session_id=request.session_id,
+            parent_tool_use_id=None,
+            timestamp="2026-08-26T12:00:00Z",
+            usage={},
+        )
+        for event in self.script:
+            yield event
+
+
+def _stream_event(
+    *,
+    kind: str,
+    original_type: str,
+    parent_tool_use_id: str | None = None,
+    usage: dict[str, int] | None = None,
+    error_code: str | None = None,
+) -> ClaudeEvent:
+    return ClaudeEvent(
+        kind=kind,
+        original_type=original_type,
+        session_id=SESSION_ID,
+        parent_tool_use_id=parent_tool_use_id,
+        timestamp="2026-08-26T12:00:01Z",
+        usage=usage or {},
+        error_code=error_code,
+    )
+
+
+def _context_evidence(database: Database) -> tuple[str, float | None]:
+    row = database.execute(
+        "SELECT state, last_percent FROM context_evidence "
+        f"WHERE worker_id = 'cell-demo:{SESSION_ID}'"
+    ).fetchone()
+    assert row is not None
+    percent = None if row["last_percent"] is None else float(row["last_percent"])
+    return str(row["state"]), percent
+
+
+@pytest.mark.asyncio
+async def test_cumulative_result_usage_never_drives_rotation(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # One modest real invocation, then the terminal result whose usage is
+    # the cumulative run total (all invocations plus children): far beyond
+    # the window, but it says nothing about live context occupancy.
+    runner.script = [
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            usage={"input_tokens": 30_000},
+        ),
+        _stream_event(
+            kind="stream.result",
+            original_type="result",
+            usage={
+                "input_tokens": 40_000,
+                "cache_read_input_tokens": 500_000,
+                "output_tokens": 9_000,
+            },
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == []
+    assert _context_evidence(database) == ("healthy", 30.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarded_child_usage_never_drives_rotation(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # A child worker's final usage forwarded inside a top-level tool-result
+    # record: it describes the child's context, never this session's.
+    runner.script = [
+        _stream_event(
+            kind="stream.user",
+            original_type="user",
+            usage={"input_tokens": 95_000, "cache_read_input_tokens": 4_000},
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == []
+    assert _context_evidence(database) == ("healthy", None)
+
+
+@pytest.mark.asyncio
+async def test_child_assistant_usage_never_drives_rotation(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    runner.script = [
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            parent_tool_use_id="toolu-child",
+            usage={"input_tokens": 95_000},
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == []
+    assert _context_evidence(database) == ("healthy", None)
+
+
+@pytest.mark.asyncio
+async def test_latest_assistant_invocation_drives_percent(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # The latest eligible individual invocation (72%) sets the percentage;
+    # the cumulative terminal result must not escalate it to a rotation.
+    runner.script = [
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            usage={"input_tokens": 40_000},
+        ),
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            usage={"input_tokens": 72_000},
+        ),
+        _stream_event(
+            kind="stream.result",
+            original_type="result",
+            usage={"input_tokens": 400_000, "cache_read_input_tokens": 90_000},
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == ["context_prepare"]
+    assert _context_evidence(database) == ("prepare", 72.0)
+
+
+@pytest.mark.asyncio
+async def test_synthetic_limit_assistant_usage_never_drives_rotation(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # A synthetic subscription-limit notice is not a real invocation even
+    # when it arrives shaped as an assistant record with usage attached.
+    runner.script = [
+        _stream_event(
+            kind="provider.limit",
+            original_type="assistant",
+            usage={"input_tokens": 90_000},
+            error_code="subscription_limit",
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    # The limit itself requires a handoff (journaled with its own reason,
+    # without a rotation handoff request); context evidence must stay clean
+    # so the replacement session does not inherit a false rotation state.
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == []
+    reasons = [
+        json.loads(str(row["payload_json"]))["reason"]
+        for row in database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'project_cell.handoff_required'"
+        ).fetchall()
+    ]
+    assert reasons == ["subscription_limit"]
+    assert _context_evidence(database) == ("healthy", None)
+
+
+@pytest.mark.asyncio
+async def test_top_level_subagent_start_usage_still_counts(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # An assistant invocation that starts a subagent is still this
+    # session's own invocation: its usage is real context occupancy and
+    # the 80% rotation behavior must be preserved.
+    runner.script = [
+        _stream_event(
+            kind="subagent.started",
+            original_type="assistant",
+            usage={"input_tokens": 86_000},
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "handoff_required"
+    assert handoff_reasons(database) == ["context_rotation"]
+    assert _context_evidence(database)[1] == 86.0
