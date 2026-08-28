@@ -12,11 +12,14 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
-from hermes_orchestrator.config import load_settings
+from hermes_orchestrator.config import Settings, load_settings
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.deploy import lifecycle
+from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
@@ -31,6 +34,7 @@ from hermes_orchestrator.remote.auth import (
     CredentialStateUnreadable,
     RemoteCredentialService,
 )
+from hermes_orchestrator.remote.serve import build_console_dependencies, run_console
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.runtime import (
     Dispatch,
@@ -144,6 +148,50 @@ def _parser() -> argparse.ArgumentParser:
         help="execute one strict Hermes JSON command",
     )
     hermes_command.add_argument("--json", dest="request_json", required=True)
+
+    def _deploy_spec_arguments(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--binary", type=PurePosixPath, required=True)
+        subparser.add_argument("--config-repo", type=PurePosixPath, required=True)
+        subparser.add_argument(
+            "--service-state-dir", type=PurePosixPath, required=True
+        )
+        subparser.add_argument("--log-dir", type=PurePosixPath, required=True)
+        subparser.add_argument("--console-port", type=int, default=8787)
+
+    deploy_render = commands.add_parser(
+        "deploy-render",
+        help="write launchd and tailnet-only serve artifacts; never activates",
+    )
+    _deploy_spec_arguments(deploy_render)
+    deploy_render.add_argument("--output-dir", type=Path, required=True)
+
+    for deploy_name, deploy_help in (
+        ("deploy-install", "plan (or with --execute run) the guarded install"),
+        ("deploy-uninstall", "plan (or with --execute run) the full reversal"),
+        ("deploy-status", "plan (or with --execute run) read-only status"),
+    ):
+        deploy_sub = commands.add_parser(deploy_name, help=deploy_help)
+        _deploy_spec_arguments(deploy_sub)
+        deploy_sub.add_argument("--rendered-dir", type=PurePosixPath, required=True)
+        deploy_sub.add_argument(
+            "--launch-agents-dir", type=PurePosixPath, required=True
+        )
+        deploy_sub.add_argument("--uid", type=int, required=True)
+        deploy_sub.add_argument("--execute", action="store_true")
+
+    deploy_serve_enable = commands.add_parser(
+        "deploy-serve-enable",
+        help="plan (or with --execute run) the guarded tailnet-only serve enable",
+    )
+    deploy_serve_enable.add_argument("--console-port", type=int, default=8787)
+    deploy_serve_enable.add_argument("--execute", action="store_true")
+
+    serve_console = commands.add_parser(
+        "serve-console",
+        help="run the loopback-only operations console over durable state",
+    )
+    serve_console.add_argument("--host", default="127.0.0.1")
+    serve_console.add_argument("--port", type=int, required=True)
     return parser
 
 
@@ -665,6 +713,144 @@ def _print_remote_auth_diagnostic(credentials: RemoteCredentialService) -> None:
     )
 
 
+def _deploy_inventory(args: argparse.Namespace):
+    return standard_inventory(
+        binary=args.binary,
+        config_repo=args.config_repo,
+        state_dir=args.service_state_dir,
+        log_dir=args.log_dir,
+        console_port=args.console_port,
+    )
+
+
+def _deploy_render(args: argparse.Namespace) -> int:
+    paths = lifecycle.render_artifacts(
+        _deploy_inventory(args), args.output_dir, console_port=args.console_port
+    )
+    print(json.dumps({"artifacts": [str(path) for path in paths]}, indent=2))
+    return 0
+
+
+def _run_deploy_plan(
+    args: argparse.Namespace,
+    steps: tuple[lifecycle.CommandStep, ...],
+    runner: lifecycle.CommandRunner | None,
+    journal: lifecycle.MutationJournal | None = None,
+) -> int:
+    if not args.execute:
+        print(
+            json.dumps(
+                {
+                    "executed": False,
+                    "plan": [
+                        {
+                            "argv": list(step.argv),
+                            "kind": step.kind,
+                            "code": step.code,
+                        }
+                        for step in steps
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+    active_runner = runner if runner is not None else lifecycle.SubprocessRunner()
+    report = lifecycle.execute_plan(
+        steps, active_runner, console_port=args.console_port, journal=journal
+    )
+    print(
+        json.dumps(
+            {
+                "executed": True,
+                "completed": report.completed,
+                "refusal_code": report.refusal_code,
+                "records": [list(record) for record in report.records],
+                "compensations": [list(pair) for pair in report.compensations],
+                "residual_codes": list(report.residual_codes),
+            },
+            indent=2,
+        )
+    )
+    return 0 if report.completed else 1
+
+
+def _deploy_install(
+    args: argparse.Namespace, runner: lifecycle.CommandRunner | None = None
+) -> int:
+    steps = lifecycle.plan_install(
+        _deploy_inventory(args),
+        rendered_dir=args.rendered_dir,
+        launch_agents_dir=args.launch_agents_dir,
+        uid=args.uid,
+        console_port=args.console_port,
+    )
+    journal: lifecycle.MutationJournal | None = None
+    if args.execute:
+        # Dry runs must construct nothing; the journal exists only when
+        # mutations may actually happen.
+        journal = lifecycle.FileMutationJournal(
+            Path(args.rendered_dir) / "install-journal.json"
+        )
+    return _run_deploy_plan(args, steps, runner, journal=journal)
+
+
+def _deploy_uninstall(
+    args: argparse.Namespace, runner: lifecycle.CommandRunner | None = None
+) -> int:
+    steps = lifecycle.plan_uninstall(
+        _deploy_inventory(args),
+        launch_agents_dir=args.launch_agents_dir,
+        uid=args.uid,
+        console_port=args.console_port,
+    )
+    return _run_deploy_plan(args, steps, runner)
+
+
+def _deploy_serve_enable(
+    args: argparse.Namespace, runner: lifecycle.CommandRunner | None = None
+) -> int:
+    steps = lifecycle.plan_serve_enable(console_port=args.console_port)
+    return _run_deploy_plan(args, steps, runner)
+
+
+def _deploy_status(
+    args: argparse.Namespace, runner: lifecycle.CommandRunner | None = None
+) -> int:
+    steps = lifecycle.plan_status(
+        _deploy_inventory(args), uid=args.uid, console_port=args.console_port
+    )
+    return _run_deploy_plan(args, steps, runner)
+
+
+def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
+    """Serve the operations console over the durable state database.
+
+    The console only ever binds the loopback address; tailnet exposure is
+    Tailscale Serve's job. No runtime, daemon lock, or live credential
+    loading is involved — only the state database and the keychain-backed
+    remote services behind the login boundary.
+    """
+
+    if args.host != "127.0.0.1":
+        print("serve-console binds 127.0.0.1 only", file=sys.stderr)
+        return 2
+    database = Database.open(settings.state_dir / "state.db")
+    try:
+        dependencies = build_console_dependencies(
+            database=database,
+            github_repos={
+                alias: project.github_repo
+                for alias, project in settings.projects.items()
+            },
+            playbook_path=settings.repo_root / "config" / "playbooks.yaml",
+        )
+        run_console(dependencies, port=args.port)
+    finally:
+        database.close()
+    return 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one CLI command and return its process exit code."""
 
@@ -676,7 +862,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return code
     if args.command == "remote-auth-init":
         return _remote_auth_init()
+    if args.command == "deploy-render":
+        return _deploy_render(args)
+    if args.command == "deploy-install":
+        return _deploy_install(args)
+    if args.command == "deploy-uninstall":
+        return _deploy_uninstall(args)
+    if args.command == "deploy-serve-enable":
+        return _deploy_serve_enable(args)
+    if args.command == "deploy-status":
+        return _deploy_status(args)
     settings = load_settings(args.repo_root, args.state_dir)
+    if args.command == "serve-console":
+        return _serve_console(args, settings)
     enable_live = args.command == "daemon" and settings.policy.mode == "active"
     runtime = open_runtime(settings, enable_live=enable_live)
     database = runtime.database

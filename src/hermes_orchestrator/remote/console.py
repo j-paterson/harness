@@ -245,7 +245,11 @@ def build_console_router(
 
     def _action(slug: str) -> ConsoleAction:
         action = CONSOLE_ACTIONS.get(slug)
-        if action is None:
+        # An action whose intent the wired executor cannot serve is treated
+        # exactly like an unknown one: it must not render a form that could
+        # only fail at prepare. GET and POST routes all resolve through
+        # this lookup, so the removal is total.
+        if action is None or not confirmations.available(action.intent):
             raise _PageError(404, "unknown_action")
         return action
 
@@ -368,7 +372,13 @@ def build_console_router(
         return _render(
             "status.html",
             summary=summary,
-            actions=list(CONSOLE_ACTIONS.values()),
+            # Only capabilities the wired executor actually serves render;
+            # the closed table itself stays intact as the naming boundary.
+            actions=[
+                action
+                for action in CONSOLE_ACTIONS.values()
+                if confirmations.available(action.intent)
+            ],
             csrf=csrf.issue(claims.session_id),
         )
 

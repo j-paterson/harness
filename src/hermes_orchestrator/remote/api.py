@@ -191,6 +191,12 @@ def create_operations_app(dependencies: RemoteDependencies) -> FastAPI:
             exception_type, _service_error_handler(status_code, code)
         )
 
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        # Unauthenticated liveness probe: static and value-free, so nothing
+        # is disclosed; the security-header middleware still applies.
+        return {"code": "ok"}
+
     @app.get("/api/status")
     async def status(request: Request) -> dict[str, Any]:
         _authenticate(request)

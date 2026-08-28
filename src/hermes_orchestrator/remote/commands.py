@@ -262,6 +262,15 @@ class ConfirmationService:
         self._executor = executor
         self._now = now
 
+    def available(self, intent: RemoteIntent) -> bool:
+        """True when the intent is specced AND its executor path is wired.
+
+        Exactly the gate ``prepare`` applies after policy: a surface may use
+        this to avoid rendering a control that could never be prepared.
+        """
+
+        return intent in _INTENT_SPECS and self._executor.supports(intent.value)
+
     def prepare(
         self, command: RemoteCommand, *, session_id: str
     ) -> PendingConfirmation:
