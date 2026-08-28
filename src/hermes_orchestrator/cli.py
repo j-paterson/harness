@@ -30,6 +30,7 @@ from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
+from hermes_orchestrator.lead_intake import LeadIntakeRouter
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.lead_wakes import (
     CommandWakeTransport,
@@ -316,7 +317,17 @@ async def _run_daemon(
     wake_reconciler: LeadWakeReconciler | None = None,
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
+    lead_intake: LeadIntakeRouter | None = None,
 ) -> Supervisor:
+    async def _maintenance() -> None:
+        if cmux_hibernation is not None:
+            await cmux_hibernation.tick()
+        if lead_intake is not None:
+            # Restart-safe by derivation: every tick re-routes any
+            # durable pending correction or wake whose envelope has
+            # not been delivered to its classic seat.
+            await lead_intake.tick()
+
     supervisor = Supervisor(
         service,
         dispatch=dispatch,
@@ -325,7 +336,9 @@ async def _run_daemon(
         interval_seconds=interval,
         wake_delivery=wake_delivery,
         maintenance=(
-            None if cmux_hibernation is None else cmux_hibernation.tick
+            None
+            if cmux_hibernation is None and lead_intake is None
+            else _maintenance
         ),
     )
     if cmux_reconciler is not None:
@@ -342,6 +355,10 @@ async def _run_daemon(
         # Idempotent startup replay: wakes committed before a crash or
         # restart re-arm the event-driven loop exactly once.
         wake_delivery.replay_startup()
+    if lead_intake is not None:
+        # Deliver any envelope a crash separated from its published
+        # packet before the first supervised tick.
+        await lead_intake.tick()
     if once:
         await supervisor.run_once()
         return supervisor
@@ -1231,6 +1248,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ),
                     cmux_reconciler=runtime.cmux_reconciler,
                     cmux_hibernation=runtime.cmux_hibernation,
+                    lead_intake=runtime.lead_intake,
                 )
             )
             payload = {

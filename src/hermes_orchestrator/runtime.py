@@ -40,6 +40,10 @@ from hermes_orchestrator.github import (
 )
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.keychain import Keychain
+from hermes_orchestrator.lead_intake import (
+    LeadIntakeRouter,
+    LeadIntakeTransport,
+)
 from hermes_orchestrator.lead_wakes import LeadTerminalWakes
 from hermes_orchestrator.linear import (
     ExternalEffectStore,
@@ -158,6 +162,7 @@ class Runtime:
     cmux_bindings: CmuxSurfaceBindings | None = None
     cmux_reconciler: CmuxSurfaceReconciler | None = None
     cmux_hibernation: CmuxHibernationDriver | None = None
+    lead_intake: LeadIntakeRouter | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -360,6 +365,7 @@ def open_runtime(
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
+        lead_intake: LeadIntakeRouter | None = None
 
         if enable_live:
             assert reader is not None
@@ -451,6 +457,18 @@ def open_runtime(
                 CmuxWakeAnnouncer(
                     bindings=cmux_bindings, port=cmux_port
                 ).attach(lead_wakes)
+                # The lead-intake router derives pending correction
+                # and wake envelopes from durable state every pass,
+                # so publication and typing can never be separated
+                # permanently by a crash.
+                lead_intake = LeadIntakeRouter(
+                    database=database,
+                    transport=LeadIntakeTransport(
+                        database=database,
+                        bindings=cmux_bindings,
+                        port=cmux_port,
+                    ),
+                )
 
             cells = ProjectCellService(
                 database=database,
@@ -527,6 +545,7 @@ def open_runtime(
             cmux_bindings=cmux_bindings,
             cmux_reconciler=cmux_reconciler,
             cmux_hibernation=cmux_hibernation,
+            lead_intake=lead_intake,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

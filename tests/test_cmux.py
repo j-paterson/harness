@@ -436,31 +436,23 @@ async def test_metadata_commands_build_expected_argv() -> None:
 
 
 @pytest.mark.asyncio
-async def test_intake_envelope_types_the_id_and_submits_return() -> None:
-    factory = FakeFactory(results=[FakeProcess(), FakeProcess()])
+async def test_intake_envelope_resets_types_and_submits_return() -> None:
+    factory = FakeFactory(
+        results=[FakeProcess(), FakeProcess(), FakeProcess()]
+    )
     port = adapter(factory)
     ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
     envelope = f"HERMES_WORK_READY {'a' * 32}"
 
     await port.deliver_intake_envelope(ref, envelope)
 
-    send_argv, key_argv = (call[0] for call in factory.calls)
-    assert send_argv[3:] == (
-        "send",
-        "--workspace",
-        WORKSPACE,
-        "--surface",
-        SURFACE,
-        envelope,
-    )
-    assert key_argv[3:] == (
-        "send-key",
-        "--workspace",
-        WORKSPACE,
-        "--surface",
-        SURFACE,
-        "Return",
-    )
+    reset_argv, send_argv, key_argv = (call[0] for call in factory.calls)
+    target = ("--workspace", WORKSPACE, "--surface", SURFACE)
+    # The line reset makes a retry after a text-without-Return partial
+    # idempotent: exactly one envelope, never a concatenation.
+    assert reset_argv[3:] == ("send-key", *target, "ctrl+u")
+    assert send_argv[3:] == ("send", *target, envelope)
+    assert key_argv[3:] == ("send-key", *target, "Return")
 
 
 @pytest.mark.asyncio

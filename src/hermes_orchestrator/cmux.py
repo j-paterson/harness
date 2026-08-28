@@ -379,6 +379,12 @@ class CmuxCliAdapter:
         packet id) addressed to one exact workspace and surface. The
         target surface is never focused, no screen content is read, and
         nothing else can ever be typed through it.
+
+        Every sequence begins by clearing the input line (ctrl+u): a
+        prior attempt that typed text but never submitted Return leaves
+        a partial line no one can read back, and the reset makes the
+        retry idempotent — recovery re-types exactly one envelope
+        instead of concatenating onto the partial.
         """
 
         if INTAKE_ENVELOPE_PATTERN.fullmatch(envelope) is None:
@@ -391,6 +397,7 @@ class CmuxCliAdapter:
             "--surface",
             ref.surface_uuid,
         )
+        await self._execute("send-key", *target, "ctrl+u")
         await self._execute("send", *target, envelope)
         await self._execute("send-key", *target, "Return")
 

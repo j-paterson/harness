@@ -235,3 +235,332 @@ async def test_stale_mismatched_and_nonclassic_bindings_are_refused(
             session_id=SESSION,
         )
     assert port.envelopes == []
+
+
+def seed_active_cell(database: Database) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at) VALUES "
+            "('cell-demo', 'demo', 'active', 'max-a', ?, ?, ?)",
+            (SESSION, NOW.isoformat(), NOW.isoformat()),
+        )
+
+
+def delivery_rows(database: Database) -> list[tuple[str, str, int]]:
+    rows = database.execute(
+        "SELECT kind, state, attempts FROM lead_intake_deliveries "
+        "ORDER BY rowid"
+    ).fetchall()
+    return [
+        (str(r["kind"]), str(r["state"]), int(r["attempts"])) for r in rows
+    ]
+
+
+@pytest.mark.asyncio
+async def test_racing_deliveries_produce_one_external_sequence(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    import asyncio
+
+    seed_packets(database)
+    seat(bindings)
+
+    class HoldingPort(RecordingPort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate = asyncio.Event()
+
+        async def deliver_intake_envelope(self, ref, envelope):  # type: ignore[no-untyped-def]
+            await self.gate.wait()
+            await super().deliver_intake_envelope(ref, envelope)
+
+    port = HoldingPort()
+    lane = transport(database, bindings, port)
+    kwargs = dict(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+
+    first = asyncio.ensure_future(lane.deliver(**kwargs))
+    await asyncio.sleep(0)
+    # The second caller finds the fresh claim and types nothing.
+    second = await lane.deliver(**kwargs)
+    port.gate.set()
+    first_result = await first
+
+    assert second.status == "pending"
+    assert first_result.status == "delivered"
+    assert len(port.envelopes) == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_after_claim_is_retried_after_the_window(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from datetime import timedelta
+
+    seed_packets(database)
+    seat(bindings)
+
+    class Died(BaseException):
+        pass
+
+    class CrashingPort(RecordingPort):
+        async def deliver_intake_envelope(self, ref, envelope):  # type: ignore[no-untyped-def]
+            raise Died("process died before typing")
+
+    crashing = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=CrashingPort(),
+        now=lambda: NOW,
+    )
+    with pytest.raises(Died):
+        await crashing.deliver(
+            kind=WORK_READY,
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+    assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
+
+    # Restart: a new transport takes over the stale attempt once the
+    # retry window has passed and completes exactly one delivery.
+    port = RecordingPort()
+    later = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=port,
+        now=lambda: NOW + timedelta(seconds=120),
+    )
+    result = await later.deliver(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+
+    assert result.status == "delivered"
+    assert len(port.envelopes) == 1
+    assert delivery_rows(database) == [(WORK_READY, "delivered", 2)]
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_stays_durable_and_distinguishable(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from datetime import timedelta
+
+    from hermes_orchestrator.cmux import CmuxUnavailable
+
+    seed_packets(database)
+    seat(bindings)
+
+    class FailingPort(RecordingPort):
+        async def deliver_intake_envelope(self, ref, envelope):  # type: ignore[no-untyped-def]
+            raise CmuxUnavailable("cmux command timed out")
+
+    failing = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=FailingPort(),
+        now=lambda: NOW,
+    )
+    outcome = await failing.deliver(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+
+    # The uncertain external effect is durably an 'attempted' row —
+    # never recorded as delivered, never lost.
+    assert outcome.status == "attempt_failed"
+    assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
+
+    # A fresh retry inside the window is refused (the owner may still
+    # be live); after the window it recovers to exactly one delivery.
+    within = await failing.deliver(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+    assert within.status == "pending"
+
+    port = RecordingPort()
+    later = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=port,
+        now=lambda: NOW + timedelta(seconds=120),
+    )
+    result = await later.deliver(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+    assert result.status == "delivered"
+    assert delivery_rows(database) == [(WORK_READY, "delivered", 2)]
+
+
+@pytest.mark.asyncio
+async def test_crash_after_return_recovers_without_losing_the_packet(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from datetime import timedelta
+
+    seed_packets(database)
+    seat(bindings)
+    port = RecordingPort()
+    lane = transport(database, bindings, port)
+    kwargs = dict(
+        kind=WORK_READY,
+        packet_id=WAKE_ID,
+        cell_id="cell-demo",
+        session_id=SESSION,
+    )
+    await lane.deliver(**kwargs)
+    # Simulate the crash window between the acknowledged Return and the
+    # delivered record: the row is still 'attempted' on restart.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_intake_deliveries SET state = 'attempted', "
+            "delivered_at = NULL, updated_at = ?",
+            (NOW.isoformat(),),
+        )
+
+    later = LeadIntakeTransport(
+        database=database,
+        bindings=bindings,
+        port=port,
+        now=lambda: NOW + timedelta(seconds=120),
+    )
+    result = await later.deliver(**kwargs)
+
+    # Recovery may repeat the envelope (the id-based packet fetch is
+    # idempotent on the lead side) but processing is never lost and
+    # never duplicated durably: one row, delivered.
+    assert result.status == "delivered"
+    rows = delivery_rows(database)
+    assert len(rows) == 1
+    assert rows[0][1] == "delivered"
+    assert len(port.envelopes) == 2
+
+
+@pytest.mark.asyncio
+async def test_router_routes_each_pending_packet_exactly_once(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+
+    seed_packets(database)
+    seed_active_cell(database)
+    seat(bindings)
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    first = await router.tick()
+    second = await router.tick()
+
+    # One CORRECTION envelope for the pending correction, one WORK
+    # envelope for the wake; the second pass types nothing.
+    assert sorted(first) == sorted([CORRECTION_ID, WAKE_ID])
+    assert second == ()
+    envelopes = sorted(text for _, text in port.envelopes)
+    assert envelopes == [
+        f"HERMES_CORRECTION_READY {CORRECTION_ID}",
+        f"HERMES_WORK_READY {WAKE_ID}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restart_between_publication_and_delivery_still_delivers(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+
+    seed_packets(database)
+    seed_active_cell(database)
+    seat(bindings)
+    # The publication happened; the process crashed before any routing
+    # pass ran. A freshly constructed router derives the pending work
+    # from durable state alone.
+    port = RecordingPort()
+    restarted = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    delivered = await restarted.tick()
+
+    assert sorted(delivered) == sorted([CORRECTION_ID, WAKE_ID])
+    assert len(port.envelopes) == 2
+
+
+@pytest.mark.asyncio
+async def test_refused_seats_retain_pending_packets_without_typing(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+
+    seed_packets(database)
+    seed_active_cell(database)
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    # No seat at all: nothing typed, everything stays pending.
+    assert await router.tick() == ()
+    assert port.envelopes == []
+    assert delivery_rows(database) == []
+
+    # A non-classic seat is refused the same way.
+    binding = seat(bindings, classic=False)
+    assert await router.tick() == ()
+    assert port.envelopes == []
+
+    # Once the seat carries classic evidence, the retained packets
+    # deliver.
+    bindings.record_classic(binding.binding_id, SESSION)
+    delivered = await router.tick()
+    assert sorted(delivered) == sorted([CORRECTION_ID, WAKE_ID])
+
+
+@pytest.mark.asyncio
+async def test_superseded_backfill_rows_are_never_typed(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+
+    seed_packets(database)
+    seed_active_cell(database)
+    seat(bindings)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_intake_deliveries("
+            "delivery_id, kind, packet_id, cell_id, session_id, "
+            "surface_uuid, state, attempts, claimed_at, updated_at) "
+            "VALUES ('backfill', 'HERMES_WORK_READY', ?, 'cell-demo', ?, "
+            "'', 'superseded', 0, ?, ?)",
+            (WAKE_ID, SESSION, NOW.isoformat(), NOW.isoformat()),
+        )
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    delivered = await router.tick()
+
+    # Only the correction routes; the superseded wake is terminal.
+    assert delivered == (CORRECTION_ID,)
+    assert [text for _, text in port.envelopes] == [
+        f"HERMES_CORRECTION_READY {CORRECTION_ID}"
+    ]
