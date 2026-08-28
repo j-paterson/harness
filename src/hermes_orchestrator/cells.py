@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
@@ -124,6 +125,8 @@ class ProjectCellService:
         cell_ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] = _utc_now,
         handoffs: HandoffPort | None = None,
+        safety: CheckpointSafetyStore | None = None,
+        checkpoints: CheckpointRequests | None = None,
         replacement_session_ids: Callable[[], UUID] = uuid.uuid4,
     ) -> None:
         self._database = database
@@ -137,6 +140,8 @@ class ProjectCellService:
         self._cell_ids = cell_ids or (lambda: str(uuid.uuid4()))
         self._now = now
         self._handoffs = handoffs
+        self._safety = safety
+        self._checkpoints = checkpoints
         self._replacement_session_ids = replacement_session_ids
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
@@ -206,6 +211,10 @@ class ProjectCellService:
         handoff_required = False
         issue_completed = False
         start_capped = False
+        # New work starts: any prior safe-boundary proof is no longer current.
+        if self._safety is not None:
+            self._safety.invalidate(cell.cell_id, reason=f"dispatch:{issue_id}")
+        last_event_id: str | None = None
         try:
             stream = (
                 self._runner.start_lead(request)
@@ -214,7 +223,7 @@ class ProjectCellService:
             )
             try:
                 async for event in stream:
-                    self.record(cell, event)
+                    last_event_id = self.record(cell, event)
                     if event.kind == "session.started":
                         if event.session_id != cell.session_id:
                             raise RuntimeError(
@@ -257,6 +266,14 @@ class ProjectCellService:
             status = "handoff_required"
         elif session_confirmed:
             status = "working"
+            # The turn ended normally: a durable, session-bound safe boundary.
+            if self._safety is not None and last_event_id is not None:
+                self._safety.mark_safe(
+                    cell.cell_id,
+                    str(cell.session_id),
+                    boundary_kind="turn_completed",
+                    evidence_id=last_event_id,
+                )
         else:
             status = "start_unconfirmed"
         return DispatchResult(
@@ -267,11 +284,14 @@ class ProjectCellService:
             profile_alias=cell.profile_alias,
         )
 
-    def record(self, cell: ProjectCell, event: ClaudeEvent) -> None:
-        """Journal a sanitized Claude event and any child worker observation."""
+    def record(self, cell: ProjectCell, event: ClaudeEvent) -> str:
+        """Journal a sanitized Claude event and any child worker observation.
+
+        Returns the durable event id so callers can bind evidence to it.
+        """
 
         with self._database.transaction() as connection:
-            self._events.append(
+            recorded = self._events.append(
                 connection,
                 EventInput(
                     event_type=event.kind,
@@ -303,6 +323,7 @@ class ProjectCellService:
                         self._aware_now().isoformat(),
                     ),
                 )
+        return recorded.event_id
 
     async def rotate(self, cell_id: str, handoff_id: str) -> ProjectCell:
         """Transfer a cell only after its replacement acknowledged the handoff."""
@@ -425,6 +446,12 @@ class ProjectCellService:
             current.project_key,
             current.profile_alias,
         )
+        if self._safety is not None:
+            self._safety.invalidate(rotated.cell_id, reason="session_rotated")
+        if self._checkpoints is not None:
+            self._checkpoints.resolve_for_cell(
+                rotated.cell_id, outcome="completed", detail=f"handoff:{handoff_id}"
+            )
         await self._runner.retire_session(current.session_id)
         return rotated
 
@@ -490,6 +517,12 @@ class ProjectCellService:
         *,
         capped: bool = False,
     ) -> bool:
+        if self._safety is not None:
+            self._safety.invalidate(cell.cell_id, reason="start_failed")
+        if self._checkpoints is not None:
+            self._checkpoints.resolve_for_cell(
+                cell.cell_id, outcome="failed", detail="cell_start_failed"
+            )
         now_value = self._aware_now()
         now = now_value.isoformat()
         cooldown_until = now_value + timedelta(hours=1) if capped else None
@@ -664,6 +697,33 @@ class ProjectCellService:
                     payload={"cell_id": cell.cell_id},
                 ),
             )
+        return True
+
+    def current_session(self, cell_id: str) -> str | None:
+        """The session id of an active cell, else None (durable read)."""
+
+        row = self._database.execute(
+            "SELECT session_id FROM project_cells WHERE cell_id = ? "
+            "AND state IN ('starting', 'active')",
+            (cell_id,),
+        ).fetchone()
+        return None if row is None else str(row["session_id"])
+
+    def request_checkpoint(self, cell_id: str, reason: str) -> bool:
+        """Ask one active lead to checkpoint and hand off at a safe boundary.
+
+        Used by resource governance at red pressure: the cell is marked
+        handoff-required and a durable handoff request is journaled when a
+        handoff service is configured. Returns False when the cell is not
+        active. Never terminates a process.
+        """
+
+        cell = self._get_cell(cell_id)
+        if cell.state not in ("starting", "active"):
+            return False
+        self._require_handoff(cell, reason)
+        if self._handoffs is not None and hasattr(self._handoffs, "request"):
+            self._handoffs.request(cell_id, reason)
         return True
 
     def _require_handoff(self, cell: ProjectCell, reason: str) -> None:

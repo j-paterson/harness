@@ -130,3 +130,85 @@ async def test_checkpoint_timeout_does_not_abort_shutdown() -> None:
         "workers.checkpoint_requested",
         "supervisor.stopped",
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_once_requests_exactly_one_checkpoint_per_tick() -> None:
+    from hermes_orchestrator.admission import ResourceAction
+
+    class RedService:
+        def start(self) -> object:
+            return type("R", (), {"admission_open": True})()
+
+        def tick(self) -> object:
+            return type(
+                "T",
+                (),
+                {
+                    "planned_actions": (),
+                    "resource_actions": (
+                        ResourceAction("stop_admission", None, "red"),
+                        ResourceAction("request_checkpoint", "cell-a", "red"),
+                        ResourceAction("request_checkpoint", "cell-b", "red"),
+                    ),
+                },
+            )()
+
+    requested: list[tuple[str, str]] = []
+
+    async def request(cell_id: str, reason: str) -> None:
+        requested.append((cell_id, reason))
+
+    supervisor = Supervisor(RedService(), request_checkpoint=request)
+    await supervisor.run_once()
+    assert requested == [("cell-a", "red")]
+    await supervisor.run_once()
+    assert requested == [("cell-a", "red"), ("cell-a", "red")]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_delivers_reserved_requests_through_the_dispatcher() -> None:
+    from hermes_orchestrator.admission import ResourceAction
+
+    class FakeDispatcher:
+        def __init__(self) -> None:
+            self.delivered: list[str] = []
+            self.pending_before: str | None = "ckpt:old"
+
+        def undelivered(self) -> str | None:
+            value, self.pending_before = self.pending_before, None
+            return value
+
+        async def deliver(self, request_id: str) -> str:
+            self.delivered.append(request_id)
+            return "delivered"
+
+    class RedService:
+        def start(self) -> object:
+            return type("R", (), {"admission_open": True})()
+
+        def tick(self) -> object:
+            return type(
+                "T",
+                (),
+                {
+                    "planned_actions": (),
+                    "resource_actions": (
+                        ResourceAction("stop_admission", None, "red"),
+                        ResourceAction(
+                            "request_checkpoint", "cell-a", "red", request_id="ckpt:a"
+                        ),
+                    ),
+                },
+            )()
+
+    dispatcher = FakeDispatcher()
+    supervisor = Supervisor(RedService(), checkpoint_dispatcher=dispatcher)
+    await supervisor.run_once()
+    # The reserved-before-restart request is delivered first, then the
+    # tick's own reservation; the legacy callback path is not used.
+    assert dispatcher.delivered == ["ckpt:old", "ckpt:a"]
+    assert supervisor.checkpoint_deliveries == [
+        ("ckpt:old", "delivered"),
+        ("ckpt:a", "delivered"),
+    ]

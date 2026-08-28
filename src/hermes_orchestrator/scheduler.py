@@ -58,7 +58,10 @@ class Scheduler:
         """Describe the next safe project-cell starts without side effects."""
 
         pressure = getattr(snapshot.pressure, "value", snapshot.pressure)
-        if not snapshot.can_admit:
+        max_priority = getattr(snapshot, "admission_max_priority", None)
+        if max_priority is None and snapshot.can_admit:
+            max_priority = 4
+        if max_priority is None:
             return [
                 PlannedAction(
                     kind="admission_blocked",
@@ -73,8 +76,12 @@ class Scheduler:
         actions: list[PlannedAction] = []
         planned_projects: set[str] = set()
         active_projects = frozenset(self._active_projects())
+        held: list[str] = []
         for issue in self._queue.list_ranked(self._now()):
             if issue.project_key in planned_projects:
+                continue
+            if issue.linear_priority > max_priority:
+                held.append(issue.issue_id)
                 continue
             planned_projects.add(issue.project_key)
             active = issue.project_key in active_projects
@@ -96,6 +103,20 @@ class Scheduler:
                         "priority": issue.linear_priority,
                         "dependency_ready": issue.dependency_ready,
                     },
+                )
+            )
+        if held:
+            actions.append(
+                PlannedAction(
+                    kind="admission_limited",
+                    project_key=None,
+                    issue_id=None,
+                    reason=(
+                        f"{pressure}: only priority <= {max_priority} work is "
+                        "admitted; active work continues"
+                    ),
+                    execute=False,
+                    evidence={"pressure": str(pressure), "held_issues": held},
                 )
             )
         return actions

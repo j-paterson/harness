@@ -110,3 +110,29 @@ def test_scheduler_uses_timezone_aware_ranking_time(
     )
 
     assert scheduler.plan(FakeSnapshot("green", True))[0].issue_id == "ENG-7"
+
+
+def test_yellow_pressure_admits_only_priority_one_work(
+    queue_service: QueueService,
+) -> None:
+    from dataclasses import dataclass
+
+    from hermes_orchestrator.domain import AdmissionRequest
+
+    @dataclass(frozen=True)
+    class YellowSnapshot:
+        pressure: str = "yellow"
+        can_admit: bool = False
+        admission_max_priority: int | None = 1
+
+    queue_service.admit(
+        AdmissionRequest("ENG-1", "demo", 1, "operator", "i-1")
+    )
+    queue_service.admit(
+        AdmissionRequest("ENG-2", "other", 3, "operator", "i-2")
+    )
+    actions = Scheduler(queue_service, mode="active").plan(YellowSnapshot())
+    kinds = [(action.kind, action.issue_id) for action in actions]
+    assert kinds == [("start_project_cell", "ENG-1"), ("admission_limited", None)]
+    assert actions[-1].evidence["held_issues"] == ["ENG-2"]
+    assert actions[-1].execute is False

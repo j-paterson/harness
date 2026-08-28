@@ -87,6 +87,9 @@ class ResourcePolicy(BaseModel):
     red_available_memory_gib: float | None = Field(default=None, gt=0)
     yellow_available_disk_gib: float | None = Field(default=None, gt=0)
     red_available_disk_gib: float | None = Field(default=None, gt=0)
+    yellow_swap_growth_gib_per_hour: float | None = Field(default=None, gt=0)
+    yellow_load_ratio: float | None = Field(default=None, gt=0)
+    hysteresis_samples: int = Field(default=2, ge=1, le=20)
 
 
 class PolicyConfig(BaseModel):

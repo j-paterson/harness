@@ -9,12 +9,13 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hermes_orchestrator.checkpoints import CheckpointDispatcher
 from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.domain import AdmissionRequest, QueuedIssue
 from hermes_orchestrator.events import EventStore
@@ -186,10 +187,14 @@ async def _run_daemon(
     shutdown_event: asyncio.Event | None = None,
     merge_flow: MergeFlow | None = None,
     projects: Sequence[str] = (),
+    request_checkpoint: Callable[[str, str], Awaitable[object]] | None = None,
+    checkpoint_dispatcher: CheckpointDispatcher | None = None,
 ) -> Supervisor:
     supervisor = Supervisor(
         service,
         dispatch=dispatch,
+        request_checkpoint=request_checkpoint,
+        checkpoint_dispatcher=checkpoint_dispatcher,
         interval_seconds=interval,
     )
     if once:
@@ -338,6 +343,13 @@ def _hermes_handlers(
     }
 
 
+def _checkpoint_requester(cells: Any) -> Callable[[str, str], Awaitable[object]]:
+    async def request(cell_id: str, reason: str) -> object:
+        return cells.request_checkpoint(cell_id, reason)
+
+    return request
+
+
 def _issue_payload(issue: QueuedIssue) -> dict[str, Any]:
     return {
         "issue_id": issue.issue_id,
@@ -422,6 +434,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     dispatch=runtime.dispatch,
                     merge_flow=runtime.merge_flow,
                     projects=tuple(settings.projects),
+                    request_checkpoint=(
+                        None
+                        if runtime.cells is None
+                        else _checkpoint_requester(runtime.cells)
+                    ),
+                    checkpoint_dispatcher=(
+                        None
+                        if runtime.cells is None or runtime.checkpoints is None
+                        else CheckpointDispatcher(
+                            runtime.checkpoints,
+                            callback=runtime.cells.request_checkpoint,
+                            current_session=runtime.cells.current_session,
+                        )
+                    ),
                 )
             )
             payload = {
@@ -564,6 +590,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 tick = service.tick()
                 payload = {
                     "snapshot": _snapshot_payload(tick.snapshot),
+                    "resource_actions": [
+                        {
+                            "kind": action.kind,
+                            "target_id": action.target_id,
+                            "reason": action.reason,
+                        }
+                        for action in tick.resource_actions
+                    ],
                     "planned_actions": [
                         {
                             "kind": action.kind,

@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
 
+from hermes_orchestrator.admission import AdmissionController, PressureClassifier
 from hermes_orchestrator.cells import DispatchResult, ProjectCellService
+from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.claude import ClaudeRunner
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.db import Database
@@ -92,6 +94,7 @@ class Runtime:
     profile_health: tuple[ProfileHealth, ...]
     merge_flow: MergeFlow | None = None
     processes: ProcessRegistry | None = None
+    checkpoints: CheckpointRequests | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -164,6 +167,8 @@ def open_runtime(
     try:
         events = EventStore(database)
         processes = ProcessRegistry(database, events)
+        safety = CheckpointSafetyStore(database, events)
+        checkpoints = CheckpointRequests(database, events)
         queue = QueueService(database, events, settings.projects)
         cells: ProjectCellService | None = None
         dispatch: Dispatch | None = None
@@ -238,6 +243,8 @@ def open_runtime(
                     for alias, project in settings.projects.items()
                 },
                 handoffs=HandoffService(database),
+                safety=safety,
+                checkpoints=checkpoints,
             )
             dispatch = cells.dispatch
 
@@ -251,10 +258,12 @@ def open_runtime(
             for alias, project in settings.projects.items()
         }
         repository_paths["orchestrator_state"] = settings.state_dir
+        classifier = PressureClassifier(settings.policy)
         sampler = ResourceSampler(
             policy=settings.policy,
             repository_paths=repository_paths,
             managed_rss=processes.managed_rss_bytes,
+            classifier=classifier,
         )
         service = OrchestratorService(
             database=database,
@@ -263,6 +272,10 @@ def open_runtime(
             scheduler=scheduler,
             policy=settings.policy,
             processes=processes,
+            admission=AdmissionController(classifier),
+            queue=queue,
+            safety=safety,
+            checkpoints=checkpoints,
         )
         return Runtime(
             database=database,
@@ -273,6 +286,7 @@ def open_runtime(
             profile_health=profile_health,
             merge_flow=merge_flow,
             processes=processes,
+            checkpoints=checkpoints,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

@@ -1274,3 +1274,53 @@ async def test_handoff_required_cell_does_not_resume(
     assert result.status == "handoff_required"
     assert runner.resume_count == 0
     assert queue.get("ENG-10").state.value == "queued"
+
+
+@pytest.mark.asyncio
+async def test_turn_completion_records_session_bound_safe_boundary(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    from hermes_orchestrator.checkpoints import (
+        CheckpointRequests,
+        CheckpointSafetyStore,
+    )
+
+    events = EventStore(database)
+    safety = CheckpointSafetyStore(database, events)
+    checkpoints = CheckpointRequests(database, events)
+    admit(queue, "ENG-9")
+    cells = ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=RecordingRunner(),
+        linear=RecordingLinear(),
+        project_paths={"demo": Path("/tmp/demo")},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        safety=safety,
+        checkpoints=checkpoints,
+    )
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    evidence = safety.current("cell-demo", str(SESSION_ID))
+    assert evidence is not None
+    assert evidence.boundary_kind == "turn_completed"
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_id = ?", (evidence.evidence_id,)
+    ) == 1
+
+    # New work on the same cell invalidates the boundary until the turn ends.
+    admit(queue, "ENG-10")
+    seen: list[bool] = []
+    original = cells.record
+
+    def spy(cell: object, event: object) -> str:
+        seen.append(safety.current("cell-demo", str(SESSION_ID)) is not None)
+        return original(cell, event)  # type: ignore[arg-type]
+
+    cells.record = spy  # type: ignore[method-assign]
+    await cells.dispatch("ENG-10")
+    assert seen and not any(seen)
+    assert safety.current("cell-demo", str(SESSION_ID)) is not None
