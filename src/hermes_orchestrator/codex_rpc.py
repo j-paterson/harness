@@ -20,6 +20,12 @@ _CLIENT_INFO = {
     "version": "0.1.0",
 }
 _MAX_LINE_BYTES = 1024 * 1024
+# INFRA-194 (operator ruling): Sol's write scope is narrowed by
+# contract and reconciled by ledger, not by credential stripping or an
+# OS sandbox. The reviewer keeps the operator's normal environment;
+# only our own API key is withheld from the child. A direct exact-head
+# merge is permitted and is detected and reconciled into the durable
+# receipts before another candidate is admitted.
 _SCRUBBED_ENVIRONMENT_KEYS = frozenset({"OPENAI_API_KEY"})
 _DEFAULT_NOTIFICATION_LIMIT = 256
 _METHOD_NOT_FOUND = -32601

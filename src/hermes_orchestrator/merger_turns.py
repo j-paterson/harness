@@ -191,6 +191,41 @@ class MergerTurnService:
                 return await self.handle_turn(project_key)
         return None
 
+    async def recover_outstanding(
+        self, project_keys: tuple[str, ...] | None = None
+    ) -> tuple[TurnOutcome, ...]:
+        """Settle any wake whose completed-turn notification was lost.
+
+        INFRA-194: the completed-turn notification is delivery, not
+        truth — a daemon restart, an rpc drop, or a crashed handler
+        loses it while the delivered wake and the thread's completed
+        report both survive durably. This boundary pass re-derives
+        them: each project with an outstanding wake gets exactly one
+        ``handle_turn``, which no-ops when the report is not yet a
+        verdict and settles exactly once when it is (the settlement
+        claim and idempotent review make a racing notification
+        harmless). Never called on a timer — only at startup and
+        explicit intake boundaries, so nothing polls.
+        """
+
+        outcomes: list[TurnOutcome] = []
+        for project_key in project_keys or tuple(self._projects):
+            if self.outstanding_wake(project_key) is None:
+                continue
+            try:
+                outcomes.append(await self.handle_turn(project_key))
+            except Exception as error:  # pragma: no cover - infra guard
+                outcomes.append(
+                    TurnOutcome(
+                        project_key,
+                        "recovery_failed",
+                        None,
+                        None,
+                        f"{type(error).__name__}: {error}",
+                    )
+                )
+        return tuple(outcomes)
+
     async def handle_turn(self, project_key: str) -> TurnOutcome:
         """Admit, read, parse, and settle the project's outstanding wake."""
 
@@ -203,6 +238,11 @@ class MergerTurnService:
                 project_key, "channel_unavailable", None, None,
                 "reviewer channel is not ready",
             )
+        # Reconcile any prior settlement — including a permitted direct
+        # exact-head Sol merge, which the driver detects and folds into
+        # the same durable receipts — before admitting another
+        # candidate.
+        await self._reviews.resume_settlements(project_key)
         outstanding = self.outstanding_wake(project_key)
         if outstanding is None:
             return TurnOutcome(

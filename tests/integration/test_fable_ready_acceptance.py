@@ -38,6 +38,7 @@ from hermes_orchestrator.qa import QaOrigin, QaRouter
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.review_intake import CandidateAdmission, CompositeIntakeGate
 from hermes_orchestrator.reviews import ReviewService
+from hermes_orchestrator.settlement import MergeSettlements
 from hermes_orchestrator.verdicts import IDLE_TERMINAL_REPORT
 from tests.test_codex_merger import FakeRpc
 from tests.test_codex_queue import FakeQueueProcessFactory
@@ -149,6 +150,7 @@ class ProductionShapedFlow:
                 )
             ),
         )
+        self.settlements = MergeSettlements(self.database, self.events, now=lambda: NOW)
         self.reviews = ReviewService(
             database=self.database,
             events=self.events,
@@ -162,6 +164,7 @@ class ProductionShapedFlow:
             linear=self.linear,
             qa=self.qa,
             lead=self.outbox,
+            settlements=self.settlements,
             now=lambda: NOW,
         )
         self.turns = self.new_turns(self.merger, self.rpc)
@@ -650,3 +653,116 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
         assert flow.ledger_state(merge_sha_for(SHA_B)) == "unresolved"
     finally:
         flow.close()
+
+
+@pytest.mark.asyncio
+async def test_lost_turn_completion_settles_at_the_next_boundary(
+    flow: ProductionShapedFlow,
+) -> None:
+    """INFRA-194: the completed-turn notification is delivery, not truth.
+
+    The wake is delivered and the Merger's approved report sits in its
+    thread, but the turn/completed notification never arrives (rpc
+    drop, daemon crash). The startup/intake boundary pass re-derives
+    both durable facts and settles exactly once; a second pass replays
+    clean with no second mutation.
+    """
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    await flow.emitter.emit(
+        "demo", "ENG-9", verification=(("uv run pytest -q", "passed"),)
+    )
+    flow.report(flow.verdict(SHA_A, branch, 14))
+    # No notification is ever handled; only the boundary pass runs.
+
+    [outcome] = await flow.turns.recover_outstanding(("demo",))
+
+    assert outcome.kind == "merged"
+    assert outcome.merge_sha == merge_sha_for(SHA_A)
+    assert len(flow.github.merge_calls) == 1
+    wake_state = flow.database.execute("SELECT state FROM wake_deliveries").fetchone()
+    assert str(wake_state["state"]) == "completed"
+
+    assert await flow.turns.recover_outstanding(("demo",)) == ()
+    assert len(flow.github.merge_calls) == 1
+    assert flow.queue.get("ENG-9").state is IssueState.DONE
+
+
+@pytest.mark.asyncio
+async def test_a_direct_sol_merge_reconciles_at_the_next_intake_boundary(
+    flow: ProductionShapedFlow,
+) -> None:
+    """INFRA-194 (operator ruling): a direct exact-head Sol merge is
+    permitted; the next intake boundary detects it and folds it into
+    the same durable receipts exactly once, before any new admission.
+    """
+
+    import json as jsonlib
+
+    from hermes_orchestrator.verdicts import VerdictBinding, parse_verdict
+
+    await flow.merger.ensure_thread("demo")
+    branch_a = flow.stage("ENG-1", SHA_A, pr_number=14)
+    await flow.emitter.emit(
+        "demo", "ENG-1", verification=(("uv run pytest -q", "passed"),)
+    )
+    flow.report(flow.verdict(SHA_A, branch_a, 14))
+    assert (await flow.turns.handle_turn("demo")).kind == "merged"
+
+    # Candidate C: verdict approved and durably recorded, wake
+    # completed, merge not yet performed.
+    branch_c = flow.stage("ENG-3", SHA_C, pr_number=16)
+    emitted = await flow.emitter.emit(
+        "demo", "ENG-3", verification=(("uv run pytest -q", "passed"),)
+    )
+    admitted = flow.admission.admit("demo", emitted.event, received_generation=1)
+    binding = VerdictBinding(
+        repository=REPOSITORY,
+        branch=branch_c,
+        pr_number=16,
+        reviewed_sha=SHA_C,
+    )
+    verdict = parse_verdict(
+        jsonlib.dumps(
+            {
+                "verdict": "approved",
+                "repository": REPOSITORY,
+                "branch": branch_c,
+                "pr_number": 16,
+                "reviewed_sha": SHA_C,
+                "packets": [],
+            }
+        ),
+        expected=binding,
+    )
+    record = await flow.reviews.record_verdict(admitted, "ENG-3", verdict)
+    assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
+    assert flow.settlements.get(record.review_id).state == "recorded"
+
+    # Sol merges the exact approved head directly.
+    flow.github.full_pulls[16] = open_pull(
+        number=16,
+        head_sha=SHA_C,
+        head_ref=branch_c,
+        state="closed",
+        merged=True,
+        mergeable=None,
+        merge_commit_sha=merge_sha_for(SHA_C),
+    )
+
+    boundary = await flow.turns.handle_turn("demo")
+
+    assert boundary.kind == "no_outstanding_wake"
+    settlement = flow.settlements.get(record.review_id)
+    assert settlement.state == "settled"
+    assert settlement.path == "externally_merged"
+    assert settlement.merge_sha == merge_sha_for(SHA_C)
+    # No second transport merge: the direct merge was reconciled, not
+    # repeated, and its ledger row exists.
+    assert len(flow.github.merge_calls) == 1
+    ledger = flow.database.execute(
+        "SELECT state FROM ci_merge_ledger WHERE merge_sha = ?",
+        (merge_sha_for(SHA_C),),
+    ).fetchone()
+    assert ledger is not None

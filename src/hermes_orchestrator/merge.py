@@ -160,6 +160,41 @@ class IntegrationMerge:
             relation=relation,
         )
 
+    def prove_landed(
+        self,
+        project_key: str,
+        *,
+        candidate_sha: str,
+        candidate_branch: str,
+        pr_number: int,
+        merge_sha: str,
+        merge_method: str = "squash",
+    ) -> ProvenMerge:
+        """Prove an externally performed merge landed the reviewed work.
+
+        INFRA-194 reconciliation: no mutation happens here — the same
+        ancestry and tree proofs that gate a guarded merge run against
+        the already-existing merge commit, and only a proof yields the
+        ProvenMerge permit. Any failure raises
+        :class:`ReconciliationRequired` and nothing may be
+        reconstructed from it.
+        """
+
+        project = self._projects.get(project_key)
+        if project is None:
+            raise MergeBlocked(f"unknown project {project_key!r}")
+        relation = self._prove(project, candidate_sha, merge_sha, merge_method)
+        return ProvenMerge(
+            project_key=project_key,
+            repository=project.github_repo,
+            pr_number=pr_number,
+            candidate_sha=candidate_sha,
+            candidate_branch=candidate_branch,
+            merge_sha=merge_sha,
+            integration_branch=project.integration_branch,
+            relation=relation,
+        )
+
     def _prove(
         self,
         project: ProjectConfig,
@@ -183,9 +218,7 @@ class IntegrationMerge:
                 f"integration fetch failed after merge: {error}"
             ) from error
         try:
-            if not self._git.is_ancestor(
-                project.repo_path, merge_sha, integration_ref
-            ):
+            if not self._git.is_ancestor(project.repo_path, merge_sha, integration_ref):
                 raise ReconciliationRequired(
                     "merge commit is not reachable from the integration branch"
                 )

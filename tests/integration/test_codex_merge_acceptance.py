@@ -21,7 +21,11 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.github import MergeBlocked, MergeResult
+from hermes_orchestrator.github import (
+    MergeBlocked,
+    MergeEffectJournal,
+    MergeResult,
+)
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.manifests import (
     MANIFEST_VERSION,
@@ -39,6 +43,7 @@ from hermes_orchestrator.review_intake import (
     CompositeIntakeGate,
 )
 from hermes_orchestrator.reviews import ReviewService
+from hermes_orchestrator.settlement import MergeSettlements
 from hermes_orchestrator.verdicts import CorrectionPacket, VerdictBinding, parse_verdict
 from tests.test_merge import FakeGit, FakeGitHub, open_pull, open_summary
 from tests.test_review_intake import NullRpc, stored_channel
@@ -117,6 +122,70 @@ class FakeStatusPort:
         )
 
 
+class JournalledGitHub:
+    """The fake transport fronted by the real merge-effect journal.
+
+    Mirrors ``GitHubClient.merge``'s fence exactly — claim, attempted,
+    mutate, complete — so a replayed effect id returns the completed
+    response without a second transport call, just like production.
+    Reads delegate untouched.
+    """
+
+    def __init__(self, inner: FakeGitHub, database: Database) -> None:
+        self.inner = inner
+        self.journal = MergeEffectJournal(database)
+
+    def merge(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str,
+        expected_head_ref: str,
+        expected_base: str,
+        effect_id: str,
+        merge_method: str = "squash",
+    ) -> MergeResult:
+        claim = self.journal.claim(
+            effect_id,
+            request={
+                "repository": repository,
+                "number": number,
+                "sha": expected_head_sha,
+                "head_ref": expected_head_ref,
+                "base": expected_base,
+                "merge_method": merge_method,
+            },
+        )
+        if claim.completed_response is not None:
+            return MergeResult(
+                str(claim.completed_response["sha"]), already_merged=True
+            )
+        assert claim.token is not None
+        self.journal.mark_attempted(effect_id, token=claim.token)
+        result = self.inner.merge(
+            repository,
+            number,
+            expected_head_sha=expected_head_sha,
+            expected_head_ref=expected_head_ref,
+            expected_base=expected_base,
+            effect_id=effect_id,
+            merge_method=merge_method,
+        )
+        self.journal.complete(
+            effect_id,
+            {"merged": True, "sha": result.merge_sha},
+            token=claim.token,
+        )
+        return result
+
+    def get_pull_request(self, repository: str, number: int) -> Any:
+        return self.inner.get_pull_request(repository, number)
+
+    def list_open_pulls(self, repository: str, *, base: str) -> Any:
+        return self.inner.list_open_pulls(repository, base=base)
+
+
 class Acceptance:
     """Local composition of the full merge flow with recording fakes."""
 
@@ -162,19 +231,25 @@ class Acceptance:
                 )
             ),
         )
+        self.settlements = MergeSettlements(
+            self.database, self.events, now=lambda: NOW
+        )
+        self.guarded_github = JournalledGitHub(self.github, self.database)
         self.service = ReviewService(
             database=self.database,
             events=self.events,
             projects=PROJECTS,
             queue=self.queue,
-            github=self.github,
+            github=self.guarded_github,
             merge=IntegrationMerge(
-                projects=PROJECTS, github=self.github, git=self.git
+                projects=PROJECTS, github=self.guarded_github, git=self.git
             ),
             window=self.window,
             linear=self.linear,
             qa=self.qa,
             lead=self.claude,
+            settlements=self.settlements,
+            merge_journal=self.guarded_github.journal,
             now=lambda: NOW,
         )
         self._events = 0

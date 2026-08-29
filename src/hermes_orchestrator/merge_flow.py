@@ -46,6 +46,7 @@ from hermes_orchestrator.review_intake import (
     CompositeIntakeGate,
 )
 from hermes_orchestrator.reviews import LinearProjector, ReviewService
+from hermes_orchestrator.settlement import MergeSettlements
 
 GITHUB_KEYCHAIN_SERVICE = "hermes-orchestrator-github"
 CIRCLECI_KEYCHAIN_SERVICE = "hermes-orchestrator-circleci"
@@ -105,6 +106,7 @@ class MergeFlow:
     outbox: LeadCorrectionOutbox
     qa: QaRouter
     manifest_root: Path
+    settlements: MergeSettlements | None = None
 
 
 def build_merge_flow(
@@ -128,9 +130,10 @@ def build_merge_flow(
     runner = git_runner if git_runner is not None else SubprocessGitRunner()
 
     github_token = keychain.read(GITHUB_KEYCHAIN_SERVICE, "default")
+    merge_journal = MergeEffectJournal(database)
     github = GitHubClient(
         transport=HttpxGitHubTransport(github_token),
-        journal=MergeEffectJournal(database),
+        journal=merge_journal,
     )
     circleci: CiStatusPort
     if any(project.ci == "circleci" for project in settings.projects.values()):
@@ -181,6 +184,7 @@ def build_merge_flow(
         intake_gate=intake_gate,
     )
     qa = QaRouter(database=database, events=events)
+    settlements = MergeSettlements(database, events)
     reviews = ReviewService(
         database=database,
         events=events,
@@ -196,6 +200,8 @@ def build_merge_flow(
         linear=linear,
         qa=qa,
         lead=outbox,
+        settlements=settlements,
+        merge_journal=merge_journal,
     )
     emitter = CandidateEmitter(
         projects=settings.projects,
@@ -230,6 +236,7 @@ def build_merge_flow(
         outbox=outbox,
         qa=qa,
         manifest_root=manifest_root,
+        settlements=settlements,
     )
 
 

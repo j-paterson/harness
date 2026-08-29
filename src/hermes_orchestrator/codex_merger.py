@@ -1,4 +1,4 @@
-"""Persistent, read-only, project-scoped Codex Merger reviewer channels."""
+"""Persistent, project-scoped Codex Merger reviewer channels."""
 
 from __future__ import annotations
 
@@ -30,6 +30,38 @@ class _WakeCasMiss(Exception):
     """Internal: roll back the combined delivery transaction on a CAS miss."""
 
 MERGER_MODEL = "gpt-5.6-sol"
+
+# The narrow writable Codex workspace mode (INFRA-194 operator scope):
+# the bounded ACCEPT_WITH_REVIEWER_FIX path must be able to write and
+# commit inside the project workspace, and nothing beyond it — never
+# the dangerous unrestricted mode. Passing the same mode on every
+# thread/resume is the recoverable configuration path for a task
+# started under an older mode: the next load corrects it without
+# waking the thread or duplicating review intake.
+SANDBOX_MODE = "workspace-write"
+
+# The durable thread goal is deliberately one succinct paragraph: the
+# role, its boundaries, and the idle token. Detailed protocol
+# mechanics live in the durable contract artifact
+# (prompts/codex-merger.md) and in Hermes code — never in the goal.
+MERGER_GOAL = (
+    "You are this project's independent reviewer and final merge "
+    "authority: review exactly one immutable candidate at a time from "
+    "durable Hermes intake; you may make only bounded mechanical, "
+    "unambiguous, auditable fixes as a single labeled "
+    "ACCEPT_WITH_REVIEWER_FIX commit under the durable repair policy, "
+    "and every larger or judgment-bearing Critical or Important "
+    "defect returns to the Fable lead as structured corrections; you "
+    "complete the exact approved pull-request merge yourself, "
+    "preferably through the guarded Hermes settlement helper because "
+    "it journals atomically (an exact-head direct merge is permitted "
+    "and is reconciled into the same durable receipts); CircleCI is "
+    "checked optimistically at intake and merge boundaries only; and "
+    "when no eligible intake exists you report exactly "
+    "BLOCKED_ON_EXTERNAL_INTAKE and complete the turn. The detailed "
+    "role contract and protocol mechanics live durably in "
+    "prompts/codex-merger.md and in Hermes code, never in this goal."
+)
 _SERVICE_NAME = "hermes_orchestrator"
 
 # The installed codex-cli 0.149.0-alpha.4.1 schema pins threads by moving them
@@ -946,10 +978,13 @@ class CodexMerger:
 
         A readable persisted thread is authoritative: ``thread/read`` is the
         only required call and its status is returned. Only a ``notLoaded``
-        thread is asked to load via ``thread/resume``; if the App Server
-        rejects that request (observed live as ``-32600`` for an
-        already-persisted readable task) the thread is re-read and stays
-        usable when still readable. Only an unreadable thread propagates
+        thread is asked to load via ``thread/resume``; the resume always
+        re-applies the bounded writable workspace mode, which is the
+        recoverable configuration path for a task started under a stale
+        mode — no wake, no duplicate intake. If the App Server rejects
+        the resume (observed live as ``-32600`` for an already-persisted
+        readable task) the thread is re-read and stays usable when still
+        readable. Only an unreadable thread propagates
         :class:`CodexRequestFailed`, which marks the channel uncertain.
         """
 
@@ -958,7 +993,9 @@ class CodexMerger:
             return status
         try:
             await self._rpc.request(
-                "thread/resume", {"threadId": thread_id}, self._timeout
+                "thread/resume",
+                {"threadId": thread_id, "sandbox": SANDBOX_MODE},
+                self._timeout,
             )
         except CodexRequestFailed:
             return await self.thread_status(thread_id)
@@ -1029,7 +1066,7 @@ class CodexMerger:
                     "model": self._model,
                     "cwd": str(project.repo_path),
                     "approvalPolicy": "never",
-                    "sandbox": "read-only",
+                    "sandbox": SANDBOX_MODE,
                     "serviceName": _SERVICE_NAME,
                 },
                 self._timeout,
@@ -1167,8 +1204,8 @@ class CodexMerger:
         project = self._project(project_key)
         objective = (
             f"Project: {project_key}. "
-            f"Integration branch: {project.integration_branch}.\n\n"
-            f"{self._contract}"
+            f"Integration branch: {project.integration_branch}. "
+            f"{MERGER_GOAL}"
         )
         await self._rpc.request(
             "thread/goal/set",

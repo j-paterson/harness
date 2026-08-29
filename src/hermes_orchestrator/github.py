@@ -315,9 +315,7 @@ class MergeEffectJournal:
                 "reconciliation required: a prior attempt crossed the "
                 "mutation boundary with an unknown outcome"
             )
-        raise MergeInFlight(
-            "merge mutation for this effect is already in flight"
-        )
+        raise MergeInFlight("merge mutation for this effect is already in flight")
 
     def mark_attempted(self, effect_id: str, *, token: str | None) -> None:
         """Fence the exact live claim at the external mutation boundary.
@@ -336,9 +334,7 @@ class MergeEffectJournal:
                 (self._now().isoformat(), effect_id, token),
             )
         if cursor.rowcount != 1:
-            raise GitHubError(
-                "stale claim token cannot reach the mutation boundary"
-            )
+            raise GitHubError("stale claim token cannot reach the mutation boundary")
 
     def complete(
         self, effect_id: str, response: dict[str, Any], *, token: str | None
@@ -361,9 +357,7 @@ class MergeEffectJournal:
                 (response_json, self._now().isoformat(), effect_id, token),
             )
         if cursor.rowcount != 1:
-            raise GitHubError(
-                "stale claim token cannot complete the merge effect"
-            )
+            raise GitHubError("stale claim token cannot complete the merge effect")
         completed = self.get(effect_id)
         if completed is None:
             raise GitHubError("completed merge effect disappeared")
@@ -387,6 +381,69 @@ class MergeEffectJournal:
                 (self._now().isoformat(), effect_id, token),
             )
 
+    def record_external(
+        self,
+        effect_id: str,
+        *,
+        request: dict[str, Any],
+        response: dict[str, Any],
+    ) -> MergeEffect:
+        """Journal a merge that GitHub already performed externally.
+
+        INFRA-194 reconciliation: the mutation happened outside the
+        guarded path, so no claim is taken and nothing is sent — the
+        completed effect is reconstructed as an auditable receipt. A
+        row already completed with the same binding replays; any
+        conflicting binding, live claim, or in-flight attempt refuses,
+        because reconciliation must never overwrite a real mutation's
+        journal.
+        """
+
+        if set(request) != _REQUEST_KEYS:
+            raise GitHubError("merge effect request is missing binding fields")
+        existing = self.get(effect_id)
+        if existing is not None:
+            if existing.request != request:
+                raise GitHubError("merge effect is bound to a different request")
+            if existing.state == "completed":
+                return existing
+            raise GitHubError(
+                "a live merge effect owns this candidate; external "
+                "reconciliation must not overwrite it"
+            )
+        stamp = self._now().isoformat()
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO github_merge_effects("
+                    "effect_id, repository, pr_number, head_sha, head_ref, "
+                    "base_ref, merge_method, state, request_json, "
+                    "response_json, claim_token, claim_expires_at, "
+                    "created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, "
+                    "NULL, NULL, ?, ?)",
+                    (
+                        effect_id,
+                        request["repository"],
+                        request["number"],
+                        request["sha"],
+                        request["head_ref"],
+                        request["base"],
+                        request["merge_method"],
+                        json.dumps(request, sort_keys=True, separators=(",", ":")),
+                        json.dumps(response, sort_keys=True, separators=(",", ":")),
+                        stamp,
+                        stamp,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise GitHubError(
+                "merge candidate is already owned by another effect"
+            ) from error
+        effect = self.get(effect_id)
+        assert effect is not None
+        return effect
+
     def get(self, effect_id: str) -> MergeEffect | None:
         """Read one merge effect from the durable journal."""
 
@@ -408,9 +465,7 @@ class MergeEffectJournal:
                 else None
             ),
             claim_token=(
-                str(row["claim_token"])
-                if row["claim_token"] is not None
-                else None
+                str(row["claim_token"]) if row["claim_token"] is not None else None
             ),
             claim_expires_at=(
                 str(row["claim_expires_at"])
@@ -437,9 +492,7 @@ class GitHubClient:
 
         _require_repository(repository)
         _require_number(number)
-        response = self._transport.request(
-            "GET", f"/repos/{repository}/pulls/{number}"
-        )
+        response = self._transport.request("GET", f"/repos/{repository}/pulls/{number}")
         if response.status != 200:
             raise GitHubError(
                 f"GitHub pull-request read returned status {response.status}"
@@ -543,18 +596,14 @@ class GitHubClient:
         if pull.head_repository != repository or pull.base_repository != repository:
             raise MergeBlocked("pull request repository does not match the project")
         if pull.base_ref != expected_base:
-            raise MergeBlocked(
-                "pull request base branch is not the integration branch"
-            )
+            raise MergeBlocked("pull request base branch is not the integration branch")
         if pull.head_ref != expected_head_ref:
             raise MergeBlocked("pull request branch does not match the review")
         if pull.merged:
             # Full identity matched above except the head; check it before
             # deciding ownership so a foreign merge is named as foreign.
             if pull.head_sha != expected_head_sha:
-                raise MergeBlocked(
-                    "merged pull request head is not the reviewed head"
-                )
+                raise MergeBlocked("merged pull request head is not the reviewed head")
             if existing is not None:
                 raise MergeAmbiguous(
                     "reconciliation required: the pull request is merged but "
@@ -609,9 +658,7 @@ class GitHubClient:
             # Unclassified outcome: stay attempted/fenced.
             raise GitHubError(f"GitHub merge returned status {response.status}")
         payload = response.payload
-        if not isinstance(payload, dict) or not isinstance(
-            payload.get("merged"), bool
-        ):
+        if not isinstance(payload, dict) or not isinstance(payload.get("merged"), bool):
             raise MergeAmbiguous(
                 "reconciliation required: the merge response is malformed "
                 "and may conceal a completed mutation"
@@ -619,14 +666,9 @@ class GitHubClient:
         if payload["merged"] is False:
             # Structurally valid proof that no merge was performed.
             self._journal.release(effect_id, token=claim.token)
-            raise GitHubError(
-                "GitHub confirmed no merge was performed; retry is safe"
-            )
+            raise GitHubError("GitHub confirmed no merge was performed; retry is safe")
         merge_sha = payload.get("sha")
-        if (
-            not isinstance(merge_sha, str)
-            or _SHA_PATTERN.match(merge_sha) is None
-        ):
+        if not isinstance(merge_sha, str) or _SHA_PATTERN.match(merge_sha) is None:
             raise MergeAmbiguous(
                 "reconciliation required: GitHub confirmed a merge without "
                 "a valid commit identity"
@@ -708,10 +750,7 @@ def _require_side(payload: dict[str, Any], side: str) -> dict[str, str]:
     if not isinstance(repo, dict):
         raise GitHubError(f"pull request {side} repository is invalid")
     full_name = repo.get("full_name")
-    if (
-        not isinstance(full_name, str)
-        or _REPOSITORY_PATTERN.match(full_name) is None
-    ):
+    if not isinstance(full_name, str) or _REPOSITORY_PATTERN.match(full_name) is None:
         raise GitHubError(f"pull request {side} repository is invalid")
     return {"ref": ref, "repo": full_name}
 
@@ -732,9 +771,5 @@ def _require_sha(value: str) -> None:
 
 
 def _require_ref(value: str, label: str) -> None:
-    if (
-        not isinstance(value, str)
-        or _REF_PATTERN.match(value) is None
-        or ".." in value
-    ):
+    if not isinstance(value, str) or _REF_PATTERN.match(value) is None or ".." in value:
         raise GitHubError(f"{label} contains unsafe characters")

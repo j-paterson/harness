@@ -36,6 +36,63 @@ from hermes_orchestrator.manifests import (
 from hermes_orchestrator.review_intake import CandidateRejected
 from hermes_orchestrator.verdicts import CorrectionPacket
 
+
+@dataclass(frozen=True, slots=True)
+class FreezeFacts:
+    """The proven identity of one candidate at the freeze boundary."""
+
+    head: str
+    branch: str
+    base: str
+    changed_files: tuple[str, ...]
+
+
+def run_freeze_gate(
+    run: Callable[..., str],
+    project: ProjectConfig,
+    *,
+    expect_pushed: bool,
+) -> FreezeFacts:
+    """The one mandatory candidate gate, shared by every publisher.
+
+    ``run(*git_args) -> stdout`` must raise :class:`EmissionBlocked`
+    on git failure. With ``expect_pushed=False`` the gate proves
+    everything provable before a push (clean tree, a real feature
+    branch, the integration base, a non-empty diff); with
+    ``expect_pushed=True`` it additionally proves the local HEAD is
+    the exact pushed branch head. The candidate emitter and the
+    reviewer-fix helper both invoke this same gate — there is no
+    second copy to drift.
+    """
+
+    if run("status", "--porcelain").strip():
+        raise EmissionBlocked("working tree is not clean at the freeze boundary")
+    head = run("rev-parse", "HEAD").strip()
+    branch = run("rev-parse", "--abbrev-ref", "HEAD").strip()
+    if _SHA_PATTERN.match(head) is None:
+        raise EmissionBlocked("HEAD is not a full commit sha")
+    if branch in ("HEAD", "", project.integration_branch):
+        raise EmissionBlocked("candidate must be on a pushed feature branch")
+    run("fetch", "--", "origin", project.integration_branch)
+    run("fetch", "--", "origin", branch)
+    if expect_pushed:
+        remote_head = run("rev-parse", f"origin/{branch}").strip()
+        if remote_head != head:
+            raise EmissionBlocked("local HEAD is not the pushed branch head")
+    base = run(
+        "merge-base", "HEAD", f"origin/{project.integration_branch}"
+    ).strip()
+    if _SHA_PATTERN.match(base) is None:
+        raise EmissionBlocked("could not determine the integration base")
+    changed = tuple(
+        line
+        for line in run("diff", "--name-only", base, head).splitlines()
+        if line.strip()
+    )
+    if not changed:
+        raise EmissionBlocked("candidate has no changes against its base")
+    return FreezeFacts(head=head, branch=branch, base=base, changed_files=changed)
+
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -147,31 +204,13 @@ class CandidateEmitter:
                     "project repository"
                 )
             repo = Path(lead_checkout)
-        if self._run(repo, "status", "--porcelain").strip():
-            raise EmissionBlocked("working tree is not clean at the freeze boundary")
-        head = self._run(repo, "rev-parse", "HEAD").strip()
-        branch = self._run(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
-        if _SHA_PATTERN.match(head) is None:
-            raise EmissionBlocked("HEAD is not a full commit sha")
-        if branch in ("HEAD", "", project.integration_branch):
-            raise EmissionBlocked("candidate must be on a pushed feature branch")
-        self._run(repo, "fetch", "--", "origin", project.integration_branch)
-        self._run(repo, "fetch", "--", "origin", branch)
-        remote_head = self._run(repo, "rev-parse", f"origin/{branch}").strip()
-        if remote_head != head:
-            raise EmissionBlocked("local HEAD is not the pushed branch head")
-        base = self._run(
-            repo, "merge-base", "HEAD", f"origin/{project.integration_branch}"
-        ).strip()
-        if _SHA_PATTERN.match(base) is None:
-            raise EmissionBlocked("could not determine the integration base")
-        changed = tuple(
-            line
-            for line in self._run(repo, "diff", "--name-only", base, head).splitlines()
-            if line.strip()
+        facts = run_freeze_gate(
+            lambda *args: self._run(repo, *args),
+            project,
+            expect_pushed=True,
         )
-        if not changed:
-            raise EmissionBlocked("candidate has no changes against its base")
+        head, branch = facts.head, facts.branch
+        base, changed = facts.base, facts.changed_files
         # A fresh event per freeze boundary: a deferred candidate must be
         # re-woken as a new event, and the durable wake registry deduplicates
         # by candidate identity, so re-emission is always safe.

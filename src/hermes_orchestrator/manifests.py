@@ -216,6 +216,36 @@ def manifest_digest_for(manifest: CandidateManifest) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def manifest_document(manifest: CandidateManifest) -> dict[str, Any]:
+    """The canonical serialized document of one validated manifest."""
+
+    document = _serialize(manifest)
+    _validate(document)
+    return document
+
+
+def manifest_from_document(value: dict[str, Any]) -> CandidateManifest:
+    """Validate and rebuild one manifest from its canonical document."""
+
+    _validate(value)
+    return CandidateManifest(
+        manifest_version=value["manifestVersion"],
+        event_id=value["eventId"],
+        status=value["status"],
+        candidate_sha=value["candidateSha"],
+        base_sha=value["baseSha"],
+        branch=value["branch"],
+        linear_issues=tuple(value["linearIssues"]),
+        changed_files=tuple(value["changedFiles"]),
+        verification=tuple(
+            (entry["command"], entry["outcome"])
+            for entry in value["verification"]
+        ),
+        blockers=tuple(value["blockers"]),
+        created_at=value["createdAt"],
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ManifestSnapshot:
     """One validated manifest with its content digest and file identity."""
@@ -309,27 +339,11 @@ def read_manifest_snapshot(
         raise ManifestError(f"manifest {name} is unreadable") from error
     if not isinstance(value, dict):
         raise ManifestError("manifest root must be an object")
-    _validate(value)
+    manifest = manifest_from_document(value)
     if value["eventId"] != name[: -len(".json")]:
         raise ManifestError(
             f"manifest {name} filename does not match its eventId"
         )
-    manifest = CandidateManifest(
-        manifest_version=value["manifestVersion"],
-        event_id=value["eventId"],
-        status=value["status"],
-        candidate_sha=value["candidateSha"],
-        base_sha=value["baseSha"],
-        branch=value["branch"],
-        linear_issues=tuple(value["linearIssues"]),
-        changed_files=tuple(value["changedFiles"]),
-        verification=tuple(
-            (entry["command"], entry["outcome"])
-            for entry in value["verification"]
-        ),
-        blockers=tuple(value["blockers"]),
-        created_at=value["createdAt"],
-    )
     return ManifestSnapshot(
         manifest=manifest, digest=digest, identity=identity
     )

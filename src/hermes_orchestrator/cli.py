@@ -171,6 +171,54 @@ def _parser() -> argparse.ArgumentParser:
     merger_turn.add_argument("--project", required=True)
     merger_turn.add_argument("--json", action="store_true")
 
+    reviewer_fix = commands.add_parser(
+        "reviewer-fix",
+        help=(
+            "the bounded ACCEPT_WITH_REVIEWER_FIX helper: commit the "
+            "eligible mechanical fix atop the immutable submitted SHA, "
+            "verify, push, recompute the base-to-final manifest, and "
+            "record the auditable receipt"
+        ),
+    )
+    reviewer_fix.add_argument("--project", required=True)
+    reviewer_fix.add_argument("--issue", required=True)
+    reviewer_fix.add_argument("--submitted", required=True)
+    reviewer_fix.add_argument("--message", required=True)
+    reviewer_fix.add_argument(
+        "--verify",
+        action="append",
+        required=True,
+        metavar="COMMAND",
+        help="one focused verification command, repeatable",
+    )
+    reviewer_fix.add_argument("--json", action="store_true")
+
+    merge_settle = commands.add_parser(
+        "merge-settle",
+        help=(
+            "drive approved reviews through the guarded settlement path "
+            "— the single bounded merge capability; without --review it "
+            "resumes every resumable settlement for the project"
+        ),
+    )
+    merge_settle.add_argument("--project", required=True)
+    merge_settle.add_argument("--review", default=None)
+    merge_settle.add_argument("--json", action="store_true")
+
+    merge_reconcile = commands.add_parser(
+        "merge-reconcile",
+        help=(
+            "reconstruct auditable receipts for a pull request merged "
+            "externally before verdict settlement; validates the exact "
+            "reviewed head and merge proof, never merges"
+        ),
+    )
+    merge_reconcile.add_argument("--project", required=True)
+    merge_reconcile.add_argument("--issue", required=True)
+    merge_reconcile.add_argument("--event", required=True)
+    merge_reconcile.add_argument("--pr", type=int, required=True)
+    merge_reconcile.add_argument("--json", action="store_true")
+
     gate = commands.add_parser(
         "subagent-gate",
         help="Claude Code PreToolUse hook: block subagents while frozen",
@@ -442,6 +490,15 @@ async def _run_daemon(
         return supervisor
     listener: asyncio.Task[None] | None = None
     if merge_flow is not None and await _start_merge_flow(merge_flow, projects):
+        # Startup settlement recovery: an approved review whose merge
+        # was separated from its verdict by a crash, a full window, or
+        # a lost completion event is re-driven from its durable
+        # settlement row before any new turn is listened for.
+        await merge_flow.reviews.resume_settlements()
+        # Then recover any completed review whose turn notification
+        # was lost: the delivered wake and the thread report are
+        # durable, so one boundary pass settles them exactly once.
+        await merge_flow.turns.recover_outstanding(tuple(projects))
         listener = asyncio.create_task(_listen_for_merger_turns(merge_flow))
     stop = shutdown_event or asyncio.Event()
     registered_signals: list[signal.Signals] = []
@@ -1634,6 +1691,139 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             )
             return 0 if payload["delivered"] else 1
+
+        if args.command == "reviewer-fix":
+            from hermes_orchestrator.git import SubprocessGitRunner
+            from hermes_orchestrator.reviewer_fix import (
+                ReviewerFixHelper,
+                ReviewerFixRefused,
+            )
+
+            helper = ReviewerFixHelper(
+                database=database,
+                events=EventStore(database),
+                projects=settings.projects,
+                git=SubprocessGitRunner(),
+                manifest_root=settings.state_dir / "manifests",
+            )
+            try:
+                receipt = helper.apply(
+                    args.project,
+                    args.issue,
+                    submitted_sha=args.submitted,
+                    message=args.message,
+                    verification=tuple(args.verify),
+                )
+            except ReviewerFixRefused as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"reviewer fix refused: {error}",
+                )
+                return 1
+            _print(
+                {
+                    "fix_id": receipt.fix_id,
+                    "submitted_sha": receipt.submitted_sha,
+                    "final_sha": receipt.final_sha,
+                    "event_id": receipt.event_id,
+                    "files": list(receipt.files),
+                    "changed_lines": receipt.changed_lines,
+                },
+                json_output=args.json,
+                human=(
+                    f"Reviewer fix {receipt.final_sha[:12]} atop "
+                    f"{receipt.submitted_sha[:12]} recorded "
+                    f"({receipt.changed_lines} lines)."
+                ),
+            )
+            return 0
+
+        if args.command == "merge-settle":
+            flow = _open_merge_flow(settings, runtime)
+            try:
+                if args.review is not None:
+                    outcomes = (
+                        asyncio.run(flow.reviews.merge_approved(args.review)),
+                    )
+                else:
+                    outcomes = asyncio.run(
+                        flow.reviews.resume_settlements(args.project)
+                    )
+            except Exception as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"settlement refused: {error}",
+                )
+                return 1
+            payload = [
+                {
+                    "review_id": outcome.review_id,
+                    "issue_id": outcome.issue_id,
+                    "state": outcome.state,
+                    "merge_sha": outcome.merge_sha,
+                    "reason": outcome.reason,
+                }
+                for outcome in outcomes
+            ]
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    f"{len(payload)} settlement(s): "
+                    + ", ".join(
+                        f"{item['review_id']}={item['state']}"
+                        for item in payload
+                    )
+                    if payload
+                    else "no resumable settlements"
+                ),
+            )
+            failed = [
+                item for item in payload if item["state"] != "merged"
+            ]
+            return 1 if args.review is not None and failed else 0
+
+        if args.command == "merge-reconcile":
+            from hermes_orchestrator.manifests import read_manifest_snapshot
+
+            flow = _open_merge_flow(settings, runtime)
+            manifest_path = flow.manifest_root / f"{args.event}.json"
+            try:
+                snapshot = read_manifest_snapshot(
+                    manifest_path, root=flow.manifest_root
+                )
+                outcome = asyncio.run(
+                    flow.reviews.reconcile_external_merge(
+                        project_key=args.project,
+                        issue_id=args.issue,
+                        manifest=snapshot.manifest,
+                        pr_number=args.pr,
+                    )
+                )
+            except Exception as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"reconciliation refused: {error}",
+                )
+                return 1
+            _print(
+                {
+                    "review_id": outcome.review_id,
+                    "issue_id": outcome.issue_id,
+                    "state": outcome.state,
+                    "merge_sha": outcome.merge_sha,
+                    "reason": outcome.reason,
+                },
+                json_output=args.json,
+                human=(
+                    f"Reconciled {outcome.issue_id}: {outcome.state} "
+                    f"({outcome.reason})."
+                ),
+            )
+            return 0 if outcome.state == "merged" else 1
 
         if args.command == "merger-turn":
             try:

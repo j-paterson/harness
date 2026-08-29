@@ -24,8 +24,9 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
-from hermes_orchestrator.github import MergeBlocked
+from hermes_orchestrator.github import MergeBlocked, MergeEffectJournal
 from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.manifests import CandidateManifest
 from hermes_orchestrator.merge import (
     IntegrationMerge,
     MergeClient,
@@ -34,6 +35,12 @@ from hermes_orchestrator.merge import (
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.review_intake import AdmittedCandidate
+from hermes_orchestrator.settlement import (
+    EXTERNALLY_MERGED,
+    MergeSettlements,
+    SettlementBinding,
+    SettlementConflict,
+)
 from hermes_orchestrator.verdicts import CorrectionPacket, ReviewVerdict
 
 # Review states that still own the issue's review slot.
@@ -122,6 +129,8 @@ class ReviewService:
         linear: LinearProjector,
         qa: QaRouter,
         lead: LeadCorrectionPort,
+        settlements: MergeSettlements,
+        merge_journal: MergeEffectJournal | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         for name, port in (
@@ -131,6 +140,7 @@ class ReviewService:
             ("linear", linear),
             ("qa", qa),
             ("lead", lead),
+            ("settlements", settlements),
         ):
             if port is None:
                 raise ValueError(f"review service requires {name}")
@@ -144,6 +154,8 @@ class ReviewService:
         self._linear = linear
         self._qa = qa
         self._lead = lead
+        self._settlements = settlements
+        self._merge_journal = merge_journal
         self._now = now or (lambda: datetime.now(UTC))
 
     # -- verdicts ---------------------------------------------------------
@@ -178,9 +190,7 @@ class ReviewService:
             raise ValueError(f"unknown verdict {verdict.verdict!r}")
 
         review_id = f"review:{admitted.project_key}:{manifest.event_id}"
-        state = (
-            "corrections_required" if verdict.packets else "approved"
-        )
+        state = "corrections_required" if verdict.packets else "approved"
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             existing = connection.execute(
@@ -250,6 +260,30 @@ class ReviewService:
                         },
                     ),
                 )
+            if state == "approved":
+                # The completion operation is atomic: the approved
+                # review and its settlement — binding project, issue,
+                # repository, branch, PR, base, candidate SHA, wake
+                # event, reviewer thread + generation, and manifest —
+                # commit together, before anything can cross the
+                # GitHub mutation boundary.
+                self._settlements.record_in(
+                    connection,
+                    SettlementBinding(
+                        settlement_id=review_id,
+                        project_key=admitted.project_key,
+                        issue_id=issue_id,
+                        event_id=manifest.event_id,
+                        repository=verdict.repository,
+                        branch=verdict.branch,
+                        pr_number=verdict.pr_number,
+                        base_sha=manifest.base_sha,
+                        candidate_sha=verdict.reviewed_sha,
+                        thread_id=admitted.thread_id,
+                        thread_generation=admitted.generation,
+                        manifest_version=manifest.manifest_version,
+                    ),
+                )
         record = self._get(review_id)
         if record.state == "corrections_required":
             self._dispatch_packets(
@@ -288,7 +322,77 @@ class ReviewService:
     # -- merge ------------------------------------------------------------
 
     async def merge_approved(self, review_id: str) -> MergeOutcome:
-        """Merge one approved review and project its exact Linear state.
+        """Settle one approved review under its exclusive merge claim.
+
+        The GitHub mutation boundary is crossed only while holding the
+        settlement's owner-token lease — the exclusive journaled merge
+        claim recorded with the verdict. A settlement that is already
+        terminal replays its outcome; a claim held elsewhere defers
+        without any external effect; and any interrupted attempt keeps
+        its ``merging`` lease so exactly one resumer re-drives it after
+        expiry. Every stage of the drive itself is idempotent under
+        deterministic effect ids, so replays are exactly-once
+        effective.
+        """
+
+        settlement = self._settlements.find(review_id)
+        if settlement is None:
+            raise SettlementConflict(
+                "no recorded settlement authorizes this merge; the "
+                "verdict was never durably bound"
+            )
+        record = self._get(review_id)
+        if settlement.state == "settled":
+            return _outcome(record, reason=record.reason or "merged")
+        if settlement.state == "failed":
+            return _outcome(record, reason=settlement.reason or record.state)
+        token = self._settlements.claim(review_id)
+        if token is None:
+            return _outcome(
+                record,
+                state="deferred",
+                reason="the exclusive merge claim is held elsewhere",
+            )
+        # An unexpected exception leaves the settlement 'merging' under
+        # its lease: nothing is released (the mutation state is
+        # unknown) and exactly one resumer re-drives after expiry.
+        outcome = await self._drive_merge(review_id)
+        if outcome.state == "merged":
+            self._settlements.mark_merged(
+                review_id,
+                token=token,
+                merge_sha=str(outcome.merge_sha),
+                path=(
+                    EXTERNALLY_MERGED
+                    if outcome.reason.startswith("externally merged")
+                    else None
+                ),
+            )
+            self._settlements.mark_settled(review_id, token=token)
+        elif outcome.state == "deferred":
+            self._settlements.release(review_id, token=token)
+        else:
+            self._settlements.mark_failed(review_id, token=token, reason=outcome.reason)
+        return outcome
+
+    async def resume_settlements(
+        self, project_key: str | None = None
+    ) -> tuple[MergeOutcome, ...]:
+        """Re-drive every resumable settlement, oldest first.
+
+        Called at startup and at intake boundaries: an approved review
+        separated from its merge by a crash, a full window, or a lost
+        completion event can never strand — the durable settlement row
+        is re-derived and driven to a terminal state.
+        """
+
+        outcomes: list[MergeOutcome] = []
+        for settlement in self._settlements.resumable(project_key):
+            outcomes.append(await self.merge_approved(settlement.settlement_id))
+        return tuple(outcomes)
+
+    async def _drive_merge(self, review_id: str) -> MergeOutcome:
+        """The idempotent merge body; call only under a settlement claim.
 
         Re-reads the pull request, refuses to overfill the CI window,
         merges through the proven state machine, journals the unresolved
@@ -305,6 +409,53 @@ class ReviewService:
         project = self._projects[record.project_key]
 
         pull = self._github.get_pull_request(record.repository, record.pr_number)
+        if (
+            pull.merged
+            and pull.head_sha == record.reviewed_sha
+            and pull.head_ref == record.branch
+            and pull.base_ref == project.integration_branch
+            and pull.merge_commit_sha is not None
+        ):
+            # A permitted direct exact-head merge (Sol merged the exact
+            # approved candidate itself): reconcile it into the same
+            # durable receipts instead of going stale — proofs first,
+            # then the external merge-effect receipt, then the ledger,
+            # review, and Linear tail, all exactly once.
+            try:
+                proven = self._merge.prove_landed(
+                    record.project_key,
+                    candidate_sha=record.reviewed_sha,
+                    candidate_branch=record.branch,
+                    pr_number=record.pr_number,
+                    merge_sha=pull.merge_commit_sha,
+                )
+            except ReconciliationRequired as error:
+                record = self._transition(
+                    record, "reconciliation_required", reason=str(error)
+                )
+                return _outcome(record, reason=str(error))
+            if self._merge_journal is not None:
+                self._merge_journal.record_external(
+                    f"merge:{record.review_id}",
+                    request={
+                        "repository": record.repository,
+                        "number": record.pr_number,
+                        "sha": record.reviewed_sha,
+                        "head_ref": record.branch,
+                        "base": project.integration_branch,
+                        "merge_method": "squash",
+                    },
+                    response={
+                        "merged": True,
+                        "sha": proven.merge_sha,
+                        "external": True,
+                    },
+                )
+            return await self._settle_proven(
+                record,
+                proven,
+                reason=f"externally merged; reconciled {proven.relation}",
+            )
         if (
             pull.state != "open"
             or pull.merged
@@ -340,17 +491,201 @@ class ReviewService:
             )
             return _outcome(record, reason=str(error))
 
+        return await self._settle_proven(
+            record, proven, reason=f"proven {proven.relation}"
+        )
+
+    async def _settle_proven(
+        self, record: ReviewRecord, proven: Any, *, reason: str
+    ) -> MergeOutcome:
+        """Journal, transition, and project one proven merge; idempotent."""
+
         self._window.record_merge(proven)
         projection = self._qa.after_merge(record.issue_id)
         record = self._transition(
             record,
             "merged",
-            reason=f"proven {proven.relation}",
+            reason=reason,
             merge_sha=proven.merge_sha,
             projection=projection,
         )
         await self._project_after_merge(record)
         return _outcome(record, reason=record.reason or "merged")
+
+    # -- external reconciliation ------------------------------------------
+
+    async def reconcile_external_merge(
+        self,
+        *,
+        project_key: str,
+        issue_id: str,
+        manifest: CandidateManifest,
+        pr_number: int,
+    ) -> MergeOutcome:
+        """Reconstruct receipts for a PR merged before verdict settlement.
+
+        INFRA-194 recovery path: the mutation already exists on GitHub,
+        so this path performs NO merge — ever. It first validates the
+        repository, pull request, exact reviewed head, base, merge
+        commit reachability, and candidate-tree equivalence; only a
+        full proof reconstructs the auditable review, settlement
+        (``path='externally_merged'``), merge-effect, CI-ledger, and
+        Linear receipts, each idempotent under its deterministic id.
+        Any validation failure raises with zero receipts written.
+        """
+
+        if self._merge_journal is None:
+            raise ValueError(
+                "external reconciliation requires the merge-effect journal"
+            )
+        project = self._projects.get(project_key)
+        if project is None:
+            raise ValueError(f"unknown project {project_key!r}")
+        if issue_id not in manifest.linear_issues:
+            raise ValueError("issue is not part of the emitted candidate")
+        review_id = f"review:{project_key}:{manifest.event_id}"
+
+        pull = self._github.get_pull_request(project.github_repo, pr_number)
+        if not pull.merged:
+            raise ValueError("the pull request is not merged; nothing to reconcile")
+        if pull.head_ref != manifest.branch or pull.head_sha != manifest.candidate_sha:
+            raise ValueError(
+                "the merged pull request head is not the reviewed candidate"
+            )
+        if pull.base_ref != project.integration_branch:
+            raise ValueError(
+                "the merged pull request base is not the integration branch"
+            )
+        if pull.merge_commit_sha is None:
+            raise ReconciliationRequired(
+                "the merged pull request reports no merge commit"
+            )
+        proven = self._merge.prove_landed(
+            project_key,
+            candidate_sha=manifest.candidate_sha,
+            candidate_branch=manifest.branch,
+            pr_number=pr_number,
+            merge_sha=pull.merge_commit_sha,
+        )
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM reviews WHERE review_id = ?", (review_id,)
+            ).fetchone()
+            if existing is not None:
+                record = _row_to_record(existing)
+                if (
+                    record.issue_id != issue_id
+                    or record.reviewed_sha != manifest.candidate_sha
+                    or record.pr_number != pr_number
+                ):
+                    raise ValueError(
+                        "review id is already bound to a different candidate"
+                    )
+                if record.state not in ("approved", "merged"):
+                    raise ValueError(
+                        f"a review in state {record.state!r} cannot be "
+                        "reconciled as merged"
+                    )
+            else:
+                connection.execute(
+                    "INSERT INTO reviews("
+                    "review_id, project_key, issue_id, event_id, repository, "
+                    "branch, pr_number, reviewed_sha, state, merge_sha, "
+                    "reason, projection_json, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved', NULL, "
+                    "NULL, NULL, ?, ?)",
+                    (
+                        review_id,
+                        project_key,
+                        issue_id,
+                        manifest.event_id,
+                        project.github_repo,
+                        manifest.branch,
+                        pr_number,
+                        manifest.candidate_sha,
+                        stamp,
+                        stamp,
+                    ),
+                )
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="review.recorded",
+                        aggregate_type="review",
+                        aggregate_id=review_id,
+                        correlation_id=manifest.event_id,
+                        actor="external_reconciliation",
+                        payload={
+                            "issue_id": issue_id,
+                            "reviewed_sha": manifest.candidate_sha,
+                            "state": "approved",
+                            "external": True,
+                        },
+                    ),
+                )
+            self._settlements.record_in(
+                connection,
+                SettlementBinding(
+                    settlement_id=review_id,
+                    project_key=project_key,
+                    issue_id=issue_id,
+                    event_id=manifest.event_id,
+                    repository=project.github_repo,
+                    branch=manifest.branch,
+                    pr_number=pr_number,
+                    base_sha=manifest.base_sha,
+                    candidate_sha=manifest.candidate_sha,
+                    thread_id="external_reconciliation",
+                    thread_generation=0,
+                    manifest_version=manifest.manifest_version,
+                ),
+                path=EXTERNALLY_MERGED,
+            )
+        settlement = self._settlements.get(review_id)
+        record = self._get(review_id)
+        if settlement.state == "settled":
+            return _outcome(record, reason=record.reason or "merged")
+        if settlement.state == "failed":
+            return _outcome(record, reason=settlement.reason or record.state)
+        token = self._settlements.claim(review_id)
+        if token is None:
+            return _outcome(
+                record,
+                state="deferred",
+                reason="the exclusive merge claim is held elsewhere",
+            )
+        self._merge_journal.record_external(
+            f"merge:{review_id}",
+            request={
+                "repository": project.github_repo,
+                "number": pr_number,
+                "sha": manifest.candidate_sha,
+                "head_ref": manifest.branch,
+                "base": project.integration_branch,
+                "merge_method": "squash",
+            },
+            response={
+                "merged": True,
+                "sha": proven.merge_sha,
+                "external": True,
+            },
+        )
+        if record.state == "merged":
+            await self._project_after_merge(record)
+            outcome = _outcome(record, reason=record.reason or "merged")
+        else:
+            outcome = await self._settle_proven(
+                record,
+                proven,
+                reason=f"externally merged; reconciled {proven.relation}",
+            )
+        self._settlements.mark_merged(
+            review_id, token=token, merge_sha=proven.merge_sha
+        )
+        self._settlements.mark_settled(review_id, token=token)
+        return outcome
 
     # -- QA ---------------------------------------------------------------
 
@@ -405,9 +740,7 @@ class ReviewService:
         ).fetchone()
         return None if row is None else _row_to_record(row)
 
-    def issue_for_candidate(
-        self, project_key: str, reviewed_sha: str
-    ) -> str | None:
+    def issue_for_candidate(self, project_key: str, reviewed_sha: str) -> str | None:
         """The issue whose review bound this exact candidate SHA, if any."""
 
         row = self._database.execute(

@@ -242,9 +242,13 @@ def stored_thread(
 
 
 @pytest.mark.asyncio
-async def test_new_merger_is_read_only_and_persistent(
+async def test_new_merger_uses_the_writable_workspace_and_persists(
     merger: CodexMerger, rpc: FakeRpc, database: Database
 ) -> None:
+    """INFRA-194 operator scope: the bounded reviewer-fix path needs
+    the narrow writable workspace mode — never read-only, and never
+    the dangerous unrestricted mode."""
+
     thread = await merger.ensure_thread("demo")
 
     assert rpc.methods[0] == "account/read"
@@ -253,9 +257,10 @@ async def test_new_merger_is_read_only_and_persistent(
         "model": "gpt-5.6-sol",
         "cwd": "/repo/demo",
         "approvalPolicy": "never",
-        "sandbox": "read-only",
+        "sandbox": "workspace-write",
         "serviceName": "hermes_orchestrator",
     }
+    assert request["params"]["sandbox"] != "danger-full-access"
     assert thread.thread_id == "thr_demo"
     assert thread.project_key == "demo"
     assert rpc.request_for("thread/name/set")["params"]["name"] == "Merger: demo"
@@ -318,6 +323,14 @@ async def test_not_loaded_thread_is_loaded_then_readable(
         "thread/read",
         "thread/goal/set",
     ]
+    # Recovery re-applies the bounded writable workspace mode, so a
+    # task started under a stale read-only configuration is corrected
+    # on its next load — without a duplicate thread or review intake.
+    assert rpc.request_for("thread/resume")["params"] == {
+        "threadId": "thr_stored",
+        "sandbox": "workspace-write",
+    }
+    assert "thread/start" not in rpc.methods
 
 
 @pytest.mark.asyncio
@@ -348,9 +361,13 @@ async def test_rejected_resume_of_a_readable_thread_stays_ready(
 
 
 @pytest.mark.asyncio
-async def test_goal_carries_the_immutable_merger_contract(
+async def test_goal_is_one_succinct_paragraph_of_role_and_boundaries(
     merger: CodexMerger, rpc: FakeRpc
 ) -> None:
+    """INFRA-194 operator requirement: the durable goal states only the
+    role, its boundaries, and the idle token in exactly one paragraph;
+    detailed protocol mechanics live in durable artifacts and code."""
+
     await merger.ensure_thread("demo")
 
     params = rpc.request_for("thread/goal/set")["params"]
@@ -359,18 +376,27 @@ async def test_goal_carries_the_immutable_merger_contract(
     assert params["status"] == "blocked"
     goal = params["objective"]
     assert "demo" in goal
+    # Exactly one paragraph: no blank lines, no headings, no lists.
+    assert "\n" not in goal
     lowered = goal.lower()
     for clause in (
-        "independent",
-        "one pull request at a time",
-        "never merge",
-        "no corrective edits",
-        "conflict",
-        "circleci",
-        "ancestry",
-        "live-state",
+        "independent reviewer",
+        "one immutable candidate at a time",
+        "accept_with_reviewer_fix",
+        "durable repair policy",
+        "judgment-bearing",
+        "returns to the fable lead as structured corrections",
+        "complete the exact approved pull-request merge yourself",
+        "guarded hermes settlement helper",
+        "direct merge is permitted",
+        "reconciled into the same durable receipts",
+        "circleci is checked optimistically at intake and merge",
+        "blocked_on_external_intake",
     ):
         assert clause in lowered
+    # Mechanics stay out of the goal; the durable artifact is named.
+    assert "prompts/codex-merger.md" in goal
+    assert "## " not in goal
 
 
 @pytest.mark.asyncio
@@ -1262,12 +1288,16 @@ def test_replacement_without_outstanding_wakes_clears_heartbeat(
 
 
 def test_prompt_contract_exists_and_is_read_only() -> None:
-    text = PROMPT_PATH.read_text(encoding="utf-8").lower()
+    text = " ".join(PROMPT_PATH.read_text(encoding="utf-8").lower().split())
     for clause in (
         "independent",
         "one pull request at a time",
-        "never merge",
+        "merge-settle",
+        "accept_with_reviewer_fix",
+        "direct exact-head merge",
+        "reconciles it into the same durable receipts",
         "read-only",
+        "reviewer repair budget",
         "critical",
         "important",
         "circleci",
@@ -1291,6 +1321,31 @@ def test_prompt_contract_exists_and_is_read_only() -> None:
         assert clause in text
 
 
+def test_goal_and_contract_authorize_only_bounded_fix_and_exact_merge() -> None:
+    """INFRA-194 operator scope: Sol's authority is exactly the bounded
+    labeled reviewer fix plus completing the exact approved merge, and
+    neither document claims an OS-enforced read-only sandbox."""
+
+    from hermes_orchestrator.codex_merger import MERGER_GOAL
+
+    goal = MERGER_GOAL.lower()
+    assert "only bounded mechanical" in goal
+    assert "accept_with_reviewer_fix" in goal
+    assert "complete the exact approved pull-request merge yourself" in goal
+    assert "read-only" not in goal
+    assert "\n" not in MERGER_GOAL  # still exactly one paragraph
+
+    contract = " ".join(PROMPT_PATH.read_text(encoding="utf-8").lower().split())
+    assert "read-only sandbox" not in contract
+    # The behavioral guard survives: outside the bounded fix path the
+    # implementation tree is untouchable.
+    assert "read-only with respect to the implementation tree" in contract
+    assert "accept_with_reviewer_fix" in contract
+    assert "authorized to complete the exact approved pull-request merge" in (
+        contract
+    )
+
+
 def test_prompt_idle_terminal_token_is_exact_and_pause_token_is_gone() -> None:
     text = PROMPT_PATH.read_text(encoding="utf-8")
     assert "BLOCKED_ON_EXTERNAL_INTAKE" in text
@@ -1307,3 +1362,28 @@ def test_prompt_requires_prior_ci_reconciliation_before_new_candidates() -> None
     assert "never watch or poll ci" in text
     assert "one pull request" in text and "in flight" in text
     assert "pr2" in text
+
+
+def test_prompt_pins_the_reviewer_repair_budget() -> None:
+    """INFRA-194 operator correction: the fix boundary is the durable
+    user-approved repair budget, with its exact eligibility limits and
+    exclusions, not zero edits."""
+
+    text = " ".join(PROMPT_PATH.read_text(encoding="utf-8").lower().split())
+    for clause in (
+        "mechanical",
+        "unambiguous",
+        "auditable",
+        "2 files",
+        "20-30 changed lines",
+        "15-20 minutes",
+        "focused verification",
+        "schemas",
+        "migrations",
+        "generated artifacts",
+        "pricing or economics",
+        "public apis",
+        "persisted ownership architecture",
+        "broad consumer-facing changes",
+    ):
+        assert clause in text, clause
