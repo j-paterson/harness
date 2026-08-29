@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 30
+    assert json.loads(result.stdout)["schema_version"] == 31
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -1005,9 +1005,11 @@ async def test_daemon_starts_when_intake_probes_fail(
         database.close()
 
 
-def test_intake_poll_hands_out_one_envelope_via_hook_json(
+def test_intake_poll_offers_and_only_explicit_ack_delivers(
     tmp_path: Path,
 ) -> None:
+    import re
+
     from hermes_orchestrator.db import Database
     from tests.test_lead_intake import (
         SESSION,
@@ -1023,23 +1025,69 @@ def test_intake_poll_hands_out_one_envelope_via_hook_json(
         seed_active_cell(database)
     finally:
         database.close()
-    arguments = [
-        "--state-dir",
-        str(state_dir),
-        "intake-poll",
-        "--session",
-        SESSION,
-    ]
+    base = ["--state-dir", str(state_dir)]
+    poll_args = [*base, "intake-poll", "--session", SESSION]
 
-    first = invoke(arguments)
-    second = invoke(arguments)
-    third = invoke(arguments)
-
-    # One envelope per handshake through hook JSON — the application
-    # layer, never a terminal buffer; an empty queue is a silent no-op.
+    first = invoke(poll_args)
     assert first.exit_code == 0
     payload = json.loads(first.stdout)
     assert payload["decision"] == "block"
-    assert "HERMES_" in payload["reason"]
-    assert second.exit_code == 0 and json.loads(second.stdout)["reason"]
+    match = re.search(
+        r"(HERMES_\w+ [0-9a-f]{32}) — Hermes intake offer ([0-9a-f]{32})",
+        payload["reason"],
+    )
+    assert match is not None
+    envelope, token = match.group(1), match.group(2)
+    packet_id = envelope.split()[1]
+
+    # Without an acknowledgement the packet is never delivered: after
+    # the second packet is also leased, further polls go quiet, but
+    # nothing is marked delivered.
+    second = invoke(poll_args)
+    assert second.exit_code == 0 and second.stdout
+    third = invoke(poll_args)
     assert third.exit_code == 0 and third.stdout == ""
+
+    # A wrong acknowledgement changes nothing and exits nonzero.
+    bad = invoke(
+        [
+            *base,
+            "intake-ack",
+            "--session",
+            SESSION,
+            "--packet",
+            packet_id,
+            "--offer",
+            "0" * 32,
+        ]
+    )
+    assert bad.exit_code == 1
+
+    # The exact acknowledgement records the delivery once.
+    good = invoke(
+        [
+            *base,
+            "intake-ack",
+            "--session",
+            SESSION,
+            "--packet",
+            packet_id,
+            "--offer",
+            token,
+        ]
+    )
+    assert good.exit_code == 0
+    assert json.loads(good.stdout)["acknowledged"] == packet_id
+    duplicate = invoke(
+        [
+            *base,
+            "intake-ack",
+            "--session",
+            SESSION,
+            "--packet",
+            packet_id,
+            "--offer",
+            token,
+        ]
+    )
+    assert duplicate.exit_code == 1

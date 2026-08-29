@@ -23,11 +23,14 @@ Announcements run a durable claimed/attempted/announced state machine
 per (kind, packet, session): the claim is a compare-and-swap insert
 before any external effect, uncertain metadata attempts remain durable
 and retry after a window (a repeated notification is harmless), and
-``announced`` is terminal for the announcer. The poll marks a delivery
-``delivered``. Stale, mismatched, non-classic, or dead seats, unknown
-packets, and every cmux probe failure are refused with the durable
-packet retained — losing an envelope never loses work, because the
-packet itself stays pending in durable state.
+``announced`` is terminal for the announcer. The poll leases an
+OFFER under an opaque token; only the lead's explicit
+acknowledgement — bound to the exact session, packet, and token —
+records ``delivered``, and an unacknowledged offer is re-offered once
+its lease expires. Stale, mismatched, non-classic, or dead seats,
+unknown packets, and every cmux probe failure are refused with the
+durable packet retained — losing an envelope never loses work, because
+the packet itself stays recoverable in durable state.
 """
 
 from __future__ import annotations
@@ -165,6 +168,7 @@ class LeadIntakeTransport:
         ).fetchone()
         if existing is not None and str(existing["state"]) in (
             "announced",
+            "offered",
             "delivered",
             "superseded",
         ):
@@ -204,14 +208,19 @@ class LeadIntakeTransport:
             )
             if delivery_id is None:
                 return outcome("pending")
-        # Record the attempt durably BEFORE the external effect.
+        # Record the attempt durably BEFORE the external effect; the
+        # state guard plus rowcount check abandon the pass if a poll
+        # meanwhile offered this row to the lead.
         with self._database.transaction() as connection:
-            connection.execute(
+            attempted = connection.execute(
                 "UPDATE lead_intake_deliveries "
                 "SET state = 'attempted', attempts = attempts + 1, "
-                "updated_at = ? WHERE delivery_id = ?",
+                "updated_at = ? WHERE delivery_id = ? "
+                "AND state IN ('claimed', 'attempted')",
                 (self._now().isoformat(), delivery_id),
             )
+            if attempted.rowcount != 1:
+                return outcome("pending")
         try:
             await self._port.set_status(
                 binding.workspace_uuid, "intake", envelope
@@ -226,12 +235,14 @@ class LeadIntakeTransport:
             # row is exactly that evidence and a later pass retries.
             return outcome("attempt_failed")
         with self._database.transaction() as connection:
-            connection.execute(
+            announced = connection.execute(
                 "UPDATE lead_intake_deliveries "
                 "SET state = 'announced', updated_at = ? "
-                "WHERE delivery_id = ?",
+                "WHERE delivery_id = ? AND state = 'attempted'",
                 (self._now().isoformat(), delivery_id),
             )
+            if announced.rowcount != 1:
+                return outcome("pending")
         return outcome("announced")
 
     def _claim(
@@ -302,18 +313,32 @@ class LeadIntakeTransport:
         return None
 
 
-class LeadIntakePoll:
-    """The lead-owned handshake: hand out exactly one envelope per poll.
+@dataclass(frozen=True, slots=True)
+class IntakeOffer:
+    """One leased envelope offer awaiting the lead's acknowledgement."""
 
-    Invoked by the lead's own Claude Code hook (or the lead directly),
-    so exclusive ownership of the delivery moment is established by
-    construction — the lead asks, and the answer travels through the
-    application layer, never through any editable terminal buffer. A
-    poll returns the oldest packet for the exact session that no
-    delivery row marks delivered or superseded, marks it ``delivered``,
-    and validates the envelope against the closed grammar before
-    handing it out. Losing a handed-out envelope loses nothing durable:
-    the packet itself stays in SQLite until the lead acts on it.
+    envelope: str
+    kind: str
+    packet_id: str
+    offer_token: str
+
+
+class LeadIntakePoll:
+    """The lead-owned handshake: an offer/acknowledgement lease.
+
+    A poll compare-and-swaps one packet's delivery row into ``offered``
+    under an opaque token and returns the envelope plus that token
+    through the application layer (the lead's own hook) — never any
+    terminal buffer. Nothing is marked delivered by the poll itself: a
+    crash, broken stdout pipe, serialization failure, or hook-host
+    rejection after the offer leaves the row ``offered``, and once the
+    lease expires the packet is safely re-offered under a fresh token.
+    Only the lead's explicit :meth:`acknowledge` — bound to the exact
+    session, packet, and offer token — records ``delivered``. Every
+    acquisition and acknowledgement is a rowcount-checked
+    compare-and-swap, so two polls can never own one offer and a stale,
+    foreign-session, wrong-packet, duplicate, or superseded
+    acknowledgement is rejected without effect.
     """
 
     def __init__(
@@ -322,12 +347,14 @@ class LeadIntakePoll:
         database: Database,
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
+        offer_ttl_seconds: float = 300.0,
     ) -> None:
         self._database = database
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or (lambda: datetime.now(UTC))
+        self._offer_ttl_seconds = offer_ttl_seconds
 
-    def next_envelope(self, session_id: str) -> str | None:
+    def next_offer(self, session_id: str) -> IntakeOffer | None:
         cell = self._database.execute(
             "SELECT cell_id, project_key FROM project_cells "
             "WHERE session_id = ? AND state = 'active' "
@@ -359,48 +386,129 @@ class LeadIntakePoll:
                 (str(row["created_at"]), WORK_READY, str(row["wake_id"]))
             )
         for _, kind, packet_id in sorted(candidates):
-            row = self._database.execute(
-                "SELECT delivery_id, state FROM lead_intake_deliveries "
-                "WHERE kind = ? AND packet_id = ? AND session_id = ?",
-                (kind, packet_id, session_id),
-            ).fetchone()
-            if row is not None and str(row["state"]) in (
-                "delivered",
-                "superseded",
-            ):
-                continue
             envelope = f"{kind} {packet_id}"
             if INTAKE_ENVELOPE_PATTERN.fullmatch(envelope) is None:
                 continue
-            stamp = self._now().isoformat()
+            token = self._acquire(
+                kind=kind,
+                packet_id=packet_id,
+                cell_id=str(cell["cell_id"]),
+                session_id=session_id,
+            )
+            if token is not None:
+                return IntakeOffer(
+                    envelope=envelope,
+                    kind=kind,
+                    packet_id=packet_id,
+                    offer_token=token,
+                )
+        return None
+
+    def acknowledge(
+        self, *, session_id: str, packet_id: str, offer_token: str
+    ) -> bool:
+        """Record the lead's consumption of one exact offer.
+
+        The compare-and-swap binds all three identities: only the row
+        currently ``offered`` under exactly this token, for exactly
+        this packet and session, becomes ``delivered``. Anything else —
+        an unknown or superseded token, a foreign session, the wrong
+        packet, or a duplicate acknowledgement — changes nothing and
+        returns False.
+        """
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE lead_intake_deliveries "
+                "SET state = 'delivered', delivered_at = ?, "
+                "updated_at = ?, offer_token = NULL, offered_at = NULL "
+                "WHERE session_id = ? AND packet_id = ? "
+                "AND offer_token = ? AND state = 'offered'",
+                (stamp, stamp, session_id, packet_id, offer_token),
+            )
+            return cursor.rowcount == 1
+
+    def _acquire(
+        self,
+        *,
+        kind: str,
+        packet_id: str,
+        cell_id: str,
+        session_id: str,
+    ) -> str | None:
+        """Lease one packet as an offer, or None when it is unavailable.
+
+        A missing row is claimed with a rowcount-checked insert; an
+        existing non-terminal row is taken only when no unexpired offer
+        lease holds it, through a compare-and-swap on its exact
+        ``updated_at`` token. Both losers walk away empty-handed.
+        """
+
+        token = self._ids()
+        stamp = self._now().isoformat()
+        row = self._database.execute(
+            "SELECT delivery_id, state, offered_at, updated_at "
+            "FROM lead_intake_deliveries "
+            "WHERE kind = ? AND packet_id = ? AND session_id = ?",
+            (kind, packet_id, session_id),
+        ).fetchone()
+        if row is None:
             with self._database.transaction() as connection:
-                if row is None:
-                    connection.execute(
-                        "INSERT OR IGNORE INTO lead_intake_deliveries("
-                        "delivery_id, kind, packet_id, cell_id, "
-                        "session_id, surface_uuid, state, attempts, "
-                        "claimed_at, updated_at, delivered_at"
-                        ") VALUES (?, ?, ?, ?, ?, '', 'delivered', 1, "
-                        "?, ?, ?)",
-                        (
-                            self._ids(),
-                            kind,
-                            packet_id,
-                            str(cell["cell_id"]),
-                            session_id,
-                            stamp,
-                            stamp,
-                            stamp,
-                        ),
-                    )
-                else:
-                    connection.execute(
-                        "UPDATE lead_intake_deliveries "
-                        "SET state = 'delivered', delivered_at = ?, "
-                        "updated_at = ? WHERE delivery_id = ?",
-                        (stamp, stamp, str(row["delivery_id"])),
-                    )
-            return envelope
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO lead_intake_deliveries("
+                    "delivery_id, kind, packet_id, cell_id, session_id, "
+                    "surface_uuid, state, attempts, offer_token, "
+                    "offered_at, claimed_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, '', 'offered', 0, ?, ?, "
+                    "?, ?)",
+                    (
+                        self._ids(),
+                        kind,
+                        packet_id,
+                        cell_id,
+                        session_id,
+                        token,
+                        stamp,
+                        stamp,
+                        stamp,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    return token
+            return None
+        state = str(row["state"])
+        if state in ("delivered", "superseded"):
+            return None
+        if state == "offered":
+            offered_at = row["offered_at"]
+            try:
+                age = (
+                    self._now()
+                    - datetime.fromisoformat(str(offered_at))
+                ).total_seconds()
+            except ValueError:
+                age = None
+            if age is not None and age < self._offer_ttl_seconds:
+                # An unexpired lease has exactly one owner already.
+                return None
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE lead_intake_deliveries "
+                "SET state = 'offered', offer_token = ?, "
+                "offered_at = ?, updated_at = ? "
+                "WHERE delivery_id = ? AND updated_at = ? "
+                "AND state NOT IN ('delivered', 'superseded')",
+                (
+                    token,
+                    stamp,
+                    stamp,
+                    str(row["delivery_id"]),
+                    str(row["updated_at"]),
+                ),
+            )
+            if cursor.rowcount == 1:
+                return token
         return None
 
 
@@ -452,7 +560,7 @@ class LeadIntakeRouter:
             "WHERE d.kind = 'HERMES_WORK_READY' "
             "AND d.packet_id = w.wake_id "
             "AND d.session_id = w.session_id "
-            "AND d.state IN ('announced', 'delivered', 'superseded')"
+            "AND d.state IN ('announced', 'offered', 'delivered', 'superseded')"
             ") ORDER BY w.created_at ASC, w.rowid ASC"
         ).fetchall()
         for row in wakes:

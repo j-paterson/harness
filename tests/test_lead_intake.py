@@ -407,57 +407,146 @@ async def test_refused_seats_retain_pending_packets(
     assert sorted(announced) == sorted([CORRECTION_ID, WAKE_ID])
 
 
-class TestLeadOwnedPoll:
-    def test_poll_hands_out_exactly_one_envelope_per_call(
+class TestOfferAcknowledgementLease:
+    def poll(
+        self, database: Database, **kwargs: object
+    ) -> LeadIntakePoll:
+        return LeadIntakePoll(database=database, **kwargs)
+
+    def test_only_one_poll_owns_an_offer_at_a_time(
         self, database: Database
     ) -> None:
         seed_packets(database)
         seed_active_cell(database)
-        poll = LeadIntakePoll(database=database)
+        poll = self.poll(database)
 
-        first = poll.next_envelope(SESSION)
-        second = poll.next_envelope(SESSION)
-        third = poll.next_envelope(SESSION)
+        first = poll.next_offer(SESSION)
+        second = poll.next_offer(SESSION)
+        third = poll.next_offer(SESSION)
 
-        # One envelope per handshake, each validated against the
-        # closed grammar; nothing else ever comes back.
+        # Two packets exist, so two racing polls each lease a distinct
+        # one; a third finds every offer owned and gets nothing. No
+        # packet is ever offered to two owners inside a lease.
         assert first is not None and second is not None
-        assert INTAKE_ENVELOPE_PATTERN.fullmatch(first)
-        assert INTAKE_ENVELOPE_PATTERN.fullmatch(second)
-        assert {first, second} == {
-            f"HERMES_CORRECTION_READY {CORRECTION_ID}",
-            f"HERMES_WORK_READY {WAKE_ID}",
-        }
+        assert first.packet_id != second.packet_id
+        assert INTAKE_ENVELOPE_PATTERN.fullmatch(first.envelope)
         assert third is None
         states = [row[1] for row in delivery_rows(database)]
-        assert states == ["delivered", "delivered"]
+        assert states == ["offered", "offered"]
 
-    def test_poll_is_the_handshake_and_touches_no_terminal(
+    def test_offer_without_acknowledgement_is_never_delivered(
         self, database: Database
     ) -> None:
-        # The poll takes no port at all: the envelope travels through
-        # the application layer (the lead's own hook), so no terminal
-        # buffer — drafted or empty, focused or unfocused — is ever
-        # involved in handing the envelope out.
+        # A crash after the offer transaction, a broken stdout pipe, or
+        # a hook-host rejection all look identical: the offer was
+        # leased but never acknowledged. Nothing is delivered.
         seed_packets(database)
         seed_active_cell(database)
+        poll = self.poll(database, now=lambda: NOW)
 
-        envelope = LeadIntakePoll(database=database).next_envelope(SESSION)
+        offer = poll.next_offer(SESSION)
 
-        assert envelope is not None
+        assert offer is not None
+        assert "delivered" not in [
+            row[1] for row in delivery_rows(database)
+        ]
 
-    def test_poll_for_an_unknown_session_returns_nothing(
+    def test_expired_offer_is_recovered_under_a_fresh_token(
         self, database: Database
     ) -> None:
         seed_packets(database)
+        seed_active_cell(database)
+        early = self.poll(database, now=lambda: NOW)
+        lost = early.next_offer(SESSION)
+        assert lost is not None
 
-        assert (
-            LeadIntakePoll(database=database).next_envelope(OTHER_SESSION)
-            is None
+        # Within the lease the packet stays owned.
+        held = self.poll(database, now=lambda: NOW).next_offer(SESSION)
+        assert held is None or held.packet_id != lost.packet_id
+
+        # After expiry (a restart later), the packet is re-offered
+        # under a fresh token; the lost token is dead.
+        later = self.poll(
+            database, now=lambda: NOW + timedelta(seconds=600)
         )
-        assert delivery_rows(database) == []
+        recovered = later.next_offer(SESSION)
+        assert recovered is not None
+        assert recovered.packet_id in (lost.packet_id, held and held.packet_id)
+        assert recovered.offer_token != lost.offer_token
+        assert (
+            later.acknowledge(
+                session_id=SESSION,
+                packet_id=lost.packet_id,
+                offer_token=lost.offer_token,
+            )
+            is False
+        )
 
-    def test_poll_skips_superseded_and_delivered_rows(
+    def test_exact_acknowledgement_delivers_and_polls_skip_it(
+        self, database: Database
+    ) -> None:
+        seed_packets(database)
+        seed_active_cell(database)
+        poll = self.poll(database)
+
+        offer = poll.next_offer(SESSION)
+        assert offer is not None
+        accepted = poll.acknowledge(
+            session_id=SESSION,
+            packet_id=offer.packet_id,
+            offer_token=offer.offer_token,
+        )
+
+        assert accepted is True
+        remaining = poll.next_offer(SESSION)
+        assert remaining is None or remaining.packet_id != offer.packet_id
+        row = database.execute(
+            "SELECT state, offer_token FROM lead_intake_deliveries "
+            "WHERE packet_id = ?",
+            (offer.packet_id,),
+        ).fetchone()
+        assert str(row["state"]) == "delivered"
+        assert row["offer_token"] is None
+
+    def test_invalid_acknowledgements_change_nothing(
+        self, database: Database
+    ) -> None:
+        seed_packets(database)
+        seed_active_cell(database)
+        poll = self.poll(database)
+        offer = poll.next_offer(SESSION)
+        assert offer is not None
+
+        # Foreign session, wrong packet, unknown token: all rejected.
+        assert not poll.acknowledge(
+            session_id=OTHER_SESSION,
+            packet_id=offer.packet_id,
+            offer_token=offer.offer_token,
+        )
+        assert not poll.acknowledge(
+            session_id=SESSION,
+            packet_id="f" * 32,
+            offer_token=offer.offer_token,
+        )
+        assert not poll.acknowledge(
+            session_id=SESSION,
+            packet_id=offer.packet_id,
+            offer_token="0" * 32,
+        )
+        # The real acknowledgement still works exactly once; a
+        # duplicate is rejected.
+        assert poll.acknowledge(
+            session_id=SESSION,
+            packet_id=offer.packet_id,
+            offer_token=offer.offer_token,
+        )
+        assert not poll.acknowledge(
+            session_id=SESSION,
+            packet_id=offer.packet_id,
+            offer_token=offer.offer_token,
+        )
+
+    def test_superseded_rows_are_never_offered_or_acknowledged(
         self, database: Database
     ) -> None:
         seed_packets(database)
@@ -471,20 +560,21 @@ class TestLeadOwnedPoll:
                 "'cell-demo', ?, '', 'superseded', 0, ?, ?)",
                 (WAKE_ID, SESSION, NOW.isoformat(), NOW.isoformat()),
             )
-        poll = LeadIntakePoll(database=database)
+        poll = self.poll(database)
 
-        first = poll.next_envelope(SESSION)
-        second = poll.next_envelope(SESSION)
+        offer = poll.next_offer(SESSION)
 
-        assert first == f"HERMES_CORRECTION_READY {CORRECTION_ID}"
-        assert second is None
+        assert offer is not None
+        assert offer.packet_id == CORRECTION_ID
+        assert not poll.acknowledge(
+            session_id=SESSION,
+            packet_id=WAKE_ID,
+            offer_token="0" * 32,
+        )
 
-    def test_announced_packets_are_pollable_and_then_terminal(
+    def test_announced_rows_are_offerable_and_announcer_backs_off(
         self, database: Database
     ) -> None:
-        # The announcement (metadata) and the handshake (delivery) are
-        # one state machine: an announced packet is still pollable, and
-        # a polled packet stops being announced again.
         seed_packets(database)
         seed_active_cell(database)
         with database.transaction() as connection:
@@ -496,19 +586,20 @@ class TestLeadOwnedPoll:
                 "'cell-demo', ?, '', 'announced', 1, ?, ?)",
                 (WAKE_ID, SESSION, NOW.isoformat(), NOW.isoformat()),
             )
-        poll = LeadIntakePoll(database=database)
+        poll = self.poll(database)
 
-        envelopes = {
-            poll.next_envelope(SESSION),
-            poll.next_envelope(SESSION),
+        offers = {
+            offer.packet_id
+            for offer in (
+                poll.next_offer(SESSION),
+                poll.next_offer(SESSION),
+            )
+            if offer is not None
         }
 
-        assert envelopes == {
-            f"HERMES_CORRECTION_READY {CORRECTION_ID}",
-            f"HERMES_WORK_READY {WAKE_ID}",
-        }
+        assert offers == {CORRECTION_ID, WAKE_ID}
         row = database.execute(
             "SELECT state FROM lead_intake_deliveries "
             "WHERE delivery_id = 'announced-row'"
         ).fetchone()
-        assert str(row["state"]) == "delivered"
+        assert str(row["state"]) == "offered"

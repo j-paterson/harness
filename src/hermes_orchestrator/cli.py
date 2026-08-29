@@ -179,11 +179,23 @@ def _parser() -> argparse.ArgumentParser:
     intake_poll = commands.add_parser(
         "intake-poll",
         help=(
-            "lead-owned intake handshake: hand out the next pending "
-            "envelope through the application layer (Claude Code hook)"
+            "lead-owned intake handshake: lease the next pending "
+            "envelope as an offer through the application layer "
+            "(Claude Code hook)"
         ),
     )
     intake_poll.add_argument("--session", default=None)
+
+    intake_ack = commands.add_parser(
+        "intake-ack",
+        help=(
+            "acknowledge one exact intake offer after retrieving its "
+            "packet; only this records the delivery"
+        ),
+    )
+    intake_ack.add_argument("--session", required=True)
+    intake_ack.add_argument("--packet", required=True)
+    intake_ack.add_argument("--offer", required=True)
 
     def _deploy_spec_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--binary", type=PurePosixPath, required=True)
@@ -936,14 +948,25 @@ def _deploy_status(
     return _run_deploy_plan(args, steps, runner)
 
 
+def _intake_state_dir(args: argparse.Namespace) -> Path:
+    return (
+        args.state_dir
+        if args.state_dir is not None
+        else Path.home() / ".local" / "share" / "hermes-orchestrator"
+    )
+
+
 def _intake_poll(args: argparse.Namespace) -> int:
-    """Hand the calling lead its next pending envelope, if any.
+    """Lease the calling lead's next pending envelope, if any.
 
     Invoked from the lead's own Claude Code hook: the session id comes
-    from the hook payload on stdin (or --session), and the envelope is
-    returned as hook JSON — through the application layer, never any
-    terminal buffer. No envelope means empty output and exit 0, so the
-    hook is a no-op.
+    from the hook payload on stdin (or --session), and the offer —
+    envelope plus its opaque token — is returned as hook JSON through
+    the application layer, never any terminal buffer. Nothing is
+    recorded delivered here: the lead must acknowledge the exact offer
+    with intake-ack after retrieving the packet, and an unacknowledged
+    offer is re-offered once its lease expires. No offer means empty
+    output and exit 0, so the hook is a no-op.
     """
 
     from hermes_orchestrator.lead_intake import LeadIntakePoll
@@ -955,32 +978,53 @@ def _intake_poll(args: argparse.Namespace) -> int:
             session = payload.get("session_id")
     if not session:
         return 0
-    state_dir = (
-        args.state_dir
-        if args.state_dir is not None
-        else Path.home() / ".local" / "share" / "hermes-orchestrator"
-    )
-    database = Database.open(Path(state_dir) / "state.db")
+    database = Database.open(_intake_state_dir(args) / "state.db")
     try:
-        envelope = LeadIntakePoll(database=database).next_envelope(
-            str(session)
-        )
+        offer = LeadIntakePoll(database=database).next_offer(str(session))
     finally:
         database.close()
-    if envelope is None:
+    if offer is None:
         return 0
     print(
         json.dumps(
             {
                 "decision": "block",
                 "reason": (
-                    f"{envelope} — Hermes intake: retrieve this packet "
-                    "from durable state (pending_corrections or the "
-                    "wake tables) by its id and act on it now."
+                    f"{offer.envelope} — Hermes intake offer "
+                    f"{offer.offer_token}: retrieve this packet from "
+                    "durable state by its id, then acknowledge with "
+                    "`hermes-orchestrator intake-ack --session "
+                    f"{session} --packet {offer.packet_id} --offer "
+                    f"{offer.offer_token}` and act on it now."
                 ),
             }
         )
     )
+    return 0
+
+
+def _intake_ack(args: argparse.Namespace) -> int:
+    """Record the lead's consumption of one exact offer."""
+
+    from hermes_orchestrator.lead_intake import LeadIntakePoll
+
+    database = Database.open(_intake_state_dir(args) / "state.db")
+    try:
+        accepted = LeadIntakePoll(database=database).acknowledge(
+            session_id=args.session,
+            packet_id=args.packet,
+            offer_token=args.offer,
+        )
+    finally:
+        database.close()
+    if not accepted:
+        print(
+            "the offer is unknown, superseded, or already delivered; "
+            "nothing changed",
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps({"acknowledged": args.packet}))
     return 0
 
 
@@ -1169,6 +1213,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _migration_env(args)
     if args.command == "intake-poll":
         return _intake_poll(args)
+    if args.command == "intake-ack":
+        return _intake_ack(args)
     settings = load_settings(args.repo_root, args.state_dir)
     if args.command == "serve-console":
         return _serve_console(args, settings)
