@@ -67,9 +67,7 @@ def bindings(database: Database) -> CmuxSurfaceBindings:
     )
 
 
-def bind_demo_lead(
-    bindings: CmuxSurfaceBindings, ref: CmuxSurfaceRef = LEAD
-) -> object:
+def bind_demo_lead(bindings: CmuxSurfaceBindings, ref: CmuxSurfaceRef = LEAD) -> object:
     return bindings.bind_lead(
         project_key="demo",
         cell_id="cell-demo",
@@ -169,31 +167,21 @@ class FakePort:
     async def close_workspace(self, workspace_uuid: str) -> None:
         self._maybe_fail("close_workspace")
         self.closed.append(workspace_uuid)
-        self.live = {
-            ref for ref in self.live if ref.workspace_uuid != workspace_uuid
-        }
+        self.live = {ref for ref in self.live if ref.workspace_uuid != workspace_uuid}
 
-    async def set_surface_resume(
-        self, ref: CmuxSurfaceRef, command: str
-    ) -> None:
+    async def set_surface_resume(self, ref: CmuxSurfaceRef, command: str) -> None:
         self._maybe_fail("set_surface_resume")
         self.resumes.append((ref, command))
 
-    async def set_status(
-        self, workspace_uuid: str, key: str, value: str
-    ) -> None:
+    async def set_status(self, workspace_uuid: str, key: str, value: str) -> None:
         self.statuses.append((workspace_uuid, key, value))
 
-    async def rename_workspace(
-        self, workspace_uuid: str, title: str
-    ) -> None:
+    async def rename_workspace(self, workspace_uuid: str, title: str) -> None:
         self._maybe_fail("rename_workspace")
         self.renames.append((workspace_uuid, title))
         self.titles[workspace_uuid] = title
 
-    async def find_workspace_uuids(
-        self, *, title_marker: str
-    ) -> frozenset[str]:
+    async def find_workspace_uuids(self, *, title_marker: str) -> frozenset[str]:
         self._maybe_fail("find_workspace_uuids")
         # Mirrors the real adapter: the marker matches only as an exact
         # whitespace-delimited token, never as a bare substring.
@@ -269,17 +257,13 @@ def test_replace_increments_generation_and_journals_lifecycle(
 ) -> None:
     first = bind_demo_lead(bindings)
 
-    successor = bindings.replace(
-        first.binding_id, FRESH, reason="surface_missing"
-    )
+    successor = bindings.replace(first.binding_id, FRESH, reason="surface_missing")
 
     assert successor.generation == 2
     assert successor.cell_id == "cell-demo"
     assert successor.session_id == SESSION
     assert bindings.get(first.binding_id).state == "stale"
-    assert bindings.active_lead("cell-demo").binding_id == (
-        successor.binding_id
-    )
+    assert bindings.active_lead("cell-demo").binding_id == (successor.binding_id)
     assert event_types(database) == [
         "cmux_binding.bound",
         "cmux_binding.replaced",
@@ -298,9 +282,10 @@ def test_closure_records_an_explicit_terminal_lifecycle_event(
     assert bindings.active_orchestrator() is None
     # Idempotent re-close changes nothing; reviving a terminal row is a
     # conflict, never a silent transfer.
-    assert bindings.mark_closed(
-        seat.binding_id, reason="operator_closed"
-    ).state == "closed"
+    assert (
+        bindings.mark_closed(seat.binding_id, reason="operator_closed").state
+        == "closed"
+    )
     with pytest.raises(CmuxBindingConflict):
         bindings.mark_lost(seat.binding_id, reason="late")
     payload_reason = database.scalar(
@@ -545,6 +530,7 @@ def seater(
     port: FakePort,
     *,
     profiles: dict[str, Path] | None = None,
+    channel_launch: object | None = None,
 ) -> object:
     from hermes_orchestrator.cmux_surfaces import CmuxLeadSeater
 
@@ -553,10 +539,9 @@ def seater(
         port=port,
         project_paths={"demo": Path("/repos/demo")},
         profile_dirs=FakeProfileDirs(
-            profiles
-            if profiles is not None
-            else {"max-a": Path("/profiles/max-a")}
+            profiles if profiles is not None else {"max-a": Path("/profiles/max-a")}
         ),
+        channel_launch=channel_launch,
     )
 
 
@@ -585,9 +570,7 @@ async def test_seater_creates_one_seat_and_reuses_it(
     # Duplicate activation reuses the exact bound identity.
     assert second.binding_id == first.binding_id
     assert len(port.created) == 1
-    assert port.created[0]["env"] == {
-        "CLAUDE_CONFIG_DIR": "/profiles/max-a"
-    }
+    assert port.created[0]["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
     assert port.resumes == [(LEAD, f"claude --resume {SESSION}")]
     # The displayed issue follows dispatch; the durable binding does not.
     assert port.statuses == [
@@ -733,9 +716,7 @@ async def test_failed_resume_and_uncertain_close_record_a_residual(
     # Compensation itself failed: the created workspace stays durably
     # owned as a residual binding for startup reconciliation.
     residuals = bindings.residual()
-    assert [held.workspace_uuid for held in residuals] == [
-        LEAD.workspace_uuid
-    ]
+    assert [held.workspace_uuid for held in residuals] == [LEAD.workspace_uuid]
     assert residuals[0].session_id == SESSION
     assert residuals[0].cell_id == "cell-demo"
     assert bindings.active_lead("cell-demo") is None
@@ -889,9 +870,7 @@ async def test_post_ping_surface_check_failure_leaves_binding_untouched(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:
     binding = bind_demo_lead(bindings)
-    port = FakePort(
-        fail={"surface_alive": CmuxUnavailable("cmux command timed out")}
-    )
+    port = FakePort(fail={"surface_alive": CmuxUnavailable("cmux command timed out")})
 
     report = await reconciler(bindings, port).reconcile()
 
@@ -1133,9 +1112,7 @@ async def test_activation_intent_is_durable_before_the_external_create(
 ) -> None:
     port = FakePort(next_refs=[LEAD])
     observed: list[tuple[tuple, str]] = []
-    port.on_create = lambda title: observed.append(
-        (bindings.pending_intents(), title)
-    )
+    port.on_create = lambda title: observed.append((bindings.pending_intents(), title))
 
     seat = await seater(bindings, port).ensure(**demo_seat())
 
@@ -1415,9 +1392,7 @@ async def test_marker_superstrings_and_substrings_never_match(
     # this intent's workspace.
     port.live.update({FRESH, THIRD})
     port.titles[FRESH.workspace_uuid] = f"demo lead x{marker}y"
-    port.titles[THIRD.workspace_uuid] = (
-        f"demo lead {marker[:-1]}-suffix]"
-    )
+    port.titles[THIRD.workspace_uuid] = f"demo lead {marker[:-1]}-suffix]"
 
     report = await reconciler(bindings, port).reconcile()
 
@@ -1440,9 +1415,7 @@ def test_intent_binds_only_once_and_never_revives(
 
     assert bound.state == "residual"
     assert bound.ref == LEAD
-    assert bindings.get_intent(intent.intent_id).binding_id == (
-        bound.binding_id
-    )
+    assert bindings.get_intent(intent.intent_id).binding_id == (bound.binding_id)
     # A resolved intent can never bind again, be aborted, or be
     # reclaimed: the durable operation identity is single-use.
     with pytest.raises(CmuxBindingConflict):
@@ -1543,3 +1516,122 @@ class TestClassicSeats:
         assert probed == ["max-a"]
         assert port.created == []
         assert bindings.active_lead("cell-demo") is None
+
+
+class FakeChannelLaunch:
+    """Records launch-material generation and retirement."""
+
+    def __init__(
+        self,
+        config: Path | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.config = config
+        self.error = error
+        self.generated: list[dict[str, object]] = []
+        self.cleaned: list[str] = []
+
+    def generate(self, **kwargs: object) -> Path:
+        self.generated.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        assert self.config is not None
+        return self.config
+
+    def cleanup(self, session_id: str) -> None:
+        self.cleaned.append(session_id)
+
+
+class TestChannelLaunch:
+    def test_the_extended_command_is_exact_and_grammar_bound(self) -> None:
+        from hermes_orchestrator.cmux_surfaces import (
+            classic_channel_command,
+        )
+
+        config = Path(f"/state/channels/{SESSION}.mcp.json")
+
+        command = classic_channel_command(SESSION, resume=False, channel_config=config)
+
+        assert command == (
+            f"claude --session-id {SESSION} --mcp-config {config} "
+            "--dangerously-load-development-channels server:hermes-control"
+        )
+
+    def test_foreign_config_paths_are_refused(self) -> None:
+        from hermes_orchestrator.cmux_surfaces import (
+            classic_channel_command,
+        )
+
+        rogue = "88888888-8888-4888-8888-888888888888"
+        for config in (
+            Path(f"/state/evil dir/{SESSION}.mcp.json"),
+            Path(f"/state/channels/{rogue}.mcp.json"),
+            Path(f"state/channels/{SESSION}.mcp.json"),
+            Path(f"/state/channels/{SESSION}.mcp.json;rm"),
+            Path("/state/channels/settings.json"),
+        ):
+            with pytest.raises(CmuxBindingConflict):
+                classic_channel_command(SESSION, resume=False, channel_config=config)
+
+    @pytest.mark.asyncio
+    async def test_a_new_seat_launches_with_its_generated_channel(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+        launch = FakeChannelLaunch(config=Path(f"/state/channels/{SESSION}.mcp.json"))
+
+        seat = await seater(bindings, port, channel_launch=launch).ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION}",
+        )
+
+        assert seat is not None
+        [created] = port.created
+        assert created["command"] == (
+            f"claude --session-id {SESSION} "
+            f"--mcp-config /state/channels/{SESSION}.mcp.json "
+            "--dangerously-load-development-channels server:hermes-control"
+        )
+        [generated] = launch.generated
+        assert generated["session_id"] == SESSION
+        assert generated["generation"] == 1
+        assert bindings.is_classic(seat.binding_id, SESSION) is True
+
+    @pytest.mark.asyncio
+    async def test_a_launcher_failure_falls_back_to_the_bare_command(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+        launch = FakeChannelLaunch(error=FileNotFoundError("no build"))
+
+        seat = await seater(bindings, port, channel_launch=launch).ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION}",
+        )
+
+        assert seat is not None
+        [created] = port.created
+        assert created["command"] == f"claude --session-id {SESSION}"
+
+    @pytest.mark.asyncio
+    async def test_rotation_retires_the_old_sessions_channel_material(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        replacement = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        port = FakePort(next_refs=[LEAD, FRESH])
+        launch = FakeChannelLaunch(config=Path(f"/state/channels/{SESSION}.mcp.json"))
+        ensure = seater(bindings, port, channel_launch=launch)
+        await ensure.ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION}",
+        )
+        launch.config = Path(f"/state/channels/{replacement}.mcp.json")
+
+        await ensure.ensure(
+            **demo_seat(session_id=replacement),
+            classic_command=f"claude --session-id {replacement}",
+        )
+
+        # The rotated-away session's config and capability were
+        # removed only after its workspace was confirmed closed.
+        assert launch.cleaned == [SESSION]

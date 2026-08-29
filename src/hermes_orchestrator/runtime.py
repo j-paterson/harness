@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from hermes_orchestrator.cells import DispatchResult, ProjectCellService
 from hermes_orchestrator.channel_hub import (
     ChannelCapabilities,
     ChannelHub,
+    ChannelLauncher,
     ChannelPacketRouter,
     hub_socket_path,
 )
@@ -437,6 +439,38 @@ def open_runtime(
                     for alias, project in settings.projects.items()
                 }
                 cmux_profile_dirs = RegistryProfileDirectory(registry)
+                # The dedicated channel is an accelerator over the
+                # same durable packets: freshly committed wakes and
+                # corrections route to a registered hermes-control
+                # channel the moment they commit, while the metadata
+                # announcements and the Stop-hook poll remain the
+                # automatic fallback.
+                channel_capabilities = ChannelCapabilities(
+                    database=database, state_dir=settings.state_dir
+                )
+                channel_hub = ChannelHub(
+                    database=database,
+                    bindings=cmux_bindings,
+                    capabilities=channel_capabilities,
+                    socket_path=hub_socket_path(settings.state_dir),
+                )
+                channel_router = ChannelPacketRouter(channel_hub)
+                channel_router.attach(lead_wakes)
+                channel_router.attach(merge_flow.outbox)
+                node_binary = shutil.which("node")
+                channel_launcher = (
+                    None
+                    if node_binary is None
+                    else ChannelLauncher(
+                        state_dir=settings.state_dir,
+                        capabilities=channel_capabilities,
+                        sidecar_entry=(
+                            settings.repo_root
+                            / "channels/hermes-control/dist/src/main.js"
+                        ),
+                        node_binary=Path(node_binary),
+                    )
+                )
                 cmux_seater = CmuxLeadSeater(
                     bindings=cmux_bindings,
                     port=cmux_port,
@@ -447,6 +481,7 @@ def open_runtime(
                     # refused before creation unless the account is a
                     # logged-in first-party Max subscription.
                     auth_probe=lambda alias: probe.check(alias).eligible,
+                    channel_launch=channel_launcher,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,
@@ -480,24 +515,6 @@ def open_runtime(
                         port=cmux_port,
                     ),
                 )
-                # The dedicated channel is an accelerator over the
-                # same durable packets: freshly committed wakes and
-                # corrections route to a registered hermes-control
-                # channel the moment they commit, while the metadata
-                # announcements and the Stop-hook poll remain the
-                # automatic fallback.
-                channel_capabilities = ChannelCapabilities(
-                    database=database, state_dir=settings.state_dir
-                )
-                channel_hub = ChannelHub(
-                    database=database,
-                    bindings=cmux_bindings,
-                    capabilities=channel_capabilities,
-                    socket_path=hub_socket_path(settings.state_dir),
-                )
-                channel_router = ChannelPacketRouter(channel_hub)
-                channel_router.attach(lead_wakes)
-                channel_router.attach(merge_flow.outbox)
 
             cells = ProjectCellService(
                 database=database,

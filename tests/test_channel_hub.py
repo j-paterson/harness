@@ -716,3 +716,109 @@ class TestDirectRouting:
 
         missing = hub.socket_path.with_name("absent.sock")
         assert await asyncio.to_thread(nudge, missing) is False
+
+
+class TestLauncher:
+    def launcher(
+        self,
+        capabilities: ChannelCapabilities,
+        state_dir: Path,
+        tmp_path: Path,
+    ) -> object:
+        from hermes_orchestrator.channel_hub import ChannelLauncher
+
+        entry = tmp_path / "sidecar" / "main.js"
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text("// sidecar", encoding="utf-8")
+        node = tmp_path / "node"
+        node.write_text("#!/bin/sh", encoding="utf-8")
+        return ChannelLauncher(
+            state_dir=state_dir,
+            capabilities=capabilities,
+            sidecar_entry=entry,
+            node_binary=node,
+        )
+
+    def test_the_config_carries_identity_but_never_the_token(
+        self,
+        capabilities: ChannelCapabilities,
+        state_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        launcher = self.launcher(capabilities, state_dir, tmp_path)
+
+        config_path = launcher.generate(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id=SESSION,
+            profile_alias="max-b",
+            generation=3,
+        )
+
+        assert config_path.name == f"{SESSION}.mcp.json"
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        raw = config_path.read_text(encoding="utf-8")
+        config = json.loads(raw)
+        server = config["mcpServers"]["hermes-control"]
+        env = server["env"]
+        assert env["HERMES_CONTROL_PROJECT"] == "demo"
+        assert env["HERMES_CONTROL_CELL"] == "cell-demo"
+        assert env["HERMES_CONTROL_SESSION"] == SESSION
+        assert env["HERMES_CONTROL_PROFILE"] == "max-b"
+        assert env["HERMES_CONTROL_GENERATION"] == "3"
+        assert env["HERMES_CONTROL_SOCKET"].endswith("channels/hub.sock")
+        capability_file = Path(env["HERMES_CONTROL_CAPABILITY_FILE"])
+        token = capability_file.read_text(encoding="ascii")
+        # The capability rides only in its 0600 file — never in the
+        # config, and the launcher issued a verifiable token.
+        assert token not in raw
+        assert capabilities.verify(SESSION, token)
+
+    def test_a_missing_sidecar_build_refuses_before_any_write(
+        self,
+        capabilities: ChannelCapabilities,
+        state_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        from hermes_orchestrator.channel_hub import ChannelLauncher
+
+        launcher = ChannelLauncher(
+            state_dir=state_dir,
+            capabilities=capabilities,
+            sidecar_entry=tmp_path / "absent" / "main.js",
+            node_binary=tmp_path / "node",
+        )
+
+        with pytest.raises(FileNotFoundError):
+            launcher.generate(
+                project_key="demo",
+                cell_id="cell-demo",
+                session_id=SESSION,
+                profile_alias="max-b",
+                generation=1,
+            )
+
+        assert not (state_dir / "channels" / f"{SESSION}.mcp.json").exists()
+
+    def test_cleanup_removes_config_and_retires_the_capability(
+        self,
+        capabilities: ChannelCapabilities,
+        state_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        launcher = self.launcher(capabilities, state_dir, tmp_path)
+        config_path = launcher.generate(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id=SESSION,
+            profile_alias="max-b",
+            generation=1,
+        )
+        capability_file = capabilities.path_for(SESSION)
+        token = capability_file.read_text(encoding="ascii")
+
+        launcher.cleanup(SESSION)
+
+        assert not config_path.exists()
+        assert not capability_file.exists()
+        assert not capabilities.verify(SESSION, token)

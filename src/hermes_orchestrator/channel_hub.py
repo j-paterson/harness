@@ -126,6 +126,90 @@ class ChannelCapabilities:
         self.path_for(session_id).unlink(missing_ok=True)
 
 
+class ChannelLauncher:
+    """Generate the session-scoped MCP config for one classic seat.
+
+    Everything lives outside the worktree under the private state
+    directory: the mode-0600 config names the exact Node entry point,
+    the hub socket, the seat's full identity, and the path of the
+    session's mode-0600 capability file — the capability itself never
+    appears in the config, argv, or logs. A missing sidecar build or
+    Node binary raises before anything is written; the caller then
+    launches the plain classic command and the channel simply stays
+    absent (packets remain pending for the fallback paths).
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dir: Path,
+        capabilities: ChannelCapabilities,
+        sidecar_entry: Path,
+        node_binary: Path,
+    ) -> None:
+        self._state_dir = state_dir
+        self._capabilities = capabilities
+        self._sidecar_entry = sidecar_entry
+        self._node_binary = node_binary
+
+    def config_path_for(self, session_id: str) -> Path:
+        canonical = str(uuid.UUID(str(session_id)))
+        return self._state_dir / "channels" / f"{canonical}.mcp.json"
+
+    def generate(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+        generation: int,
+    ) -> Path:
+        canonical = str(uuid.UUID(str(session_id)))
+        if not self._sidecar_entry.is_file():
+            raise FileNotFoundError("the hermes-control sidecar build is missing")
+        if not self._node_binary.is_file():
+            raise FileNotFoundError("the Node binary is missing")
+        capability_path = self._capabilities.issue(canonical)
+        config = {
+            "mcpServers": {
+                "hermes-control": {
+                    "type": "stdio",
+                    "command": str(self._node_binary),
+                    "args": [str(self._sidecar_entry)],
+                    "env": {
+                        "HERMES_CONTROL_SOCKET": str(hub_socket_path(self._state_dir)),
+                        "HERMES_CONTROL_PROJECT": project_key,
+                        "HERMES_CONTROL_CELL": cell_id,
+                        "HERMES_CONTROL_SESSION": canonical,
+                        "HERMES_CONTROL_PROFILE": profile_alias,
+                        "HERMES_CONTROL_GENERATION": str(generation),
+                        "HERMES_CONTROL_CAPABILITY_FILE": str(capability_path),
+                    },
+                }
+            }
+        }
+        path = self.config_path_for(canonical)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(
+                descriptor,
+                json.dumps(config, indent=2, sort_keys=True).encode("utf-8"),
+            )
+        finally:
+            os.close(descriptor)
+        return path
+
+    def cleanup(self, session_id: str) -> None:
+        """Remove the config and retire the capability — only called
+        after the seat's safe retirement."""
+
+        canonical = str(uuid.UUID(str(session_id)))
+        self.config_path_for(canonical).unlink(missing_ok=True)
+        self._capabilities.retire(canonical)
+
+
 class ChannelHub:
     """Socket server, durable event ledger, and replay engine."""
 
