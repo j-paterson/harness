@@ -186,6 +186,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     intake_poll.add_argument("--session", default=None)
 
+    intake_signal = commands.add_parser(
+        "intake-signal",
+        help=(
+            "deliberately wake one idle classic lead with the bounded "
+            "signal; your invocation asserts no draft is staged in its "
+            "prompt"
+        ),
+    )
+    intake_signal.add_argument("--cell", required=True)
+    intake_signal.add_argument("--session", required=True)
+    intake_signal.add_argument("--packet", required=True)
+    intake_signal.add_argument(
+        "--kind", choices=("correction", "work"), required=True
+    )
+    intake_signal.add_argument("--json", action="store_true")
+
     intake_ack = commands.add_parser(
         "intake-ack",
         help=(
@@ -1231,6 +1247,57 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "mode": settings.policy.mode,
             }
             _print(payload, json_output=args.json, human="Local state initialized.")
+            return 0
+
+        if args.command == "intake-signal":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            from hermes_orchestrator.lead_intake import (
+                CORRECTION_READY,
+                WORK_READY,
+                IntakeRefused,
+                ManualIntakeSignal,
+            )
+
+            signal = ManualIntakeSignal(
+                database=database,
+                bindings=runtime.cmux_bindings,
+                port=CmuxCliAdapter(
+                    settings.cmux.cli,
+                    base_env=os.environ,
+                    password_source=cmux_password_source(Keychain()),
+                ),
+            )
+            try:
+                envelope = asyncio.run(
+                    signal.send(
+                        kind=(
+                            CORRECTION_READY
+                            if args.kind == "correction"
+                            else WORK_READY
+                        ),
+                        packet_id=args.packet,
+                        cell_id=args.cell,
+                        session_id=args.session,
+                    )
+                )
+            except (IntakeRefused, CmuxError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"signal refused: {error}",
+                )
+                return 1
+            _print(
+                {"signalled": envelope},
+                json_output=args.json,
+                human=f"Signalled: {envelope}",
+            )
             return 0
 
         if args.command == "cmux-focus":

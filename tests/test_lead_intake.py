@@ -171,9 +171,8 @@ async def test_delivery_signals_the_surface_with_supplemental_metadata(
 
     assert outcome.status == "announced"
     envelope = f"HERMES_WORK_READY {WAKE_ID}"
-    # The primary delivery is one bounded signal to the exact surface;
-    # metadata is supplemental visibility.
-    assert port.signals == [(LEAD, envelope + "\n")]
+    # The automatic path announces with metadata only and never types.
+    assert port.signals == []
     assert port.statuses == [(LEAD.workspace_uuid, "intake", envelope)]
     assert port.notifications == [
         (LEAD.workspace_uuid, "Hermes intake pending", envelope)
@@ -182,12 +181,14 @@ async def test_delivery_signals_the_surface_with_supplemental_metadata(
 
 
 @pytest.mark.asyncio
-async def test_router_signals_each_packet_to_its_exact_surface(
+async def test_router_performs_zero_interactive_sends(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:
-    # The post-idle wake: for every pending packet with a valid classic
-    # binding, exactly one bounded signal reaches the exact surface —
-    # nothing outside the closed grammar can ever reach a terminal.
+    # Sol's staged-draft proofs, by construction: whatever the target
+    # prompt buffer holds — a focused draft, an unfocused draft, or
+    # nothing — a router tick performs zero interactive sends, so any
+    # draft is preserved byte-for-byte. Only metadata announcements
+    # happen, one per packet.
     seed_packets(database)
     seed_active_cell(database)
     seat(bindings)
@@ -199,40 +200,38 @@ async def test_router_signals_each_packet_to_its_exact_surface(
     announced = await router.tick()
 
     assert sorted(announced) == sorted([CORRECTION_ID, WAKE_ID])
-    assert len(port.signals) == 2
-    assert all(ref == LEAD for ref, _ in port.signals)
-    assert {text for _, text in port.signals} == {
-        f"HERMES_CORRECTION_READY {CORRECTION_ID}\n",
-        f"HERMES_WORK_READY {WAKE_ID}\n",
-    }
+    assert port.signals == []
+    assert len(port.statuses) == 2
+    assert len(port.notifications) == 2
 
 
 @pytest.mark.asyncio
-async def test_metadata_alone_is_never_treated_as_delivery(
+async def test_failed_metadata_announcement_stays_uncertain(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:
     seed_packets(database)
     seat(bindings)
-    port = RecordingPort()
-    port.signal_error = CmuxUnavailable("cmux command timed out")
 
-    outcome = await transport(database, bindings, port).deliver(
-        **DELIVER_KWARGS
-    )
+    class FailingNotify(RecordingPort):
+        async def notify(self, workspace_uuid, title, body):  # type: ignore[no-untyped-def]
+            raise CmuxUnavailable("cmux command timed out")
 
-    # The signal failed, so the delivery is an uncertain attempt even
-    # though the metadata channel was healthy; nothing is announced.
+    outcome = await transport(
+        database, bindings, FailingNotify()
+    ).deliver(**DELIVER_KWARGS)
+
     assert outcome.status == "attempt_failed"
     assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
-    assert port.signals == []
 
 
 @pytest.mark.asyncio
-async def test_post_stop_correction_race_wakes_once_across_restart(
+async def test_post_stop_race_wakes_through_polling_not_injection(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:
-    # The live acceptance failure: the lead's final scan is empty, the
-    # lead goes idle, and only then does a correction commit.
+    # The live acceptance race: the lead's final scan is empty, the
+    # lead goes idle, and only then does a correction commit. The
+    # automatic wake is announcement plus the lead's own poll — never
+    # prompt injection — and restart never duplicates effective intake.
     seed_active_cell(database)
     seat(bindings)
     port = RecordingPort()
@@ -244,25 +243,27 @@ async def test_post_stop_correction_race_wakes_once_across_restart(
     seed_packets(database)
     announced = await router.tick()
     assert sorted(announced) == sorted([CORRECTION_ID, WAKE_ID])
-    assert len(port.signals) == 2
+    assert port.signals == []
 
-    # The woken lead retrieves the durable packets by id and
-    # acknowledges the correction through the existing application
-    # APIs.
-    with database.transaction() as connection:
-        connection.execute(
-            "UPDATE lead_corrections SET state = 'acknowledged' "
-            "WHERE correction_id = ?",
-            (CORRECTION_ID,),
+    # The lead drains through the offer/ack poll at its next boundary.
+    poll = LeadIntakePoll(database=database)
+    drained = []
+    while (offer := poll.next_offer(SESSION)) is not None:
+        assert poll.acknowledge(
+            session_id=SESSION,
+            packet_id=offer.packet_id,
+            offer_token=offer.offer_token,
         )
+        drained.append(offer.packet_id)
+    assert sorted(drained) == sorted([CORRECTION_ID, WAKE_ID])
 
-    # Restart: a fresh router derives everything from durable state and
-    # signals nothing again — one effective intake per packet.
+    # Restart: a fresh router derives everything from durable state,
+    # re-announces nothing, and still types nothing.
     restarted = LeadIntakeRouter(
         database=database, transport=transport(database, bindings, port)
     )
     assert await restarted.tick() == ()
-    assert len(port.signals) == 2
+    assert port.signals == []
 
 
 @pytest.mark.asyncio
@@ -392,9 +393,13 @@ async def test_uncertain_attempt_stays_durable_and_retries_after_window(
     seed_packets(database)
     seat(bindings)
 
-    failing_port = RecordingPort()
-    failing_port.signal_error = CmuxUnavailable("cmux command timed out")
-    failing = transport(database, bindings, failing_port, now=lambda: NOW)
+    class FailingNotifyPort(RecordingPort):
+        async def notify(self, workspace_uuid, title, body):  # type: ignore[no-untyped-def]
+            raise CmuxUnavailable("cmux command timed out")
+
+    failing = transport(
+        database, bindings, FailingNotifyPort(), now=lambda: NOW
+    )
     outcome = await failing.deliver(**DELIVER_KWARGS)
     assert outcome.status == "attempt_failed"
     assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
@@ -403,9 +408,8 @@ async def test_uncertain_attempt_stays_durable_and_retries_after_window(
     held = await failing.deliver(**DELIVER_KWARGS)
     assert held.status == "pending"
 
-    # After the window the retry re-signals and completes; a repeated
-    # signal is dedup-safe on the lead side because the packet fetch by
-    # id is idempotent.
+    # After the window the retry repeats the harmless metadata and
+    # completes.
     port = RecordingPort()
     later = transport(
         database,
@@ -693,3 +697,119 @@ def test_the_lead_contract_documents_the_signal_protocol() -> None:
     assert "signal only" in contract
     assert "Terminal text is never authoritative" in contract
     assert "fallback" in contract
+
+
+class TestManualEmergencySignal:
+    """The operator-only bounded cmux signal (emergency recovery)."""
+
+    def signal(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        port: RecordingPort,
+    ):
+        from hermes_orchestrator.lead_intake import ManualIntakeSignal
+
+        return ManualIntakeSignal(
+            database=database, bindings=bindings, port=port
+        )
+
+    @pytest.mark.asyncio
+    async def test_operator_signal_sends_one_bounded_envelope(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        seed_packets(database)
+        seed_active_cell(database)
+        seat(bindings)
+        port = RecordingPort()
+
+        envelope = await self.signal(database, bindings, port).send(
+            kind=WORK_READY,
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+
+        assert envelope == f"HERMES_WORK_READY {WAKE_ID}"
+        assert port.signals == [(LEAD, envelope + "\n")]
+        # The manual signal records into the same durable machine, so
+        # the automatic announcer never re-announces it.
+        assert delivery_rows(database) == [(WORK_READY, "announced", 1)]
+        router = LeadIntakeRouter(
+            database=database,
+            transport=transport(database, bindings, port),
+        )
+        # Only the correction remains to announce; the signalled wake
+        # is deduplicated.
+        announced = await router.tick()
+        assert announced == (CORRECTION_ID,)
+        assert len(port.signals) == 1
+
+    @pytest.mark.asyncio
+    async def test_manual_signal_fails_closed_everywhere(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        seed_packets(database)
+        port = RecordingPort()
+        lane = self.signal(database, bindings, port)
+
+        with pytest.raises(IntakeRefused, match="no active seat"):
+            await lane.send(
+                kind=WORK_READY,
+                packet_id=WAKE_ID,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+        binding = seat(bindings, classic=False)
+        with pytest.raises(IntakeRefused, match="non-classic"):
+            await lane.send(
+                kind=WORK_READY,
+                packet_id=WAKE_ID,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+        bindings.record_classic(binding.binding_id, SESSION)
+        with pytest.raises(IntakeRefused, match="no durable packet"):
+            await lane.send(
+                kind=WORK_READY,
+                packet_id="c" * 32,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+        port.alive = False
+        with pytest.raises(IntakeRefused, match="no longer live"):
+            await lane.send(
+                kind=WORK_READY,
+                packet_id=WAKE_ID,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+        assert port.signals == []
+
+    @pytest.mark.asyncio
+    async def test_consumed_packets_are_never_resignalled(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        seed_packets(database)
+        seed_active_cell(database)
+        seat(bindings)
+        port = RecordingPort()
+        poll = LeadIntakePoll(database=database)
+        offer = poll.next_offer(SESSION)
+        while offer is not None and offer.packet_id != WAKE_ID:
+            offer = poll.next_offer(SESSION)
+        assert offer is not None
+        assert poll.acknowledge(
+            session_id=SESSION,
+            packet_id=WAKE_ID,
+            offer_token=offer.offer_token,
+        )
+
+        with pytest.raises(IntakeRefused, match="already consumed"):
+            await self.signal(database, bindings, port).send(
+                kind=WORK_READY,
+                packet_id=WAKE_ID,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+        assert port.signals == []

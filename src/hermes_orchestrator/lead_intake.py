@@ -6,12 +6,15 @@ channels. The only text that can ever reach a terminal is the closed
 signal grammar below; arbitrary typing remains structurally
 impossible:
 
-* The in-cmux Hermes daemon SIGNALS each pending packet to the
-  lead's exact bound surface: one bounded ``send`` operation carrying
-  only the closed envelope grammar plus Return (the primary wake for
-  an already-idle classic session, operator-approved 2026-08-29),
-  supplemented by metadata status/notification for operator
-  visibility. Metadata alone is never treated as delivery.
+* The in-cmux Hermes daemon ANNOUNCES each pending packet on the
+  lead's bound workspace with metadata only (``set-status`` and
+  ``notify``); the automatic path never writes into any interactive
+  surface, so a staged operator draft in the target pane is preserved
+  byte-for-byte by construction. The lead drains announcements through
+  the Stop-hook offer/ack poll, and an urgent idle wake is the
+  operator's deliberate ``intake-signal`` command — the human
+  invocation is the exclusive-buffer ownership assertion no metadata
+  can provide.
 * The lead itself POLLS for the next envelope through an
   application-level handshake (``hermes-orchestrator intake-poll``,
   invoked from the lead's own Claude Code hook at its own turn
@@ -225,19 +228,12 @@ class LeadIntakeTransport:
             if attempted.rowcount != 1:
                 return outcome("pending")
         try:
-            # The primary delivery is the bounded wake signal to the
-            # exact surface: one send operation carrying the envelope
-            # and Return together. Metadata alone is never success.
-            await self._port.deliver_intake_envelope(
-                binding.ref, envelope + "\n"
-            )
-        except Exception:
-            # The signal is uncertain; the durable 'attempted' row is
-            # exactly that evidence and a later pass retries.
-            return outcome("attempt_failed")
-        try:
-            # Supplemental operator visibility only; its failure never
-            # affects the delivery outcome.
+            # The automatic path never writes into any interactive
+            # surface: a staged operator draft in the target pane is
+            # preserved byte-for-byte by construction, focused or not.
+            # The announcement is metadata only; the lead drains it
+            # through the Stop-hook offer/ack poll, and an urgent idle
+            # wake is the operator's deliberate intake-signal command.
             await self._port.set_status(
                 binding.workspace_uuid, "intake", envelope
             )
@@ -247,7 +243,9 @@ class LeadIntakeTransport:
                 envelope,
             )
         except Exception:
-            pass
+            # The metadata effect is uncertain; the durable 'attempted'
+            # row is exactly that evidence and a later pass retries.
+            return outcome("attempt_failed")
         with self._database.transaction() as connection:
             announced = connection.execute(
                 "UPDATE lead_intake_deliveries "
@@ -613,3 +611,136 @@ class LeadIntakeRouter:
             return
         if result.status == "announced":
             announced.append(packet_id)
+
+
+class ManualIntakeSignal:
+    """The operator's deliberate idle-wake: one bounded signal, by hand.
+
+    No metadata can prove an interactive prompt buffer is empty, so the
+    automatic router never types. When an idle lead must be woken NOW,
+    the operator (or the Hermes controller) invokes this explicitly —
+    the human invocation is the exclusive-buffer ownership assertion:
+    the sender is looking at (or responsible for) the pane and vouches
+    that no draft is staged. Everything else stays fail-closed: the
+    packet must exist durably, the exact active classic binding must
+    match, the surface must be live, and a packet already delivered or
+    superseded is refused. The signal is recorded in the same durable
+    state machine as an announcement, so the automatic path never
+    re-announces what the operator already signalled.
+    """
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        port: CmuxControlPort,
+        ids: Callable[[], str] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._database = database
+        self._bindings = bindings
+        self._port = port
+        self._ids = ids or (lambda: uuid.uuid4().hex)
+        self._now = now or (lambda: datetime.now(UTC))
+
+    async def send(
+        self,
+        *,
+        kind: str,
+        packet_id: str,
+        cell_id: str,
+        session_id: str,
+    ) -> str:
+        source = _PACKET_SOURCES.get(kind)
+        if source is None:
+            raise IntakeRefused(
+                "only HERMES_CORRECTION_READY and HERMES_WORK_READY "
+                "signals exist"
+            )
+        if _PACKET_ID.fullmatch(packet_id) is None:
+            raise IntakeRefused(
+                "the packet id must be one 32-hex durable identity"
+            )
+        table, column = source
+        packet = self._database.execute(
+            f"SELECT 1 FROM {table} WHERE {column} = ?",
+            (packet_id,),
+        ).fetchone()
+        if packet is None:
+            raise IntakeRefused(
+                "no durable packet carries this id; nothing to signal"
+            )
+        binding = self._bindings.active_lead(cell_id)
+        if binding is None:
+            raise IntakeRefused(
+                "no active seat binding exists for this cell"
+            )
+        if binding.session_id != session_id:
+            raise IntakeRefused(
+                "the active seat belongs to a different session; "
+                "refusing the stale target"
+            )
+        if not self._bindings.is_classic(binding.binding_id, session_id):
+            raise IntakeRefused(
+                "the bound surface has no recorded classic-seat "
+                "evidence; refusing the non-classic seat"
+            )
+        row = self._database.execute(
+            "SELECT delivery_id, state FROM lead_intake_deliveries "
+            "WHERE kind = ? AND packet_id = ? AND session_id = ?",
+            (kind, packet_id, session_id),
+        ).fetchone()
+        if row is not None and str(row["state"]) in (
+            "delivered",
+            "superseded",
+        ):
+            raise IntakeRefused(
+                "this packet was already consumed; refusing to signal it"
+            )
+        try:
+            alive = await self._port.surface_alive(binding.ref)
+        except Exception as error:
+            raise IntakeRefused(
+                "cmux was unavailable during liveness validation "
+                f"({type(error).__name__}); nothing was signalled"
+            ) from None
+        if not alive:
+            raise IntakeRefused(
+                "the bound surface is no longer live; refusing the "
+                "stale binding"
+            )
+        envelope = f"{kind} {packet_id}"
+        await self._port.deliver_intake_envelope(
+            binding.ref, envelope + "\n"
+        )
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            if row is None:
+                connection.execute(
+                    "INSERT OR IGNORE INTO lead_intake_deliveries("
+                    "delivery_id, kind, packet_id, cell_id, session_id, "
+                    "surface_uuid, state, attempts, claimed_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, ?, 'announced', "
+                    "1, ?, ?)",
+                    (
+                        self._ids(),
+                        kind,
+                        packet_id,
+                        cell_id,
+                        session_id,
+                        binding.surface_uuid,
+                        stamp,
+                        stamp,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE lead_intake_deliveries "
+                    "SET state = 'announced', "
+                    "attempts = attempts + 1, updated_at = ? "
+                    "WHERE delivery_id = ? "
+                    "AND state NOT IN ('delivered', 'superseded')",
+                    (stamp, str(row["delivery_id"])),
+                )
+        return envelope
