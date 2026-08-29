@@ -29,6 +29,7 @@ LEAD = CmuxSurfaceRef(
 WAKE_ID = "a" * 32
 CORRECTION_ID = "b" * 32
 ASSIGNMENT_ID = "c" * 32
+OPERATION_ID = "d" * 32
 
 
 @pytest.fixture
@@ -308,6 +309,40 @@ def test_the_poll_offers_a_published_assignment_and_ack_settles_it(
     )
     assert str(state) == "acknowledged"
     # Settled means gone: nothing further is offered.
+    assert poll.next_offer(SESSION) is None
+
+
+def test_the_poll_offers_a_control_operation_and_ack_settles_it(
+    database: Database,
+) -> None:
+    seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, reason, state, "
+            "created_at, updated_at, acknowledged_at) VALUES "
+            "(?, 1, 'channel.replayed', 'demo', 'cell-demo', ?, "
+            "'channel.replayed:' || ?, '{\"replay_count\": 0}', NULL, "
+            "'published', ?, ?, NULL)",
+            (OPERATION_ID, SESSION, SESSION, NOW.isoformat(), NOW.isoformat()),
+        )
+    poll = LeadIntakePoll(database=database)
+
+    offer = poll.next_offer(SESSION)
+
+    assert offer is not None
+    assert offer.envelope == f"HERMES_CONTROL_READY {OPERATION_ID}"
+    assert poll.acknowledge(
+        session_id=SESSION,
+        packet_id=offer.packet_id,
+        offer_token=offer.offer_token,
+    )
+    state = database.scalar(
+        "SELECT state FROM control_operations WHERE operation_id = ?",
+        (OPERATION_ID,),
+    )
+    assert str(state) == "acknowledged"
     assert poll.next_offer(SESSION) is None
 
 

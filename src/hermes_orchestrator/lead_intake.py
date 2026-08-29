@@ -49,6 +49,7 @@ from datetime import UTC, datetime
 
 from hermes_orchestrator.cmux import CmuxControlPort
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+from hermes_orchestrator.control_operations import CONTROL_READY
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.lead_assignments import ASSIGNMENT_READY
 
@@ -59,7 +60,7 @@ WORK_READY = "HERMES_WORK_READY"
 # id. This is the only shape the poll may ever hand to a lead.
 INTAKE_ENVELOPE_PATTERN = re.compile(
     r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY"
-    r"|HERMES_ASSIGNMENT_READY) [0-9a-f]{32}$"
+    r"|HERMES_ASSIGNMENT_READY|HERMES_CONTROL_READY) [0-9a-f]{32}$"
 )
 
 _PACKET_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -69,6 +70,7 @@ _PACKET_SOURCES = {
     CORRECTION_READY: ("lead_corrections", "correction_id"),
     WORK_READY: ("lead_terminal_wakes", "wake_id"),
     ASSIGNMENT_READY: ("lead_assignments", "assignment_id"),
+    CONTROL_READY: ("control_operations", "operation_id"),
 }
 
 
@@ -127,7 +129,8 @@ class LeadIntakeTransport:
         source = _PACKET_SOURCES.get(kind)
         if source is None:
             raise IntakeRefused(
-                "only HERMES_CORRECTION_READY and HERMES_WORK_READY "
+                "only HERMES_CORRECTION_READY, HERMES_WORK_READY, "
+                "HERMES_ASSIGNMENT_READY, and HERMES_CONTROL_READY "
                 "envelopes exist"
             )
         if _PACKET_ID.fullmatch(packet_id) is None:
@@ -413,6 +416,19 @@ class LeadIntakePoll:
                     str(row["assignment_id"]),
                 )
             )
+        for row in self._database.execute(
+            "SELECT operation_id, created_at FROM control_operations "
+            "WHERE session_id = ? AND state = 'published' "
+            "ORDER BY created_at ASC, rowid ASC",
+            (session_id,),
+        ).fetchall():
+            candidates.append(
+                (
+                    str(row["created_at"]),
+                    CONTROL_READY,
+                    str(row["operation_id"]),
+                )
+            )
         for _, kind, packet_id in sorted(candidates):
             envelope = f"{kind} {packet_id}"
             if INTAKE_ENVELOPE_PATTERN.fullmatch(envelope) is None:
@@ -457,13 +473,21 @@ class LeadIntakePoll:
             )
             if cursor.rowcount != 1:
                 return False
-            # An assignment's own ledger records the lead's exact
-            # acknowledgement in the same transaction, so the fallback
-            # drain and the dedicated channel converge on one truth.
+            # An assignment's or control operation's own ledger records
+            # the lead's exact acknowledgement in the same transaction,
+            # so the fallback drain and the dedicated channel converge
+            # on one truth.
             connection.execute(
                 "UPDATE lead_assignments SET state = 'acknowledged', "
                 "acknowledged_at = ?, updated_at = ? "
                 "WHERE assignment_id = ? AND session_id = ? "
+                "AND state = 'published'",
+                (stamp, stamp, packet_id, session_id),
+            )
+            connection.execute(
+                "UPDATE control_operations SET state = 'acknowledged', "
+                "acknowledged_at = ?, updated_at = ? "
+                "WHERE operation_id = ? AND session_id = ? "
                 "AND state = 'published'",
                 (stamp, stamp, packet_id, session_id),
             )
@@ -626,6 +650,25 @@ class LeadIntakeRouter:
             await self._route(
                 ASSIGNMENT_READY,
                 str(row["assignment_id"]),
+                str(row["cell_id"]),
+                str(row["session_id"]),
+                announced,
+            )
+        operations = self._database.execute(
+            "SELECT o.operation_id, o.cell_id, o.session_id "
+            "FROM control_operations AS o "
+            "WHERE o.state = 'published' AND NOT EXISTS ("
+            "SELECT 1 FROM lead_intake_deliveries AS d "
+            "WHERE d.kind = 'HERMES_CONTROL_READY' "
+            "AND d.packet_id = o.operation_id "
+            "AND d.session_id = o.session_id "
+            "AND d.state IN ('announced', 'offered', 'delivered', 'superseded')"
+            ") ORDER BY o.created_at ASC, o.rowid ASC"
+        ).fetchall()
+        for row in operations:
+            await self._route(
+                CONTROL_READY,
+                str(row["operation_id"]),
                 str(row["cell_id"]),
                 str(row["session_id"]),
                 announced,

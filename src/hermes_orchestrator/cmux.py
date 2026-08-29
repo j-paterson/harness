@@ -44,7 +44,7 @@ _SHORT_WORKSPACE_ACK = re.compile(r"^OK\s+workspace:\d+$")
 # SQLite and never rides this channel.
 INTAKE_SIGNAL_PATTERN = re.compile(
     r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY"
-    r"|HERMES_ASSIGNMENT_READY) [0-9a-f]{32}\n$"
+    r"|HERMES_ASSIGNMENT_READY|HERMES_CONTROL_READY) [0-9a-f]{32}\n$"
 )
 
 

@@ -22,6 +22,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxSurfaceBindings,
     CmuxSurfaceRef,
 )
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 
@@ -942,6 +943,123 @@ class TestAssignmentEvents:
             (ASSIGNMENT_ID,),
         )
         assert str(state) == "superseded"
+
+
+@pytest.mark.asyncio
+class TestControlOperationEvents:
+    """INFRA-195: recovery is provable through ACKable receipts."""
+
+    async def test_a_replay_receipts_its_exact_count_including_zero(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            sidecar = await registered_sidecar(hub, capabilities)
+            await sidecar.close()
+        finally:
+            await hub.stop()
+
+        [receipt] = operations.pending_for_session(SESSION)
+        assert receipt.kind == "channel.replayed"
+        assert receipt.result == {"replay_count": 0}
+
+    async def test_a_reregistration_gets_a_durable_receipt(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            first = await registered_sidecar(hub, capabilities)
+            await first.close()
+            second = await registered_sidecar(hub, capabilities)
+            await second.close()
+        finally:
+            await hub.stop()
+
+        kinds = {
+            receipt.kind: receipt
+            for receipt in operations.pending_for_session(SESSION)
+        }
+        assert "channel.reregistered" in kinds
+        assert kinds["channel.reregistered"].result["prior_registrations"] >= 1
+
+    async def test_the_exact_channel_ack_settles_the_receipt(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            recorded = operations.record(
+                kind="daemon.restarted",
+                project_key="demo",
+                cell_id="cell-demo",
+                session_id=SESSION,
+                result={"interval_seconds": 30},
+            )
+            assert recorded is not None
+            sidecar = await registered_sidecar(hub, capabilities)
+            await hub.publish_pending()
+            # Two receipts ride the channel: the seeded restart and the
+            # replay receipt the registration itself produced.
+            events = [await sidecar.receive(), await sidecar.receive()]
+            target = next(
+                event
+                for event in events
+                if event["packet_id"] == recorded.operation_id
+            )
+            assert target["kind"] == "HERMES_CONTROL_READY"
+            await sidecar.send(
+                {
+                    "op": "ack",
+                    "event_id": target["event_id"],
+                    "packet_id": recorded.operation_id,
+                    "session_id": SESSION,
+                }
+            )
+            reply = await sidecar.receive()
+            assert reply["op"] == "ack_ok"
+            await sidecar.close()
+        finally:
+            await hub.stop()
+
+        assert operations.get(recorded.operation_id).state == "acknowledged"
 
 
 @pytest.mark.asyncio

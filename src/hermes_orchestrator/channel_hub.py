@@ -38,6 +38,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+from hermes_orchestrator.control_operations import (
+    CONTROL_READY,
+    ControlOperations,
+)
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.lead_assignments import ASSIGNMENT_READY
 from hermes_orchestrator.lead_intake import CORRECTION_READY, WORK_READY
@@ -47,7 +51,7 @@ MAX_LINE_BYTES = 4096
 
 _PACKET_ID = re.compile(r"^[0-9a-f]{32}$")
 _CAPABILITY = re.compile(r"^[0-9a-f]{64}$")
-_KINDS = (CORRECTION_READY, WORK_READY, ASSIGNMENT_READY)
+_KINDS = (CORRECTION_READY, WORK_READY, ASSIGNMENT_READY, CONTROL_READY)
 
 
 def _utc_now() -> datetime:
@@ -223,6 +227,7 @@ class ChannelHub:
         socket_path: Path,
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
+        control: ControlOperations | None = None,
     ) -> None:
         self._database = database
         self._bindings = bindings
@@ -230,6 +235,7 @@ class ChannelHub:
         self._socket_path = socket_path
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or _utc_now
+        self._control = control
         self._server: asyncio.AbstractServer | None = None
         self._connections: dict[str, asyncio.StreamWriter] = {}
         self._peers: set[asyncio.StreamWriter] = set()
@@ -342,16 +348,17 @@ class ChannelHub:
         # channel. Superseding is durable and terminal for the event
         # while the packet's own ledger remains the truth.
         stamp = self._now().isoformat()
+        repaired = 0
         with self._database.transaction() as connection:
-            connection.execute(
+            repaired += connection.execute(
                 "UPDATE channel_events SET state = 'superseded', "
                 "updated_at = ? WHERE kind = 'HERMES_WORK_READY' "
                 "AND state IN ('pending', 'published') AND packet_id IN ("
                 "SELECT wake_id FROM lead_terminal_wakes "
                 "WHERE state != 'pending')",
                 (stamp,),
-            )
-            connection.execute(
+            ).rowcount
+            repaired += connection.execute(
                 "UPDATE channel_events SET state = 'superseded', "
                 "updated_at = ? "
                 "WHERE kind = 'HERMES_CORRECTION_READY' "
@@ -359,13 +366,13 @@ class ChannelHub:
                 "SELECT correction_id FROM lead_corrections "
                 "WHERE state != 'pending')",
                 (stamp,),
-            )
+            ).rowcount
             # An assignment supersedes only when its own ledger is
             # terminal (acknowledged through any exact path, or
             # replaced) — never merely because a transport marked a
             # delivery, so the exact-ACK contract survives races that
             # consumed the wake-based bootstrap events before ACK.
-            connection.execute(
+            repaired += connection.execute(
                 "UPDATE channel_events SET state = 'superseded', "
                 "updated_at = ? "
                 "WHERE kind = 'HERMES_ASSIGNMENT_READY' "
@@ -373,7 +380,17 @@ class ChannelHub:
                 "SELECT assignment_id FROM lead_assignments "
                 "WHERE state != 'published')",
                 (stamp,),
-            )
+            ).rowcount
+            repaired += connection.execute(
+                "UPDATE channel_events SET state = 'superseded', "
+                "updated_at = ? "
+                "WHERE kind = 'HERMES_CONTROL_READY' "
+                "AND state IN ('pending', 'published') AND packet_id IN ("
+                "SELECT operation_id FROM control_operations "
+                "WHERE state != 'published')",
+                (stamp,),
+            ).rowcount
+        self._record_dedup_repair(repaired)
         corrections = self._database.execute(
             "SELECT correction_id, project_key FROM lead_corrections "
             "WHERE state = 'pending' ORDER BY created_at ASC, rowid ASC"
@@ -435,7 +452,44 @@ class ChannelHub:
             )
             if status == "published":
                 published.append(f"{ASSIGNMENT_READY} {row['assignment_id']}")
+        operations = self._database.execute(
+            "SELECT o.operation_id, o.cell_id, o.session_id "
+            "FROM control_operations AS o "
+            "WHERE o.state = 'published' AND NOT EXISTS ("
+            "SELECT 1 FROM channel_events AS e "
+            "WHERE e.kind = 'HERMES_CONTROL_READY' "
+            "AND e.packet_id = o.operation_id "
+            "AND e.session_id = o.session_id "
+            "AND e.state IN ('acked', 'superseded')"
+            ") ORDER BY o.created_at ASC, o.rowid ASC"
+        ).fetchall()
+        for row in operations:
+            status = await self.publish(
+                kind=CONTROL_READY,
+                packet_id=str(row["operation_id"]),
+                cell_id=str(row["cell_id"]),
+                session_id=str(row["session_id"]),
+            )
+            if status == "published":
+                published.append(f"{CONTROL_READY} {row['operation_id']}")
         return tuple(published)
+
+    def _record_dedup_repair(self, repaired: int) -> None:
+        """Receipt a sweep that superseded stale events, per active lead.
+
+        A zero-change sweep is routine maintenance and receipts
+        nothing; the explicit zero-valued absence receipt belongs to
+        operations a lead must be able to distinguish, such as a
+        replay that delivered no events.
+        """
+
+        if self._control is None or repaired <= 0:
+            return
+        with suppress(Exception):
+            self._control.record_for_active_cells(
+                kind="intake.dedup_repaired",
+                result={"superseded_events": repaired},
+            )
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -539,12 +593,18 @@ class ChannelHub:
 
     def _record_registration(self, message: dict[str, object]) -> None:
         stamp = self._now().isoformat()
+        session_id = str(message["session_id"])
         with self._database.transaction() as connection:
+            prior = connection.execute(
+                "SELECT COUNT(*) FROM channel_registrations "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
             connection.execute(
                 "UPDATE channel_registrations SET state = 'superseded', "
                 "closed_at = ?, close_reason = 'superseded' "
                 "WHERE session_id = ? AND state = 'active'",
-                (stamp, str(message["session_id"])),
+                (stamp, session_id),
             )
             connection.execute(
                 "INSERT INTO channel_registrations("
@@ -561,6 +621,21 @@ class ChannelHub:
                     stamp,
                 ),
             )
+        # A registration that follows any earlier one is a recovery:
+        # the lead gets a durable, ACKable receipt instead of the
+        # operator having to notice a reconnect in a terminal.
+        if self._control is not None and int(prior[0]) > 0:
+            with suppress(Exception):
+                self._control.record(
+                    kind="channel.reregistered",
+                    project_key=str(message["project"]),
+                    cell_id=str(message["cell_id"]),
+                    session_id=session_id,
+                    result={
+                        "generation": int(message["generation"]),  # type: ignore[arg-type]
+                        "prior_registrations": int(prior[0]),
+                    },
+                )
 
     def _close_registration(self, session_id: str, *, reason: str) -> None:
         with self._database.transaction() as connection:
@@ -600,13 +675,21 @@ class ChannelHub:
                 (stamp, stamp, event_id, packet_id, session_id),
             )
             if cursor.rowcount == 1:
-                # An assignment's exact channel ACK is the lead's
-                # acknowledgement of the packet itself; both records
-                # move in one transaction.
+                # An assignment's or control operation's exact channel
+                # ACK is the lead's acknowledgement of the packet
+                # itself; both records move in one transaction.
                 connection.execute(
                     "UPDATE lead_assignments SET state = 'acknowledged', "
                     "acknowledged_at = ?, updated_at = ? "
                     "WHERE assignment_id = ? AND session_id = ? "
+                    "AND state = 'published'",
+                    (stamp, stamp, packet_id, session_id),
+                )
+                connection.execute(
+                    "UPDATE control_operations "
+                    "SET state = 'acknowledged', "
+                    "acknowledged_at = ?, updated_at = ? "
+                    "WHERE operation_id = ? AND session_id = ? "
                     "AND state = 'published'",
                     (stamp, stamp, packet_id, session_id),
                 )
@@ -631,6 +714,33 @@ class ChannelHub:
                 kind=str(row["kind"]),
                 packet_id=str(row["packet_id"]),
                 session_id=session_id,
+            )
+        self._record_replay(session_id, len(rows))
+
+    def _record_replay(self, session_id: str, replay_count: int) -> None:
+        """Receipt every replay's exact count — zero is a recorded fact.
+
+        The lead can then prove "nothing was waiting" durably instead
+        of inferring it from silence after a reconnect.
+        """
+
+        if self._control is None:
+            return
+        registration = self._database.execute(
+            "SELECT project_key, cell_id FROM channel_registrations "
+            "WHERE session_id = ? AND state = 'active' "
+            "ORDER BY connected_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if registration is None:
+            return
+        with suppress(Exception):
+            self._control.record(
+                kind="channel.replayed",
+                project_key=str(registration["project_key"]),
+                cell_id=str(registration["cell_id"]),
+                session_id=session_id,
+                result={"replay_count": replay_count},
             )
 
     async def _send_event(

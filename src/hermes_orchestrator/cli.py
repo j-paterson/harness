@@ -31,6 +31,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxSurfaceReconciler,
 )
 from hermes_orchestrator.config import Settings, load_settings
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
@@ -427,6 +428,7 @@ async def _run_daemon(
     cmux_hibernation: CmuxHibernationDriver | None = None,
     lead_intake: LeadIntakeRouter | None = None,
     channel_hub: ChannelHub | None = None,
+    control_operations: ControlOperations | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
@@ -463,6 +465,14 @@ async def _run_daemon(
         # The hub socket exists before any tick so a sidecar spawned
         # by an already-running classic seat can register immediately.
         await channel_hub.start()
+    if control_operations is not None:
+        # Every active lead gets a durable, ACKable restart receipt:
+        # daemon recovery is provable without watching any terminal.
+        with suppress(Exception):
+            control_operations.record_for_active_cells(
+                kind="daemon.restarted",
+                result={"interval_seconds": interval, "once": once},
+            )
     if cmux_reconciler is not None:
         # Visible cmux seats are restored from durable identity before
         # any work is accepted; a denied or unreachable socket leaves the
@@ -1594,6 +1604,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     cmux_hibernation=runtime.cmux_hibernation,
                     lead_intake=runtime.lead_intake,
                     channel_hub=runtime.channel_hub,
+                    control_operations=runtime.control_operations,
                 )
             )
             payload = {

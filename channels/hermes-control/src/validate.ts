@@ -9,6 +9,7 @@ export const EVENT_KINDS = new Set<string>([
   "HERMES_CORRECTION_READY",
   "HERMES_WORK_READY",
   "HERMES_ASSIGNMENT_READY",
+  "HERMES_CONTROL_READY",
 ]);
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
