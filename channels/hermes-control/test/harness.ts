@@ -97,6 +97,11 @@ export class FakeHub {
   }
 
   async nextConnection(timeoutMs = 5000): Promise<FakeHubConnection> {
+    if (this.connections.length > this.consumedCount) {
+      const conn = this.connections[this.consumedCount];
+      this.consumedCount++;
+      return conn;
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error("timed out waiting for a hub connection"));

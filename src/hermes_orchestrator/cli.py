@@ -17,6 +17,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
+from hermes_orchestrator.channel_hub import (
+    ChannelHub,
+    hub_socket_path,
+)
+from hermes_orchestrator.channel_hub import (
+    nudge as nudge_channel,
+)
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
@@ -371,6 +378,7 @@ async def _run_daemon(
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
     lead_intake: LeadIntakeRouter | None = None,
+    channel_hub: ChannelHub | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
@@ -380,6 +388,11 @@ async def _run_daemon(
             # durable pending correction or wake whose envelope has
             # not been delivered to its classic seat.
             await lead_intake.tick()
+        if channel_hub is not None:
+            # Low-frequency repair only: freshly committed packets
+            # route directly through the in-process router and the
+            # nudge op; this sweep recovers whatever those missed.
+            await channel_hub.publish_pending()
 
     supervisor = Supervisor(
         service,
@@ -390,10 +403,18 @@ async def _run_daemon(
         wake_delivery=wake_delivery,
         maintenance=(
             None
-            if cmux_hibernation is None and lead_intake is None
+            if (
+                cmux_hibernation is None
+                and lead_intake is None
+                and channel_hub is None
+            )
             else _maintenance
         ),
     )
+    if channel_hub is not None:
+        # The hub socket exists before any tick so a sidecar spawned
+        # by an already-running classic seat can register immediately.
+        await channel_hub.start()
     if cmux_reconciler is not None:
         # Visible cmux seats are restored from durable identity before
         # any work is accepted; a denied or unreachable socket leaves the
@@ -413,7 +434,11 @@ async def _run_daemon(
         # packet before the first supervised tick.
         await lead_intake.tick()
     if once:
-        await supervisor.run_once()
+        try:
+            await supervisor.run_once()
+        finally:
+            if channel_hub is not None:
+                await channel_hub.stop()
         return supervisor
     listener: asyncio.Task[None] | None = None
     if merge_flow is not None and await _start_merge_flow(merge_flow, projects):
@@ -443,6 +468,8 @@ async def _run_daemon(
                 await listener
         if merge_flow is not None:
             await merge_flow.rpc.close()
+        if channel_hub is not None:
+            await channel_hub.stop()
     return supervisor
 
 
@@ -1448,6 +1475,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ).execute(request)
             print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             rejected = {"invalid_command", "intent_not_allowed"}
+            if settings.cmux is not None and result.code not in rejected:
+                # Best-effort: any command that just committed a
+                # durable packet reaches a registered channel now
+                # instead of at the daemon's next repair tick.
+                nudge_channel(hub_socket_path(settings.state_dir))
             return 0 if result.code not in rejected else 1
 
         if args.command == "daemon":
@@ -1504,6 +1536,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     cmux_reconciler=runtime.cmux_reconciler,
                     cmux_hibernation=runtime.cmux_hibernation,
                     lead_intake=runtime.lead_intake,
+                    channel_hub=runtime.channel_hub,
                 )
             )
             payload = {
@@ -1614,6 +1647,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 json_output=args.json,
                 human=f"Merger turn for {args.project}: {payload['kind']}.",
             )
+            if settings.cmux is not None:
+                # A settled Merger turn may have journalled correction
+                # packets; route them to a registered channel now.
+                nudge_channel(hub_socket_path(settings.state_dir))
             return 0
 
         if args.command == "status":

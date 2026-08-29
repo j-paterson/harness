@@ -4,12 +4,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startFixture, initializeSidecar } from "./setup.js";
-import { baseEnv, makeCapabilityFile, spawnSidecar } from "./harness.js";
+import { baseEnv, makeCapabilityFile, spawnSidecar, sleep } from "./harness.js";
 
 async function registerAndGetConn(fx: Awaited<ReturnType<typeof startFixture>>) {
   const conn = await fx.hub.nextConnection();
   await conn.waitForLine((m) => m.op === "register");
   conn.send({ op: "registered", proto: 1 });
+  // The sidecar flips to "registered" asynchronously as it reads the socket,
+  // on an event source independent from the stdin/MCP side that is about to
+  // drive tools/call. Give it a moment so the ensuing ack isn't raced against
+  // that internal state transition (local Unix-socket round trips are well
+  // under a millisecond in practice).
+  await sleep(100);
   return conn;
 }
 

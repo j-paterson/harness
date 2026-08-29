@@ -602,3 +602,117 @@ class TestDelivery:
                 session_id=SESSION,
             )
         assert database.scalar("SELECT COUNT(*) FROM channel_events") == 0
+
+
+@pytest.mark.asyncio
+class TestDirectRouting:
+    async def test_a_committed_wake_reaches_the_channel_without_a_tick(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        from uuid import UUID
+
+        from hermes_orchestrator.channel_hub import ChannelPacketRouter
+        from hermes_orchestrator.lead_wakes import (
+            LeadTerminalWakes,
+            TerminalWakeInput,
+        )
+
+        seat(bindings)
+        wakes = LeadTerminalWakes(database=database, events=EventStore(database))
+        ChannelPacketRouter(hub).attach(wakes)
+        sidecar = await registered_sidecar(hub, capabilities)
+
+        wakes.commit(
+            TerminalWakeInput(
+                project_key="demo",
+                issue_id="ENG-9",
+                cell_id="cell-demo",
+                session_id=UUID(SESSION),
+                profile_alias="max-b",
+                turn_key="turn-9",
+                kind="completed",
+                reason="turn completed",
+            )
+        )
+        event = await sidecar.receive()
+
+        assert event["op"] == "event"
+        assert event["kind"] == "HERMES_WORK_READY"
+        assert event["session_id"] == SESSION
+        await sidecar.close()
+
+    async def test_a_journalled_correction_reaches_the_channel_directly(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        from hermes_orchestrator.channel_hub import ChannelPacketRouter
+        from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+        from hermes_orchestrator.verdicts import CorrectionPacket
+
+        seat(bindings)
+        seed_active_cell(database)
+        outbox = LeadCorrectionOutbox(
+            database=database,
+            events=EventStore(database),
+            project_for_issue=lambda issue_id: "demo",
+        )
+        ChannelPacketRouter(hub).attach(outbox)
+        sidecar = await registered_sidecar(hub, capabilities)
+
+        outbox.deliver(
+            "ENG-9",
+            (
+                CorrectionPacket(
+                    severity="Critical",
+                    repository="owner/demo",
+                    branch="feature/x",
+                    pr_number=7,
+                    reviewed_sha="abc",
+                    evidence="the defect",
+                    acceptance_criterion="it works",
+                    required_correction="fix it",
+                    required_tests=("pytest",),
+                ),
+            ),
+        )
+        event = await sidecar.receive()
+
+        assert event["kind"] == "HERMES_CORRECTION_READY"
+        await sidecar.close()
+
+    async def test_the_nudge_client_triggers_routing_or_reports_failure(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        from hermes_orchestrator.channel_hub import nudge
+
+        seat(bindings)
+        seed_active_cell(database)
+        sidecar = await registered_sidecar(hub, capabilities)
+        seed_packets(database)
+
+        nudged = await asyncio.to_thread(nudge, hub.socket_path)
+
+        assert nudged is True
+        kinds = {
+            (await sidecar.receive())["kind"],
+            (await sidecar.receive())["kind"],
+        }
+        assert kinds == {
+            "HERMES_CORRECTION_READY",
+            "HERMES_WORK_READY",
+        }
+        await sidecar.close()
+
+        missing = hub.socket_path.with_name("absent.sock")
+        assert await asyncio.to_thread(nudge, missing) is False

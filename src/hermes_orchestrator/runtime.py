@@ -11,6 +11,12 @@ from typing import Any, Protocol, TextIO
 
 from hermes_orchestrator.admission import AdmissionController, PressureClassifier
 from hermes_orchestrator.cells import DispatchResult, ProjectCellService
+from hermes_orchestrator.channel_hub import (
+    ChannelCapabilities,
+    ChannelHub,
+    ChannelPacketRouter,
+    hub_socket_path,
+)
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.circleci import (
     CircleCiClient,
@@ -164,6 +170,8 @@ class Runtime:
     cmux_reconciler: CmuxSurfaceReconciler | None = None
     cmux_hibernation: CmuxHibernationDriver | None = None
     lead_intake: LeadIntakeRouter | None = None
+    channel_hub: ChannelHub | None = None
+    channel_capabilities: ChannelCapabilities | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -367,6 +375,8 @@ def open_runtime(
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
         lead_intake: LeadIntakeRouter | None = None
+        channel_hub: ChannelHub | None = None
+        channel_capabilities: ChannelCapabilities | None = None
 
         if enable_live:
             assert reader is not None
@@ -470,6 +480,24 @@ def open_runtime(
                         port=cmux_port,
                     ),
                 )
+                # The dedicated channel is an accelerator over the
+                # same durable packets: freshly committed wakes and
+                # corrections route to a registered hermes-control
+                # channel the moment they commit, while the metadata
+                # announcements and the Stop-hook poll remain the
+                # automatic fallback.
+                channel_capabilities = ChannelCapabilities(
+                    database=database, state_dir=settings.state_dir
+                )
+                channel_hub = ChannelHub(
+                    database=database,
+                    bindings=cmux_bindings,
+                    capabilities=channel_capabilities,
+                    socket_path=hub_socket_path(settings.state_dir),
+                )
+                channel_router = ChannelPacketRouter(channel_hub)
+                channel_router.attach(lead_wakes)
+                channel_router.attach(merge_flow.outbox)
 
             cells = ProjectCellService(
                 database=database,
@@ -548,6 +576,8 @@ def open_runtime(
             cmux_reconciler=cmux_reconciler,
             cmux_hibernation=cmux_hibernation,
             lead_intake=lead_intake,
+            channel_hub=channel_hub,
+            channel_capabilities=channel_capabilities,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

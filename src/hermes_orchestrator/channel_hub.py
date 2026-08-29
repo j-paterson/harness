@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -515,3 +516,63 @@ class ChannelHub:
     ) -> None:
         writer.write((json.dumps(message) + "\n").encode("utf-8"))
         await writer.drain()
+
+
+def hub_socket_path(state_dir: Path) -> Path:
+    """The one canonical hub socket location under the state dir."""
+
+    return state_dir / "channels" / "hub.sock"
+
+
+def nudge(socket_path: Path, *, timeout: float = 1.0) -> bool:
+    """Best-effort trigger: tell a running hub to route pending packets.
+
+    Called by whichever process just committed a durable packet. The
+    packet is already durable, so every failure here — no daemon, no
+    socket, timeout — is absorbed and the repair tick recovers; a
+    nudge carries no data and can never lose or duplicate work.
+    """
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(socket_path))
+            client.sendall(b'{"op": "nudge"}\n')
+            reply = client.recv(MAX_LINE_BYTES)
+        message = json.loads(reply.split(b"\n", 1)[0])
+        return isinstance(message, dict) and message.get("op") == "nudged"
+    except (OSError, ValueError):
+        return False
+
+
+class ChannelPacketRouter:
+    """Route packets to the channel the moment they commit in-process.
+
+    Subscribes to the wake and correction outboxes inside the daemon:
+    each post-commit signal schedules one ``publish_pending`` pass,
+    which derives everything from durable state and deduplicates — so
+    a committed packet reaches a registered channel immediately
+    instead of waiting for the low-frequency repair tick. Outside a
+    running event loop the signal is skipped; the durable row and the
+    tick remain the truth.
+    """
+
+    def __init__(self, hub: ChannelHub) -> None:
+        self._hub = hub
+        self._tasks: set[asyncio.Task[object]] = set()
+
+    def attach(self, outbox: object) -> None:
+        outbox.subscribe(self._on_commit)  # type: ignore[attr-defined]
+
+    def _on_commit(self, _packet: object) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._route())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _route(self) -> None:
+        with suppress(Exception):
+            await self._hub.publish_pending()

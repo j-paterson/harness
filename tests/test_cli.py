@@ -203,6 +203,49 @@ async def test_continuous_daemon_stops_cleanly_when_signaled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daemon_opens_and_closes_the_channel_hub(
+    tmp_path: Path,
+) -> None:
+    import tempfile
+
+    from hermes_orchestrator.channel_hub import (
+        ChannelCapabilities,
+        ChannelHub,
+    )
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(tmp_path / "state.db")
+    try:
+        with tempfile.TemporaryDirectory() as short:
+            socket_path = Path(short) / "hub.sock"
+            hub = ChannelHub(
+                database=database,
+                bindings=CmuxSurfaceBindings(
+                    database=database, events=EventStore(database)
+                ),
+                capabilities=ChannelCapabilities(
+                    database=database, state_dir=tmp_path
+                ),
+                socket_path=socket_path,
+            )
+            service = FakeService()
+
+            await _run_daemon(
+                service, once=True, interval=60, channel_hub=hub
+            )
+
+            # The hub served for the daemon's lifetime and its socket
+            # was removed at shutdown — nothing dangles for a stale
+            # sidecar to connect to.
+            assert service.ticks == 1
+            assert not socket_path.exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
 async def test_daemon_starts_when_cmux_fails_after_ping(
     tmp_path: Path,
 ) -> None:

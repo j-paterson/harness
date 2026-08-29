@@ -71,6 +71,12 @@ class LeadCorrectionOutbox:
         self._project_for_issue = project_for_issue
         self._now = now or (lambda: datetime.now(UTC))
         self._ids = ids or (lambda: uuid.uuid4().hex)
+        self._listeners: list[Callable[[LeadCorrection], None]] = []
+
+    def subscribe(self, listener: Callable[[LeadCorrection], None]) -> None:
+        """Signal each newly journalled correction after its commit."""
+
+        self._listeners.append(listener)
 
     def deliver(
         self,
@@ -141,7 +147,15 @@ class LeadCorrectionOutbox:
                     },
                 ),
             )
-        return self.get(correction_id)
+        correction = self.get(correction_id)
+        for listener in self._listeners:
+            try:
+                listener(correction)
+            except Exception:
+                # The durable row is the truth; a failed in-process
+                # signal leaves it pending for the repair sweep.
+                continue
+        return correction
 
     def pending(self, project_key: str | None = None) -> tuple[LeadCorrection, ...]:
         if project_key is None:
