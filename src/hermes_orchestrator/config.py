@@ -105,6 +105,10 @@ class CmuxRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cli: list[NonEmptyId] = Field(min_length=1)
+    # Classic seats run each lead as the native interactive Claude TUI
+    # inside its own cmux surface; the daemon then launches no
+    # -p/stream-JSON shadow process for it.
+    classic_leads: bool = True
 
 
 class ResourcePolicy(BaseModel):
@@ -232,6 +236,17 @@ def load_settings(repo_root: Path, state_dir: Path | None = None) -> Settings:
                         strict=False
                     )
                 }
+            )
+        if (validated.repo_path / ".git").is_file():
+            # A linked git worktree keeps `.git` as a file pointing at
+            # the primary repository; that is exactly the checkout that
+            # issue cleanup later removes. Every durable consumer of
+            # this path — lead cwd, cmux workspace cwd, process-lease
+            # cwd, resource sampling — must stay anchored to the stable
+            # primary checkout, so a worktree path fails closed here.
+            raise ValueError(
+                f"project {alias!r} repo_path resolves to a linked git "
+                "worktree; configure the stable primary checkout"
             )
         projects[alias] = validated
     if linear is not None:

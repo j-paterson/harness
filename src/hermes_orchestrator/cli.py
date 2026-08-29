@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -16,6 +17,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
+from hermes_orchestrator.channel_hub import (
+    ChannelHub,
+    hub_socket_path,
+)
+from hermes_orchestrator.channel_hub import (
+    nudge as nudge_channel,
+)
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
@@ -30,6 +38,7 @@ from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
+from hermes_orchestrator.lead_intake import LeadIntakeRouter
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.lead_wakes import (
     CommandWakeTransport,
@@ -42,6 +51,10 @@ from hermes_orchestrator.migration_gate import (
     jo_loans_commands,
     load_verdict,
     render_handoff,
+)
+from hermes_orchestrator.operator_decisions import (
+    DecisionRefused,
+    OperatorDecisions,
 )
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
@@ -174,6 +187,54 @@ def _parser() -> argparse.ArgumentParser:
         help="execute one strict Hermes JSON command",
     )
     hermes_command.add_argument("--json", dest="request_json", required=True)
+
+    intake_poll = commands.add_parser(
+        "intake-poll",
+        help=(
+            "lead-owned intake handshake: lease the next pending "
+            "envelope as an offer through the application layer "
+            "(Claude Code hook)"
+        ),
+    )
+    intake_poll.add_argument("--session", default=None)
+
+    intake_signal = commands.add_parser(
+        "intake-signal",
+        help=(
+            "deliberately wake one idle classic lead with the bounded "
+            "signal; your invocation asserts no draft is staged in its "
+            "prompt"
+        ),
+    )
+    intake_signal.add_argument("--cell", required=True)
+    intake_signal.add_argument("--session", required=True)
+    intake_signal.add_argument("--packet", required=True)
+    intake_signal.add_argument(
+        "--kind", choices=("correction", "work"), required=True
+    )
+    intake_signal.add_argument("--json", action="store_true")
+
+    intake_ack = commands.add_parser(
+        "intake-ack",
+        help=(
+            "acknowledge one exact intake offer after retrieving its "
+            "packet; only this records the delivery"
+        ),
+    )
+    intake_ack.add_argument("--session", required=True)
+    intake_ack.add_argument("--packet", required=True)
+    intake_ack.add_argument("--offer", required=True)
+
+    decision_import = commands.add_parser(
+        "decision-import",
+        help=(
+            "import one recorded operator-decision receipt as durable "
+            "state; refuses unless the file matches the given SHA-256"
+        ),
+    )
+    decision_import.add_argument("--receipt", type=Path, required=True)
+    decision_import.add_argument("--sha256", required=True)
+    decision_import.add_argument("--json", action="store_true")
 
     def _deploy_spec_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--binary", type=PurePosixPath, required=True)
@@ -316,7 +377,23 @@ async def _run_daemon(
     wake_reconciler: LeadWakeReconciler | None = None,
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
+    lead_intake: LeadIntakeRouter | None = None,
+    channel_hub: ChannelHub | None = None,
 ) -> Supervisor:
+    async def _maintenance() -> None:
+        if cmux_hibernation is not None:
+            await cmux_hibernation.tick()
+        if lead_intake is not None:
+            # Restart-safe by derivation: every tick re-routes any
+            # durable pending correction or wake whose envelope has
+            # not been delivered to its classic seat.
+            await lead_intake.tick()
+        if channel_hub is not None:
+            # Low-frequency repair only: freshly committed packets
+            # route directly through the in-process router and the
+            # nudge op; this sweep recovers whatever those missed.
+            await channel_hub.publish_pending()
+
     supervisor = Supervisor(
         service,
         dispatch=dispatch,
@@ -325,9 +402,19 @@ async def _run_daemon(
         interval_seconds=interval,
         wake_delivery=wake_delivery,
         maintenance=(
-            None if cmux_hibernation is None else cmux_hibernation.tick
+            None
+            if (
+                cmux_hibernation is None
+                and lead_intake is None
+                and channel_hub is None
+            )
+            else _maintenance
         ),
     )
+    if channel_hub is not None:
+        # The hub socket exists before any tick so a sidecar spawned
+        # by an already-running classic seat can register immediately.
+        await channel_hub.start()
     if cmux_reconciler is not None:
         # Visible cmux seats are restored from durable identity before
         # any work is accepted; a denied or unreachable socket leaves the
@@ -342,8 +429,16 @@ async def _run_daemon(
         # Idempotent startup replay: wakes committed before a crash or
         # restart re-arm the event-driven loop exactly once.
         wake_delivery.replay_startup()
+    if lead_intake is not None:
+        # Deliver any envelope a crash separated from its published
+        # packet before the first supervised tick.
+        await lead_intake.tick()
     if once:
-        await supervisor.run_once()
+        try:
+            await supervisor.run_once()
+        finally:
+            if channel_hub is not None:
+                await channel_hub.stop()
         return supervisor
     listener: asyncio.Task[None] | None = None
     if merge_flow is not None and await _start_merge_flow(merge_flow, projects):
@@ -373,6 +468,8 @@ async def _run_daemon(
                 await listener
         if merge_flow is not None:
             await merge_flow.rpc.close()
+        if channel_hub is not None:
+            await channel_hub.stop()
     return supervisor
 
 
@@ -413,6 +510,9 @@ async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
             verification=tuple(verification),
             blockers=tuple(args.blocker),
             status=args.status,
+            # The lead runs candidate-ready from its own checkout; the
+            # emitter validates it belongs to the project repository.
+            lead_checkout=Path.cwd(),
         )
         thread_status: str | None = None
         if emitted.delivery.thread_id is not None:
@@ -576,6 +676,23 @@ def _hermes_handlers(
             raise ValueError("lead terminal wakes are unavailable")
         return runtime.lead_wakes.mark_delivered(command.wake_id).as_dict()
 
+    def apply_operator_decision(command: Any) -> dict[str, Any]:
+        decisions = OperatorDecisions(runtime.database)
+        try:
+            decision = decisions.apply(
+                decision_id=command.decision_id,
+                status=command.status,
+                source_message=command.source_message,
+            )
+        except DecisionRefused as error:
+            raise ValueError(str(error)) from error
+        return {
+            "decision_id": decision.decision_id,
+            "issue_id": decision.issue_id,
+            "status": decision.status,
+            "applied_at": decision.applied_at,
+        }
+
     def qa_reject(command: Any) -> dict[str, Any]:
         flow = _open_merge_flow(settings, runtime)
         outcome = asyncio.run(
@@ -671,6 +788,7 @@ def _hermes_handlers(
         "ack_correction": ack_correction,
         "pending_wakes": pending_wakes,
         "ack_wake": ack_wake,
+        "apply_operator_decision": apply_operator_decision,
         "qa_reject": qa_reject,
         "report_stall": report_stall,
         "approve_playbook": approve_playbook,
@@ -907,6 +1025,86 @@ def _deploy_status(
     return _run_deploy_plan(args, steps, runner)
 
 
+def _intake_state_dir(args: argparse.Namespace) -> Path:
+    return (
+        args.state_dir
+        if args.state_dir is not None
+        else Path.home() / ".local" / "share" / "hermes-orchestrator"
+    )
+
+
+def _intake_poll(args: argparse.Namespace) -> int:
+    """Lease the calling lead's next pending envelope, if any.
+
+    Invoked from the lead's own Claude Code hook: the session id comes
+    from the hook payload on stdin (or --session), and the offer —
+    envelope plus its opaque token — is returned as hook JSON through
+    the application layer, never any terminal buffer. Nothing is
+    recorded delivered here: the lead must acknowledge the exact offer
+    with intake-ack after retrieving the packet, and an unacknowledged
+    offer is re-offered once its lease expires. No offer means empty
+    output and exit 0, so the hook is a no-op.
+    """
+
+    from hermes_orchestrator.lead_intake import LeadIntakePoll
+
+    session = args.session
+    if session is None:
+        with suppress(Exception):
+            payload = json.loads(sys.stdin.read() or "{}")
+            session = payload.get("session_id")
+    if not session:
+        return 0
+    database = Database.open(_intake_state_dir(args) / "state.db")
+    try:
+        offer = LeadIntakePoll(database=database).next_offer(str(session))
+    finally:
+        database.close()
+    if offer is None:
+        return 0
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": (
+                    f"{offer.envelope} — Hermes intake offer "
+                    f"{offer.offer_token}: retrieve this packet from "
+                    "durable state by its id, then acknowledge with "
+                    "`hermes-orchestrator intake-ack --session "
+                    f"{session} --packet {offer.packet_id} --offer "
+                    f"{offer.offer_token}` and act on it now."
+                ),
+            }
+        )
+    )
+    return 0
+
+
+def _intake_ack(args: argparse.Namespace) -> int:
+    """Record the lead's consumption of one exact offer."""
+
+    from hermes_orchestrator.lead_intake import LeadIntakePoll
+
+    database = Database.open(_intake_state_dir(args) / "state.db")
+    try:
+        accepted = LeadIntakePoll(database=database).acknowledge(
+            session_id=args.session,
+            packet_id=args.packet,
+            offer_token=args.offer,
+        )
+    finally:
+        database.close()
+    if not accepted:
+        print(
+            "the offer is unknown, superseded, or already delivered; "
+            "nothing changed",
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps({"acknowledged": args.packet}))
+    return 0
+
+
 def _migration_env(
     args: argparse.Namespace,
     runner: migration_env_module.EnvCommandRunner | None = None,
@@ -1090,6 +1288,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _deploy_status(args)
     if args.command == "migration-env":
         return _migration_env(args)
+    if args.command == "intake-poll":
+        return _intake_poll(args)
+    if args.command == "intake-ack":
+        return _intake_ack(args)
     settings = load_settings(args.repo_root, args.state_dir)
     if args.command == "serve-console":
         return _serve_console(args, settings)
@@ -1106,6 +1308,106 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "mode": settings.policy.mode,
             }
             _print(payload, json_output=args.json, human="Local state initialized.")
+            return 0
+
+        if args.command == "intake-signal":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            from hermes_orchestrator.lead_intake import (
+                CORRECTION_READY,
+                WORK_READY,
+                IntakeRefused,
+                ManualIntakeSignal,
+            )
+
+            signal = ManualIntakeSignal(
+                database=database,
+                bindings=runtime.cmux_bindings,
+                port=CmuxCliAdapter(
+                    settings.cmux.cli,
+                    base_env=os.environ,
+                    password_source=cmux_password_source(Keychain()),
+                ),
+            )
+            try:
+                envelope = asyncio.run(
+                    signal.send(
+                        kind=(
+                            CORRECTION_READY
+                            if args.kind == "correction"
+                            else WORK_READY
+                        ),
+                        packet_id=args.packet,
+                        cell_id=args.cell,
+                        session_id=args.session,
+                    )
+                )
+            except (IntakeRefused, CmuxError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"signal refused: {error}",
+                )
+                return 1
+            _print(
+                {"signalled": envelope},
+                json_output=args.json,
+                human=f"Signalled: {envelope}",
+            )
+            return 0
+
+        if args.command == "decision-import":
+            try:
+                raw = args.receipt.read_bytes()
+            except OSError as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"receipt unreadable: {error}",
+                )
+                return 1
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != args.sha256.lower():
+                _print(
+                    {"error": "sha256 mismatch", "computed": digest},
+                    json_output=args.json,
+                    human=(
+                        "refused: receipt SHA-256 does not match the "
+                        "operator-provided digest"
+                    ),
+                )
+                return 1
+            try:
+                receipt = json.loads(raw)
+                decision = OperatorDecisions(database).import_receipt(
+                    receipt, receipt_sha256=digest
+                )
+            except (json.JSONDecodeError, DecisionRefused) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"import refused: {error}",
+                )
+                return 1
+            _print(
+                {
+                    "decision_id": decision.decision_id,
+                    "issue_id": decision.issue_id,
+                    "choice": decision.choice,
+                    "status": decision.status,
+                    "receipt_sha256": decision.receipt_sha256,
+                },
+                json_output=args.json,
+                human=(
+                    f"Decision {decision.decision_id} for "
+                    f"{decision.issue_id}: {decision.status}."
+                ),
+            )
             return 0
 
         if args.command == "cmux-focus":
@@ -1173,6 +1475,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ).execute(request)
             print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             rejected = {"invalid_command", "intent_not_allowed"}
+            if settings.cmux is not None and result.code not in rejected:
+                # Best-effort: any command that just committed a
+                # durable packet reaches a registered channel now
+                # instead of at the daemon's next repair tick.
+                nudge_channel(hub_socket_path(settings.state_dir))
             return 0 if result.code not in rejected else 1
 
         if args.command == "daemon":
@@ -1228,6 +1535,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ),
                     cmux_reconciler=runtime.cmux_reconciler,
                     cmux_hibernation=runtime.cmux_hibernation,
+                    lead_intake=runtime.lead_intake,
+                    channel_hub=runtime.channel_hub,
                 )
             )
             payload = {
@@ -1299,6 +1608,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "candidate-ready":
+            pending = OperatorDecisions(runtime.database).pending_for_issue(
+                args.issue_id
+            )
+            if pending:
+                print(
+                    f"awaiting operator decision {pending[0].decision_id}; "
+                    "candidate publication is blocked until the operator "
+                    "resolves it",
+                    file=sys.stderr,
+                )
+                return 1
             try:
                 flow = _open_merge_flow(settings, runtime)
                 payload = asyncio.run(_candidate_ready(flow, args))
@@ -1327,6 +1647,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 json_output=args.json,
                 human=f"Merger turn for {args.project}: {payload['kind']}.",
             )
+            if settings.cmux is not None:
+                # A settled Merger turn may have journalled correction
+                # packets; route them to a registered channel now.
+                nudge_channel(hub_socket_path(settings.state_dir))
             return 0
 
         if args.command == "status":

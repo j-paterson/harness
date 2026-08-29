@@ -89,13 +89,27 @@ class ResourceSampler:
         self._classifier = classifier
         self._previous: ResourceSnapshot | None = None
 
+    def _free_bytes(self, path: Path) -> int:
+        """Free bytes at one sampling target, degrading fail-closed.
+
+        A leased worktree that cleanup removed mid-flight must not
+        crash the long-running daemon's tick; the vanished target
+        reports zero free bytes, so calibrated admission closes instead
+        of admitting on missing evidence.
+        """
+
+        try:
+            return int(self._disk_usage(path).free)
+        except OSError:
+            return 0
+
     def sample(self) -> ResourceSnapshot:
         """Read current resource measurements and classify admission pressure."""
 
         memory = self._psutil.virtual_memory()
         swap = self._psutil.swap_memory()
         disk_free = {
-            alias: int(self._disk_usage(path).free)
+            alias: self._free_bytes(path)
             for alias, path in self._repository_paths.items()
         }
         measured = ResourceSnapshot(

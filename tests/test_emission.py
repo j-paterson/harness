@@ -25,10 +25,19 @@ class FakeGitRunner:
 
     responses: dict[tuple[str, ...], str] = field(default_factory=dict)
     calls: list[tuple[str, ...]] = field(default_factory=list)
+    cwds: list[Path] = field(default_factory=list)
+    common_dirs: dict[Path, str] = field(default_factory=dict)
 
     def run(self, args: tuple[str, ...], cwd: Path) -> GitResult:
         self.calls.append(args)
+        self.cwds.append(cwd)
         key = args[1:]
+        if key == (
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ) and cwd in self.common_dirs:
+            return GitResult(0, self.common_dirs[cwd] + "\n", "")
         if key not in self.responses:
             return GitResult(128, "", "fatal")
         return GitResult(0, self.responses[key], "")
@@ -279,3 +288,60 @@ async def test_rejected_intake_reports_the_bounded_reason(tmp_path: Path) -> Non
     )
     assert result.delivery.reason == "intake_rejected"
     assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_lead_worktree_checkout_is_validated_and_used(
+    emitter_parts: tuple[CandidateEmitter, FakeGitRunner, FakeDeliverer],
+    tmp_path: Path,
+) -> None:
+    emitter, git, deliverer = emitter_parts
+    worktree = tmp_path / "issue-worktree"
+    worktree.mkdir()
+    # Both checkouts share one git common dir: the same repository.
+    git.common_dirs[worktree] = str(tmp_path / ".git")
+    git.common_dirs[tmp_path] = str(tmp_path / ".git")
+
+    result = await emitter.emit(
+        "demo",
+        "ENG-9",
+        verification=(("uv run pytest -q", "12 passed"),),
+        lead_checkout=worktree,
+    )
+
+    assert result.event.candidate_sha == HEAD
+    assert deliverer.events
+    # Every freeze-boundary git check after the repository-identity
+    # probes ran against the lead's own checkout, where the candidate
+    # branch actually lives — never the stable anchor's working tree.
+    assert set(git.cwds[2:]) == {worktree}
+
+
+@pytest.mark.asyncio
+async def test_foreign_checkout_is_refused_before_any_freeze_check(
+    emitter_parts: tuple[CandidateEmitter, FakeGitRunner, FakeDeliverer],
+    tmp_path: Path,
+) -> None:
+    emitter, git, deliverer = emitter_parts
+    foreign = tmp_path / "somewhere-else"
+    foreign.mkdir()
+    git.common_dirs[foreign] = "/other/repository/.git"
+    git.common_dirs[tmp_path] = str(tmp_path / ".git")
+
+    with pytest.raises(
+        EmissionBlocked, match="does not belong to the project repository"
+    ):
+        await emitter.emit(
+            "demo",
+            "ENG-9",
+            verification=(("uv run pytest -q", "12 passed"),),
+            lead_checkout=foreign,
+        )
+
+    assert deliverer.events == []
+    # Nothing beyond the two identity probes ran against the foreign path.
+    assert git.calls[-1][1:] == (
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )

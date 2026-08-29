@@ -296,3 +296,54 @@ def test_cmux_config_rejects_unknown_or_secret_like_keys(
 
     with pytest.raises(ValueError):
         load_settings(tmp_path, tmp_path / "state")
+
+
+def test_project_path_resolving_to_an_issue_worktree_is_refused(
+    tmp_path: Path,
+) -> None:
+    # A linked git worktree is exactly the checkout that issue cleanup
+    # later removes; pinning the durable project path (lead cwd, cmux
+    # workspace cwd, resource sampling target) to it must fail closed
+    # at settings load, keeping the stable checkout the only anchor.
+    from tests.test_migration_env import make_linked_worktree
+
+    _, linked = make_linked_worktree(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {linked}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="worktree"):
+        load_settings(tmp_path, tmp_path / "state")
+
+
+def test_the_stable_primary_checkout_is_accepted(tmp_path: Path) -> None:
+    from tests.test_migration_env import make_linked_worktree
+
+    primary, _ = make_linked_worktree(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {primary}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\n", encoding="utf-8"
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.projects["demo"].repo_path == primary

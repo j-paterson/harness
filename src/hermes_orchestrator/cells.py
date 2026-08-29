@@ -15,12 +15,14 @@ from uuid import UUID
 
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
+from hermes_orchestrator.cmux_surfaces import classic_resume_command
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor, ContextSignal
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import ProfilePool
 from hermes_orchestrator.queue import QueueService
 
@@ -52,7 +54,7 @@ class LeadRunner(Protocol):
 
 
 class LeadSeatEnsurer(Protocol):
-    """Optional observational terminal seat for a confirmed lead session."""
+    """The visible terminal seat a lead session runs in (or beside)."""
 
     async def ensure(
         self,
@@ -62,6 +64,7 @@ class LeadSeatEnsurer(Protocol):
         session_id: str,
         profile_alias: str,
         issue_id: str,
+        classic_command: str | None = None,
     ) -> object | None: ...
 
 
@@ -161,6 +164,8 @@ class ProjectCellService:
         replacement_session_ids: Callable[[], UUID] = uuid.uuid4,
         completion_sink: LeadCompletionSink | None = None,
         surfaces: LeadSeatEnsurer | None = None,
+        classic_seats: bool = False,
+        decisions: OperatorDecisions | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -181,6 +186,8 @@ class ProjectCellService:
         self._replacement_session_ids = replacement_session_ids
         self._completion_sink = completion_sink
         self._surfaces = surfaces
+        self._classic_seats = classic_seats
+        self._decisions = decisions
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
@@ -199,6 +206,12 @@ class ProjectCellService:
         """Start or resume the issue's project lead after explicit admission."""
 
         issue = self._queue.get(issue_id)
+        if self._decisions is not None:
+            pending = self._decisions.pending_for_issue(issue_id)
+            if pending:
+                return DispatchResult(
+                    status="awaiting_operator_decision", issue_id=issue_id
+                )
         lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
         async with lock:
             return await self._dispatch_locked(issue_id)
@@ -259,6 +272,64 @@ class ProjectCellService:
         # lead can run and admit any Agent assignment, even if the process
         # stopped between the durable transition and the marker write.
         self.reconcile_freeze(cell)
+        # The ordering/compensation boundary between seat activation and
+        # lead launch: with terminal visibility configured, the visible
+        # seat activates BEFORE any lead process exists, and a failed
+        # activation refuses the launch entirely — a lead without its
+        # seat would be a hidden process no operator can see. There is
+        # nothing to compensate on this side of the boundary because
+        # nothing has been launched yet.
+        if self._surfaces is not None:
+            seated = await self._ensure_lead_seat(
+                cell, issue_id, resume=not created
+            )
+            if not seated:
+                if created:
+                    self._fail_unconfirmed_start(cell, issue_id=issue_id)
+                return DispatchResult(
+                    status="seat_failed",
+                    issue_id=issue_id,
+                    cell_id=cell.cell_id,
+                    session_id=cell.session_id,
+                    profile_alias=cell.profile_alias,
+                )
+            if self._classic_seats:
+                # The pane itself runs the classic interactive lead; the
+                # daemon never launches a -p/stream-JSON shadow of it.
+                await self._linear.project(
+                    issue_id,
+                    LinearProjection(
+                        status="In Development",
+                        assignee_alias="operator",
+                    ),
+                    effect_id=f"linear:{issue_id}:in-development:v2",
+                )
+                if self._activate_issue(cell, issue_id):
+                    return DispatchResult(
+                        status="seated",
+                        issue_id=issue_id,
+                        cell_id=cell.cell_id,
+                        session_id=cell.session_id,
+                        profile_alias=cell.profile_alias,
+                    )
+                issue_completed = (
+                    self._queue.get(issue_id).state == IssueState.DONE
+                )
+                if issue_completed:
+                    self._record_issue_already_completed(cell, issue_id)
+                elif created:
+                    self._fail_unconfirmed_start(cell, issue_id=issue_id)
+                return DispatchResult(
+                    status=(
+                        "already_completed"
+                        if issue_completed
+                        else "start_failed"
+                    ),
+                    issue_id=issue_id,
+                    cell_id=cell.cell_id,
+                    session_id=cell.session_id,
+                    profile_alias=cell.profile_alias,
+                )
         try:
             stream = (
                 self._runner.start_lead(request)
@@ -292,7 +363,6 @@ class ProjectCellService:
                                 self._active_time.open(
                                     self._worker_key(cell), self._aware_now()
                                 )
-                            await self._ensure_lead_seat(cell, issue_id)
                         else:
                             issue_completed = (
                                 self._queue.get(issue_id).state == IssueState.DONE
@@ -466,37 +536,61 @@ class ProjectCellService:
             )
         )
 
-    async def _ensure_lead_seat(self, cell: ProjectCell, issue_id: str) -> None:
-        """Give the confirmed session its observational cmux seat, if any.
+    async def _ensure_lead_seat(
+        self, cell: ProjectCell, issue_id: str, *, resume: bool
+    ) -> bool:
+        """Activate the lead's visible seat before any process launch.
 
-        Terminal visibility is a side effect of durable orchestration
-        state: a failed or denied seat creation journals one metadata
-        event and never disturbs the turn.
+        Returns False — journaling one ``cmux.seat_failed`` event — when
+        the seat cannot be activated. The caller must then refuse the
+        launch: with visibility configured, a lead without its seat
+        would be a hidden process. In classic mode the seat's workspace
+        runs the sanitized native TUI command for this exact session.
         """
 
         if self._surfaces is None:
-            return
+            return True
+        classic_command = (
+            classic_resume_command(str(cell.session_id), resume=resume)
+            if self._classic_seats
+            else None
+        )
         try:
-            await self._surfaces.ensure(
+            seat = await self._surfaces.ensure(
                 project_key=cell.project_key,
                 cell_id=cell.cell_id,
                 session_id=str(cell.session_id),
                 profile_alias=cell.profile_alias,
                 issue_id=issue_id,
+                classic_command=classic_command,
             )
-        except Exception:
-            with suppress(Exception), (
-                self._database.transaction()
-            ) as connection:
-                self._events.append(
-                    connection,
-                    EventInput(
-                        event_type="cmux.seat_failed",
-                        aggregate_type="project_cell",
-                        aggregate_id=cell.cell_id,
-                        payload={"issue_id": issue_id},
-                    ),
-                )
+        except Exception as error:
+            self._journal_seat_failure(
+                cell, issue_id, reason=type(error).__name__
+            )
+            return False
+        if seat is None:
+            self._journal_seat_failure(
+                cell, issue_id, reason="unresolvable_identity"
+            )
+            return False
+        return True
+
+    def _journal_seat_failure(
+        self, cell: ProjectCell, issue_id: str, *, reason: str
+    ) -> None:
+        with suppress(Exception), (
+            self._database.transaction()
+        ) as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="cmux.seat_failed",
+                    aggregate_type="project_cell",
+                    aggregate_id=cell.cell_id,
+                    payload={"issue_id": issue_id, "reason": reason},
+                ),
+            )
 
     def _record_issue_already_completed(
         self, cell: ProjectCell, issue_id: str

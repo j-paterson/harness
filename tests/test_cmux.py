@@ -179,6 +179,146 @@ async def test_create_workspace_returns_typed_identities() -> None:
     assert create_argv[focus_at + 1] == "false"
 
 
+MARKER = "[hermes:op-1]"
+
+
+@pytest.mark.asyncio
+async def test_short_ack_resolves_through_the_durable_marker() -> None:
+    # cmux 0.64.22 acknowledges the mutation with a short workspace ref
+    # instead of a UUID; the adapter accepts it only as an intermediate
+    # response and resolves the exact workspace through the metadata
+    # listing and the durable activation marker.
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:14\n"),
+            FakeProcess(
+                stdout=f"{WORKSPACE} demo lead {MARKER}\n".encode()
+            ),
+            FakeProcess(
+                stdout=f"{WORKSPACE} pane surface {SURFACE}\n".encode()
+            ),
+        ]
+    )
+    port = adapter(factory)
+
+    ref = await port.create_workspace(
+        title=f"demo lead {MARKER}",
+        cwd=Path("/repos/demo"),
+        resolve_marker=MARKER,
+    )
+
+    assert ref == CmuxSurfaceRef(
+        workspace_uuid=WORKSPACE, surface_uuid=SURFACE
+    )
+    commands = [call[0][3] for call in factory.calls]
+    assert commands == [
+        "new-workspace",
+        "list-workspaces",
+        "list-pane-surfaces",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_short_ack_resolution_matches_the_live_cmux_output_shapes() -> None:
+    # Byte-shapes captured verbatim from the installed cmux (0.64.20)
+    # during live characterization: uppercase UUIDs, leading spaces in
+    # the workspace listing, and a starred [selected] surface line.
+    live_workspace = "F4414CAE-4FBD-447A-AF99-48F1E85C3E63"
+    live_surface = "F2D6008C-7D5F-4E7A-9E23-F3938A0FFD91"
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:17\n"),
+            FakeProcess(
+                stdout=(
+                    f"  {live_workspace}  hermes-probe {MARKER}\n"
+                ).encode()
+            ),
+            FakeProcess(
+                stdout=(
+                    f"* {live_surface}  /tmp  [selected]\n"
+                ).encode()
+            ),
+        ]
+    )
+
+    ref = await adapter(factory).create_workspace(
+        title=f"hermes-probe {MARKER}",
+        cwd=Path("/tmp"),
+        resolve_marker=MARKER,
+    )
+
+    assert ref == CmuxSurfaceRef(
+        workspace_uuid=live_workspace, surface_uuid=live_surface
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_ack_with_zero_marker_matches_fails_closed() -> None:
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:14\n"),
+            FakeProcess(stdout=f"{WORKSPACE} other lead\n".encode()),
+        ]
+    )
+
+    with pytest.raises(CmuxProtocolError, match="exactly one"):
+        await adapter(factory).create_workspace(
+            title=f"demo lead {MARKER}",
+            cwd=Path("/repos/demo"),
+            resolve_marker=MARKER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_ack_with_multiple_marker_matches_fails_closed() -> None:
+    other = "99999999-8888-4777-8666-555555555544"
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:14\n"),
+            FakeProcess(
+                stdout=(
+                    f"{WORKSPACE} demo lead {MARKER}\n"
+                    f"{other} demo lead {MARKER}\n"
+                ).encode()
+            ),
+        ]
+    )
+
+    with pytest.raises(CmuxProtocolError, match="exactly one"):
+        await adapter(factory).create_workspace(
+            title=f"demo lead {MARKER}",
+            cwd=Path("/repos/demo"),
+            resolve_marker=MARKER,
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_ack_without_a_marker_fails_closed() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"OK workspace:14\n")])
+
+    with pytest.raises(CmuxProtocolError, match="marker"):
+        await adapter(factory).create_workspace(
+            title="demo lead", cwd=Path("/repos/demo")
+        )
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_ack_text_is_never_treated_as_a_short_ref() -> None:
+    # Only the exact short mutation acknowledgement shape is accepted as
+    # an intermediate response; anything else stays a protocol failure
+    # even when a marker could have resolved it.
+    factory = FakeFactory(
+        results=[FakeProcess(stdout=b"workspace created just fine\n")]
+    )
+
+    with pytest.raises(CmuxProtocolError, match="workspace identity"):
+        await adapter(factory).create_workspace(
+            title=f"demo lead {MARKER}",
+            cwd=Path("/repos/demo"),
+            resolve_marker=MARKER,
+        )
+
+
 @pytest.mark.asyncio
 async def test_create_workspace_without_identities_fails_closed() -> None:
     factory = FakeFactory(results=[FakeProcess(stdout=b"created ok")])
@@ -293,3 +433,89 @@ async def test_metadata_commands_build_expected_argv() -> None:
     resume_argv = factory.calls[4][0]
     assert resume_argv[-1] == "claude --resume abc"
     assert SURFACE in resume_argv
+
+
+@pytest.mark.asyncio
+async def test_the_only_text_path_is_the_closed_signal_grammar() -> None:
+    # The bounded signal (operator-approved 2026-08-29) is the sole
+    # route by which any text reaches a terminal, and it accepts only
+    # the closed grammar. The general vocabulary still rejects every
+    # raw input command outright, so arbitrary typing remains
+    # structurally impossible.
+    port = adapter(FakeFactory())
+
+    for forbidden in ("send", "send-key", "send-panel", "paste-buffer"):
+        with pytest.raises(ValueError, match="not allow-listed"):
+            await port._run(forbidden)
+
+
+VALID_ID = "0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", ["HERMES_CORRECTION_READY", "HERMES_WORK_READY"]
+)
+async def test_signal_builds_exactly_one_bounded_send(kind: str) -> None:
+    # cmux is the bounded signal plane: exactly one send operation
+    # carrying the envelope and Return together (the trailing newline),
+    # addressed to the exact workspace and surface. SQLite remains the
+    # authoritative data plane; no payload ever rides this channel.
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+    envelope = f"{kind} {VALID_ID}\n"
+
+    await port.deliver_intake_envelope(ref, envelope)
+
+    assert len(factory.calls) == 1
+    assert factory.calls[0][0] == (
+        "/apps/cmux",
+        "send",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        envelope,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejected",
+    [
+        "run this payload",
+        f"HERMES_CORRECTION_READY {VALID_ID}",  # missing Return
+        f"HERMES_CORRECTION_READY {VALID_ID}\n\n",  # double Return
+        f"HERMES_CORRECTION_READY {VALID_ID} extra\n",
+        f"HERMES_CORRECTION_READY {VALID_ID[:31]}\n",  # short id
+        f"HERMES_CORRECTION_READY {VALID_ID}0\n",  # long id
+        f"HERMES_CORRECTION_READY {'G' * 32}\n",  # non-hex
+        f"HERMES_CORRECTION_READY {VALID_ID.upper()}\n",
+        f" HERMES_CORRECTION_READY {VALID_ID}\n",  # leading space
+        f"HERMES_CORRECTION_READY {VALID_ID} \n",  # trailing space
+        f"HERMES_CORRECTION_READY\n{VALID_ID}\n",  # embedded newline
+        f"HERMES_CORRECTION_READY {VALID_ID}; rm -rf /\n",
+        f"HERMES_CORRECTION_READY {VALID_ID} && echo pwn\n",
+        f"HERMES_CORRECTION_READY $({VALID_ID})\n",
+        f"send-key {VALID_ID}\n",
+        f"HERMES_FEEDBACK_ACK {VALID_ID}\n",  # foreign kind
+        f"HERMES_ANYTHING {VALID_ID}\n",
+        "",
+    ],
+)
+async def test_everything_outside_the_signal_grammar_is_refused(
+    rejected: str,
+) -> None:
+    factory = FakeFactory()
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    with pytest.raises(ValueError, match="signal grammar"):
+        await port.deliver_intake_envelope(ref, rejected)
+
+    # The subprocess runner never ran: refusal happens before any
+    # external effect, and raw send/send-key stay rejected generally.
+    assert factory.calls == []
+    with pytest.raises(ValueError, match="not allow-listed"):
+        await port._run("send")

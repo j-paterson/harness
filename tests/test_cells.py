@@ -21,6 +21,7 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import (
     ProfileHealth,
     ProfilePool,
@@ -2805,10 +2806,11 @@ async def test_confirmed_session_gets_exactly_one_lead_seat(
 ) -> None:
     class RecordingSeater:
         def __init__(self) -> None:
-            self.ensured: list[dict[str, str]] = []
+            self.ensured: list[dict[str, object]] = []
 
-        async def ensure(self, **identity: str) -> None:
+        async def ensure(self, **identity: object) -> object:
             self.ensured.append(dict(identity))
+            return object()
 
     seater = RecordingSeater()
     admit(queue, "ENG-9")
@@ -2830,6 +2832,7 @@ async def test_confirmed_session_gets_exactly_one_lead_seat(
     result = await service.dispatch("ENG-9")
 
     assert result.status == "working"
+    # The seat activates exactly once, before the lead process launch.
     assert seater.ensured == [
         {
             "project_key": "demo",
@@ -2837,12 +2840,13 @@ async def test_confirmed_session_gets_exactly_one_lead_seat(
             "session_id": str(SESSION_ID),
             "profile_alias": "max-a",
             "issue_id": "ENG-9",
+            "classic_command": None,
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_failed_seat_creation_never_disturbs_the_turn(
+async def test_failed_seat_activation_never_launches_a_hidden_lead(
     database: Database,
     queue: QueueService,
     profiles: ProfilePool,
@@ -2871,8 +2875,127 @@ async def test_failed_seat_creation_never_disturbs_the_turn(
 
     result = await service.dispatch("ENG-9")
 
-    assert result.status == "working"
+    # With terminal visibility configured, a lead without its visible
+    # seat would be a hidden process: the launch is refused entirely and
+    # the failed start releases the claim.
+    assert result.status == "seat_failed"
+    assert runner.start_count == 0
+    assert runner.resume_count == 0
     failures = database.execute(
         "SELECT aggregate_id FROM events WHERE event_type = 'cmux.seat_failed'"
     ).fetchall()
     assert [str(row["aggregate_id"]) for row in failures] == ["cell-demo"]
+    cell_state = database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    )
+    assert str(cell_state) == "failed"
+
+
+@pytest.mark.asyncio
+async def test_classic_seat_dispatch_never_spawns_a_stream_shadow(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    class RecordingSeater:
+        def __init__(self) -> None:
+            self.ensured: list[dict[str, object]] = []
+
+        async def ensure(self, **identity: object) -> object:
+            self.ensured.append(dict(identity))
+            return object()
+
+    seater = RecordingSeater()
+    admit(queue, "ENG-9")
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        surfaces=seater,
+        classic_seats=True,
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    # The pane itself runs the classic interactive lead: the daemon
+    # projects Linear, activates the issue, and launches nothing.
+    assert result.status == "seated"
+    assert runner.start_count == 0
+    assert runner.resume_count == 0
+    [ensured] = seater.ensured
+    assert ensured["classic_command"] == (
+        f"claude --session-id {SESSION_ID}"
+    )
+    assert ("ENG-9", "In Development", "operator") in linear.targets
+    cell_state = database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    )
+    assert str(cell_state) == "active"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_waits_while_an_operator_decision_is_pending(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """awaiting_operator_decision is enforceable state, not narrative.
+
+    While a decision is pending for the issue, dispatch performs zero
+    work — no lead start, no Linear projection, no cell row. An
+    explicit application command lifts the block; nothing else does.
+    """
+
+    decisions = OperatorDecisions(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        decisions=decisions,
+    )
+    admit(queue, "ENG-90")
+    decisions.record_pending(
+        decision_id="dec-arch-1",
+        issue_id="ENG-90",
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=str(SESSION_ID),
+        choice="channel_pilot",
+    )
+
+    blocked = await service.dispatch("ENG-90")
+
+    assert blocked.status == "awaiting_operator_decision"
+    assert runner.start_count == 0
+    assert linear.targets == []
+    assert database.scalar("SELECT COUNT(*) FROM project_cells") == 0
+
+    decisions.apply(
+        decision_id="dec-arch-1",
+        status="approved",
+        source_message="Let's try that dedicated channel.",
+    )
+    resumed = await service.dispatch("ENG-90")
+
+    assert resumed.status == "working"
+    assert runner.start_count == 1

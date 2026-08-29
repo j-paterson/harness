@@ -32,6 +32,21 @@ _UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
+# cmux 0.64.22 acknowledges a mutation with a short numeric ref such as
+# "OK workspace:14" instead of a UUID. Exactly this shape — and nothing
+# else — may be accepted as an intermediate response.
+_SHORT_WORKSPACE_ACK = re.compile(r"^OK\s+workspace:\d+$")
+
+# The complete grammar of the bounded intake signal: one envelope kind,
+# one 32-hex durable packet id, and exactly one trailing newline (the
+# Return, submitted together with the envelope in one send operation).
+# cmux is the signal plane only — the packet itself lives in durable
+# SQLite and never rides this channel.
+INTAKE_SIGNAL_PATTERN = re.compile(
+    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY) [0-9a-f]{32}\n$"
+)
+
+
 # The complete cmux vocabulary this orchestrator may speak. Everything is
 # workspace/surface lifecycle or sanitized metadata display. Screen and
 # input commands (read-screen, capture-pane, send, send-key, pipe-pane)
@@ -93,6 +108,7 @@ class CmuxControlPort(Protocol):
         cwd: Path,
         command: str | None = None,
         env: Mapping[str, str] | None = None,
+        resolve_marker: str | None = None,
     ) -> CmuxSurfaceRef: ...
 
     async def live_workspace_uuids(self) -> frozenset[str]: ...
@@ -128,6 +144,10 @@ class CmuxControlPort(Protocol):
     async def focus_workspace(self, workspace_uuid: str) -> None: ...
 
     async def set_hibernation(self, enabled: bool) -> None: ...
+
+    async def deliver_intake_envelope(
+        self, ref: CmuxSurfaceRef, envelope: str
+    ) -> None: ...
 
 
 ProcessFactory = Callable[..., "asyncio.Future[asyncio.subprocess.Process]"]
@@ -173,6 +193,7 @@ class CmuxCliAdapter:
         cwd: Path,
         command: str | None = None,
         env: Mapping[str, str] | None = None,
+        resolve_marker: str | None = None,
     ) -> CmuxSurfaceRef:
         arguments = [
             "new-workspace",
@@ -190,8 +211,8 @@ class CmuxCliAdapter:
         created = await self._run(*arguments)
         workspace_uuid = _first_uuid(created)
         if workspace_uuid is None:
-            raise CmuxProtocolError(
-                "cmux did not return a workspace identity"
+            workspace_uuid = await self._resolve_short_ack(
+                created, resolve_marker
             )
         listed = await self._run(
             "list-pane-surfaces", "--workspace", workspace_uuid
@@ -211,6 +232,39 @@ class CmuxCliAdapter:
         return CmuxSurfaceRef(
             workspace_uuid=workspace_uuid, surface_uuid=surface_uuid
         )
+
+    async def _resolve_short_ack(
+        self, output: str, resolve_marker: str | None
+    ) -> str:
+        """Resolve a short mutation acknowledgement to exactly one UUID.
+
+        Only the exact ``OK workspace:<n>`` shape is accepted, and only
+        as an intermediate response: the workspace identity itself comes
+        from the metadata listing through the caller's durable
+        activation marker — never from cwd, generic titles, list
+        position, substrings, or the focused workspace — and zero or
+        multiple exact marker matches fail closed. No terminal screen
+        content is ever read.
+        """
+
+        if not _SHORT_WORKSPACE_ACK.fullmatch(output.strip()):
+            raise CmuxProtocolError(
+                "cmux did not return a workspace identity"
+            )
+        if not resolve_marker:
+            raise CmuxProtocolError(
+                "cmux returned a short mutation acknowledgement and no "
+                "durable marker was provided to resolve it"
+            )
+        matches = await self.find_workspace_uuids(
+            title_marker=resolve_marker
+        )
+        if len(matches) != 1:
+            raise CmuxProtocolError(
+                f"the short acknowledgement resolved to {len(matches)} "
+                "durable marker matches; exactly one is required"
+            )
+        return next(iter(matches))
 
     async def live_workspace_uuids(self) -> frozenset[str]:
         output = await self._run("list-workspaces")
@@ -317,13 +371,52 @@ class CmuxCliAdapter:
     async def _run(self, command: str, *arguments: str) -> str:
         if command not in _ALLOWED_COMMANDS:
             raise ValueError(f"cmux command is not allow-listed: {command}")
-        argv = (
-            *self._argv_base,
-            "--id-format",
-            "uuids",
-            command,
-            *arguments,
+        return await self._execute(command, *arguments)
+
+    async def deliver_intake_envelope(
+        self, ref: CmuxSurfaceRef, envelope: str
+    ) -> None:
+        """Submit one bounded wake signal to one exact surface.
+
+        The single ``send`` operation carries the envelope and its
+        Return (the trailing newline) together, addressed to the exact
+        validated workspace and surface. Only the closed signal grammar
+        — one allowed kind, one 32-hex durable packet id, one trailing
+        newline — is accepted; anything else is refused before any
+        subprocess exists. Raw ``send``/``send-key`` remain rejected by
+        the general vocabulary, so no other text can ever reach a
+        terminal. The target surface is never focused and no screen
+        content is read.
+        """
+
+        if INTAKE_SIGNAL_PATTERN.fullmatch(envelope) is None:
+            raise ValueError(
+                "only the closed intake signal grammar may be submitted"
+            )
+        await self._spawn(
+            (
+                *self._argv_base,
+                "send",
+                "--workspace",
+                ref.workspace_uuid,
+                "--surface",
+                ref.surface_uuid,
+                envelope,
+            )
         )
+
+    async def _execute(self, command: str, *arguments: str) -> str:
+        return await self._spawn(
+            (
+                *self._argv_base,
+                "--id-format",
+                "uuids",
+                command,
+                *arguments,
+            )
+        )
+
+    async def _spawn(self, argv: tuple[str, ...]) -> str:
         environment = {
             key: value
             for key, value in self._base_env.items()

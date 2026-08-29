@@ -9,6 +9,7 @@ import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from hermes_orchestrator.processes import ProcessRegistry, register_spawned
@@ -49,10 +50,27 @@ _CLOSED = object()
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 
-def app_server_command(executable: str = "codex") -> list[str]:
-    """Return the stable argv that launches the App Server on stdio."""
+# The installed Codex application binary. The daemon runs under cmux's
+# minimal shell environment where a PATH-resolved bare "codex" fails
+# with exit 127, so the App Server always launches through a validated
+# absolute path.
+CODEX_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
 
-    return [executable, "app-server", "--listen", "stdio://"]
+
+def app_server_command(executable: str | None = None) -> list[str]:
+    """Return the stable argv that launches the App Server on stdio.
+
+    Only an absolute executable path is accepted; a bare or relative
+    name would resolve through the caller's PATH and reproduce the
+    observed exit-127 launch failure under cmux's minimal environment.
+    """
+
+    resolved = executable if executable is not None else CODEX_BINARY
+    if not Path(resolved).is_absolute():
+        raise ValueError(
+            "the codex app-server executable must be an absolute path"
+        )
+    return [resolved, "app-server", "--listen", "stdio://"]
 
 
 class CodexUnavailable(RuntimeError):

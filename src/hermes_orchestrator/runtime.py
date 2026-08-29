@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,13 @@ from typing import Any, Protocol, TextIO
 
 from hermes_orchestrator.admission import AdmissionController, PressureClassifier
 from hermes_orchestrator.cells import DispatchResult, ProjectCellService
+from hermes_orchestrator.channel_hub import (
+    ChannelCapabilities,
+    ChannelHub,
+    ChannelLauncher,
+    ChannelPacketRouter,
+    hub_socket_path,
+)
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.circleci import (
     CircleCiClient,
@@ -40,6 +48,10 @@ from hermes_orchestrator.github import (
 )
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.keychain import Keychain
+from hermes_orchestrator.lead_intake import (
+    LeadIntakeRouter,
+    LeadIntakeTransport,
+)
 from hermes_orchestrator.lead_wakes import LeadTerminalWakes
 from hermes_orchestrator.linear import (
     ExternalEffectStore,
@@ -54,6 +66,7 @@ from hermes_orchestrator.merge_flow import (
     MergeFlow,
     build_merge_flow,
 )
+from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -158,6 +171,9 @@ class Runtime:
     cmux_bindings: CmuxSurfaceBindings | None = None
     cmux_reconciler: CmuxSurfaceReconciler | None = None
     cmux_hibernation: CmuxHibernationDriver | None = None
+    lead_intake: LeadIntakeRouter | None = None
+    channel_hub: ChannelHub | None = None
+    channel_capabilities: ChannelCapabilities | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -360,6 +376,9 @@ def open_runtime(
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
+        lead_intake: LeadIntakeRouter | None = None
+        channel_hub: ChannelHub | None = None
+        channel_capabilities: ChannelCapabilities | None = None
 
         if enable_live:
             assert reader is not None
@@ -420,11 +439,49 @@ def open_runtime(
                     for alias, project in settings.projects.items()
                 }
                 cmux_profile_dirs = RegistryProfileDirectory(registry)
+                # The dedicated channel is an accelerator over the
+                # same durable packets: freshly committed wakes and
+                # corrections route to a registered hermes-control
+                # channel the moment they commit, while the metadata
+                # announcements and the Stop-hook poll remain the
+                # automatic fallback.
+                channel_capabilities = ChannelCapabilities(
+                    database=database, state_dir=settings.state_dir
+                )
+                channel_hub = ChannelHub(
+                    database=database,
+                    bindings=cmux_bindings,
+                    capabilities=channel_capabilities,
+                    socket_path=hub_socket_path(settings.state_dir),
+                )
+                channel_router = ChannelPacketRouter(channel_hub)
+                channel_router.attach(lead_wakes)
+                channel_router.attach(merge_flow.outbox)
+                node_binary = shutil.which("node")
+                channel_launcher = (
+                    None
+                    if node_binary is None
+                    else ChannelLauncher(
+                        state_dir=settings.state_dir,
+                        capabilities=channel_capabilities,
+                        sidecar_entry=(
+                            settings.repo_root
+                            / "channels/hermes-control/dist/src/main.js"
+                        ),
+                        node_binary=Path(node_binary),
+                    )
+                )
                 cmux_seater = CmuxLeadSeater(
                     bindings=cmux_bindings,
                     port=cmux_port,
                     project_paths=cmux_project_paths,
                     profile_dirs=cmux_profile_dirs,
+                    # The read-only auth-status probe under the leased
+                    # profile's exact CLAUDE_CONFIG_DIR: a seat is
+                    # refused before creation unless the account is a
+                    # logged-in first-party Max subscription.
+                    auth_probe=lambda alias: probe.check(alias).eligible,
+                    channel_launch=channel_launcher,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,
@@ -446,6 +503,18 @@ def open_runtime(
                 CmuxWakeAnnouncer(
                     bindings=cmux_bindings, port=cmux_port
                 ).attach(lead_wakes)
+                # The lead-intake router derives pending correction
+                # and wake envelopes from durable state every pass,
+                # so publication and typing can never be separated
+                # permanently by a crash.
+                lead_intake = LeadIntakeRouter(
+                    database=database,
+                    transport=LeadIntakeTransport(
+                        database=database,
+                        bindings=cmux_bindings,
+                        port=cmux_port,
+                    ),
+                )
 
             cells = ProjectCellService(
                 database=database,
@@ -466,6 +535,12 @@ def open_runtime(
                 context_window_tokens=settings.policy.context_window_tokens,
                 completion_sink=lead_wakes,
                 surfaces=cmux_seater,
+                classic_seats=(
+                    settings.cmux is not None
+                    and settings.cmux.classic_leads
+                    and cmux_seater is not None
+                ),
+                decisions=OperatorDecisions(database),
             )
             dispatch = cells.dispatch
 
@@ -517,6 +592,9 @@ def open_runtime(
             cmux_bindings=cmux_bindings,
             cmux_reconciler=cmux_reconciler,
             cmux_hibernation=cmux_hibernation,
+            lead_intake=lead_intake,
+            channel_hub=channel_hub,
+            channel_capabilities=channel_capabilities,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

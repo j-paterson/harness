@@ -156,6 +156,20 @@ class AckWakeCommand(_Command):
     wake_id: NonEmptyText
 
 
+class ApplyOperatorDecisionCommand(_Command):
+    """The only event shape that may resolve a pending decision.
+
+    Every field is schema-enforced nonempty: a blank message, hook
+    firing, or replayed transcript cannot parse into this command and
+    therefore cannot mutate decision state.
+    """
+
+    intent: Literal["apply_operator_decision"]
+    decision_id: NonEmptyText
+    status: Literal["approved", "rejected"]
+    source_message: NonEmptyText
+
+
 HermesCommand = Annotated[
     QueueIssueCommand
     | StatusCommand
@@ -175,7 +189,8 @@ HermesCommand = Annotated[
     | PendingConsultationsCommand
     | RecordRemedyResultCommand
     | PendingWakesCommand
-    | AckWakeCommand,
+    | AckWakeCommand
+    | ApplyOperatorDecisionCommand,
     Field(discriminator="intent"),
 ]
 
@@ -203,6 +218,7 @@ _ALLOWED_INTENTS = frozenset(
         "record_remedy_result",
         "pending_wakes",
         "ack_wake",
+        "apply_operator_decision",
     }
 )
 

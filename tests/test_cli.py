@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 27
+    assert json.loads(result.stdout)["schema_version"] == 33
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -200,6 +200,49 @@ async def test_continuous_daemon_stops_cleanly_when_signaled() -> None:
         "workers.checkpoint_requested",
         "supervisor.stopped",
     ]
+
+
+@pytest.mark.asyncio
+async def test_daemon_opens_and_closes_the_channel_hub(
+    tmp_path: Path,
+) -> None:
+    import tempfile
+
+    from hermes_orchestrator.channel_hub import (
+        ChannelCapabilities,
+        ChannelHub,
+    )
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(tmp_path / "state.db")
+    try:
+        with tempfile.TemporaryDirectory() as short:
+            socket_path = Path(short) / "hub.sock"
+            hub = ChannelHub(
+                database=database,
+                bindings=CmuxSurfaceBindings(
+                    database=database, events=EventStore(database)
+                ),
+                capabilities=ChannelCapabilities(
+                    database=database, state_dir=tmp_path
+                ),
+                socket_path=socket_path,
+            )
+            service = FakeService()
+
+            await _run_daemon(
+                service, once=True, interval=60, channel_hub=hub
+            )
+
+            # The hub served for the daemon's lifetime and its socket
+            # was removed at shutdown — nothing dangles for a stale
+            # sidecar to connect to.
+            assert service.ticks == 1
+            assert not socket_path.exists()
+    finally:
+        database.close()
 
 
 @pytest.mark.asyncio
@@ -952,3 +995,142 @@ def test_migration_env_mark_stamps_only_a_linked_worktree(
     marker = (worktree / ".fable-isolated-worktree").read_text()
     assert "slug=infra_189" in marker
     assert "repository=" in marker
+
+
+@pytest.mark.asyncio
+async def test_daemon_starts_when_intake_probes_fail(
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.cmux import CmuxUnavailable
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_intake import LeadIntakeRouter
+    from tests.test_lead_intake import (
+        RecordingPort,
+        seat,
+        seed_active_cell,
+        seed_packets,
+        transport,
+    )
+
+    database = Database.open(tmp_path / "state.db")
+    try:
+        bindings = CmuxSurfaceBindings(
+            database=database, events=EventStore(database)
+        )
+        seed_packets(database)
+        seed_active_cell(database)
+        seat(bindings)
+        port = RecordingPort()
+        port.probe_error = CmuxUnavailable("cmux command timed out")
+        router = LeadIntakeRouter(
+            database=database,
+            transport=transport(database, bindings, port),
+        )
+        service = FakeService()
+
+        supervisor = await _run_daemon(
+            service, once=True, interval=60, lead_intake=router
+        )
+
+        # The optional intake channel timing out never blocks startup
+        # or the supervised tick; nothing was typed and the durable
+        # packets stayed pending for the next pass.
+        assert service.ticks == 1
+        assert supervisor is not None
+        assert port.notifications == []
+        pending = database.scalar(
+            "SELECT count(*) FROM lead_corrections WHERE state = 'pending'"
+        )
+        assert int(pending) == 1
+    finally:
+        database.close()
+
+
+def test_intake_poll_offers_and_only_explicit_ack_delivers(
+    tmp_path: Path,
+) -> None:
+    import re
+
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import (
+        SESSION,
+        seed_active_cell,
+        seed_packets,
+    )
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    database = Database.open(state_dir / "state.db")
+    try:
+        seed_packets(database)
+        seed_active_cell(database)
+    finally:
+        database.close()
+    base = ["--state-dir", str(state_dir)]
+    poll_args = [*base, "intake-poll", "--session", SESSION]
+
+    first = invoke(poll_args)
+    assert first.exit_code == 0
+    payload = json.loads(first.stdout)
+    assert payload["decision"] == "block"
+    match = re.search(
+        r"(HERMES_\w+ [0-9a-f]{32}) — Hermes intake offer ([0-9a-f]{32})",
+        payload["reason"],
+    )
+    assert match is not None
+    envelope, token = match.group(1), match.group(2)
+    packet_id = envelope.split()[1]
+
+    # Without an acknowledgement the packet is never delivered: after
+    # the second packet is also leased, further polls go quiet, but
+    # nothing is marked delivered.
+    second = invoke(poll_args)
+    assert second.exit_code == 0 and second.stdout
+    third = invoke(poll_args)
+    assert third.exit_code == 0 and third.stdout == ""
+
+    # A wrong acknowledgement changes nothing and exits nonzero.
+    bad = invoke(
+        [
+            *base,
+            "intake-ack",
+            "--session",
+            SESSION,
+            "--packet",
+            packet_id,
+            "--offer",
+            "0" * 32,
+        ]
+    )
+    assert bad.exit_code == 1
+
+    # The exact acknowledgement records the delivery once.
+    good = invoke(
+        [
+            *base,
+            "intake-ack",
+            "--session",
+            SESSION,
+            "--packet",
+            packet_id,
+            "--offer",
+            token,
+        ]
+    )
+    assert good.exit_code == 0
+    assert json.loads(good.stdout)["acknowledged"] == packet_id
+    duplicate = invoke(
+        [
+            *base,
+            "intake-ack",
+            "--session",
+            SESSION,
+            "--packet",
+            packet_id,
+            "--offer",
+            token,
+        ]
+    )
+    assert duplicate.exit_code == 1

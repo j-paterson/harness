@@ -109,6 +109,7 @@ class CandidateEmitter:
         verification: tuple[tuple[str, str], ...],
         blockers: tuple[str, ...] = (),
         status: str = "FABLE_READY",
+        lead_checkout: Path | None = None,
     ) -> EmissionResult:
         project = self._projects.get(project_key)
         if project is None:
@@ -117,7 +118,35 @@ class CandidateEmitter:
             raise EmissionBlocked(f"unknown wake status {status!r}")
         if not verification:
             raise EmissionBlocked("a candidate requires recorded verification")
+        # The durable project path stays anchored to the stable primary
+        # checkout, so the candidate branch usually lives in the lead's
+        # own linked worktree. The freeze boundary is that checkout —
+        # but only after its git common dir proves it belongs to this
+        # exact project repository; a foreign checkout is refused before
+        # any freeze check runs.
         repo = project.repo_path
+        if (
+            lead_checkout is not None
+            and Path(lead_checkout).resolve() != repo.resolve()
+        ):
+            claimed = self._run(
+                Path(lead_checkout),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ).strip()
+            anchor = self._run(
+                repo,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ).strip()
+            if claimed != anchor:
+                raise EmissionBlocked(
+                    "the candidate checkout does not belong to the "
+                    "project repository"
+                )
+            repo = Path(lead_checkout)
         if self._run(repo, "status", "--porcelain").strip():
             raise EmissionBlocked("working tree is not clean at the freeze boundary")
         head = self._run(repo, "rev-parse", "HEAD").strip()

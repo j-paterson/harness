@@ -14,6 +14,7 @@ cell, lease, and checkpoint-safety evidence.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -52,6 +53,74 @@ _TRANSITION_SOURCES: Mapping[str, tuple[str, ...]] = {
 
 class CmuxBindingConflict(RuntimeError):
     """A live binding already owns this seat; replacement must be explicit."""
+
+
+class SeatAuthRefused(RuntimeError):
+    """The leased profile's auth probe did not prove the intended
+    first-party Max account; no seat is created and no lead may start."""
+
+
+# The complete grammar of a classic in-pane lead command: the native
+# interactive Claude TUI addressing exactly one session — never a
+# prompt, flag soup, or credential. The one permitted extension is the
+# controller-generated session-scoped MCP config plus the fixed
+# hermes-control development-channel entry; arbitrary flags, commands,
+# and user-selected paths remain structurally impossible.
+_UUID_PATTERN = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+CHANNEL_ENTRY = "server:hermes-control"
+_CLASSIC_COMMAND = re.compile(
+    r"^claude --(resume|session-id) " + _UUID_PATTERN + r"( --mcp-config "
+    r"/[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
+    r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY) + r")?$"
+)
+# The config path may hold nothing a shell, cmux, or argv parser could
+# reinterpret — no spaces, quotes, or metacharacters.
+_CHANNEL_CONFIG_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
+
+
+def classic_resume_command(session_id: str, *, resume: bool) -> str:
+    """The sanitized native command that runs the classic TUI in-pane.
+
+    ``--resume`` reattaches an existing session; ``--session-id`` starts
+    a new one under the exact preassigned identity. The session id must
+    parse as a UUID, so nothing else can ever ride along.
+    """
+
+    canonical = str(uuid.UUID(str(session_id)))
+    flag = "--resume" if resume else "--session-id"
+    return f"claude {flag} {canonical}"
+
+
+def classic_channel_command(
+    session_id: str, *, resume: bool, channel_config: Path
+) -> str:
+    """The classic command extended with exactly one channel load.
+
+    Accepts only the controller-generated session config — an absolute
+    metacharacter-free path whose filename is exactly this session's
+    canonical UUID plus ``.mcp.json`` — and the fixed
+    ``server:hermes-control`` entry. Anything else refuses before any
+    command exists.
+    """
+
+    base = classic_resume_command(session_id, resume=resume)
+    canonical = str(uuid.UUID(str(session_id)))
+    path = str(channel_config)
+    if (
+        _CHANNEL_CONFIG_PATH.fullmatch(path) is None
+        or channel_config.name != f"{canonical}.mcp.json"
+    ):
+        raise CmuxBindingConflict(
+            "only the controller-generated session-scoped config may "
+            "load a development channel"
+        )
+    return (
+        f"{base} --mcp-config {path} "
+        f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +177,22 @@ class ProfileDirectory(Protocol):
     """Resolve a profile alias to its exact CLAUDE_CONFIG_DIR."""
 
     def config_dir(self, alias: str) -> Path: ...
+
+
+class ChannelLaunchSource(Protocol):
+    """Generate and retire session-scoped channel launch material."""
+
+    def generate(
+        self,
+        *,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+        generation: int,
+    ) -> Path: ...
+
+    def cleanup(self, session_id: str) -> None: ...
 
 
 class CmuxSurfaceBindings:
@@ -192,9 +277,7 @@ class CmuxSurfaceBindings:
 
         current = self.get(binding_id)
         if current.state != "active":
-            raise CmuxBindingConflict(
-                f"a {current.state} binding cannot be replaced"
-            )
+            raise CmuxBindingConflict(f"a {current.state} binding cannot be replaced")
         successor_id = self._ids()
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
@@ -240,9 +323,7 @@ class CmuxSurfaceBindings:
 
         pending = self.get(binding_id)
         if pending.state != "residual":
-            raise CmuxBindingConflict(
-                "only a residual binding can be activated"
-            )
+            raise CmuxBindingConflict("only a residual binding can be activated")
         predecessor = None if replacing is None else self.get(replacing)
         if predecessor is not None and predecessor.state != "active":
             raise CmuxBindingConflict(
@@ -370,9 +451,7 @@ class CmuxSurfaceBindings:
             )
         return self.get_intent(intent_id)
 
-    def bind_intent(
-        self, intent_id: str, *, ref: CmuxSurfaceRef
-    ) -> CmuxBinding:
+    def bind_intent(self, intent_id: str, *, ref: CmuxSurfaceRef) -> CmuxBinding:
         """Atomically bind the returned workspace identities to their
         write-ahead intent as a residual (not yet active) seat.
 
@@ -412,9 +491,7 @@ class CmuxSurfaceBindings:
             )
         return self.get(binding_id)
 
-    def abort_intent(
-        self, intent_id: str, *, reason: str
-    ) -> CmuxActivationIntent:
+    def abort_intent(self, intent_id: str, *, reason: str) -> CmuxActivationIntent:
         """Record that no workspace ever carried this intent's identity."""
 
         intent = self._pending_intent(intent_id, action="be aborted")
@@ -485,9 +562,7 @@ class CmuxSurfaceBindings:
             raise KeyError(intent_id)
         return _row_to_intent(row)
 
-    def _pending_intent(
-        self, intent_id: str, *, action: str
-    ) -> CmuxActivationIntent:
+    def _pending_intent(self, intent_id: str, *, action: str) -> CmuxActivationIntent:
         intent = self.get_intent(intent_id)
         if intent.state != "pending":
             raise CmuxBindingConflict(
@@ -530,6 +605,28 @@ class CmuxSurfaceBindings:
                 payload=payload,
             ),
         )
+
+    def record_classic(self, binding_id: str, session_id: str) -> None:
+        """Durably record that this seat runs the classic TUI in-pane.
+
+        The lead-intake transport refuses any surface without this
+        evidence, so envelopes can never be typed into a pane that is
+        not the classic interactive lead.
+        """
+
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO cmux_classic_seats("
+                "binding_id, session_id, recorded_at) VALUES (?, ?, ?)",
+                (binding_id, session_id, self._now().isoformat()),
+            )
+
+    def is_classic(self, binding_id: str, session_id: str) -> bool:
+        row = self._database.execute(
+            "SELECT 1 FROM cmux_classic_seats WHERE binding_id = ? AND session_id = ?",
+            (binding_id, session_id),
+        ).fetchone()
+        return row is not None
 
     def active(self) -> tuple[CmuxBinding, ...]:
         rows = self._database.execute(
@@ -587,19 +684,22 @@ class CmuxSurfaceBindings:
             raise KeyError(binding_id)
         return _row_to_binding(row)
 
+    def next_lead_generation(self, cell_id: str) -> int:
+        """The generation the cell's next created binding will carry."""
+
+        return self._next_generation(cell_id=cell_id)
+
     def _next_generation(
         self, *, role: str = "lead", cell_id: str | None = None
     ) -> int:
         if cell_id is not None:
             highest = self._database.scalar(
-                "SELECT max(generation) FROM cmux_surface_bindings "
-                "WHERE cell_id = ?",
+                "SELECT max(generation) FROM cmux_surface_bindings WHERE cell_id = ?",
                 (cell_id,),
             )
         else:
             highest = self._database.scalar(
-                "SELECT max(generation) FROM cmux_surface_bindings "
-                "WHERE role = ?",
+                "SELECT max(generation) FROM cmux_surface_bindings WHERE role = ?",
                 (role,),
             )
         return int(highest or 0) + 1
@@ -818,9 +918,7 @@ class CmuxSurfaceReconciler:
         surface = self._environ.get(CMUX_SURFACE_ID_ENV, "").strip()
         if not workspace or not surface:
             return None
-        return CmuxSurfaceRef(
-            workspace_uuid=workspace, surface_uuid=surface
-        )
+        return CmuxSurfaceRef(workspace_uuid=workspace, surface_uuid=surface)
 
     async def reconcile(self) -> CmuxReconciliationReport:
         try:
@@ -860,10 +958,7 @@ class CmuxSurfaceReconciler:
                 else:
                     await self._reconcile_lead(binding, replaced, lost)
             seat = self.own_seat()
-            if (
-                seat is not None
-                and self._bindings.active_orchestrator() is None
-            ):
+            if seat is not None and self._bindings.active_orchestrator() is None:
                 self._bindings.bind_orchestrator(seat)
         except CmuxError:
             # cmux failed mid-pass. Visibility is optional: every
@@ -885,9 +980,7 @@ class CmuxSurfaceReconciler:
             intents_ambiguous=tuple(intents_ambiguous),
         )
 
-    async def _reclaim_residuals(
-        self, reclaimed: list[str], lost: list[str]
-    ) -> None:
+    async def _reclaim_residuals(self, reclaimed: list[str], lost: list[str]) -> None:
         """Resolve workspaces whose earlier close was never confirmed.
 
         Each residual row is ownership evidence for an exact workspace
@@ -932,9 +1025,7 @@ class CmuxSurfaceReconciler:
         assert binding.profile_alias is not None
         cwd = self._project_paths.get(binding.project_key)
         try:
-            config_dir = self._profile_dirs.config_dir(
-                binding.profile_alias
-            )
+            config_dir = self._profile_dirs.config_dir(binding.profile_alias)
         except (KeyError, ValueError):
             config_dir = None
         if cwd is None or config_dir is None:
@@ -943,9 +1034,7 @@ class CmuxSurfaceReconciler:
             # isolation, so the seat is recorded lost instead.
             self._bindings.mark_lost(
                 binding.binding_id,
-                reason=(
-                    "project_missing" if cwd is None else "profile_missing"
-                ),
+                reason=("project_missing" if cwd is None else "profile_missing"),
             )
             lost.append(binding.binding_id)
             return
@@ -976,6 +1065,7 @@ async def _activate_lead_seat(
     profile_alias: str,
     replacing: str | None = None,
     replace_reason: str | None = None,
+    command: str | None = None,
 ) -> CmuxBinding:
     """Create, prepare, and durably bind one lead seat as a write-ahead
     compensated activation from durable identity alone.
@@ -1000,10 +1090,16 @@ async def _activate_lead_seat(
         session_id=session_id,
         profile_alias=profile_alias,
     )
+    # The marker resolves cmux 0.64.22's short mutation acknowledgement
+    # (``OK workspace:<n>``) to exactly one workspace through the
+    # metadata listing; zero or multiple matches fail closed inside the
+    # adapter.
     ref = await port.create_workspace(
         title=f"{title} {intent.title_marker}",
         cwd=cwd,
+        command=command,
         env={"CLAUDE_CONFIG_DIR": str(config_dir)},
+        resolve_marker=intent.title_marker,
     )
     try:
         pending = bindings.bind_intent(intent.intent_id, ref=ref)
@@ -1076,9 +1172,7 @@ async def _resolve_pending_intents(
     """
 
     for intent in intents:
-        matches = await port.find_workspace_uuids(
-            title_marker=intent.title_marker
-        )
+        matches = await port.find_workspace_uuids(title_marker=intent.title_marker)
         if not matches:
             bindings.abort_intent(
                 intent.intent_id, reason="no_workspace_carries_identity"
@@ -1126,16 +1220,12 @@ async def _resolve_residual_bindings(
     live = await port.live_workspace_uuids()
     for binding in residuals:
         if binding.workspace_uuid not in live:
-            bindings.mark_lost(
-                binding.binding_id, reason="residual_workspace_vanished"
-            )
+            bindings.mark_lost(binding.binding_id, reason="residual_workspace_vanished")
             if lost is not None:
                 lost.append(binding.binding_id)
             continue
         await port.close_workspace(binding.workspace_uuid)
-        bindings.mark_closed(
-            binding.binding_id, reason="residual_reclaimed"
-        )
+        bindings.mark_closed(binding.binding_id, reason="residual_reclaimed")
         if reclaimed is not None:
             reclaimed.append(binding.binding_id)
 
@@ -1157,11 +1247,15 @@ class CmuxLeadSeater:
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
         profile_dirs: ProfileDirectory,
+        auth_probe: Callable[[str], bool] | None = None,
+        channel_launch: ChannelLaunchSource | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
         self._profile_dirs = profile_dirs
+        self._auth_probe = auth_probe
+        self._channel_launch = channel_launch
 
     async def ensure(
         self,
@@ -1171,7 +1265,28 @@ class CmuxLeadSeater:
         session_id: str,
         profile_alias: str,
         issue_id: str | None = None,
+        classic_command: str | None = None,
     ) -> CmuxBinding | None:
+        # The pane runs exactly the sanitized native TUI command for
+        # this exact session; anything else is refused before any
+        # workspace exists.
+        if classic_command is not None and (
+            _CLASSIC_COMMAND.fullmatch(classic_command) is None
+            or session_id not in classic_command
+        ):
+            raise CmuxBindingConflict(
+                "only the sanitized classic command for this exact "
+                "session may run in a lead seat"
+            )
+        if self._auth_probe is not None and not self._auth_probe(profile_alias):
+            # The probe is a read-only `claude auth status` under the
+            # leased profile's exact CLAUDE_CONFIG_DIR: it never starts
+            # an OAuth flow, and anything short of a logged-in
+            # first-party Max account refuses the seat before creation.
+            raise SeatAuthRefused(
+                f"profile {profile_alias!r} did not prove the intended "
+                "first-party Max account"
+            )
         existing = self._bindings.active_lead(cell_id)
         if existing is not None:
             if existing.session_id == session_id:
@@ -1204,6 +1319,28 @@ class CmuxLeadSeater:
             config_dir = self._profile_dirs.config_dir(profile_alias)
         except (KeyError, ValueError):
             return None
+        if classic_command is not None and self._channel_launch is not None:
+            # Best-effort channel attachment for the new pane: the
+            # session-scoped config and capability are generated under
+            # the private state directory and only the sanitized
+            # extension grammar can carry them. Any launcher failure
+            # falls back to the plain classic command — a seat without
+            # its channel still drains through the Stop-hook poll.
+            try:
+                config = self._channel_launch.generate(
+                    project_key=project_key,
+                    cell_id=cell_id,
+                    session_id=session_id,
+                    profile_alias=profile_alias,
+                    generation=self._bindings.next_lead_generation(cell_id),
+                )
+                classic_command = classic_channel_command(
+                    session_id,
+                    resume="--resume" in classic_command,
+                    channel_config=config,
+                )
+            except Exception:
+                pass
         bound = await _activate_lead_seat(
             self._port,
             self._bindings,
@@ -1213,7 +1350,10 @@ class CmuxLeadSeater:
             cell_id=cell_id,
             session_id=session_id,
             profile_alias=profile_alias,
+            command=classic_command,
         )
+        if classic_command is not None:
+            self._bindings.record_classic(bound.binding_id, session_id)
         await self._show_issue(bound, issue_id)
         return bound
 
@@ -1234,21 +1374,20 @@ class CmuxLeadSeater:
                 reason="session_rotated_close_uncertain",
             )
             raise
-        self._bindings.mark_closed(
-            existing.binding_id, reason="session_rotated"
-        )
+        self._bindings.mark_closed(existing.binding_id, reason="session_rotated")
+        if self._channel_launch is not None and existing.session_id:
+            # The rotated-away session is safely retired: its channel
+            # config and capability may now be removed.
+            with suppress(Exception):
+                self._channel_launch.cleanup(existing.session_id)
 
-    async def _show_issue(
-        self, binding: CmuxBinding, issue_id: str | None
-    ) -> None:
+    async def _show_issue(self, binding: CmuxBinding, issue_id: str | None) -> None:
         """Display the seat's current issue id; cosmetic, never binding."""
 
         if issue_id is None:
             return
         try:
-            await self._port.set_status(
-                binding.workspace_uuid, "issue", issue_id
-            )
+            await self._port.set_status(binding.workspace_uuid, "issue", issue_id)
         except CmuxError:
             return
 
@@ -1310,9 +1449,7 @@ class CmuxHibernationGate:
             if str(cell_state or "") != "active":
                 blockers.append(f"{binding.cell_id}:unrestorable")
                 continue
-            evidence = self._safety.current(
-                binding.cell_id, binding.session_id
-            )
+            evidence = self._safety.current(binding.cell_id, binding.session_id)
             if evidence is None:
                 blockers.append(f"{binding.cell_id}:uncheckpointed")
         for binding in self._bindings.residual():
@@ -1323,9 +1460,7 @@ class CmuxHibernationGate:
             # A pending intent may own a live workspace whose identities
             # were never bound; hibernation waits for its resolution.
             blockers.append(f"{intent.cell_id}:activation_intent")
-        return HibernationDecision(
-            clear=not blockers, blockers=tuple(blockers)
-        )
+        return HibernationDecision(clear=not blockers, blockers=tuple(blockers))
 
 
 class RegistryProfileDirectory:
@@ -1462,9 +1597,7 @@ def _row_to_intent(row: Any) -> CmuxActivationIntent:
         session_id=str(row["session_id"]),
         profile_alias=str(row["profile_alias"]),
         state=str(row["state"]),
-        binding_id=(
-            None if row["binding_id"] is None else str(row["binding_id"])
-        ),
+        binding_id=(None if row["binding_id"] is None else str(row["binding_id"])),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -1474,17 +1607,11 @@ def _row_to_binding(row: Any) -> CmuxBinding:
     return CmuxBinding(
         binding_id=str(row["binding_id"]),
         role=str(row["role"]),
-        project_key=(
-            None if row["project_key"] is None else str(row["project_key"])
-        ),
+        project_key=(None if row["project_key"] is None else str(row["project_key"])),
         cell_id=(None if row["cell_id"] is None else str(row["cell_id"])),
-        session_id=(
-            None if row["session_id"] is None else str(row["session_id"])
-        ),
+        session_id=(None if row["session_id"] is None else str(row["session_id"])),
         profile_alias=(
-            None
-            if row["profile_alias"] is None
-            else str(row["profile_alias"])
+            None if row["profile_alias"] is None else str(row["profile_alias"])
         ),
         workspace_uuid=str(row["workspace_uuid"]),
         surface_uuid=str(row["surface_uuid"]),

@@ -374,6 +374,9 @@ def test_active_runtime_assembles_cmux_visibility_when_configured(
         assert runtime.cmux_bindings is not None
         assert runtime.cmux_reconciler is not None
         assert runtime.cmux_hibernation is not None
+        # The lead-intake router is part of production composition, so
+        # published corrections and wakes actually reach classic seats.
+        assert runtime.lead_intake is not None
         # The cmux socket password is read lazily at call time, never
         # during assembly: the documented credential read order holds.
         assert keychain.reads == [
