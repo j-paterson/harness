@@ -58,6 +58,7 @@ from hermes_orchestrator.merge_flow import (
     MergeFlow,
     build_merge_flow,
 )
+from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -494,6 +495,7 @@ def open_runtime(
                     and settings.cmux.classic_leads
                     and cmux_seater is not None
                 ),
+                decisions=OperatorDecisions(database),
             )
             dispatch = cells.dispatch
 

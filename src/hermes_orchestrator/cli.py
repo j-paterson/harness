@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -43,6 +44,10 @@ from hermes_orchestrator.migration_gate import (
     jo_loans_commands,
     load_verdict,
     render_handoff,
+)
+from hermes_orchestrator.operator_decisions import (
+    DecisionRefused,
+    OperatorDecisions,
 )
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
@@ -212,6 +217,17 @@ def _parser() -> argparse.ArgumentParser:
     intake_ack.add_argument("--session", required=True)
     intake_ack.add_argument("--packet", required=True)
     intake_ack.add_argument("--offer", required=True)
+
+    decision_import = commands.add_parser(
+        "decision-import",
+        help=(
+            "import one recorded operator-decision receipt as durable "
+            "state; refuses unless the file matches the given SHA-256"
+        ),
+    )
+    decision_import.add_argument("--receipt", type=Path, required=True)
+    decision_import.add_argument("--sha256", required=True)
+    decision_import.add_argument("--json", action="store_true")
 
     def _deploy_spec_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--binary", type=PurePosixPath, required=True)
@@ -633,6 +649,23 @@ def _hermes_handlers(
             raise ValueError("lead terminal wakes are unavailable")
         return runtime.lead_wakes.mark_delivered(command.wake_id).as_dict()
 
+    def apply_operator_decision(command: Any) -> dict[str, Any]:
+        decisions = OperatorDecisions(runtime.database)
+        try:
+            decision = decisions.apply(
+                decision_id=command.decision_id,
+                status=command.status,
+                source_message=command.source_message,
+            )
+        except DecisionRefused as error:
+            raise ValueError(str(error)) from error
+        return {
+            "decision_id": decision.decision_id,
+            "issue_id": decision.issue_id,
+            "status": decision.status,
+            "applied_at": decision.applied_at,
+        }
+
     def qa_reject(command: Any) -> dict[str, Any]:
         flow = _open_merge_flow(settings, runtime)
         outcome = asyncio.run(
@@ -728,6 +761,7 @@ def _hermes_handlers(
         "ack_correction": ack_correction,
         "pending_wakes": pending_wakes,
         "ack_wake": ack_wake,
+        "apply_operator_decision": apply_operator_decision,
         "qa_reject": qa_reject,
         "report_stall": report_stall,
         "approve_playbook": approve_playbook,
@@ -1300,6 +1334,55 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "decision-import":
+            try:
+                raw = args.receipt.read_bytes()
+            except OSError as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"receipt unreadable: {error}",
+                )
+                return 1
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != args.sha256.lower():
+                _print(
+                    {"error": "sha256 mismatch", "computed": digest},
+                    json_output=args.json,
+                    human=(
+                        "refused: receipt SHA-256 does not match the "
+                        "operator-provided digest"
+                    ),
+                )
+                return 1
+            try:
+                receipt = json.loads(raw)
+                decision = OperatorDecisions(database).import_receipt(
+                    receipt, receipt_sha256=digest
+                )
+            except (json.JSONDecodeError, DecisionRefused) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"import refused: {error}",
+                )
+                return 1
+            _print(
+                {
+                    "decision_id": decision.decision_id,
+                    "issue_id": decision.issue_id,
+                    "choice": decision.choice,
+                    "status": decision.status,
+                    "receipt_sha256": decision.receipt_sha256,
+                },
+                json_output=args.json,
+                human=(
+                    f"Decision {decision.decision_id} for "
+                    f"{decision.issue_id}: {decision.status}."
+                ),
+            )
+            return 0
+
         if args.command == "cmux-focus":
             if settings.cmux is None or runtime.cmux_bindings is None:
                 _print(
@@ -1492,6 +1575,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "candidate-ready":
+            pending = OperatorDecisions(runtime.database).pending_for_issue(
+                args.issue_id
+            )
+            if pending:
+                print(
+                    f"awaiting operator decision {pending[0].decision_id}; "
+                    "candidate publication is blocked until the operator "
+                    "resolves it",
+                    file=sys.stderr,
+                )
+                return 1
             try:
                 flow = _open_merge_flow(settings, runtime)
                 payload = asyncio.run(_candidate_ready(flow, args))

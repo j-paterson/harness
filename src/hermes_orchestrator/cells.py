@@ -22,6 +22,7 @@ from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import ProfilePool
 from hermes_orchestrator.queue import QueueService
 
@@ -164,6 +165,7 @@ class ProjectCellService:
         completion_sink: LeadCompletionSink | None = None,
         surfaces: LeadSeatEnsurer | None = None,
         classic_seats: bool = False,
+        decisions: OperatorDecisions | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -185,6 +187,7 @@ class ProjectCellService:
         self._completion_sink = completion_sink
         self._surfaces = surfaces
         self._classic_seats = classic_seats
+        self._decisions = decisions
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
@@ -203,6 +206,12 @@ class ProjectCellService:
         """Start or resume the issue's project lead after explicit admission."""
 
         issue = self._queue.get(issue_id)
+        if self._decisions is not None:
+            pending = self._decisions.pending_for_issue(issue_id)
+            if pending:
+                return DispatchResult(
+                    status="awaiting_operator_decision", issue_id=issue_id
+                )
         lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
         async with lock:
             return await self._dispatch_locked(issue_id)

@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 31
+    assert json.loads(result.stdout)["schema_version"] == 32
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
