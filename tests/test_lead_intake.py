@@ -45,19 +45,32 @@ def bindings(database: Database) -> CmuxSurfaceBindings:
 
 
 class RecordingPort:
-    """A metadata-only port: it has no typing interface at all, so any
-    attempt to write into a terminal buffer would be an AttributeError."""
+    """Records the bounded signal plus the supplemental metadata."""
 
     def __init__(self) -> None:
+        self.signals: list[tuple[CmuxSurfaceRef, str]] = []
         self.statuses: list[tuple[str, str, str]] = []
         self.notifications: list[tuple[str, str, str]] = []
         self.alive = True
         self.probe_error: Exception | None = None
+        self.signal_error: Exception | None = None
 
     async def surface_alive(self, ref: CmuxSurfaceRef) -> bool:
         if self.probe_error is not None:
             raise self.probe_error
         return self.alive
+
+    async def deliver_intake_envelope(
+        self, ref: CmuxSurfaceRef, envelope: str
+    ) -> None:
+        from hermes_orchestrator.cmux import INTAKE_SIGNAL_PATTERN
+
+        if self.signal_error is not None:
+            raise self.signal_error
+        # The adapter-side grammar is the last line of defence; the
+        # transport must never hand it anything else.
+        assert INTAKE_SIGNAL_PATTERN.fullmatch(envelope)
+        self.signals.append((ref, envelope))
 
     async def set_status(
         self, workspace_uuid: str, key: str, value: str
@@ -158,6 +171,9 @@ async def test_announcement_publishes_metadata_only(
 
     assert outcome.status == "announced"
     envelope = f"HERMES_WORK_READY {WAKE_ID}"
+    # The primary delivery is one bounded signal to the exact surface;
+    # metadata is supplemental visibility.
+    assert port.signals == [(LEAD, envelope + "\n")]
     assert port.statuses == [(LEAD.workspace_uuid, "intake", envelope)]
     assert port.notifications == [
         (LEAD.workspace_uuid, "Hermes intake pending", envelope)
@@ -166,15 +182,12 @@ async def test_announcement_publishes_metadata_only(
 
 
 @pytest.mark.asyncio
-async def test_no_keystroke_channel_exists_regardless_of_drafts(
+async def test_router_signals_each_packet_to_its_exact_surface(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:
-    # A staged operator draft — focused or unfocused — is untouchable
-    # by construction: the router's whole external vocabulary is the
-    # metadata port above, which has no typing interface, and the
-    # production adapter rejects send/send-key structurally. This
-    # announcement emits exactly one status and one notification per
-    # packet and nothing else, whatever any prompt buffer holds.
+    # The post-idle wake: for every pending packet with a valid classic
+    # binding, exactly one bounded signal reaches the exact surface —
+    # nothing outside the closed grammar can ever reach a terminal.
     seed_packets(database)
     seed_active_cell(database)
     seat(bindings)
@@ -186,9 +199,70 @@ async def test_no_keystroke_channel_exists_regardless_of_drafts(
     announced = await router.tick()
 
     assert sorted(announced) == sorted([CORRECTION_ID, WAKE_ID])
-    assert len(port.statuses) == 2
-    assert len(port.notifications) == 2
-    assert not hasattr(port, "deliver_intake_envelope")
+    assert len(port.signals) == 2
+    assert all(ref == LEAD for ref, _ in port.signals)
+    assert {text for _, text in port.signals} == {
+        f"HERMES_CORRECTION_READY {CORRECTION_ID}\n",
+        f"HERMES_WORK_READY {WAKE_ID}\n",
+    }
+
+
+@pytest.mark.asyncio
+async def test_metadata_alone_is_never_treated_as_delivery(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    seed_packets(database)
+    seat(bindings)
+    port = RecordingPort()
+    port.signal_error = CmuxUnavailable("cmux command timed out")
+
+    outcome = await transport(database, bindings, port).deliver(
+        **DELIVER_KWARGS
+    )
+
+    # The signal failed, so the delivery is an uncertain attempt even
+    # though the metadata channel was healthy; nothing is announced.
+    assert outcome.status == "attempt_failed"
+    assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
+    assert port.signals == []
+
+
+@pytest.mark.asyncio
+async def test_post_stop_correction_race_wakes_once_across_restart(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    # The live acceptance failure: the lead's final scan is empty, the
+    # lead goes idle, and only then does a correction commit.
+    seed_active_cell(database)
+    seat(bindings)
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+    assert await router.tick() == ()
+
+    seed_packets(database)
+    announced = await router.tick()
+    assert sorted(announced) == sorted([CORRECTION_ID, WAKE_ID])
+    assert len(port.signals) == 2
+
+    # The woken lead retrieves the durable packets by id and
+    # acknowledges the correction through the existing application
+    # APIs.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_corrections SET state = 'acknowledged' "
+            "WHERE correction_id = ?",
+            (CORRECTION_ID,),
+        )
+
+    # Restart: a fresh router derives everything from durable state and
+    # signals nothing again — one effective intake per packet.
+    restarted = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+    assert await restarted.tick() == ()
+    assert len(port.signals) == 2
 
 
 @pytest.mark.asyncio
@@ -318,11 +392,9 @@ async def test_uncertain_attempt_stays_durable_and_retries_after_window(
     seed_packets(database)
     seat(bindings)
 
-    class FailingPort(RecordingPort):
-        async def notify(self, workspace_uuid, title, body):  # type: ignore[no-untyped-def]
-            raise CmuxUnavailable("cmux command timed out")
-
-    failing = transport(database, bindings, FailingPort(), now=lambda: NOW)
+    failing_port = RecordingPort()
+    failing_port.signal_error = CmuxUnavailable("cmux command timed out")
+    failing = transport(database, bindings, failing_port, now=lambda: NOW)
     outcome = await failing.deliver(**DELIVER_KWARGS)
     assert outcome.status == "attempt_failed"
     assert delivery_rows(database) == [(WORK_READY, "attempted", 1)]
@@ -331,7 +403,9 @@ async def test_uncertain_attempt_stays_durable_and_retries_after_window(
     held = await failing.deliver(**DELIVER_KWARGS)
     assert held.status == "pending"
 
-    # After the window the retry is harmless metadata and completes.
+    # After the window the retry re-signals and completes; a repeated
+    # signal is dedup-safe on the lead side because the packet fetch by
+    # id is idempotent.
     port = RecordingPort()
     later = transport(
         database,

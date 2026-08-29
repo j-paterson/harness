@@ -2,13 +2,16 @@
 lead-owned poll handshake.
 
 INFRA-190: work reaches a classic in-pane Claude lead through two
-channels, neither of which can touch the operator's editable prompt
-buffer — the adapter has no keystroke vocabulary at all, so writing
-into a shared interactive buffer is structurally impossible:
+channels. The only text that can ever reach a terminal is the closed
+signal grammar below; arbitrary typing remains structurally
+impossible:
 
-* The in-cmux Hermes daemon ANNOUNCES pending packets on the lead's
-  bound workspace using already-allow-listed metadata commands only
-  (``set-status`` and ``notify``). Nothing is typed anywhere.
+* The in-cmux Hermes daemon SIGNALS each pending packet to the
+  lead's exact bound surface: one bounded ``send`` operation carrying
+  only the closed envelope grammar plus Return (the primary wake for
+  an already-idle classic session, operator-approved 2026-08-29),
+  supplemented by metadata status/notification for operator
+  visibility. Metadata alone is never treated as delivery.
 * The lead itself POLLS for the next envelope through an
   application-level handshake (``hermes-orchestrator intake-poll``,
   invoked from the lead's own Claude Code hook at its own turn
@@ -222,6 +225,19 @@ class LeadIntakeTransport:
             if attempted.rowcount != 1:
                 return outcome("pending")
         try:
+            # The primary delivery is the bounded wake signal to the
+            # exact surface: one send operation carrying the envelope
+            # and Return together. Metadata alone is never success.
+            await self._port.deliver_intake_envelope(
+                binding.ref, envelope + "\n"
+            )
+        except Exception:
+            # The signal is uncertain; the durable 'attempted' row is
+            # exactly that evidence and a later pass retries.
+            return outcome("attempt_failed")
+        try:
+            # Supplemental operator visibility only; its failure never
+            # affects the delivery outcome.
             await self._port.set_status(
                 binding.workspace_uuid, "intake", envelope
             )
@@ -231,9 +247,7 @@ class LeadIntakeTransport:
                 envelope,
             )
         except Exception:
-            # The metadata effect is uncertain; the durable 'attempted'
-            # row is exactly that evidence and a later pass retries.
-            return outcome("attempt_failed")
+            pass
         with self._database.transaction() as connection:
             announced = connection.execute(
                 "UPDATE lead_intake_deliveries "
