@@ -9,6 +9,19 @@ export interface HubClientOptions {
   profile: string;
   generation: number;
   capability: string;
+  /**
+   * Re-read the capability before each registration attempt, so a
+   * capability reissued for a running session heals without a process
+   * restart. Falls back to the static `capability` when absent or
+   * when the read fails.
+   */
+  readCapability?: () => string;
+  /**
+   * Invoked once when the hub refuses this process terminally (wrong
+   * protocol or stale generation): no retry can ever succeed, so the
+   * host should exit and let the MCP layer surface the failure.
+   */
+  onTerminal?: (reason: string) => void;
   onEvent: (kind: string, packetId: string, eventId: string) => void;
   onLog: (message: string) => void;
 }
@@ -22,6 +35,17 @@ export type AckResult =
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
 const ACK_TIMEOUT_MS = 10000;
+
+// Refusals no retry can ever cure from inside this process: the wire
+// protocol itself is wrong, or this process belongs to a superseded
+// seat generation. Everything else (a lagging seat binding, a
+// capability being reissued, a hub mid-restart) is retried with
+// backoff and a fresh capability read — the supported non-interactive
+// recovery path.
+const TERMINAL_REFUSALS = new Set<string>([
+  "unsupported protocol version",
+  "stale binding generation",
+]);
 
 type State = "connecting" | "registered" | "refused";
 
@@ -76,6 +100,20 @@ export class HubClient {
     });
   }
 
+  private currentCapability(): string {
+    if (this.opts.readCapability) {
+      try {
+        const fresh = this.opts.readCapability();
+        if (fresh) return fresh;
+      } catch (err) {
+        this.opts.onLog(
+          `hub-client: capability re-read failed: ${String(err)}`
+        );
+      }
+    }
+    return this.opts.capability;
+  }
+
   private sendRegister(socket: net.Socket): void {
     const msg = {
       op: "register",
@@ -85,7 +123,7 @@ export class HubClient {
       session_id: this.opts.session,
       profile: this.opts.profile,
       generation: this.opts.generation,
-      capability: this.opts.capability,
+      capability: this.currentCapability(),
     };
     socket.write(JSON.stringify(msg) + "\n");
   }
@@ -145,9 +183,24 @@ export class HubClient {
       case "refused": {
         const reasonRaw = (msg as Record<string, unknown>)["reason"];
         const reason = typeof reasonRaw === "string" ? reasonRaw : "refused";
-        this.state = "refused";
         this.opts.onLog(`hub-client: registration refused: ${reason}`);
         this.failAllPending({ kind: "refused", reason });
+        if (TERMINAL_REFUSALS.has(reason)) {
+          // No retry can cure this process: stop, surface, and let
+          // the durable ledger plus the hub's blocked receipt carry
+          // the recovery story.
+          this.state = "refused";
+          if (this.socket) {
+            this.socket.destroy();
+          }
+          this.opts.onTerminal?.(reason);
+          return true;
+        }
+        // Transient refusal: keep reconnecting (with the ordinary
+        // doubling backoff and a fresh capability read) until the
+        // hub's state catches up — the supported non-interactive
+        // recovery path.
+        this.state = "connecting";
         if (this.socket) {
           this.socket.destroy();
         }

@@ -10,6 +10,7 @@ export interface TestFixture {
   session: string;
   tmpDir: string;
   capability: string;
+  capabilityFile: string;
   teardown(): Promise<void>;
 }
 
@@ -41,6 +42,7 @@ export async function startFixture(
     session,
     tmpDir,
     capability,
+    capabilityFile,
     async teardown() {
       sidecar.child.kill();
       await hub.close();

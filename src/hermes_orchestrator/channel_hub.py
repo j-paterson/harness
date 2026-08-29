@@ -514,6 +514,7 @@ class ChannelHub:
                         return
                     reason = self._refuse_registration(message)
                     if reason is not None:
+                        self._record_channel_blocked(message, reason)
                         await self._write(writer, {"op": "refused", "reason": reason})
                         return
                     session = str(message["session_id"])
@@ -591,6 +592,41 @@ class ChannelHub:
             return "no classic-seat evidence for this session"
         return None
 
+    def _record_channel_blocked(
+        self, message: dict[str, object], reason: str
+    ) -> None:
+        """One durable, actionable blocked receipt per refused channel.
+
+        Routine recovery must never require /mcp, a manual relaunch,
+        Computer Use, or a terminal paste — so the refusal itself
+        becomes a durable control operation the lead (or the fallback
+        drain) can fetch and act on. A successful registration later
+        supersedes it.
+        """
+
+        if self._control is None:
+            return
+        project = str(message.get("project") or "")
+        cell_id = str(message.get("cell_id") or "")
+        session_id = str(message.get("session_id") or "")
+        if not (project and cell_id and session_id):
+            return
+        with suppress(Exception):
+            self._control.record(
+                kind="channel.blocked",
+                project_key=project,
+                cell_id=cell_id,
+                session_id=session_id,
+                result={"refusal": reason},
+                reason=(
+                    f"channel registration refused: {reason}; the "
+                    "sidecar retries transient refusals itself, a "
+                    "stale generation needs the seat relaunched by "
+                    "the seater, and a rejected capability needs a "
+                    "reissued capability file"
+                ),
+            )
+
     def _record_registration(self, message: dict[str, object]) -> None:
         stamp = self._now().isoformat()
         session_id = str(message["session_id"])
@@ -600,6 +636,15 @@ class ChannelHub:
                 "WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
+            # A live blocked receipt is healed by the registration it
+            # was blocking on; supersede it so it never wakes a lead
+            # whose channel already recovered.
+            connection.execute(
+                "UPDATE control_operations SET state = 'superseded', "
+                "updated_at = ? WHERE session_id = ? "
+                "AND kind = 'channel.blocked' AND state = 'published'",
+                (stamp, session_id),
+            )
             connection.execute(
                 "UPDATE channel_registrations SET state = 'superseded', "
                 "closed_at = ?, close_reason = 'superseded' "

@@ -70,6 +70,20 @@ function main(): void {
     profile,
     generation,
     capability,
+    readCapability: () => {
+      // A reissued capability heals a running session on the next
+      // registration attempt; a failed re-read falls back to the
+      // startup value rather than killing the channel.
+      const raw = fs.readFileSync(capabilityFile, "utf8").trim();
+      return CAPABILITY_RE.test(raw) ? raw : "";
+    },
+    onTerminal: (reason) => {
+      onLog(
+        `hermes-control: terminal refusal (${reason}); exiting so the ` +
+          "host surfaces the failed server"
+      );
+      process.exit(1);
+    },
     onEvent: (kind, packetId, eventId) => {
       mcp?.notifyChannelEvent(kind, packetId, eventId);
     },

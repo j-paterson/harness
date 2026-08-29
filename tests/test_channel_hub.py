@@ -1008,6 +1008,64 @@ class TestControlOperationEvents:
         assert "channel.reregistered" in kinds
         assert kinds["channel.reregistered"].result["prior_registrations"] >= 1
 
+    async def test_a_refused_registration_records_one_blocked_receipt(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        """Routine recovery must never require /mcp or a relaunch by
+        hand: a refusal becomes one durable, actionable receipt, and a
+        later successful registration supersedes it."""
+
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            # No seat binding exists yet: the registration is refused.
+            sidecar = await Sidecar.connect(hub.socket_path)
+            await sidecar.send(
+                register_message(issued_capability(capabilities))
+            )
+            reply = await sidecar.receive()
+            assert reply["op"] == "refused"
+            await sidecar.close()
+
+            [receipt] = operations.pending_for_session(SESSION)
+            assert receipt.kind == "channel.blocked"
+            assert receipt.result["refusal"] == reply["reason"]
+            assert "reissued capability" in str(receipt.reason)
+
+            # A duplicate refusal never floods: one live receipt.
+            second = await Sidecar.connect(hub.socket_path)
+            await second.send(
+                register_message(issued_capability(capabilities))
+            )
+            await second.receive()
+            await second.close()
+            assert len(operations.pending_for_session(SESSION)) == 1
+
+            # The seat lands and registration succeeds: the blocked
+            # receipt is healed by the recovery it was blocking on.
+            seat(bindings)
+            healed = await registered_sidecar(hub, capabilities)
+            await healed.close()
+        finally:
+            await hub.stop()
+
+        kinds = [
+            receipt.kind
+            for receipt in operations.pending_for_session(SESSION)
+        ]
+        assert "channel.blocked" not in kinds
+
     async def test_the_exact_channel_ack_settles_the_receipt(
         self,
         database: Database,

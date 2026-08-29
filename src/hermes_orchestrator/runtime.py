@@ -490,6 +490,7 @@ def open_runtime(
                     # logged-in first-party Max subscription.
                     auth_probe=lambda alias: probe.check(alias).eligible,
                     channel_launch=channel_launcher,
+                    control=control_operations,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,

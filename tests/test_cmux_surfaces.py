@@ -531,6 +531,7 @@ def seater(
     *,
     profiles: dict[str, Path] | None = None,
     channel_launch: object | None = None,
+    control: object | None = None,
 ) -> object:
     from hermes_orchestrator.cmux_surfaces import CmuxLeadSeater
 
@@ -542,6 +543,7 @@ def seater(
             profiles if profiles is not None else {"max-a": Path("/profiles/max-a")}
         ),
         channel_launch=channel_launch,
+        control=control,
     )
 
 
@@ -1612,6 +1614,35 @@ class TestChannelLaunch:
         assert seat is not None
         [created] = port.created
         assert created["command"] == f"claude --session-id {SESSION}"
+
+    @pytest.mark.asyncio
+    async def test_a_launcher_failure_records_a_blocked_receipt(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        """INFRA-195: a channel-less seat is never a silent fallback —
+        one durable, actionable channel.blocked receipt says why."""
+
+        from hermes_orchestrator.control_operations import (
+            ControlOperations,
+        )
+        from hermes_orchestrator.events import EventStore
+
+        port = FakePort(next_refs=[LEAD])
+        launch = FakeChannelLaunch(error=FileNotFoundError("no build"))
+        control = ControlOperations(database, events=EventStore(database))
+
+        seat = await seater(
+            bindings, port, channel_launch=launch, control=control
+        ).ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION}",
+        )
+
+        assert seat is not None
+        [receipt] = control.pending_for_session(SESSION)
+        assert receipt.kind == "channel.blocked"
+        assert receipt.result["launcher_error"] == "no build"
+        assert "Stop-hook" in str(receipt.reason)
 
     @pytest.mark.asyncio
     async def test_rotation_retires_the_old_sessions_channel_material(
