@@ -37,6 +37,15 @@ _UUID_PATTERN = re.compile(
 # else — may be accepted as an intermediate response.
 _SHORT_WORKSPACE_ACK = re.compile(r"^OK\s+workspace:\d+$")
 
+# The complete grammar of the bounded intake signal: one envelope kind,
+# one 32-hex durable packet id, and exactly one trailing newline (the
+# Return, submitted together with the envelope in one send operation).
+# cmux is the signal plane only — the packet itself lives in durable
+# SQLite and never rides this channel.
+INTAKE_SIGNAL_PATTERN = re.compile(
+    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY) [0-9a-f]{32}\n$"
+)
+
 
 # The complete cmux vocabulary this orchestrator may speak. Everything is
 # workspace/surface lifecycle or sanitized metadata display. Screen and
@@ -135,6 +144,10 @@ class CmuxControlPort(Protocol):
     async def focus_workspace(self, workspace_uuid: str) -> None: ...
 
     async def set_hibernation(self, enabled: bool) -> None: ...
+
+    async def deliver_intake_envelope(
+        self, ref: CmuxSurfaceRef, envelope: str
+    ) -> None: ...
 
 
 ProcessFactory = Callable[..., "asyncio.Future[asyncio.subprocess.Process]"]
@@ -360,14 +373,50 @@ class CmuxCliAdapter:
             raise ValueError(f"cmux command is not allow-listed: {command}")
         return await self._execute(command, *arguments)
 
-    async def _execute(self, command: str, *arguments: str) -> str:
-        argv = (
-            *self._argv_base,
-            "--id-format",
-            "uuids",
-            command,
-            *arguments,
+    async def deliver_intake_envelope(
+        self, ref: CmuxSurfaceRef, envelope: str
+    ) -> None:
+        """Submit one bounded wake signal to one exact surface.
+
+        The single ``send`` operation carries the envelope and its
+        Return (the trailing newline) together, addressed to the exact
+        validated workspace and surface. Only the closed signal grammar
+        — one allowed kind, one 32-hex durable packet id, one trailing
+        newline — is accepted; anything else is refused before any
+        subprocess exists. Raw ``send``/``send-key`` remain rejected by
+        the general vocabulary, so no other text can ever reach a
+        terminal. The target surface is never focused and no screen
+        content is read.
+        """
+
+        if INTAKE_SIGNAL_PATTERN.fullmatch(envelope) is None:
+            raise ValueError(
+                "only the closed intake signal grammar may be submitted"
+            )
+        await self._spawn(
+            (
+                *self._argv_base,
+                "send",
+                "--workspace",
+                ref.workspace_uuid,
+                "--surface",
+                ref.surface_uuid,
+                envelope,
+            )
         )
+
+    async def _execute(self, command: str, *arguments: str) -> str:
+        return await self._spawn(
+            (
+                *self._argv_base,
+                "--id-format",
+                "uuids",
+                command,
+                *arguments,
+            )
+        )
+
+    async def _spawn(self, argv: tuple[str, ...]) -> str:
         environment = {
             key: value
             for key, value in self._base_env.items()

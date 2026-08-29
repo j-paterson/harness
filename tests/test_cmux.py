@@ -436,14 +436,86 @@ async def test_metadata_commands_build_expected_argv() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_adapter_has_no_typing_channel_at_all() -> None:
-    # Keystroke injection is structurally impossible: the adapter
-    # exposes no delivery or focus-typing method, and the general
-    # vocabulary rejects every input command outright — so no code path
-    # can ever write into any terminal buffer, drafted or empty.
+async def test_the_only_text_path_is_the_closed_signal_grammar() -> None:
+    # The bounded signal (operator-approved 2026-08-29) is the sole
+    # route by which any text reaches a terminal, and it accepts only
+    # the closed grammar. The general vocabulary still rejects every
+    # raw input command outright, so arbitrary typing remains
+    # structurally impossible.
     port = adapter(FakeFactory())
 
-    assert not hasattr(port, "deliver_intake_envelope")
     for forbidden in ("send", "send-key", "send-panel", "paste-buffer"):
         with pytest.raises(ValueError, match="not allow-listed"):
             await port._run(forbidden)
+
+
+VALID_ID = "0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", ["HERMES_CORRECTION_READY", "HERMES_WORK_READY"]
+)
+async def test_signal_builds_exactly_one_bounded_send(kind: str) -> None:
+    # cmux is the bounded signal plane: exactly one send operation
+    # carrying the envelope and Return together (the trailing newline),
+    # addressed to the exact workspace and surface. SQLite remains the
+    # authoritative data plane; no payload ever rides this channel.
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+    envelope = f"{kind} {VALID_ID}\n"
+
+    await port.deliver_intake_envelope(ref, envelope)
+
+    assert len(factory.calls) == 1
+    assert factory.calls[0][0] == (
+        "/apps/cmux",
+        "send",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        envelope,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejected",
+    [
+        "run this payload",
+        f"HERMES_CORRECTION_READY {VALID_ID}",  # missing Return
+        f"HERMES_CORRECTION_READY {VALID_ID}\n\n",  # double Return
+        f"HERMES_CORRECTION_READY {VALID_ID} extra\n",
+        f"HERMES_CORRECTION_READY {VALID_ID[:31]}\n",  # short id
+        f"HERMES_CORRECTION_READY {VALID_ID}0\n",  # long id
+        f"HERMES_CORRECTION_READY {'G' * 32}\n",  # non-hex
+        f"HERMES_CORRECTION_READY {VALID_ID.upper()}\n",
+        f" HERMES_CORRECTION_READY {VALID_ID}\n",  # leading space
+        f"HERMES_CORRECTION_READY {VALID_ID} \n",  # trailing space
+        f"HERMES_CORRECTION_READY\n{VALID_ID}\n",  # embedded newline
+        f"HERMES_CORRECTION_READY {VALID_ID}; rm -rf /\n",
+        f"HERMES_CORRECTION_READY {VALID_ID} && echo pwn\n",
+        f"HERMES_CORRECTION_READY $({VALID_ID})\n",
+        f"send-key {VALID_ID}\n",
+        f"HERMES_FEEDBACK_ACK {VALID_ID}\n",  # foreign kind
+        f"HERMES_ANYTHING {VALID_ID}\n",
+        "",
+    ],
+)
+async def test_everything_outside_the_signal_grammar_is_refused(
+    rejected: str,
+) -> None:
+    factory = FakeFactory()
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    with pytest.raises(ValueError, match="signal grammar"):
+        await port.deliver_intake_envelope(ref, rejected)
+
+    # The subprocess runner never ran: refusal happens before any
+    # external effect, and raw send/send-key stay rejected generally.
+    assert factory.calls == []
+    with pytest.raises(ValueError, match="not allow-listed"):
+        await port._run("send")
