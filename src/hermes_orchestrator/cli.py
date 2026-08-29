@@ -256,6 +256,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     child_stop.add_argument("--session", default=None)
 
+    runtime_activate = commands.add_parser(
+        "runtime-activate",
+        help=(
+            "prove this checkout (clean tree, schema match) and record "
+            "it as the active runtime identity; a failed attempt is "
+            "recorded and the prior activation stays active"
+        ),
+    )
+    runtime_activate.add_argument("--json", action="store_true")
+
     hooks_install = commands.add_parser(
         "hooks-install",
         help=(
@@ -458,6 +468,7 @@ async def _run_daemon(
     lead_intake: LeadIntakeRouter | None = None,
     channel_hub: ChannelHub | None = None,
     control_operations: ControlOperations | None = None,
+    activation: object | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
@@ -495,12 +506,24 @@ async def _run_daemon(
         # by an already-running classic seat can register immediately.
         await channel_hub.start()
     if control_operations is not None:
-        # Every active lead gets a durable, ACKable restart receipt:
-        # daemon recovery is provable without watching any terminal.
+        # Every active lead gets a durable, ACKable restart receipt —
+        # carrying the exact activated runtime identity — so daemon
+        # recovery is provable without watching any terminal.
+        result: dict[str, object] = {
+            "interval_seconds": interval,
+            "once": once,
+        }
+        if activation is not None:
+            result["activation"] = {
+                "generation": activation.generation,  # type: ignore[attr-defined]
+                "git_sha": activation.git_sha,  # type: ignore[attr-defined]
+                "checkout_root": activation.checkout_root,  # type: ignore[attr-defined]
+                "binary_path": activation.binary_path,  # type: ignore[attr-defined]
+                "database_schema": activation.database_schema,  # type: ignore[attr-defined]
+            }
         with suppress(Exception):
             control_operations.record_for_active_cells(
-                kind="daemon.restarted",
-                result={"interval_seconds": interval, "once": once},
+                kind="daemon.restarted", result=result
             )
     if cmux_reconciler is not None:
         # Visible cmux seats are restored from durable identity before
@@ -1129,6 +1152,61 @@ def _intake_state_dir(args: argparse.Namespace) -> Path:
     )
 
 
+def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
+    """Deliberate approved-version activation with safe rollback."""
+
+    from hermes_orchestrator.activation import (
+        ActivationRefused,
+        RuntimeActivator,
+    )
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(settings.state_dir / "state.db")
+    try:
+        activator = RuntimeActivator(database, events=EventStore(database))
+        try:
+            activation = activator.activate(
+                checkout_root=settings.repo_root,
+                binary_path=Path(sys.argv[0]).resolve(),
+            )
+        except ActivationRefused as error:
+            current = activator.current()
+            _print(
+                {
+                    "activated": False,
+                    "reason": str(error),
+                    "active_generation": (
+                        None if current is None else current.generation
+                    ),
+                },
+                json_output=args.json,
+                human=(
+                    f"activation refused: {error}; the prior activation "
+                    "stays active"
+                ),
+            )
+            return 1
+    finally:
+        database.close()
+    _print(
+        {
+            "activated": True,
+            "generation": activation.generation,
+            "git_sha": activation.git_sha,
+            "checkout_root": activation.checkout_root,
+            "binary_path": activation.binary_path,
+            "database_schema": activation.database_schema,
+        },
+        json_output=args.json,
+        human=(
+            f"activated generation {activation.generation}: "
+            f"{activation.checkout_root} @ {activation.git_sha[:12]} "
+            f"(schema {activation.database_schema})"
+        ),
+    )
+    return 0
+
+
 def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
     """Install the Hermes hooks into every classic profile, idempotently."""
 
@@ -1503,6 +1581,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _serve_console(args, settings)
     if args.command == "hooks-install":
         return _hooks_install(args, settings)
+    if args.command == "runtime-activate":
+        return _runtime_activate(args, settings)
     enable_live = args.command == "daemon" and settings.policy.mode == "active"
     runtime = open_runtime(settings, enable_live=enable_live)
     database = runtime.database
@@ -1691,11 +1771,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0 if result.code not in rejected else 1
 
         if args.command == "daemon":
+            # The running identity is a durable record, not terminal
+            # lore: a clean, schema-matched checkout activates (or the
+            # attempt is durably recorded 'failed' and the prior
+            # activation stays authoritative — the safe rollback).
+            activation = None
+            with suppress(Exception):
+                from hermes_orchestrator.activation import RuntimeActivator
+
+                activation = RuntimeActivator(
+                    runtime.database,
+                    events=EventStore(runtime.database),
+                ).activate(
+                    checkout_root=settings.repo_root,
+                    binary_path=Path(sys.argv[0]).resolve(),
+                )
             supervisor = asyncio.run(
                 _run_daemon(
                     service,
                     once=args.once,
                     interval=args.interval,
+                    activation=activation,
                     dispatch=runtime.dispatch,
                     merge_flow=runtime.merge_flow,
                     projects=tuple(settings.projects),
