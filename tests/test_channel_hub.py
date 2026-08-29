@@ -114,7 +114,7 @@ def seed_packets(database: Database) -> None:
             "session_id, profile_alias, turn_key, kind, reason, state, "
             "created_at) VALUES (?, 1, 'demo', 'ENG-9', 'cell-demo', ?, "
             "'max-b', 'turn-1', 'completed', 'turn completed', "
-            "'delivered', ?)",
+            "'pending', ?)",
             (WAKE_ID, SESSION, NOW.isoformat()),
         )
         connection.execute(
@@ -822,3 +822,65 @@ class TestLauncher:
         assert not config_path.exists()
         assert not capability_file.exists()
         assert not capabilities.verify(SESSION, token)
+
+
+@pytest.mark.asyncio
+class TestConsumedPacketRepair:
+    """Live regression: consumed packets must never replay as events."""
+
+    async def test_consumed_packets_are_never_derived_and_get_superseded(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        seed_active_cell(database)
+        seed_packets(database)
+        # Both packets grew channel events while still pending...
+        await hub.publish(
+            kind="HERMES_WORK_READY",
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+        await hub.publish(
+            kind="HERMES_CORRECTION_READY",
+            packet_id=CORRECTION_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+        # ...and were then consumed through another path (the
+        # Stop-hook poll, an operator signal) before any channel ACK.
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE lead_terminal_wakes SET state = 'delivered' WHERE wake_id = ?",
+                (WAKE_ID,),
+            )
+            connection.execute(
+                "UPDATE lead_corrections SET state = 'acknowledged' "
+                "WHERE correction_id = ?",
+                (CORRECTION_ID,),
+            )
+
+        published = await hub.publish_pending()
+
+        assert published == ()
+        states = {
+            str(row["packet_id"]): str(row["state"])
+            for row in database.execute(
+                "SELECT packet_id, state FROM channel_events"
+            ).fetchall()
+        }
+        assert states == {
+            WAKE_ID: "superseded",
+            CORRECTION_ID: "superseded",
+        }
+
+        # A registration after the repair replays nothing: the day-old
+        # consumed wake can never wake the lead again.
+        sidecar = await registered_sidecar(hub, capabilities)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(sidecar.reader.readline(), timeout=0.3)
+        await sidecar.close()

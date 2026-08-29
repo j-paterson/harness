@@ -333,6 +333,32 @@ class ChannelHub:
         """
 
         published: list[str] = []
+        # Repair first, in the same derivation pass: an unacknowledged
+        # channel event whose packet was already consumed through
+        # another path (Stop-hook poll, prior session, operator
+        # signal) must never replay as a fresh wake — live evidence: a
+        # day-old delivered INFRA-185 wake resurfaced through the
+        # channel. Superseding is durable and terminal for the event
+        # while the packet's own ledger remains the truth.
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE channel_events SET state = 'superseded', "
+                "updated_at = ? WHERE kind = 'HERMES_WORK_READY' "
+                "AND state IN ('pending', 'published') AND packet_id IN ("
+                "SELECT wake_id FROM lead_terminal_wakes "
+                "WHERE state != 'pending')",
+                (stamp,),
+            )
+            connection.execute(
+                "UPDATE channel_events SET state = 'superseded', "
+                "updated_at = ? "
+                "WHERE kind = 'HERMES_CORRECTION_READY' "
+                "AND state IN ('pending', 'published') AND packet_id IN ("
+                "SELECT correction_id FROM lead_corrections "
+                "WHERE state != 'pending')",
+                (stamp,),
+            )
         corrections = self._database.execute(
             "SELECT correction_id, project_key FROM lead_corrections "
             "WHERE state = 'pending' ORDER BY created_at ASC, rowid ASC"
@@ -357,7 +383,7 @@ class ChannelHub:
         wakes = self._database.execute(
             "SELECT w.wake_id, w.cell_id, w.session_id "
             "FROM lead_terminal_wakes AS w "
-            "WHERE NOT EXISTS ("
+            "WHERE w.state = 'pending' AND NOT EXISTS ("
             "SELECT 1 FROM channel_events AS e "
             "WHERE e.kind = 'HERMES_WORK_READY' "
             "AND e.packet_id = w.wake_id "
