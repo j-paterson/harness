@@ -237,6 +237,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     hermes_command.add_argument("--json", dest="request_json", required=True)
 
+    child_start = commands.add_parser(
+        "child-start",
+        help=(
+            "durably count one background child start "
+            "(Claude Code PreToolUse Agent hook)"
+        ),
+    )
+    child_start.add_argument("--session", default=None)
+
+    child_stop = commands.add_parser(
+        "child-stop",
+        help=(
+            "durably count one background child completion and "
+            "reactivate a waiting lead exactly once "
+            "(Claude Code SubagentStop hook)"
+        ),
+    )
+    child_stop.add_argument("--session", default=None)
+
+    hooks_install = commands.add_parser(
+        "hooks-install",
+        help=(
+            "install the Hermes Stop/SubagentStop/PreToolUse hooks "
+            "into every eligible classic profile's settings.json, "
+            "idempotently"
+        ),
+    )
+    hooks_install.add_argument("--json", action="store_true")
+
     intake_poll = commands.add_parser(
         "intake-poll",
         help=(
@@ -1100,6 +1129,94 @@ def _intake_state_dir(args: argparse.Namespace) -> Path:
     )
 
 
+def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
+    """Install the Hermes hooks into every classic profile, idempotently."""
+
+    import shutil
+
+    from hermes_orchestrator.hook_install import (
+        HookCommandSet,
+        HookInstaller,
+    )
+    from hermes_orchestrator.profiles import ProfileRegistry
+
+    profile_path = settings.repo_root / "config" / "profiles.yaml"
+    if not profile_path.exists():
+        print(
+            "hooks-install requires config/profiles.yaml", file=sys.stderr
+        )
+        return 1
+    registry = ProfileRegistry.load(profile_path)
+    uv_binary = shutil.which("uv") or "uv"
+    base = (
+        f"{uv_binary} run --project {settings.repo_root} "
+        f"hermes-orchestrator --repo-root {settings.repo_root} "
+        f"--state-dir {settings.state_dir}"
+    )
+    installer = HookInstaller(
+        profiles={
+            profile.alias: profile.config_dir
+            for profile in registry.profiles
+        },
+        commands=HookCommandSet(
+            stop=f"{base} intake-poll",
+            subagent_stop=f"{base} child-stop",
+            child_start=f"{base} child-start",
+        ),
+    )
+    reports = installer.install()
+    if args.json:
+        print(
+            json.dumps(
+                {"profiles": [report.as_dict() for report in reports]}
+            )
+        )
+    else:
+        for report in reports:
+            status = (
+                "updated" if report.changed else "already installed"
+            )
+            print(f"{report.alias}: {status} ({report.path})")
+    return 0
+
+
+def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
+    """Durably count one child start or completion from a lead hook.
+
+    A hook must never break its lead: any failure is swallowed and the
+    exit code stays 0. The completion that settles the last
+    outstanding child reactivates a waiting continuation exactly once
+    through a children.completed control operation.
+    """
+
+    session = args.session
+    if session is None:
+        with suppress(Exception):
+            payload = json.loads(sys.stdin.read() or "{}")
+            session = payload.get("session_id")
+    if not session:
+        return 0
+    with suppress(Exception):
+        from hermes_orchestrator.events import EventStore
+        from hermes_orchestrator.lead_children import LeadChildTracker
+
+        database = Database.open(_intake_state_dir(args) / "state.db")
+        try:
+            tracker = LeadChildTracker(
+                database,
+                control=ControlOperations(
+                    database, events=EventStore(database)
+                ),
+            )
+            if completed:
+                tracker.child_completed(str(session))
+            else:
+                tracker.child_started(str(session))
+        finally:
+            database.close()
+    return 0
+
+
 def _intake_poll(args: argparse.Namespace) -> int:
     """Lease the calling lead's next pending envelope, if any.
 
@@ -1116,14 +1233,32 @@ def _intake_poll(args: argparse.Namespace) -> int:
     from hermes_orchestrator.lead_intake import LeadIntakePoll
 
     session = args.session
+    hook_event = None
     if session is None:
         with suppress(Exception):
             payload = json.loads(sys.stdin.read() or "{}")
             session = payload.get("session_id")
+            hook_event = payload.get("hook_event_name")
     if not session:
         return 0
     database = Database.open(_intake_state_dir(args) / "state.db")
     try:
+        if hook_event == "Stop":
+            # A Stop with live background children records the durable
+            # continuation the last child completion will reactivate;
+            # a Stop with none supersedes any stale promise.
+            with suppress(Exception):
+                from hermes_orchestrator.events import EventStore
+                from hermes_orchestrator.lead_children import (
+                    LeadChildTracker,
+                )
+
+                LeadChildTracker(
+                    database,
+                    control=ControlOperations(
+                        database, events=EventStore(database)
+                    ),
+                ).record_turn_stop(str(session))
         offer = LeadIntakePoll(database=database).next_offer(str(session))
     finally:
         database.close()
@@ -1359,9 +1494,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _intake_poll(args)
     if args.command == "intake-ack":
         return _intake_ack(args)
+    if args.command == "child-start":
+        return _child_event(args, completed=False)
+    if args.command == "child-stop":
+        return _child_event(args, completed=True)
     settings = load_settings(args.repo_root, args.state_dir)
     if args.command == "serve-console":
         return _serve_console(args, settings)
+    if args.command == "hooks-install":
+        return _hooks_install(args, settings)
     enable_live = args.command == "daemon" and settings.policy.mode == "active"
     runtime = open_runtime(settings, enable_live=enable_live)
     database = runtime.database

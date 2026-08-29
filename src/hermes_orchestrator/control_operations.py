@@ -34,6 +34,7 @@ CONTROL_KINDS = frozenset(
         "channel.replayed",
         "intake.dedup_repaired",
         "channel.blocked",
+        "children.completed",
     }
 )
 
@@ -124,6 +125,36 @@ class ControlOperations:
         result is exactly the point.
         """
 
+        with self._database.transaction() as connection:
+            record = self.record_in(
+                connection,
+                kind=kind,
+                project_key=project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                result=result,
+                reason=reason,
+                dedup_key=dedup_key,
+            )
+        if record is not None:
+            self.notify_committed(record)
+        return record
+
+    def record_in(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        kind: str,
+        project_key: str,
+        cell_id: str,
+        session_id: str,
+        result: Mapping[str, object],
+        reason: str | None = None,
+        dedup_key: str | None = None,
+    ) -> ControlOperation | None:
+        """Record inside the caller's transaction; the caller notifies
+        listeners (``notify_committed``) only after its commit."""
+
         if kind not in CONTROL_KINDS:
             raise ControlOperationRefused(
                 f"unknown control-operation kind {kind!r}"
@@ -131,52 +162,51 @@ class ControlOperations:
         key = dedup_key or f"{kind}:{session_id}"
         stamp = self._now().isoformat()
         operation_id = self._ids()
-        with self._database.transaction() as connection:
-            live = connection.execute(
-                "SELECT operation_id FROM control_operations "
-                "WHERE dedup_key = ? AND state = 'published'",
-                (key,),
-            ).fetchone()
-            if live is not None:
-                return None
-            connection.execute(
-                "INSERT INTO control_operations("
-                "operation_id, schema_version, kind, project_key, "
-                "cell_id, session_id, dedup_key, result_json, reason, "
-                "state, created_at, updated_at, acknowledged_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, "
-                "NULL)",
-                (
-                    operation_id,
-                    CONTROL_SCHEMA_VERSION,
-                    kind,
-                    project_key,
-                    cell_id,
-                    session_id,
-                    key,
-                    json.dumps(dict(result), sort_keys=True),
-                    reason,
-                    stamp,
-                    stamp,
-                ),
-            )
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="control_operation.published",
-                    aggregate_type="control_operation",
-                    aggregate_id=operation_id,
-                    payload={
-                        "kind": kind,
-                        "project_key": project_key,
-                        "cell_id": cell_id,
-                        "session_id": session_id,
-                        "result": dict(result),
-                        "reason": reason,
-                    },
-                ),
-            )
-        record = ControlOperation(
+        live = connection.execute(
+            "SELECT operation_id FROM control_operations "
+            "WHERE dedup_key = ? AND state = 'published'",
+            (key,),
+        ).fetchone()
+        if live is not None:
+            return None
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, "
+            "cell_id, session_id, dedup_key, result_json, reason, "
+            "state, created_at, updated_at, acknowledged_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, "
+            "NULL)",
+            (
+                operation_id,
+                CONTROL_SCHEMA_VERSION,
+                kind,
+                project_key,
+                cell_id,
+                session_id,
+                key,
+                json.dumps(dict(result), sort_keys=True),
+                reason,
+                stamp,
+                stamp,
+            ),
+        )
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="control_operation.published",
+                aggregate_type="control_operation",
+                aggregate_id=operation_id,
+                payload={
+                    "kind": kind,
+                    "project_key": project_key,
+                    "cell_id": cell_id,
+                    "session_id": session_id,
+                    "result": dict(result),
+                    "reason": reason,
+                },
+            ),
+        )
+        return ControlOperation(
             operation_id=operation_id,
             schema_version=CONTROL_SCHEMA_VERSION,
             kind=kind,
@@ -191,8 +221,6 @@ class ControlOperations:
             updated_at=stamp,
             acknowledged_at=None,
         )
-        self.notify_committed(record)
-        return record
 
     def record_for_active_cells(
         self,
