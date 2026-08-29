@@ -44,22 +44,39 @@ export class McpServer {
     this.onLog = onLog;
   }
 
-  start(): void {
+  start(onStdioClosed: () => void): void {
     this.rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
     this.rl.on("line", (line: string) => {
       this.handleLine(line);
     });
+    // Fail closed with the host: once the MCP stdio pipe is gone the
+    // channel cannot reach Claude, so lingering would only hold a live
+    // hub registration that masks the outage. Exiting drops the hub
+    // socket, closes the registration, and lets pending packets fall
+    // back to the Stop-hook poll.
+    this.rl.on("close", onStdioClosed);
+    process.stdin.on("error", onStdioClosed);
+    process.stdout.on("error", onStdioClosed);
   }
 
-  notifyChannelEvent(kind: string, packetId: string): void {
+  notifyChannelEvent(kind: string, packetId: string, eventId: string): void {
+    // The client contract for notifications/claude/channel requires a
+    // string `content` plus optional string-valued `meta` whose keys
+    // are identifiers (anything else is dropped, and a missing
+    // `content` is a ProtocolError that kills the stdio connection —
+    // the exact live failure this shape now prevents). `content` is
+    // the bounded envelope and nothing more; meta carries the ids the
+    // lead needs to fetch the durable packet and call the ACK tool.
     this.writeMessage({
       jsonrpc: "2.0",
       method: "notifications/claude/channel",
       params: {
-        channel: "hermes-control",
-        kind,
-        packet_id: packetId,
-        envelope: `${kind} ${packetId}`,
+        content: `${kind} ${packetId}`,
+        meta: {
+          kind,
+          packet_id: packetId,
+          event_id: eventId,
+        },
       },
     });
   }

@@ -9,7 +9,7 @@ export interface HubClientOptions {
   profile: string;
   generation: number;
   capability: string;
-  onEvent: (kind: string, packetId: string) => void;
+  onEvent: (kind: string, packetId: string, eventId: string) => void;
   onLog: (message: string) => void;
 }
 
@@ -159,7 +159,7 @@ export class HubClient {
         if (!validated) return false;
         if (!this.seenEventIds.has(validated.event_id)) {
           this.seenEventIds.add(validated.event_id);
-          this.opts.onEvent(validated.kind, validated.packet_id);
+          this.opts.onEvent(validated.kind, validated.packet_id, validated.event_id);
         }
         return true;
       }

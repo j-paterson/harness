@@ -51,9 +51,16 @@ supersedes and closes the previous connection.
 The hub persists the event durably before writing it to the socket.
 The sidecar re-validates: known kind, exact packet id shape, its own
 session id. Valid events are surfaced to Claude as a
-`notifications/claude/channel` notification whose data carries the
-bounded envelope `<KIND> <packet_id>` and nothing else. Invalid
-events are protocol violations.
+`notifications/claude/channel` notification with the client's exact
+params contract — a required string `content` holding the bounded
+envelope `<KIND> <packet_id>`, plus `meta` limited to the
+identifier-keyed strings `kind`, `packet_id`, and `event_id` (the ids
+the lead needs to fetch the durable packet and call the ACK tool).
+Nothing else rides along: a malformed shape is a client-side
+ProtocolError that drops the whole MCP connection (observed live),
+and when that stdio pipe closes the sidecar exits so the hub sees the
+channel go away instead of feeding a zombie. Invalid events are
+protocol violations.
 
 ## Acknowledgment (sidecar → hub)
 

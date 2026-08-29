@@ -27,10 +27,22 @@ test("valid event produces exactly one notification; replayed event_id is dedupe
     const notif = await fx.sidecar.nextMessage(
       (m) => m.method === "notifications/claude/channel"
     );
-    assert.equal(notif.params.channel, "hermes-control");
-    assert.equal(notif.params.kind, "HERMES_WORK_READY");
-    assert.equal(notif.params.packet_id, "a".repeat(32));
-    assert.equal(notif.params.envelope, `HERMES_WORK_READY ${"a".repeat(32)}`);
+    // The client contract: a required string `content` (the bounded
+    // envelope) plus identifier-keyed string meta. A missing `content`
+    // is a live-proven ProtocolError that drops the whole connection.
+    assert.equal(notif.params.content, `HERMES_WORK_READY ${"a".repeat(32)}`);
+    assert.deepEqual(notif.params.meta, {
+      kind: "HERMES_WORK_READY",
+      packet_id: "a".repeat(32),
+      event_id: "evt-1",
+    });
+    for (const key of Object.keys(notif.params)) {
+      assert.ok(["content", "meta"].includes(key), `unexpected param ${key}`);
+    }
+    for (const [key, value] of Object.entries(notif.params.meta)) {
+      assert.match(key, /^[A-Za-z0-9_]+$/);
+      assert.equal(typeof value, "string");
+    }
 
     // Replay the same event_id: must not produce a second notification.
     conn.send({

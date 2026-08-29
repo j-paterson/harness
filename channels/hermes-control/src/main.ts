@@ -70,8 +70,8 @@ function main(): void {
     profile,
     generation,
     capability,
-    onEvent: (kind, packetId) => {
-      mcp?.notifyChannelEvent(kind, packetId);
+    onEvent: (kind, packetId, eventId) => {
+      mcp?.notifyChannelEvent(kind, packetId, eventId);
     },
     onLog,
   });
@@ -79,7 +79,10 @@ function main(): void {
   mcp = new McpServer(hub, onLog);
 
   hub.start();
-  mcp.start();
+  mcp.start(() => {
+    onLog("hermes-control: MCP stdio closed; exiting so the hub sees the channel go away");
+    process.exit(1);
+  });
 }
 
 main();

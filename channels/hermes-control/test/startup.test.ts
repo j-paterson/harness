@@ -103,3 +103,27 @@ test("missing generation env var: exits nonzero before answering initialize", as
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("MCP stdio close: the sidecar exits and the hub sees the socket drop", async () => {
+  const { startFixture, initializeSidecar } = await import("./setup.js");
+  const fx = await startFixture();
+  try {
+    await initializeSidecar(fx.sidecar);
+    const conn = await fx.hub.nextConnection();
+    await conn.waitForLine((m: Record<string, unknown>) => m.op === "register");
+    conn.send({ op: "registered", proto: 1 });
+
+    const exited = new Promise<number | null>((resolve) => {
+      fx.sidecar.child.once("exit", (code: number | null) => resolve(code));
+    });
+    fx.sidecar.child.stdin!.end();
+
+    // Fail closed with the host: no lingering zombie holding a live
+    // hub registration once Claude's side of the pipe is gone.
+    const code = await exited;
+    assert.notEqual(code, 0);
+    await conn.waitForClose();
+  } finally {
+    await fx.teardown();
+  }
+});
