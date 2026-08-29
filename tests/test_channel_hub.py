@@ -28,6 +28,7 @@ from hermes_orchestrator.events import EventStore
 SESSION = "11111111-2222-4333-8444-555555555555"
 WAKE_ID = "a" * 32
 CORRECTION_ID = "b" * 32
+ASSIGNMENT_ID = "c" * 32
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
 LEAD = CmuxSurfaceRef(workspace_uuid="w" * 8, surface_uuid="s" * 8)
 
@@ -822,6 +823,125 @@ class TestLauncher:
         assert not config_path.exists()
         assert not capability_file.exists()
         assert not capabilities.verify(SESSION, token)
+
+
+def seed_assignment(database: Database, *, state: str = "published") -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_assignments("
+            "assignment_id, schema_version, project_key, issue_id, "
+            "cell_id, session_id, profile_alias, instruction_id, "
+            "queue_transition, state, created_at, updated_at, "
+            "acknowledged_at) VALUES (?, 1, 'demo', 'ENG-9', "
+            "'cell-demo', ?, 'max-b', 'chat-ENG-9', "
+            "'queued->in_development', ?, ?, ?, NULL)",
+            (ASSIGNMENT_ID, SESSION, state, NOW.isoformat(), NOW.isoformat()),
+        )
+
+
+@pytest.mark.asyncio
+class TestAssignmentEvents:
+    """INFRA-195: assignment packets ride the channel with exact ACK."""
+
+    async def test_a_published_assignment_reaches_the_exact_session(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        seed_active_cell(database)
+        seed_assignment(database)
+        sidecar = await registered_sidecar(hub, capabilities)
+
+        published = await hub.publish_pending()
+
+        assert published == (f"HERMES_ASSIGNMENT_READY {ASSIGNMENT_ID}",)
+        event = await sidecar.receive()
+        assert event["op"] == "event"
+        assert event["kind"] == "HERMES_ASSIGNMENT_READY"
+        assert event["packet_id"] == ASSIGNMENT_ID
+        assert event["session_id"] == SESSION
+        await sidecar.close()
+
+    async def test_the_exact_channel_ack_acknowledges_the_ledger(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        seed_active_cell(database)
+        seed_assignment(database)
+        sidecar = await registered_sidecar(hub, capabilities)
+        await hub.publish_pending()
+        event = await sidecar.receive()
+
+        await sidecar.send(
+            {
+                "op": "ack",
+                "event_id": event["event_id"],
+                "packet_id": ASSIGNMENT_ID,
+                "session_id": SESSION,
+            }
+        )
+        reply = await sidecar.receive()
+
+        assert reply == {"op": "ack_ok", "event_id": event["event_id"]}
+        row = database.execute(
+            "SELECT state, acknowledged_at FROM lead_assignments "
+            "WHERE assignment_id = ?",
+            (ASSIGNMENT_ID,),
+        ).fetchone()
+        assert str(row["state"]) == "acknowledged"
+        assert row["acknowledged_at"] is not None
+        await sidecar.close()
+
+    async def test_an_unacked_assignment_event_survives_the_repair_sweep(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        """The bootstrap defect, inverted: only the assignment ledger's
+        own terminal state may supersede its channel event — a delivery
+        marked elsewhere never consumes the exact-ACK contract."""
+
+        seat(bindings)
+        seed_active_cell(database)
+        seed_assignment(database)
+        await hub.publish(
+            kind="HERMES_ASSIGNMENT_READY",
+            packet_id=ASSIGNMENT_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+
+        await hub.publish_pending()
+
+        state = database.scalar(
+            "SELECT state FROM channel_events WHERE packet_id = ?",
+            (ASSIGNMENT_ID,),
+        )
+        assert str(state) != "superseded"
+
+        # Once the ledger itself is terminal (acknowledged through the
+        # fallback drain), the event supersedes and never replays.
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE lead_assignments SET state = 'acknowledged' "
+                "WHERE assignment_id = ?",
+                (ASSIGNMENT_ID,),
+            )
+        await hub.publish_pending()
+        state = database.scalar(
+            "SELECT state FROM channel_events WHERE packet_id = ?",
+            (ASSIGNMENT_ID,),
+        )
+        assert str(state) == "superseded"
 
 
 @pytest.mark.asyncio

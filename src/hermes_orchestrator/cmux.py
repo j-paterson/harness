@@ -43,7 +43,8 @@ _SHORT_WORKSPACE_ACK = re.compile(r"^OK\s+workspace:\d+$")
 # cmux is the signal plane only — the packet itself lives in durable
 # SQLite and never rides this channel.
 INTAKE_SIGNAL_PATTERN = re.compile(
-    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY) [0-9a-f]{32}\n$"
+    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY"
+    r"|HERMES_ASSIGNMENT_READY) [0-9a-f]{32}\n$"
 )
 
 

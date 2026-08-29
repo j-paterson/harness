@@ -50,6 +50,7 @@ from datetime import UTC, datetime
 from hermes_orchestrator.cmux import CmuxControlPort
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.lead_assignments import ASSIGNMENT_READY
 
 CORRECTION_READY = "HERMES_CORRECTION_READY"
 WORK_READY = "HERMES_WORK_READY"
@@ -57,7 +58,8 @@ WORK_READY = "HERMES_WORK_READY"
 # The complete envelope grammar: one kind, one 32-hex durable packet
 # id. This is the only shape the poll may ever hand to a lead.
 INTAKE_ENVELOPE_PATTERN = re.compile(
-    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY) [0-9a-f]{32}$"
+    r"^(HERMES_CORRECTION_READY|HERMES_WORK_READY"
+    r"|HERMES_ASSIGNMENT_READY) [0-9a-f]{32}$"
 )
 
 _PACKET_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -66,6 +68,7 @@ _PACKET_ID = re.compile(r"^[0-9a-f]{32}$")
 _PACKET_SOURCES = {
     CORRECTION_READY: ("lead_corrections", "correction_id"),
     WORK_READY: ("lead_terminal_wakes", "wake_id"),
+    ASSIGNMENT_READY: ("lead_assignments", "assignment_id"),
 }
 
 
@@ -397,6 +400,19 @@ class LeadIntakePoll:
             candidates.append(
                 (str(row["created_at"]), WORK_READY, str(row["wake_id"]))
             )
+        for row in self._database.execute(
+            "SELECT assignment_id, created_at FROM lead_assignments "
+            "WHERE session_id = ? AND state = 'published' "
+            "ORDER BY created_at ASC, rowid ASC",
+            (session_id,),
+        ).fetchall():
+            candidates.append(
+                (
+                    str(row["created_at"]),
+                    ASSIGNMENT_READY,
+                    str(row["assignment_id"]),
+                )
+            )
         for _, kind, packet_id in sorted(candidates):
             envelope = f"{kind} {packet_id}"
             if INTAKE_ENVELOPE_PATTERN.fullmatch(envelope) is None:
@@ -439,7 +455,19 @@ class LeadIntakePoll:
                 "AND offer_token = ? AND state = 'offered'",
                 (stamp, stamp, session_id, packet_id, offer_token),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return False
+            # An assignment's own ledger records the lead's exact
+            # acknowledgement in the same transaction, so the fallback
+            # drain and the dedicated channel converge on one truth.
+            connection.execute(
+                "UPDATE lead_assignments SET state = 'acknowledged', "
+                "acknowledged_at = ?, updated_at = ? "
+                "WHERE assignment_id = ? AND session_id = ? "
+                "AND state = 'published'",
+                (stamp, stamp, packet_id, session_id),
+            )
+            return True
 
     def _acquire(
         self,
@@ -579,6 +607,25 @@ class LeadIntakeRouter:
             await self._route(
                 WORK_READY,
                 str(row["wake_id"]),
+                str(row["cell_id"]),
+                str(row["session_id"]),
+                announced,
+            )
+        assignments = self._database.execute(
+            "SELECT a.assignment_id, a.cell_id, a.session_id "
+            "FROM lead_assignments AS a "
+            "WHERE a.state = 'published' AND NOT EXISTS ("
+            "SELECT 1 FROM lead_intake_deliveries AS d "
+            "WHERE d.kind = 'HERMES_ASSIGNMENT_READY' "
+            "AND d.packet_id = a.assignment_id "
+            "AND d.session_id = a.session_id "
+            "AND d.state IN ('announced', 'offered', 'delivered', 'superseded')"
+            ") ORDER BY a.created_at ASC, a.rowid ASC"
+        ).fetchall()
+        for row in assignments:
+            await self._route(
+                ASSIGNMENT_READY,
+                str(row["assignment_id"]),
                 str(row["cell_id"]),
                 str(row["session_id"]),
                 announced,

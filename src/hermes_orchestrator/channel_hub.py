@@ -39,6 +39,7 @@ from pathlib import Path
 
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.lead_assignments import ASSIGNMENT_READY
 from hermes_orchestrator.lead_intake import CORRECTION_READY, WORK_READY
 
 PROTOCOL_VERSION = 1
@@ -46,7 +47,7 @@ MAX_LINE_BYTES = 4096
 
 _PACKET_ID = re.compile(r"^[0-9a-f]{32}$")
 _CAPABILITY = re.compile(r"^[0-9a-f]{64}$")
-_KINDS = (CORRECTION_READY, WORK_READY)
+_KINDS = (CORRECTION_READY, WORK_READY, ASSIGNMENT_READY)
 
 
 def _utc_now() -> datetime:
@@ -359,6 +360,20 @@ class ChannelHub:
                 "WHERE state != 'pending')",
                 (stamp,),
             )
+            # An assignment supersedes only when its own ledger is
+            # terminal (acknowledged through any exact path, or
+            # replaced) — never merely because a transport marked a
+            # delivery, so the exact-ACK contract survives races that
+            # consumed the wake-based bootstrap events before ACK.
+            connection.execute(
+                "UPDATE channel_events SET state = 'superseded', "
+                "updated_at = ? "
+                "WHERE kind = 'HERMES_ASSIGNMENT_READY' "
+                "AND state IN ('pending', 'published') AND packet_id IN ("
+                "SELECT assignment_id FROM lead_assignments "
+                "WHERE state != 'published')",
+                (stamp,),
+            )
         corrections = self._database.execute(
             "SELECT correction_id, project_key FROM lead_corrections "
             "WHERE state = 'pending' ORDER BY created_at ASC, rowid ASC"
@@ -400,6 +415,26 @@ class ChannelHub:
             )
             if status == "published":
                 published.append(f"{WORK_READY} {row['wake_id']}")
+        assignments = self._database.execute(
+            "SELECT a.assignment_id, a.cell_id, a.session_id "
+            "FROM lead_assignments AS a "
+            "WHERE a.state = 'published' AND NOT EXISTS ("
+            "SELECT 1 FROM channel_events AS e "
+            "WHERE e.kind = 'HERMES_ASSIGNMENT_READY' "
+            "AND e.packet_id = a.assignment_id "
+            "AND e.session_id = a.session_id "
+            "AND e.state IN ('acked', 'superseded')"
+            ") ORDER BY a.created_at ASC, a.rowid ASC"
+        ).fetchall()
+        for row in assignments:
+            status = await self.publish(
+                kind=ASSIGNMENT_READY,
+                packet_id=str(row["assignment_id"]),
+                cell_id=str(row["cell_id"]),
+                session_id=str(row["session_id"]),
+            )
+            if status == "published":
+                published.append(f"{ASSIGNMENT_READY} {row['assignment_id']}")
         return tuple(published)
 
     async def _handle(
@@ -565,6 +600,16 @@ class ChannelHub:
                 (stamp, stamp, event_id, packet_id, session_id),
             )
             if cursor.rowcount == 1:
+                # An assignment's exact channel ACK is the lead's
+                # acknowledgement of the packet itself; both records
+                # move in one transaction.
+                connection.execute(
+                    "UPDATE lead_assignments SET state = 'acknowledged', "
+                    "acknowledged_at = ?, updated_at = ? "
+                    "WHERE assignment_id = ? AND session_id = ? "
+                    "AND state = 'published'",
+                    (stamp, stamp, packet_id, session_id),
+                )
                 return {"op": "ack_ok", "event_id": event_id}
         return {
             "op": "ack_refused",

@@ -20,6 +20,7 @@ from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor, Conte
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.operator_decisions import OperatorDecisions
@@ -166,6 +167,7 @@ class ProjectCellService:
         surfaces: LeadSeatEnsurer | None = None,
         classic_seats: bool = False,
         decisions: OperatorDecisions | None = None,
+        assignments: LeadAssignments | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -188,6 +190,7 @@ class ProjectCellService:
         self._surfaces = surfaces
         self._classic_seats = classic_seats
         self._decisions = decisions
+        self._assignments = assignments
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
@@ -304,7 +307,13 @@ class ProjectCellService:
                     ),
                     effect_id=f"linear:{issue_id}:in-development:v2",
                 )
-                if self._activate_issue(cell, issue_id):
+                activated, assignment = self._activate_issue(cell, issue_id)
+                if activated:
+                    if assignment is not None and self._assignments is not None:
+                        # The packet is already durable; this only routes
+                        # it to the channel immediately instead of the
+                        # next repair tick.
+                        self._assignments.notify_committed(assignment)
                     return DispatchResult(
                         status="seated",
                         issue_id=issue_id,
@@ -357,7 +366,8 @@ class ProjectCellService:
                             ),
                             effect_id=f"linear:{issue_id}:in-development:v2",
                         )
-                        if self._activate_issue(cell, issue_id):
+                        activated, _ = self._activate_issue(cell, issue_id)
+                        if activated:
                             session_confirmed = True
                             if self._active_time is not None:
                                 self._active_time.open(
@@ -1036,17 +1046,26 @@ class ProjectCellService:
             raise
         return cell, True
 
-    def _activate_issue(self, cell: ProjectCell, issue_id: str) -> bool:
+    def _activate_issue(
+        self, cell: ProjectCell, issue_id: str
+    ) -> tuple[bool, LeadAssignment | None]:
+        """Activate the cell and issue; on the classic path, commit the
+        durable assignment packet in the very same transaction, so a
+        queue transition can never again outrun its assignment."""
+
         now = self._aware_now().isoformat()
+        assignment: LeadAssignment | None = None
         with self._database.transaction() as connection:
             issue_row = connection.execute(
-                "SELECT state FROM admitted_issues WHERE issue_id = ?",
+                "SELECT state, instruction_id FROM admitted_issues "
+                "WHERE issue_id = ?",
                 (issue_id,),
             ).fetchone()
             if issue_row is None:
                 raise KeyError(issue_id)
-            if str(issue_row["state"]) == IssueState.DONE.value:
-                return False
+            prior_state = str(issue_row["state"])
+            if prior_state == IssueState.DONE.value:
+                return False, None
             activated = connection.execute(
                 "UPDATE project_cells SET state = 'active', updated_at = ? "
                 "WHERE cell_id = ? AND state IN ('starting', 'active') "
@@ -1057,7 +1076,7 @@ class ProjectCellService:
                 (now, cell.cell_id, cell.project_key, cell.profile_alias),
             )
             if activated.rowcount == 0:
-                return False
+                return False, None
             updated = connection.execute(
                 "UPDATE admitted_issues SET state = ?, updated_at = ? "
                 "WHERE issue_id = ? AND state != ?",
@@ -1069,7 +1088,7 @@ class ProjectCellService:
                 ),
             )
             if updated.rowcount == 0:
-                return False
+                return False, None
             self._events.append(
                 connection,
                 EventInput(
@@ -1079,7 +1098,20 @@ class ProjectCellService:
                     payload={"cell_id": cell.cell_id},
                 ),
             )
-        return True
+            if self._assignments is not None and self._classic_seats:
+                assignment = self._assignments.publish_in(
+                    connection,
+                    project_key=cell.project_key,
+                    issue_id=issue_id,
+                    cell_id=cell.cell_id,
+                    session_id=str(cell.session_id),
+                    profile_alias=cell.profile_alias,
+                    instruction_id=str(issue_row["instruction_id"]),
+                    queue_transition=(
+                        f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
+                    ),
+                )
+        return True, assignment
 
     def _worker_key(self, cell: ProjectCell) -> str:
         return f"{cell.cell_id}:{cell.session_id}"

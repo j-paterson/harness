@@ -8,6 +8,7 @@ export const MAX_LINE_BYTES = 4096;
 export const EVENT_KINDS = new Set<string>([
   "HERMES_CORRECTION_READY",
   "HERMES_WORK_READY",
+  "HERMES_ASSIGNMENT_READY",
 ]);
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
