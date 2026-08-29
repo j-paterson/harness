@@ -158,7 +158,7 @@ DELIVER_KWARGS = dict(
 
 
 @pytest.mark.asyncio
-async def test_announcement_publishes_metadata_only(
+async def test_delivery_signals_the_surface_with_supplemental_metadata(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:
     seed_packets(database)
@@ -677,3 +677,19 @@ class TestOfferAcknowledgementLease:
             "WHERE delivery_id = 'announced-row'"
         ).fetchone()
         assert str(row["state"]) == "offered"
+
+
+def test_the_lead_contract_documents_the_signal_protocol() -> None:
+    from pathlib import Path as _Path
+
+    contract = (
+        _Path(__file__).parent.parent / "prompts" / "claude-lead.md"
+    ).read_text()
+
+    # Signals are wake-only; SQLite is authoritative; the Stop-hook
+    # offer flow is the fallback, not the primary wake.
+    assert "HERMES_CORRECTION_READY <id>" in contract
+    assert "HERMES_WORK_READY <id>" in contract
+    assert "signal only" in contract
+    assert "Terminal text is never authoritative" in contract
+    assert "fallback" in contract
