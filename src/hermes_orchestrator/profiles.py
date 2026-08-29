@@ -194,6 +194,7 @@ class ClaudeProfileProbe:
             result.get("loggedIn") is True
             and result.get("authMethod") == "claude.ai"
             and result.get("apiProvider") == "firstParty"
+            and result.get("subscriptionType") == "max"
         )
         return ProfileHealth(
             profile_alias=alias,
