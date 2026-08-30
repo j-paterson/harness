@@ -1447,3 +1447,147 @@ def test_intake_poll_offers_and_only_explicit_ack_delivers(
         ]
     )
     assert duplicate.exit_code == 1
+
+
+# --- verify / verify-check (INFRA-186 P9: any-agent verifier CLI) ----------
+
+
+def _verifier_git(checkout: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ("git", "-C", str(checkout), *args),
+        check=True,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "PATH": "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+            "HOME": str(checkout),
+        },
+    )
+
+
+def _build_verify_target(root: Path) -> Path:
+    target = root / "verify-target"
+    target.mkdir()
+    (target / "README.md").write_text("hello\n")
+    _verifier_git(target, "init", "-q")
+    _verifier_git(target, "add", "-A")
+    _verifier_git(target, "commit", "-qm", "init")
+    return target
+
+
+def test_verify_runs_a_command_and_prints_a_receipt_id(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    target = _build_verify_target(tmp_path)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify",
+            "--gate",
+            "demo-gate",
+            "--cwd",
+            str(target),
+            "--json",
+            "--",
+            "python3",
+            "-c",
+            "print('1 passed')",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["gate_id"] == "demo-gate"
+    assert payload["exit_code"] == 0
+    assert payload["fresh"] is True
+    assert len(payload["receipt_id"]) == 64
+
+
+def test_verify_refuses_an_empty_trailing_command(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    target = _build_verify_target(tmp_path)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify",
+            "--gate",
+            "demo-gate",
+            "--cwd",
+            str(target),
+        ]
+    )
+
+    assert result.exit_code == 2
+    assert "command" in result.output
+
+
+def test_verify_check_is_fresh_then_stale_after_a_tree_change(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    target = _build_verify_target(tmp_path)
+    first = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify",
+            "--gate",
+            "demo-gate",
+            "--cwd",
+            str(target),
+            "--json",
+            "--",
+            "python3",
+            "-c",
+            "print('1 passed')",
+        ]
+    )
+    receipt_id = json.loads(first.stdout)["receipt_id"]
+
+    fresh = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify-check",
+            "--gate",
+            "demo-gate",
+            "--receipt",
+            receipt_id,
+            "--cwd",
+            str(target),
+            "--json",
+        ]
+    )
+    assert fresh.exit_code == 0
+    assert json.loads(fresh.stdout) == {
+        "receipt_id": receipt_id,
+        "valid": True,
+        "reason": "fresh",
+    }
+
+    (target / "README.md").write_text("changed\n")
+    _verifier_git(target, "add", "README.md")
+    _verifier_git(target, "commit", "-qm", "change")
+
+    stale = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify-check",
+            "--gate",
+            "demo-gate",
+            "--receipt",
+            receipt_id,
+            "--cwd",
+            str(target),
+            "--json",
+        ]
+    )
+    assert stale.exit_code == 1
+    payload = json.loads(stale.stdout)
+    assert payload["valid"] is False
+    assert payload["reason"] == "stale: tree changed"

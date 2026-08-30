@@ -25,7 +25,12 @@ narrative claims: verify each returned diff, scope, red/green evidence, and
 cleanup before `accept_packet`. Direct lead implementation is a durable
 recorded exception (`record_direct_exception`, reviewer-fix scale only), never
 the default; `candidate-ready` fails closed on a non-trivial candidate without
-accepted packets or a valid exception. If a packet repeatedly fails or reveals
+accepted packets or a valid exception, and without a fresh attested
+verification receipt for the mandatory complete gate on exactly the
+candidate tree — run it through `hermes-orchestrator verify --gate
+candidate-full-gate -- <full test command>` (any agent may run
+`verify`/`verify-check`; trust comes from the runner's attestation and
+measured bindings, never from narrative). If a packet repeatedly fails or reveals
 coupling, stop delegating it, revise the decomposition, and take the coupled
 decision yourself.
 

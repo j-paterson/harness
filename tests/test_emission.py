@@ -460,3 +460,127 @@ async def test_no_packets_wired_skips_the_delegation_gate(tmp_path: Path) -> Non
 
     assert result.delivery.delivered is True
     assert deliverer.events == [("demo", result.event)]
+
+
+# --- final candidate-gate receipt requirement (INFRA-186 P9) ---------------
+#
+# A real ``Verifier`` measures the ACTUAL git tree at ``repo`` (rev-parse
+# HEAD^{tree}, git diff HEAD, ...); the emission tests' ``FakeGitRunner``
+# fakes the CandidateEmitter's own git seam with a synthetic 40-char HEAD
+# sha that is never a real commit, and ``tmp_path`` (the fake's
+# ``repo_path``) is never git-initialized. Wiring a real ``Verifier``
+# through that seam would be incoherent (it would shell out to git
+# against a directory that both isn't a repo and doesn't have the fake's
+# claimed HEAD). So — per the packet's documented discretion — a stub
+# exposing exactly ``Verifier``'s two consumed methods
+# (``receipt_ids_for_gate``, ``validate_for_tree``) stands in, and the
+# tests assert the emitter calls it correctly rather than re-deriving
+# git's own tree hashing.
+
+
+@dataclass
+class StubVerifier:
+    ids_by_gate: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    outcomes: dict[str, tuple[bool, str]] = field(default_factory=dict)
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    def receipt_ids_for_gate(self, gate_id: str) -> tuple[str, ...]:
+        self.calls.append(("receipt_ids_for_gate", gate_id))
+        return self.ids_by_gate.get(gate_id, ())
+
+    def validate_for_tree(
+        self, receipt_id: str, *, cwd: Path, gate_id: str
+    ) -> tuple[bool, str]:
+        self.calls.append(("validate_for_tree", receipt_id, gate_id))
+        return self.outcomes.get(receipt_id, (False, "unknown receipt"))
+
+
+def _emitter_with_verifier(
+    tmp_path: Path, git: FakeGitRunner, verifier: StubVerifier | None
+) -> tuple[CandidateEmitter, FakeDeliverer]:
+    deliverer = FakeDeliverer()
+    root = tmp_path / "manifests"
+    root.mkdir(exist_ok=True)
+    emitter = CandidateEmitter(
+        projects={
+            "demo": ProjectConfig(
+                linear_team="infrastructure",
+                repo_path=tmp_path,
+                integration_branch="main",
+                github_repo="j-paterson/demo",
+            )
+        },
+        git=git,
+        manifest_root=root,
+        delivery=deliverer,
+        now=lambda: NOW,
+        verifier=verifier,
+    )
+    return emitter, deliverer
+
+
+@pytest.mark.asyncio
+async def test_missing_final_gate_receipt_blocks_with_no_side_effects(
+    tmp_path: Path,
+) -> None:
+    verifier = StubVerifier()
+    emitter, deliverer = _emitter_with_verifier(tmp_path, clean_git(), verifier)
+
+    with pytest.raises(EmissionBlocked, match="final candidate-gate receipt"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+    assert verifier.calls == [("receipt_ids_for_gate", "candidate-full-gate")]
+
+
+@pytest.mark.asyncio
+async def test_stale_final_gate_receipt_blocks_with_no_side_effects(
+    tmp_path: Path,
+) -> None:
+    verifier = StubVerifier(
+        ids_by_gate={"candidate-full-gate": ("abc123",)},
+        outcomes={"abc123": (False, "stale: tree changed")},
+    )
+    emitter, deliverer = _emitter_with_verifier(tmp_path, clean_git(), verifier)
+
+    with pytest.raises(EmissionBlocked, match="final candidate-gate receipt"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_final_gate_receipt_publishes_and_is_threaded_into_the_manifest(
+    tmp_path: Path,
+) -> None:
+    verifier = StubVerifier(
+        ids_by_gate={"candidate-full-gate": ("abc123",)},
+        outcomes={"abc123": (True, "fresh")},
+    )
+    emitter, deliverer = _emitter_with_verifier(tmp_path, clean_git(), verifier)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("gate:candidate-full-gate", "receipt:abc123") in manifest.verification
+    assert manifest.verification == (
+        ("pytest", "ok"),
+        ("gate:candidate-full-gate", "receipt:abc123"),
+    )
+    assert ("validate_for_tree", "abc123", "candidate-full-gate") in verifier.calls
+
+
+@pytest.mark.asyncio
+async def test_no_verifier_wired_skips_the_final_gate_receipt_check(
+    tmp_path: Path,
+) -> None:
+    emitter, deliverer = _emitter_with_verifier(tmp_path, clean_git(), None)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]

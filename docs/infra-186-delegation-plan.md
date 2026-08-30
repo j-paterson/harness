@@ -131,14 +131,46 @@ Mirrored here and recorded in the live `subagent_packets` table in one
 batch at final integration (before candidate publication, so the new
 delegation-evidence gate judges this issue by its own ledger):
 
-- P1 **accepted** (Sonnet): red `ModuleNotFoundError` →
+- P1 **accepted** (Sonnet, `fe64a01a…`): red `ModuleNotFoundError` →
   19 green packet tests, ruff clean; scope exactly its three files;
   interface conformant; integrated in `8b70b39`.
-- P7 **accepted** (Haiku): red `ModuleNotFoundError` → 16 green tests,
-  ruff clean; scope exactly its three files; integrated in `8b70b39`.
-- Lead direct-work exception (documented, reviewer-fix scale): the
+- P7 **accepted** (Haiku, `b20d4e1f…`): red `ModuleNotFoundError` →
+  16 green tests, ruff clean; scope exactly its three files;
+  integrated in `8b70b39`.
+- Lead direct-work exception (recorded through the production
+  `record_direct_exception` command, `9068723a…`, **accepted**): the
   two-field `ClaudeEvent` interface stub enabling wave-2 parallelism
-  (`dc4d83b`, 5 lines, one file).
-- P2, P3, P4 **reserved** (Sonnet, wave 2, disjoint files) — in
-  flight.
-- P5, P6 planned (wave 3, blocked on wave-2 integration).
+  (`dc4d83b`, 5 lines, one file — under the ≤2 files/≤30 lines cap).
+- P2 **accepted** (Sonnet, `a14dfad7…`): admission service; red →
+  green, scope exact; integrated in `2c8a81d`.
+- P3 **accepted** (Sonnet, `ffa66736…`): redacted Agent metadata in
+  the parser; integrated in `2c8a81d`.
+- P4 **accepted** (Sonnet, `6f8aa240…`): exactly-once lease/packet
+  settlement; integrated in `2c8a81d`.
+- P5 **accepted** (Sonnet, `907bb0f0…`): typed packet commands,
+  delegation-evidence gate, direct-work exception command; reasoned
+  red accepted for net-new symbols (append-only diff proof; empirical
+  stash red impossible in the shared worktree); integrated in
+  `7916fd9`.
+- P6 **accepted** (Haiku, `a6d48601…`): delegation status view;
+  integrated in `7916fd9`.
+- P8 **accepted** (Sonnet, `496d8e30…`): migration 0046 +
+  `verifier.py` attested receipts, 13 green tests; reconciled to v3
+  without redesign; integrated in `7916fd9`.
+- P9 **accepted** (Sonnet, `e507684f…`): `validate_for_tree` /
+  `receipt_ids_for_gate`, any-agent `verify`/`verify-check` CLI, and
+  the candidate-gate receipt enforcement in `CandidateEmitter`; red
+  `AttributeError`/unknown-subcommand → 77 focused green, full suite
+  1997 green, ruff clean, scope exactly its six files. Found and
+  fixed (with a red test) a real argparse dest collision between the
+  subparser `dest="command"` and the spec's literal REMAINDER
+  positional.
+- Lead wiring after P9: `build_merge_flow` constructs the production
+  `Verifier` and passes it to `CandidateEmitter`, so a non-trivial
+  candidate fails closed without BOTH accepted-packet delegation
+  evidence and a fresh `candidate-full-gate` receipt for exactly the
+  candidate tree.
+
+All nine packets plus the direct exception are recorded as
+**accepted** in the live `subagent_packets` ledger, so this issue's
+own candidate is judged by its own machinery.

@@ -360,6 +360,99 @@ class Verifier:
                 return self.get(receipt_id)
         return None
 
+    def _measured_bindings(self, cwd: Path) -> dict[str, str]:
+        """Tree/dependency/runner facts measured BY THIS RUNNER, right
+        now, independent of any particular gate command — the subset
+        ``validate_for_tree`` needs to prove a green run happened on
+        exactly this tree."""
+
+        tree_hash = _git(cwd, "rev-parse", "HEAD^{tree}").strip()
+        diff_output = _git(cwd, "diff", "HEAD")
+        dirty_patch_hash = (
+            ""
+            if diff_output == ""
+            else hashlib.sha256(diff_output.encode("utf-8")).hexdigest()
+        )
+        return {
+            "tree_hash": tree_hash,
+            "dirty_patch_hash": dirty_patch_hash,
+            "dependency_hash": _dependency_hash(cwd),
+            "runner_fingerprint": _runner_fingerprint(),
+        }
+
+    def validate_for_tree(
+        self, receipt_id: str, *, cwd: Path, gate_id: str
+    ) -> tuple[bool, str]:
+        """Prove that SOME green attested run of ``gate_id`` happened on
+        exactly the current tree — without asserting which command was
+        invoked.
+
+        This is the transition validator for the mandatory candidate
+        gate: the gate's own command is bound INSIDE the attested
+        receipt document and is reported to reviewers from there, so a
+        caller here (Hermes, the candidate gate, or any agent through
+        the ``verify-check`` CLI) does not need to know or restate the
+        exact command to confirm the gate already ran green on this
+        tree. Everything else — signature integrity, the tree/dirty-
+        patch hash, the dependency hash, and the runner fingerprint —
+        is still checked exactly as ``validate`` checks it; only the
+        command comparison is dropped.
+        """
+
+        row = self._database.execute(
+            "SELECT * FROM verification_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            return False, "unknown receipt"
+
+        stored_test_counts = json.loads(str(row["test_counts"]))
+        stored_binding = {
+            "schema_version": int(row["schema_version"]),
+            "gate_id": str(row["gate_id"]),
+            "command": str(row["command"]),
+            "tree_hash": str(row["tree_hash"]),
+            "dirty_patch_hash": str(row["dirty_patch_hash"]),
+            "dependency_hash": str(row["dependency_hash"]),
+            "runner_fingerprint": str(row["runner_fingerprint"]),
+            "exit_code": int(row["exit_code"]),
+            "test_counts": stored_test_counts,
+            "output_hash": str(row["output_hash"]),
+        }
+        canonical = json.dumps(stored_binding, sort_keys=True)
+        expected_signature = hmac.new(
+            self._signing_key(), canonical.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, str(row["signature"])):
+            return False, "signature invalid"
+
+        if stored_binding["gate_id"] != gate_id:
+            return False, "gate mismatch"
+
+        measured = self._measured_bindings(cwd)
+        if (
+            measured["tree_hash"] != stored_binding["tree_hash"]
+            or measured["dirty_patch_hash"] != stored_binding["dirty_patch_hash"]
+        ):
+            return False, "stale: tree changed"
+        if measured["dependency_hash"] != stored_binding["dependency_hash"]:
+            return False, "stale: dependencies changed"
+        if measured["runner_fingerprint"] != stored_binding["runner_fingerprint"]:
+            return False, "stale: runner or environment changed"
+        if stored_binding["exit_code"] != 0:
+            return False, "receipt records a failing run"
+        return True, "fresh"
+
+    def receipt_ids_for_gate(self, gate_id: str) -> tuple[str, ...]:
+        """Every receipt id recorded for ``gate_id``, newest first."""
+
+        rows = self._database.execute(
+            "SELECT receipt_id FROM verification_receipts "
+            "WHERE gate_id = ? ORDER BY created_at DESC, rowid DESC",
+            (gate_id,),
+        ).fetchall()
+        return tuple(str(row["receipt_id"]) for row in rows)
+
     def get(self, receipt_id: str) -> VerificationReceipt:
         row = self._database.execute(
             "SELECT * FROM verification_receipts WHERE receipt_id = ?",

@@ -415,6 +415,38 @@ def _parser() -> argparse.ArgumentParser:
     migration_env.add_argument("--out", type=Path)
     migration_env.add_argument("--verdict", type=Path)
     migration_env.add_argument("--execute", action="store_true")
+
+    verify = commands.add_parser(
+        "verify",
+        help=(
+            "any-agent trusted verification runner: execute a gate "
+            "command under --cwd and record a signed, content-addressed "
+            "receipt (INFRA-186)"
+        ),
+    )
+    verify.add_argument("--gate", required=True)
+    verify.add_argument("--cwd", type=Path, default=Path("."))
+    verify.add_argument("--json", action="store_true")
+    # NOTE: the positional is named ``gate_command`` (not ``command``)
+    # because the subparsers' own dispatch dest is ALSO "command"
+    # (``commands = parser.add_subparsers(dest="command", ...)`` above);
+    # a same-named positional here would silently overwrite that dest
+    # with the REMAINDER list and break dispatch in ``main()``. The
+    # metavar keeps the help text reading as "command".
+    verify.add_argument("gate_command", nargs=argparse.REMAINDER, metavar="command")
+
+    verify_check = commands.add_parser(
+        "verify-check",
+        help=(
+            "any-agent transition validator: prove a fresh, signed "
+            "receipt for --gate exists on the current tree at --cwd, "
+            "without restating the gate's command (INFRA-186)"
+        ),
+    )
+    verify_check.add_argument("--gate", required=True)
+    verify_check.add_argument("--receipt", required=True)
+    verify_check.add_argument("--cwd", type=Path, default=Path("."))
+    verify_check.add_argument("--json", action="store_true")
     return parser
 
 
@@ -1647,6 +1679,90 @@ def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _verify(args: argparse.Namespace, settings: Settings) -> int:
+    """Any-agent trusted verification runner (INFRA-186): execute the
+    trailing command under ``--cwd`` and record a signed,
+    content-addressed receipt. Callable by the lead, an implementation
+    subagent, or Sol alike — nothing here binds to a session or role."""
+
+    import shlex
+
+    from hermes_orchestrator.verifier import Verifier
+
+    command = list(args.gate_command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        _print(
+            {"error": "no command given"},
+            json_output=args.json,
+            human=(
+                "verify: a trailing command is required, e.g. "
+                "`verify --gate g -- pytest -q`"
+            ),
+        )
+        return 2
+    database = Database.open(settings.state_dir / "state.db")
+    try:
+        verifier = Verifier(
+            database, events=EventStore(database), state_dir=settings.state_dir
+        )
+        # Each already-split argv element is re-quoted before being
+        # rejoined: ``Verifier`` takes one command STRING and
+        # ``shlex.split``s it itself, so an unquoted join would corrupt
+        # any argument containing whitespace or shell metacharacters
+        # (e.g. an inline ``python3 -c "print('1 passed')"``).
+        receipt = verifier.run_verified(
+            args.cwd,
+            gate_id=args.gate,
+            command=" ".join(shlex.quote(part) for part in command),
+        )
+    finally:
+        database.close()
+    _print(
+        {
+            "receipt_id": receipt.receipt_id,
+            "gate_id": receipt.gate_id,
+            "exit_code": receipt.exit_code,
+            "test_counts": receipt.test_counts,
+            "fresh": True,
+        },
+        json_output=args.json,
+        human=(
+            f"receipt {receipt.receipt_id}: gate {receipt.gate_id} "
+            f"exit {receipt.exit_code}"
+        ),
+    )
+    return 0 if receipt.exit_code == 0 else 1
+
+
+def _verify_check(args: argparse.Namespace, settings: Settings) -> int:
+    """Any-agent transition validator (INFRA-186): prove SOME fresh,
+    signed receipt for ``--gate`` exists on the current tree at
+    ``--cwd``, without restating the gate's own command — the command
+    is bound inside the attested receipt and reported to reviewers
+    from there."""
+
+    from hermes_orchestrator.verifier import Verifier
+
+    database = Database.open(settings.state_dir / "state.db")
+    try:
+        verifier = Verifier(
+            database, events=EventStore(database), state_dir=settings.state_dir
+        )
+        valid, reason = verifier.validate_for_tree(
+            args.receipt, cwd=args.cwd, gate_id=args.gate
+        )
+    finally:
+        database.close()
+    _print(
+        {"receipt_id": args.receipt, "valid": valid, "reason": reason},
+        json_output=args.json,
+        human=f"receipt {args.receipt}: {reason}",
+    )
+    return 0 if valid else 1
+
+
 def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     """Durably count one child start or completion from a lead hook.
 
@@ -2003,6 +2119,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _hooks_install(args, settings)
     if args.command == "runtime-activate":
         return _runtime_activate(args, settings)
+    if args.command == "verify":
+        return _verify(args, settings)
+    if args.command == "verify-check":
+        return _verify_check(args, settings)
     enable_live = args.command == "daemon" and settings.policy.mode == "active"
     runtime = open_runtime(settings, enable_live=enable_live)
     database = runtime.database

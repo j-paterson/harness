@@ -38,6 +38,7 @@ from hermes_orchestrator.verdicts import CorrectionPacket
 
 if TYPE_CHECKING:
     from hermes_orchestrator.subagent_packets import SubagentPackets
+    from hermes_orchestrator.verifier import Verifier
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +153,8 @@ class CandidateEmitter:
         lead: CorrectionSinkPort | None = None,
         issue_for_failure: Callable[[str, str], str | None] | None = None,
         packets: SubagentPackets | None = None,
+        verifier: Verifier | None = None,
+        candidate_gate_id: str = "candidate-full-gate",
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -162,6 +165,8 @@ class CandidateEmitter:
         self._lead = lead
         self._issue_for_failure = issue_for_failure
         self._packets = packets
+        self._verifier = verifier
+        self._candidate_gate_id = candidate_gate_id
 
     async def emit(
         self,
@@ -218,6 +223,12 @@ class CandidateEmitter:
         base, changed = facts.base, facts.changed_files
         if self._packets is not None:
             self._enforce_delegation_evidence(repo, issue_id, base, head, changed)
+        verification_extra: tuple[tuple[str, str], ...] = ()
+        if self._verifier is not None:
+            receipt_id = self._enforce_final_gate_receipt(repo)
+            verification_extra = (
+                (f"gate:{self._candidate_gate_id}", f"receipt:{receipt_id}"),
+            )
         # A fresh event per freeze boundary: a deferred candidate must be
         # re-woken as a new event, and the durable wake registry deduplicates
         # by candidate identity, so re-emission is always safe.
@@ -232,7 +243,7 @@ class CandidateEmitter:
             branch=branch,
             linear_issues=(issue_id,),
             changed_files=changed,
-            verification=verification,
+            verification=verification + verification_extra,
             blockers=blockers,
             created_at=self._now().astimezone(UTC).isoformat(),
         )
@@ -350,6 +361,37 @@ class CandidateEmitter:
                 "requires accepted subagent packets or a recorded "
                 "direct-work exception (record_direct_exception)"
             )
+
+    def _enforce_final_gate_receipt(self, repo: Path) -> str:
+        """Require a fresh, signed receipt for the mandatory complete
+        gate on this EXACT proven tree before any candidate publishes.
+
+        The gate's own command is bound INSIDE the attested receipt
+        document and is reported to reviewers from there, so this
+        transition validator does not restate or compare a command —
+        it only needs to prove that SOME green attested run of
+        ``candidate_gate_id`` happened on exactly this tree. It walks
+        the newest receipts for the gate (``receipt_ids_for_gate``) and
+        accepts the first that ``validate_for_tree`` reports fresh;
+        never inferred, always proven from the durable, HMAC-signed
+        ledger.
+        """
+
+        assert self._verifier is not None
+        for receipt_id in self._verifier.receipt_ids_for_gate(
+            self._candidate_gate_id
+        ):
+            valid, reason = self._verifier.validate_for_tree(
+                receipt_id, cwd=repo, gate_id=self._candidate_gate_id
+            )
+            if valid and reason == "fresh":
+                return receipt_id
+        raise EmissionBlocked(
+            "final candidate-gate receipt missing or stale: run the "
+            "mandatory complete gate through `hermes-orchestrator "
+            f"verify --gate {self._candidate_gate_id} -- <full test "
+            "command>` on this exact tree"
+        )
 
     def _run(self, repo: Path, *args: str) -> str:
         try:

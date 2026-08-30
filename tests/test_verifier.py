@@ -262,3 +262,107 @@ def test_the_signing_key_is_created_once_with_restrictive_permissions(
     assert mode == 0o600
     key_bytes = bytes.fromhex(key_path.read_text().strip())
     assert len(key_bytes) == 32
+
+
+# --- validate_for_tree (INFRA-186 P9: the any-agent transition validator) ---
+
+
+def test_validate_for_tree_is_fresh_on_an_unchanged_tree_without_a_command(
+    verifier: Verifier, repo: Path
+) -> None:
+    receipt = verifier.run_verified(repo, gate_id=GATE_ID, command=PASS_COMMAND)
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id=GATE_ID
+    )
+
+    assert outcome == (True, "fresh")
+
+
+def test_validate_for_tree_reports_gate_mismatch(
+    verifier: Verifier, repo: Path
+) -> None:
+    receipt = verifier.run_verified(repo, gate_id=GATE_ID, command=PASS_COMMAND)
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id="some-other-gate"
+    )
+
+    assert outcome == (False, "gate mismatch")
+
+
+def test_validate_for_tree_is_stale_on_a_tree_change(
+    verifier: Verifier, repo: Path
+) -> None:
+    receipt = verifier.run_verified(repo, gate_id=GATE_ID, command=PASS_COMMAND)
+
+    (repo / "README.md").write_text("changed\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-qm", "change")
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id=GATE_ID
+    )
+
+    assert outcome == (False, "stale: tree changed")
+
+
+def test_validate_for_tree_reports_a_forged_row_invalid(
+    verifier: Verifier, repo: Path, database: Database
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO verification_receipts("
+            "receipt_id, schema_version, gate_id, command, tree_hash, "
+            "dirty_patch_hash, dependency_hash, runner_fingerprint, "
+            "exit_code, test_counts, duration_seconds, output_hash, "
+            "signature, created_at) "
+            "VALUES ('forged-for-tree', 1, ?, ?, 'deadbeef', '', 'cafe', "
+            "'runner', 0, '{}', 0.1, 'output', 'not-a-real-signature', ?)",
+            (GATE_ID, PASS_COMMAND, NOW.isoformat()),
+        )
+
+    outcome = verifier.validate_for_tree(
+        "forged-for-tree", cwd=repo, gate_id=GATE_ID
+    )
+
+    assert outcome == (False, "signature invalid")
+
+
+def test_validate_for_tree_refuses_a_failing_run(
+    verifier: Verifier, repo: Path
+) -> None:
+    receipt = verifier.run_verified(repo, gate_id=GATE_ID, command=FAIL_COMMAND)
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id=GATE_ID
+    )
+
+    assert outcome == (False, "receipt records a failing run")
+
+
+def test_validate_for_tree_reports_unknown_receipt(
+    verifier: Verifier, repo: Path
+) -> None:
+    outcome = verifier.validate_for_tree(
+        "does-not-exist", cwd=repo, gate_id=GATE_ID
+    )
+
+    assert outcome == (False, "unknown receipt")
+
+
+def test_receipt_ids_for_gate_orders_newest_first(
+    verifier: Verifier, repo: Path
+) -> None:
+    first = verifier.run_verified(repo, gate_id=GATE_ID, command=PASS_COMMAND)
+
+    (repo / "README.md").write_text("changed\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-qm", "change")
+    second = verifier.run_verified(repo, gate_id=GATE_ID, command=PASS_COMMAND)
+
+    assert verifier.receipt_ids_for_gate(GATE_ID) == (
+        second.receipt_id,
+        first.receipt_id,
+    )
+    assert verifier.receipt_ids_for_gate("no-such-gate") == ()
