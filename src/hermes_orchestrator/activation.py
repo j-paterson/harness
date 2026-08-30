@@ -175,6 +175,22 @@ class RuntimeActivator:
         ).fetchone()
         return None if row is None else self._record(row)
 
+    @staticmethod
+    def _write_active_pointer(artifact: Path) -> None:
+        """Refresh the derived ACTIVE pointer beside the artifacts.
+
+        The database stays the authority (runtime-exec re-resolves it
+        read-only); the pointer is what the rendered shell bootstrap
+        reads, atomically replaced so a crash can never leave it
+        half-written. A WAL database cannot be opened by a read-only
+        shell client, which is why the shell never touches SQL.
+        """
+
+        pointer = artifact.parent / "ACTIVE"
+        staging = artifact.parent / f".ACTIVE.tmp-{os.getpid()}"
+        staging.write_text(str(artifact) + "\n", encoding="utf-8")
+        staging.rename(pointer)
+
     def observed_sha(self, checkout_root: Path) -> str | None:
         """The running code's commit identity: an immutable artifact's
         RUNTIME_SHA marker, or the checkout's git HEAD."""
@@ -296,6 +312,7 @@ class RuntimeActivator:
                     reason=str(refusal),
                 )
                 raise refusal from error
+        self._write_active_pointer(artifact)
         return self._record_attempt(
             state="active",
             binary_path=artifact / ".venv" / "bin" / "hermes-orchestrator",
@@ -331,6 +348,8 @@ class RuntimeActivator:
             )
         if not (prior_root / "RUNTIME_SHA").is_file():
             self._validate(prior_root)
+        else:
+            self._write_active_pointer(prior_root)
         return self._record_attempt(
             state="active",
             binary_path=Path(prior.binary_path),

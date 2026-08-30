@@ -655,3 +655,31 @@ class TestImmutableArtifacts:
         assert current is not None
         assert current.checkout_root == prior.checkout_root
         assert current.git_sha == prior.git_sha
+
+
+def test_activation_maintains_the_derived_active_pointer(
+    database: Database, tmp_path: Path
+) -> None:
+    """The shell bootstrap reads runtimes/ACTIVE; every artifact
+    activation and rollback refreshes it atomically."""
+
+    checkout = build_checkout(tmp_path, schema=database.schema_version())
+    state_dir = tmp_path / "state"
+    activator = RuntimeActivator(database, events=EventStore(database))
+
+    prior = activator.activate_artifact(
+        source_checkout=checkout, state_dir=state_dir
+    )
+    pointer = state_dir / "runtimes" / "ACTIVE"
+    assert pointer.read_text().strip() == prior.checkout_root
+
+    (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+    git(checkout, "add", "-A")
+    git(checkout, "commit", "-qm", "advance")
+    fresh = activator.activate_artifact(
+        source_checkout=checkout, state_dir=state_dir
+    )
+    assert pointer.read_text().strip() == fresh.checkout_root
+
+    activator.reactivate(prior)
+    assert pointer.read_text().strip() == prior.checkout_root

@@ -38,11 +38,12 @@ def render_bootstrap(
 ) -> str:
     """Render the durable, worktree-independent launchd entry script.
 
-    The script resolves the durable active runtime activation from the
-    state database READ-ONLY (never migrating anything) and execs the
-    CLI from that immutable artifact; with no activation yet, the
-    durable config clone is the bootstrap fallback. It never references
-    any disposable issue worktree.
+    The script reads the derived ACTIVE pointer the activator maintains
+    beside the immutable runtime artifacts (the WAL state database is
+    not shell-readable; runtime-exec re-resolves the durable ledger
+    read-only anyway) and execs the CLI from that artifact; with no
+    activation yet, the durable config clone is the bootstrap fallback.
+    It never references any disposable issue worktree.
     """
 
     return (
@@ -50,10 +51,7 @@ def render_bootstrap(
         "# Rendered by hermes-orchestrator deploy-render; installed by\n"
         "# deploy-install. Do not edit by hand.\n"
         f"export PATH={BOOTSTRAP_PATH}\n"
-        "ACTIVE=$(/usr/bin/sqlite3 -readonly "
-        f'"{state_dir}/state.db" '
-        '"SELECT checkout_root FROM runtime_activations '
-        "WHERE state = 'active'\" 2>/dev/null || true)\n"
+        f'ACTIVE=$(cat "{state_dir}/runtimes/ACTIVE" 2>/dev/null || true)\n'
         f'PROJECT="{config_repo}"\n'
         'if [ -n "$ACTIVE" ] && [ -f "$ACTIVE/pyproject.toml" ]; then\n'
         '  PROJECT="$ACTIVE"\n'
