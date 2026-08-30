@@ -395,9 +395,25 @@ class ChannelHub:
                 "WHERE kind = 'HERMES_CONTROL_READY' "
                 "AND state IN ('pending', 'published') AND packet_id IN ("
                 "SELECT operation_id FROM control_operations "
-                "WHERE state != 'published')",
+                "WHERE state != 'published' "
+                "AND kind != 'intake.dedup_repaired')",
                 (stamp,),
             ).rowcount
+            # A consumed repair receipt's own stale event is swept the
+            # same terminal way but never counted as a repair: counting
+            # it would mint a fresh receipt each pass and feed the very
+            # churn it reports — one spurious wake per tick whenever no
+            # live channel can ack the events it mints.
+            connection.execute(
+                "UPDATE channel_events SET state = 'superseded', "
+                "updated_at = ? "
+                "WHERE kind = 'HERMES_CONTROL_READY' "
+                "AND state IN ('pending', 'published') AND packet_id IN ("
+                "SELECT operation_id FROM control_operations "
+                "WHERE state != 'published' "
+                "AND kind = 'intake.dedup_repaired')",
+                (stamp,),
+            )
         self._record_dedup_repair(repaired)
         corrections = self._database.execute(
             "SELECT correction_id, project_key FROM lead_corrections "

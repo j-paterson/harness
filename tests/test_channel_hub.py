@@ -1383,3 +1383,126 @@ class TestCloseReasons:
         )
         assert str(close_reason) == "superseded"
         await second.close()
+
+
+@pytest.mark.asyncio
+class TestRepairReceiptChurn:
+    """INFRA-197: the repair sweep never feeds on its own receipts.
+
+    Live evidence: with no publishable channel, every consumed
+    ``intake.dedup_repaired`` receipt left behind a stale channel
+    event the next sweep counted as a fresh repair, minting a new
+    receipt each pass — one spurious wake per maintenance tick,
+    indefinitely.
+    """
+
+    async def test_a_consumed_repair_receipt_never_mints_another(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            seed_active_cell(database)
+            recorded = operations.record(
+                kind="intake.dedup_repaired",
+                project_key="demo",
+                cell_id="cell-demo",
+                session_id=SESSION,
+                result={"superseded_events": 1},
+            )
+            assert recorded is not None
+            await hub.publish(
+                kind="HERMES_CONTROL_READY",
+                packet_id=recorded.operation_id,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+            assert operations.acknowledge(
+                recorded.operation_id, session_id=SESSION
+            )
+
+            await hub.publish_pending()
+
+            # The stale event is still swept terminally...
+            state = database.scalar(
+                "SELECT state FROM channel_events WHERE packet_id = ?",
+                (recorded.operation_id,),
+            )
+            assert str(state) == "superseded"
+            # ...but the sweep of pure receipt churn mints nothing.
+            kinds = [
+                receipt.kind
+                for receipt in operations.pending_for_session(SESSION)
+            ]
+            assert "intake.dedup_repaired" not in kinds
+        finally:
+            await hub.stop()
+
+    async def test_a_consumed_ordinary_receipt_still_counts_as_repair(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        """The INFRA-185 protection is intact: a stale event for any
+        other consumed packet still supersedes and still receipts."""
+
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            seed_active_cell(database)
+            recorded = operations.record(
+                kind="daemon.restarted",
+                project_key="demo",
+                cell_id="cell-demo",
+                session_id=SESSION,
+                result={"interval_seconds": 30},
+            )
+            assert recorded is not None
+            await hub.publish(
+                kind="HERMES_CONTROL_READY",
+                packet_id=recorded.operation_id,
+                cell_id="cell-demo",
+                session_id=SESSION,
+            )
+            assert operations.acknowledge(
+                recorded.operation_id, session_id=SESSION
+            )
+
+            await hub.publish_pending()
+
+            state = database.scalar(
+                "SELECT state FROM channel_events WHERE packet_id = ?",
+                (recorded.operation_id,),
+            )
+            assert str(state) == "superseded"
+            repairs = [
+                receipt
+                for receipt in operations.pending_for_session(SESSION)
+                if receipt.kind == "intake.dedup_repaired"
+            ]
+            assert len(repairs) == 1
+            assert repairs[0].result == {"superseded_events": 1}
+        finally:
+            await hub.stop()
