@@ -351,6 +351,109 @@ def test_validate_for_tree_reports_unknown_receipt(
     assert outcome == (False, "unknown receipt")
 
 
+# --- authorized gate specifications (Sol reviewer Critical finding 1) ---
+
+
+def test_the_candidate_full_gate_is_the_only_authorized_gate_by_default() -> None:
+    from hermes_orchestrator.verifier import AUTHORIZED_GATES
+
+    assert AUTHORIZED_GATES == {"candidate-full-gate": "uv run pytest -q"}
+
+
+def test_an_unauthorized_command_for_the_candidate_full_gate_is_refused(
+    verifier: Verifier, repo: Path, database: Database
+) -> None:
+    with pytest.raises(ValueError):
+        verifier.run_verified(repo, gate_id="candidate-full-gate", command="true")
+
+    assert receipt_count(database) == 0
+
+
+def test_an_authorized_gate_produces_a_fresh_receipt_for_its_exact_command(
+    verifier: Verifier, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "hermes_orchestrator.verifier.AUTHORIZED_GATES",
+        {"fake-full-gate": PASS_COMMAND},
+    )
+
+    receipt = verifier.run_verified(
+        repo, gate_id="fake-full-gate", command=PASS_COMMAND
+    )
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id="fake-full-gate"
+    )
+
+    assert outcome == (True, "fresh")
+
+
+def test_extra_whitespace_in_an_authorized_command_still_matches(
+    verifier: Verifier, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "hermes_orchestrator.verifier.AUTHORIZED_GATES",
+        {"fake-full-gate": PASS_COMMAND},
+    )
+
+    receipt = verifier.run_verified(
+        repo, gate_id="fake-full-gate", command=PASS_COMMAND_EXTRA_WHITESPACE
+    )
+
+    assert receipt.exit_code == 0
+
+
+def test_validate_for_tree_rejects_a_receipt_when_the_authorized_command_changes(
+    verifier: Verifier, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "hermes_orchestrator.verifier.AUTHORIZED_GATES",
+        {"fake-full-gate": PASS_COMMAND},
+    )
+    receipt = verifier.run_verified(
+        repo, gate_id="fake-full-gate", command=PASS_COMMAND
+    )
+
+    monkeypatch.setattr(
+        "hermes_orchestrator.verifier.AUTHORIZED_GATES",
+        {"fake-full-gate": OTHER_COMMAND},
+    )
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id="fake-full-gate"
+    )
+
+    assert outcome[0] is False
+    assert outcome[1] in ("stale: command not authorized", "signature invalid")
+
+
+def test_changing_the_authorized_gate_specification_invalidates_earlier_receipts(
+    verifier: Verifier, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "hermes_orchestrator.verifier.AUTHORIZED_GATES",
+        {"fake-full-gate": PASS_COMMAND},
+    )
+    receipt = verifier.run_verified(
+        repo, gate_id="fake-full-gate", command=PASS_COMMAND
+    )
+    fresh = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id="fake-full-gate"
+    )
+    assert fresh == (True, "fresh")
+
+    monkeypatch.setattr(
+        "hermes_orchestrator.verifier.AUTHORIZED_GATES",
+        {"fake-full-gate": OTHER_COMMAND},
+    )
+
+    outcome = verifier.validate_for_tree(
+        receipt.receipt_id, cwd=repo, gate_id="fake-full-gate"
+    )
+
+    assert outcome[0] is False
+
+
 def test_receipt_ids_for_gate_orders_newest_first(
     verifier: Verifier, repo: Path
 ) -> None:

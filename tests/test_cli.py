@@ -916,9 +916,14 @@ def test_hermes_command_record_direct_exception_creates_accepted_packet(
     assert payload["state"]["state"] == "accepted"
     assert payload["state"]["model_tier"] == "fable"
     assert payload["state"]["allowed_files"] == ["src/app.py"]
+    # Updated for the CLI-side measurement requirement: with no worktree
+    # declared, the live diff cannot be measured, so evidence records
+    # that explicitly and the existing declared-cap check remains the
+    # deciding factor.
     assert payload["state"]["evidence"] == {
         "exception_reason": "one-line typo fix",
         "expected_lines": "5",
+        "measured_lines": "unmeasured",
     }
 
     over_scale = invoke(
@@ -942,6 +947,91 @@ def test_hermes_command_record_direct_exception_creates_accepted_packet(
     over_payload = json.loads(over_scale.stdout)
     assert over_payload["code"] == "rejected"
     assert "reviewer-fix scale" in str(over_payload["state"]["reason"])
+
+
+def test_record_direct_exception_measures_the_live_diff_via_the_run_seam(
+    tmp_path: Path,
+) -> None:
+    """The declared ``expected_files``/``expected_lines`` are never taken
+    on faith when a worktree is given: ``record_direct_exception`` shells
+    out (through an injectable ``run`` seam) to measure the actual git
+    diff and refuses before creating any packet when the measured total
+    exceeds either the fixed reviewer-fix scale or the caller's own
+    declared bound; within bounds, the measurement is recorded as
+    ``measured_lines`` evidence."""
+
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_active_cell(
+        tmp_path / "state.db",
+        project_key="demo",
+        session_id="sess-1",
+        cell_id="cell-1",
+    )
+    events = EventStore(runtime.database)
+    outbox = LeadCorrectionOutbox(
+        database=runtime.database,
+        events=events,
+        project_for_issue=lambda issue_id: "demo",
+    )
+    packets = SubagentPackets(runtime.database, events=events)
+    settings = SimpleNamespace(repo_root=tmp_path)
+
+    def command(**overrides: object) -> object:
+        base: dict[str, object] = {
+            "issue_id": "ENG-9",
+            "reason": "measured exception",
+            "expected_files": ["src/app.py"],
+            "expected_lines": 20,
+            "verification": "pytest -q",
+            "worktree": "/some/worktree",
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    over_bound_calls: list[list[str]] = []
+
+    def over_bound_run(args: list[str]) -> str:
+        over_bound_calls.append(list(args))
+        return "15\t10\tsrc/app.py\n"  # 25 lines: over the declared cap of 20
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=over_bound_run)
+    with pytest.raises(ValueError, match="measured diff bound"):
+        handlers["record_direct_exception"](command())
+    assert over_bound_calls == [
+        [
+            "git",
+            "-C",
+            "/some/worktree",
+            "diff",
+            "--numstat",
+            "HEAD",
+            "--",
+            "src/app.py",
+        ]
+    ]
+    # No packet was created by the refused attempt.
+    assert packets.for_issue("ENG-9") == ()
+
+    def within_bound_run(args: list[str]) -> str:
+        return "5\t3\tsrc/app.py\n"  # 8 lines: within every bound
+
+    handlers = _hermes_handlers(
+        settings, runtime, outbox, packets, run=within_bound_run
+    )
+    result = handlers["record_direct_exception"](command())
+    assert result["evidence"] == {
+        "exception_reason": "measured exception",
+        "expected_lines": "20",
+        "measured_lines": "8",
+    }
 
 
 def _recording_hermes_config(tmp_path: Path, *, exit_code: int = 0) -> Path:

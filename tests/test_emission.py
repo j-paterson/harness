@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -353,6 +354,13 @@ async def test_foreign_checkout_is_refused_before_any_freeze_check(
 @dataclass
 class FakePacket:
     state: str
+    packet_id: str = "pkt-default"
+    allowed_files: tuple[str, ...] = ()
+    evidence: dict[str, str] | None = None
+    session_id: str = "sess-1"
+    worktree: str = "/repo"
+    generation: int = 1
+    updated_at: str = "2026-08-28T00:00:00+00:00"
 
 
 @dataclass
@@ -422,12 +430,22 @@ async def test_non_trivial_candidate_without_accepted_packets_is_blocked(
 async def test_non_trivial_candidate_with_one_accepted_packet_publishes(
     tmp_path: Path,
 ) -> None:
+    # Updated for the reconciliation contract: an accepted packet no
+    # longer authorizes an arbitrary non-trivial diff merely by existing
+    # — its ``allowed_files`` must actually cover every changed path.
+    # Here the single accepted packet's scope covers both changed files,
+    # so the candidate is admitted and the manifest records its credit.
     git = _non_trivial_git()
     packets = FakePackets(
         by_issue={
             "ENG-9": [
                 FakePacket(state="reserved"),
-                FakePacket(state="accepted"),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                ),
             ]
         }
     )
@@ -437,6 +455,8 @@ async def test_non_trivial_candidate_with_one_accepted_packet_publishes(
 
     assert result.delivery.delivered is True
     assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-1", "files=2;lines=44") in manifest.verification
 
 
 @pytest.mark.asyncio
@@ -460,6 +480,396 @@ async def test_no_packets_wired_skips_the_delegation_gate(tmp_path: Path) -> Non
 
     assert result.delivery.delivered is True
     assert deliverer.events == [("demo", result.event)]
+
+
+# --- delegation-evidence reconciliation (Sol reviewer Critical finding 2) ---
+
+
+def _custom_git(files: tuple[tuple[str, int, int], ...]) -> FakeGitRunner:
+    """A clean freeze boundary whose diff touches exactly ``files``,
+    each an ``(path, added, deleted)`` triple reflected in both
+    ``diff --name-only`` and ``diff --numstat``."""
+
+    git = clean_git()
+    names = "".join(f"{name}\n" for name, _, _ in files)
+    numstat = "".join(f"{added}\t{deleted}\t{name}\n" for name, added, deleted in files)
+    git.responses[("diff", "--name-only", BASE, HEAD)] = names
+    git.responses[("diff", "--numstat", BASE, HEAD)] = numstat
+    return git
+
+
+@pytest.mark.asyncio
+async def test_unrelated_accepted_packet_does_not_authorize_the_diff(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-unrelated",
+                    allowed_files=("some/other/file.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("src/app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_changed_path_outside_every_accepted_scope_is_named(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-partial",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("tests/test_app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_unparsable_numstat_line_for_a_changed_path_fails_closed(
+    tmp_path: Path,
+) -> None:
+    # A binary-style numstat line ("-\t-\t<path>") for a changed path
+    # cannot be measured at all, so it must fail closed naming the path
+    # even though an accepted packet fully covers every changed path.
+    git = clean_git()
+    changed_files = ("bin.dat", "src/app.py")
+    git.responses[("diff", "--name-only", BASE, HEAD)] = "".join(
+        f"{name}\n" for name in changed_files
+    )
+    git.responses[("diff", "--numstat", BASE, HEAD)] = (
+        "-\t-\tbin.dat\n20\t15\tsrc/app.py\n"
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg",
+                    allowed_files=("bin.dat", "src/app.py"),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("bin.dat")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_direct_exception_exceeding_the_credited_file_bound_is_blocked(
+    tmp_path: Path,
+) -> None:
+    git = _custom_git(
+        (
+            ("a.py", 1, 1),
+            ("b.py", 1, 1),
+            ("c.py", 1, 1),
+        )
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("a.py", "b.py", "c.py"),
+                    evidence={"exception_reason": "typo sweep", "expected_lines": "30"},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="pkt-exc"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_direct_exception_exceeding_the_credited_line_bound_is_blocked(
+    tmp_path: Path,
+) -> None:
+    # Two files, credited lines total 44 > the fixed thirty-line cap even
+    # though the packet declared a generous expected_lines.
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={
+                        "exception_reason": "large exception",
+                        "expected_lines": "100",
+                    },
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="pkt-exc"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_direct_exception_exceeding_its_own_declared_expected_lines_is_blocked(
+    tmp_path: Path,
+) -> None:
+    # Three changed files force non-triviality by file count; the
+    # exception's two credited files sum to 25 lines — under the fixed
+    # cap of thirty, but over its own declared expected_lines of 20.
+    git = _custom_git(
+        (
+            ("exc1.py", 10, 5),
+            ("exc2.py", 5, 5),
+            ("reg.py", 1, 1),
+        )
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg",
+                    allowed_files=("reg.py",),
+                    evidence={},
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("exc1.py", "exc2.py"),
+                    evidence={
+                        "exception_reason": "tight exception",
+                        "expected_lines": "20",
+                    },
+                ),
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="pkt-exc"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_two_exceptions_claiming_the_same_path_fail_closed(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc-1",
+                    allowed_files=("src/app.py",),
+                    evidence={"exception_reason": "first", "expected_lines": "30"},
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc-2",
+                    allowed_files=("src/app.py",),
+                    evidence={"exception_reason": "second", "expected_lines": "30"},
+                ),
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("src/app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_regular_packet_wins_over_an_exception_on_the_same_path(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("src/app.py",),
+                    evidence={"exception_reason": "also claims it here"},
+                ),
+            ]
+        }
+    )
+    emitter, _deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-reg", "files=2;lines=44") in manifest.verification
+    assert not any(
+        entry[0] == "packet:pkt-exc" for entry in manifest.verification
+    )
+
+
+@pytest.mark.asyncio
+async def test_fully_covered_candidate_with_regulars_and_a_bounded_exception(
+    tmp_path: Path,
+) -> None:
+    git = _custom_git(
+        (
+            ("reg1.py", 5, 5),
+            ("reg2.py", 4, 4),
+            ("exc.py", 3, 2),
+        )
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg1",
+                    allowed_files=("reg1.py",),
+                    evidence={},
+                    session_id="sess-shared",
+                    worktree="/wt-shared",
+                    generation=3,
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg2",
+                    allowed_files=("reg2.py",),
+                    evidence={},
+                    session_id="sess-shared",
+                    worktree="/wt-shared",
+                    generation=3,
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("exc.py",),
+                    evidence={
+                        "exception_reason": "small bounded exception",
+                        "expected_lines": "10",
+                    },
+                    session_id="sess-shared",
+                    worktree="/wt-shared",
+                    generation=3,
+                ),
+            ]
+        }
+    )
+    emitter, _deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert manifest.verification == (
+        ("pytest", "ok"),
+        ("packet:pkt-exc", "files=1;lines=5"),
+        ("packet:pkt-reg1", "files=1;lines=10"),
+        ("packet:pkt-reg2", "files=1;lines=8"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_credited_packet_identity_mismatch_is_blocked(tmp_path: Path) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-a",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                    session_id="sess-a",
+                    worktree="/wt-a",
+                    generation=1,
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-b",
+                    allowed_files=("tests/test_app.py",),
+                    evidence={},
+                    session_id="sess-b",
+                    worktree="/wt-a",
+                    generation=1,
+                ),
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="identity mismatch"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_emission_side_effect_free_when_every_verifier_receipt_is_invalid(
+    tmp_path: Path,
+) -> None:
+    verifier = StubVerifier(
+        ids_by_gate={"candidate-full-gate": ("r-1", "r-2", "r-3")},
+        outcomes={
+            "r-1": (False, "stale: command not authorized"),
+            "r-2": (False, "stale: command not authorized"),
+            "r-3": (False, "stale: command not authorized"),
+        },
+    )
+    emitter, deliverer = _emitter_with_verifier(tmp_path, clean_git(), verifier)
+
+    with pytest.raises(EmissionBlocked, match="final candidate-gate receipt"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
 
 
 # --- final candidate-gate receipt requirement (INFRA-186 P9) ---------------

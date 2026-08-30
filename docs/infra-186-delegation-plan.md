@@ -174,3 +174,43 @@ delegation-evidence gate judges this issue by its own ledger):
 All nine packets plus the direct exception are recorded as
 **accepted** in the live `subagent_packets` ledger, so this issue's
 own candidate is judged by its own machinery.
+
+## Sol correction cycle (PR #30, correction `f3b912a5…`)
+
+Sol returned two Critical defects against reviewed head `9456d33`,
+both corrected through delegation packets on disjoint files:
+
+- C1 **accepted** (Sonnet, `4345f613…`): authorized gate
+  specifications live in trusted code (`AUTHORIZED_GATES` in
+  `verifier.py`); `run_verified` refuses command substitution for an
+  authorized gate before running anything; the normalized authorized
+  command (`gate_spec`) is recomputed into the HMAC-signed canonical
+  document at validation, so changing the specification — or having
+  signed before it existed — invalidates the receipt;
+  `validate`/`validate_for_tree` additionally report
+  `"stale: command not authorized"`. `RUNNER_VERSION` bumped to 2,
+  retroactively invalidating every pre-correction receipt. Red: 6
+  failing tests; green: 26 verifier tests, emission/cli untouched.
+- C2 **accepted** (Sonnet, `3a6a5fee…`): `_enforce_delegation_evidence`
+  reconciles the actual base→head numstat against accepted packet
+  scopes — complete path coverage (uncovered path named, fail
+  closed), deterministic ownership (most recently accepted regular
+  packet wins; a regular packet always beats a direct exception for
+  the same path; two exceptions sharing a path fail closed),
+  identity agreement on `(session_id, worktree, generation)` among
+  credited packets, git-measured exception bounds (≤2 credited
+  files, ≤30 and ≤declared lines), unparsable/binary numstat fails
+  closed, and per-packet credit entries
+  (`packet:<id>`, `files=n;lines=m`) preserved in the immutable
+  manifest. `record_direct_exception` gained a `worktree` field,
+  measures the live diff through a fakeable `run` seam, refuses
+  over-bound measurements before creating any packet, and records
+  `measured_lines`. Red: 13 failing tests against restored HEAD
+  sources; green: 117 focused, full suite 2015, ruff clean.
+- Lead coverage packets L1–L4 (fable, `590631fd…`, `b717af50…`,
+  `023e759c…`, `7e2b54b7…`, all **accepted**): honest durable
+  ownership of the lead-integration paths (runtime wiring, schema
+  pins, handoff test, plan/prompt docs) so the corrected
+  path-coverage gate judges this candidate truthfully — lead work at
+  beyond-exception scale is recorded as auditable fable-tier
+  packets, never hidden under an exception.

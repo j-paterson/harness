@@ -189,6 +189,7 @@ class RecordDirectExceptionCommand(_Command):
     expected_files: list[NonEmptyText] = Field(min_length=1)
     expected_lines: int = Field(gt=0)
     verification: NonEmptyText
+    worktree: str | None = None
 
 
 class ApplyOperatorDecisionCommand(_Command):

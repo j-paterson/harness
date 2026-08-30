@@ -10,6 +10,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -864,12 +865,70 @@ def _packet_payload(packet: Any) -> dict[str, Any]:
     return dict(dataclasses.asdict(packet))
 
 
+def _measure_direct_exception_diff(
+    run: Callable[[Sequence[str]], str],
+    worktree: str | None,
+    expected_files: Sequence[str],
+) -> int | None:
+    """The authoritative-on-the-cli-side measured added+deleted line total
+    for ``expected_files`` in ``worktree``, or ``None`` when the worktree
+    is absent or the measurement could not be produced (git failure or an
+    unparsable numstat line) — the caller then falls back to the declared
+    cap and the emission-side reconciliation remains the real boundary."""
+
+    if not worktree:
+        return None
+    try:
+        output = run(
+            [
+                "git",
+                "-C",
+                str(worktree),
+                "diff",
+                "--numstat",
+                "HEAD",
+                "--",
+                *expected_files,
+            ]
+        )
+    except Exception:
+        return None
+    total = 0
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            total += int(parts[0]) + int(parts[1])
+        except ValueError:
+            return None
+    return total
+
+
+def _default_diff_numstat_run(args: Sequence[str]) -> str:
+    """Argv-safe, no-shell subprocess seam for one bounded git invocation."""
+
+    completed = subprocess.run(
+        list(args),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    return completed.stdout
+
+
 def _hermes_handlers(
     settings: Any,
     runtime: Runtime,
     outbox: LeadCorrectionOutbox,
     packets: SubagentPackets,
+    *,
+    run: Callable[[Sequence[str]], str] | None = None,
 ) -> dict[str, Any]:
+    git_diff_run = run or _default_diff_numstat_run
     def pending_corrections(command: Any) -> dict[str, Any]:
         items = outbox.pending(command.project_key)
         return {"corrections": [item.as_dict() for item in items]}
@@ -1033,6 +1092,19 @@ def _hermes_handlers(
         cell_id, session_id, _project_key = _active_cell_for_issue(
             runtime.database, command.issue_id
         )
+        worktree = command.worktree
+        measured_lines = _measure_direct_exception_diff(
+            git_diff_run, worktree, command.expected_files
+        )
+        if measured_lines is not None and (
+            measured_lines > 30 or measured_lines > command.expected_lines
+        ):
+            raise ValueError(
+                "direct-work exception exceeds the measured diff bound"
+            )
+        measured_lines_value = (
+            "unmeasured" if measured_lines is None else str(measured_lines)
+        )
         packet = packets.create(
             issue_id=command.issue_id,
             project_key=_project_key,
@@ -1042,7 +1114,7 @@ def _hermes_handlers(
             model_tier="fable",
             effort="high",
             allowed_files=command.expected_files,
-            worktree=cell_id,
+            worktree=worktree if worktree else cell_id,
             red_test="direct-work exception",
             verification=[command.verification],
             invariants=command.reason,
@@ -1060,6 +1132,7 @@ def _hermes_handlers(
             evidence={
                 "exception_reason": command.reason,
                 "expected_lines": str(command.expected_lines),
+                "measured_lines": measured_lines_value,
             },
         )
         return _packet_payload(packet)

@@ -27,7 +27,7 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +36,21 @@ from typing import Any
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 
-RUNNER_VERSION = 1
+RUNNER_VERSION = 2
+
+# The mandatory candidate gate (and any other gate id listed here) is
+# authorized for EXACTLY one command, defined in trusted code — never
+# supplied by a caller. HMAC over a receipt proves this runner executed
+# the given command; it does NOT by itself prove that command was the
+# authorized full suite. ``run_verified`` refuses (before running
+# anything) to mint a receipt for an authorized gate id under any other
+# command, and the authorized specification is bound into the attested
+# document itself (see ``_gate_spec``) so that later tightening or
+# changing an entry here retroactively invalidates receipts signed
+# under the old specification. An unknown/ad-hoc gate id is unrestricted.
+AUTHORIZED_GATES: Mapping[str, str] = {
+    "candidate-full-gate": "uv run pytest -q",
+}
 
 _DEPENDENCY_FILES = ("uv.lock", "pyproject.toml")
 _ABSENT_MARKER = b"<absent>"
@@ -51,6 +65,7 @@ _BINDING_FIELDS = (
     "schema_version",
     "gate_id",
     "command",
+    "gate_spec",
     "tree_hash",
     "dirty_patch_hash",
     "dependency_hash",
@@ -107,6 +122,31 @@ def _dependency_hash(cwd: Path) -> str:
             hasher.update(_ABSENT_MARKER)
         hasher.update(b"\x00")
     return hasher.hexdigest()
+
+
+def _normalize_command(command: str) -> str:
+    """Canonical form used for every command comparison in this module:
+    re-shell-quoted after splitting, so equivalent commands that differ
+    only in whitespace or quoting style compare and hash identically."""
+
+    return shlex.join(shlex.split(command))
+
+
+def _gate_spec(gate_id: str) -> str:
+    """The authorized command specification bound into the attested
+    document for ``gate_id``, recomputed from the CURRENT
+    ``AUTHORIZED_GATES`` mapping — never stored. An unknown/ad-hoc gate
+    id binds the literal marker ``"adhoc"``. Because this is recomputed
+    at validation time rather than read back from the database,
+    changing ``AUTHORIZED_GATES`` after a receipt was signed changes
+    what this function returns for that receipt's ``gate_id``, which
+    changes the recomputed canonical document, which fails signature
+    verification for every receipt signed under the old specification."""
+
+    authorized_command = AUTHORIZED_GATES.get(gate_id)
+    if authorized_command is None:
+        return "adhoc"
+    return _normalize_command(authorized_command)
 
 
 def _runner_fingerprint() -> str:
@@ -179,7 +219,7 @@ class Verifier:
         )
         return {
             "gate_id": gate_id,
-            "command": " ".join(shlex.split(command)),
+            "command": _normalize_command(command),
             "tree_hash": tree_hash,
             "dirty_patch_hash": dirty_patch_hash,
             "dependency_hash": _dependency_hash(cwd),
@@ -197,7 +237,25 @@ class Verifier:
         """Execute ``command`` under ``cwd`` and record a signed,
         content-addressed receipt. Reruning the identical command against
         an unchanged tree yields the identical receipt (same
-        ``receipt_id``) rather than a new row."""
+        ``receipt_id``) rather than a new row.
+
+        For a gate id listed in ``AUTHORIZED_GATES``, ``command`` MUST
+        normalize to exactly the authorized command for that gate — a
+        caller cannot mint an acceptable receipt for, e.g., the
+        mandatory candidate gate by substituting any other successful
+        command. This check runs before anything is executed and
+        before any receipt is recorded; an unauthorized command fails
+        closed with ``ValueError`` and leaves no trace."""
+
+        authorized_command = AUTHORIZED_GATES.get(gate_id)
+        if authorized_command is not None and _normalize_command(
+            command
+        ) != _normalize_command(authorized_command):
+            raise ValueError(
+                f"gate {gate_id!r} is authorized only for the command "
+                f"{_normalize_command(authorized_command)!r}; refusing to "
+                f"run or record a receipt for {command!r}"
+            )
 
         context = self._context(cwd, gate_id, command)
         argv = shlex.split(command)
@@ -231,6 +289,7 @@ class Verifier:
             "schema_version": RUNNER_VERSION,
             "gate_id": context["gate_id"],
             "command": context["command"],
+            "gate_spec": _gate_spec(gate_id),
             "tree_hash": context["tree_hash"],
             "dirty_patch_hash": context["dirty_patch_hash"],
             "dependency_hash": context["dependency_hash"],
@@ -303,10 +362,12 @@ class Verifier:
             return False, "unknown receipt"
 
         stored_test_counts = json.loads(str(row["test_counts"]))
+        stored_gate_id = str(row["gate_id"])
         stored_binding = {
             "schema_version": int(row["schema_version"]),
-            "gate_id": str(row["gate_id"]),
+            "gate_id": stored_gate_id,
             "command": str(row["command"]),
+            "gate_spec": _gate_spec(stored_gate_id),
             "tree_hash": str(row["tree_hash"]),
             "dirty_patch_hash": str(row["dirty_patch_hash"]),
             "dependency_hash": str(row["dependency_hash"]),
@@ -321,6 +382,18 @@ class Verifier:
         ).hexdigest()
         if not hmac.compare_digest(expected_signature, str(row["signature"])):
             return False, "signature invalid"
+
+        # Defense in depth on top of the signature recomputation above:
+        # for an authorized gate id, the STORED command must still
+        # normalize to the CURRENT authorized command. In practice a
+        # changed AUTHORIZED_GATES entry already changes ``gate_spec``
+        # and so fails the signature check first, but this check stands
+        # on its own regardless of how the signature check is reached.
+        authorized_command = AUTHORIZED_GATES.get(stored_gate_id)
+        if authorized_command is not None and _normalize_command(
+            stored_binding["command"]
+        ) != _normalize_command(authorized_command):
+            return False, "stale: command not authorized"
 
         context = self._context(cwd, gate_id, command)
         if (
@@ -407,10 +480,12 @@ class Verifier:
             return False, "unknown receipt"
 
         stored_test_counts = json.loads(str(row["test_counts"]))
+        stored_gate_id = str(row["gate_id"])
         stored_binding = {
             "schema_version": int(row["schema_version"]),
-            "gate_id": str(row["gate_id"]),
+            "gate_id": stored_gate_id,
             "command": str(row["command"]),
+            "gate_spec": _gate_spec(stored_gate_id),
             "tree_hash": str(row["tree_hash"]),
             "dirty_patch_hash": str(row["dirty_patch_hash"]),
             "dependency_hash": str(row["dependency_hash"]),
@@ -425,6 +500,18 @@ class Verifier:
         ).hexdigest()
         if not hmac.compare_digest(expected_signature, str(row["signature"])):
             return False, "signature invalid"
+
+        # Defense in depth on top of the signature recomputation above:
+        # for an authorized gate id, the STORED command must still
+        # normalize to the CURRENT authorized command. In practice a
+        # changed AUTHORIZED_GATES entry already changes ``gate_spec``
+        # and so fails the signature check first, but this check stands
+        # on its own regardless of how the signature check is reached.
+        authorized_command = AUTHORIZED_GATES.get(stored_gate_id)
+        if authorized_command is not None and _normalize_command(
+            stored_binding["command"]
+        ) != _normalize_command(authorized_command):
+            return False, "stale: command not authorized"
 
         if stored_binding["gate_id"] != gate_id:
             return False, "gate mismatch"

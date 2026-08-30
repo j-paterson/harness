@@ -383,6 +383,21 @@ def test_packet_intents_are_strict_and_routed(database: Database) -> None:
     )
     assert within_scale.code == "accepted"
     assert within_scale.state == {"packet_id": "p-2", "state": "accepted"}
+    assert seen[-1].worktree is None
+
+    with_worktree = service.execute(
+        {
+            "intent": "record_direct_exception",
+            "issue_id": "ENG-9",
+            "reason": "one-line typo fix in a named worktree",
+            "expected_files": ["src/app.py"],
+            "expected_lines": 5,
+            "verification": "pytest -q",
+            "worktree": "/repo/worktrees/eng-9",
+        }
+    )
+    assert with_worktree.code == "accepted"
+    assert seen[-1].worktree == "/repo/worktrees/eng-9"
 
     over_scale = service.execute(
         {

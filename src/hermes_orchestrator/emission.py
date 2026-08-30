@@ -221,8 +221,11 @@ class CandidateEmitter:
         )
         head, branch = facts.head, facts.branch
         base, changed = facts.base, facts.changed_files
+        delegation_extra: tuple[tuple[str, str], ...] = ()
         if self._packets is not None:
-            self._enforce_delegation_evidence(repo, issue_id, base, head, changed)
+            delegation_extra = self._enforce_delegation_evidence(
+                repo, issue_id, base, head, changed
+            )
         verification_extra: tuple[tuple[str, str], ...] = ()
         if self._verifier is not None:
             receipt_id = self._enforce_final_gate_receipt(repo)
@@ -243,7 +246,7 @@ class CandidateEmitter:
             branch=branch,
             linear_issues=(issue_id,),
             changed_files=changed,
-            verification=verification + verification_extra,
+            verification=verification + delegation_extra + verification_extra,
             blockers=blockers,
             created_at=self._now().astimezone(UTC).isoformat(),
         )
@@ -325,15 +328,30 @@ class CandidateEmitter:
         base: str,
         head: str,
         changed: tuple[str, ...],
-    ) -> None:
-        """Refuse a non-trivial candidate with no delegation evidence.
+    ) -> tuple[tuple[str, str], ...]:
+        """Refuse a non-trivial candidate with no delegation evidence, and
+        reconcile the actual diff against accepted packet scopes.
 
         Triviality is proven from the same freeze-boundary diff: at most
         two changed files and at most thirty added-plus-deleted lines. A
-        non-trivial diff requires at least one accepted subagent packet
-        for this issue (a direct-work exception is itself recorded as an
-        immediately-accepted packet) — never inferred, always proven from
-        the durable ledger.
+        trivial candidate needs no reconciliation and contributes no
+        verification entries.
+
+        A non-trivial diff is reconciled path-by-path against every
+        ``accepted`` subagent packet for this issue: a packet whose
+        evidence carries ``exception_reason`` is a DIRECT EXCEPTION,
+        every other accepted packet is REGULAR. A path claimed by one or
+        more regular packets is credited to the most recently accepted
+        one (regular packets may legitimately share files across
+        sequential waves); a path claimed only by exceptions is credited
+        to the sole claiming exception, but two or more exceptions
+        claiming the same path fail closed. An uncovered path fails
+        closed, naming it. Each credited exception's paths and measured
+        lines must stay inside both the fixed reviewer-fix scale and its
+        own declared ``expected_lines``. Every credited packet must share
+        one ``(session_id, worktree, generation)`` identity. Never
+        inferred — always proven from the durable ledger and the actual
+        git diff.
         """
 
         numstat = self._run(repo, "diff", "--numstat", base, head)
@@ -348,7 +366,30 @@ class CandidateEmitter:
                 continue
         non_trivial = len(changed) > 2 or total_lines > 30
         if not non_trivial:
-            return
+            return ()
+
+        changed_set = set(changed)
+        lines_by_path: dict[str, int] = {}
+        for line in numstat.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            path = parts[-1]
+            try:
+                added = int(parts[0])
+                deleted = int(parts[1])
+            except ValueError as error:
+                if path in changed_set:
+                    raise EmissionBlocked(
+                        f"could not measure the diff for {path!r}: "
+                        "git numstat did not report parseable line counts "
+                        "(binary or otherwise unmeasurable)"
+                    ) from error
+                continue
+            lines_by_path[path] = lines_by_path.get(path, 0) + added + deleted
+
         assert self._packets is not None
         accepted = [
             packet
@@ -361,6 +402,105 @@ class CandidateEmitter:
                 "requires accepted subagent packets or a recorded "
                 "direct-work exception (record_direct_exception)"
             )
+
+        regular = []
+        exceptions = []
+        for packet in accepted:
+            evidence = packet.evidence or {}
+            if "exception_reason" in evidence:
+                exceptions.append(packet)
+            else:
+                regular.append(packet)
+
+        def recency_key(packet: object) -> tuple[datetime, str]:
+            return (self._packet_timestamp(packet), packet.packet_id)
+
+        credited_by_path: dict[str, object] = {}
+        for path in changed:
+            regular_claimants = [p for p in regular if path in p.allowed_files]
+            exception_claimants = [p for p in exceptions if path in p.allowed_files]
+            if regular_claimants:
+                credited_by_path[path] = max(regular_claimants, key=recency_key)
+            elif exception_claimants:
+                if len(exception_claimants) > 1:
+                    raise EmissionBlocked(
+                        "delegation evidence conflict: "
+                        f"{path!r} is claimed by more than one direct "
+                        "exception"
+                    )
+                credited_by_path[path] = exception_claimants[0]
+            else:
+                raise EmissionBlocked(
+                    "delegation evidence missing: "
+                    f"{path!r} is not covered by any accepted subagent "
+                    "packet"
+                )
+
+        packet_paths: dict[str, list[str]] = {}
+        packet_by_id: dict[str, object] = {}
+        for path, packet in credited_by_path.items():
+            packet_paths.setdefault(packet.packet_id, []).append(path)
+            packet_by_id[packet.packet_id] = packet
+
+        for packet in exceptions:
+            paths = packet_paths.get(packet.packet_id)
+            if not paths:
+                continue
+            if len(paths) > 2:
+                raise EmissionBlocked(
+                    f"direct exception {packet.packet_id!r} exceeds the "
+                    "reviewer-fix scale: more than two credited files"
+                )
+            credited_lines = sum(lines_by_path.get(path, 0) for path in paths)
+            if credited_lines > 30:
+                raise EmissionBlocked(
+                    f"direct exception {packet.packet_id!r} exceeds the "
+                    "reviewer-fix scale: more than thirty credited lines"
+                )
+            evidence = packet.evidence or {}
+            expected_lines_raw = evidence.get("expected_lines")
+            if expected_lines_raw is not None:
+                try:
+                    expected_lines = int(expected_lines_raw)
+                except (TypeError, ValueError):
+                    expected_lines = None
+                if expected_lines is not None and credited_lines > expected_lines:
+                    raise EmissionBlocked(
+                        f"direct exception {packet.packet_id!r} exceeds its "
+                        "own declared expected_lines bound"
+                    )
+
+        credited_packets = list(packet_by_id.values())
+        identities = {
+            (packet.session_id, packet.worktree, packet.generation)
+            for packet in credited_packets
+        }
+        if len(identities) > 1:
+            raise EmissionBlocked(
+                "delegation evidence identity mismatch: credited packets "
+                "do not share one session, worktree, and generation"
+            )
+
+        return tuple(
+            sorted(
+                (
+                    f"packet:{packet_id}",
+                    f"files={len(paths)};lines="
+                    f"{sum(lines_by_path.get(path, 0) for path in paths)}",
+                )
+                for packet_id, paths in packet_paths.items()
+            )
+        )
+
+    @staticmethod
+    def _packet_timestamp(packet: object) -> datetime:
+        raw = getattr(packet, "updated_at", None)
+        if not raw:
+            return datetime.min.replace(tzinfo=UTC)
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return datetime.min.replace(tzinfo=UTC)
 
     def _enforce_final_gate_receipt(self, repo: Path) -> str:
         """Require a fresh, signed receipt for the mandatory complete
