@@ -789,20 +789,34 @@ class ProjectCellService:
         persisted_session = getattr(handoff, "replacement_session_id", None)
         persisted_profile = getattr(handoff, "replacement_profile_alias", None)
         already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
-        if (
-            already_acknowledged
-            and persisted_session is not None
-            and persisted_profile is not None
-        ):
-            # Sol correction b4b545f3 P2: the acknowledgement already
-            # persisted the exact replacement identities, so recovery
-            # reconstructs them — no lead-runner call, no capacity
-            # reselection.
-            return await self._recover_acknowledged_rotation(
-                current,
-                handoff_id,
-                replacement_session=UUID(str(persisted_session)),
-                replacement_profile=str(persisted_profile),
+        if already_acknowledged:
+            if persisted_session is not None and persisted_profile is not None:
+                # Sol correction b4b545f3 P2: the acknowledgement already
+                # persisted the exact replacement identities, so recovery
+                # reconstructs them — no lead-runner call, no capacity
+                # reselection.
+                return await self._recover_acknowledged_rotation(
+                    current,
+                    handoff_id,
+                    replacement_session=UUID(str(persisted_session)),
+                    replacement_profile=str(persisted_profile),
+                )
+            # Sol correction f0a5a403 P1: a migration-era acknowledged row
+            # can legitimately lack the durable replacement profile.
+            # Falling through would reserve fresh capacity and relaunch a
+            # lead for a handoff that is already acknowledged, so fail
+            # closed before any reservation or runner call.
+            missing = (
+                "replacement_profile_alias"
+                if persisted_session is not None
+                else "replacement_session_id and replacement_profile_alias"
+            )
+            raise RotationBlocked(
+                f"handoff {handoff_id} is acknowledged but its durable "
+                f"{missing} is missing (migration-era row): backfill it "
+                "with an identical re-acknowledgement naming the selected "
+                "profile_alias (or run operator recovery), then retry — "
+                "no capacity was reserved and no lead was launched"
             )
 
         reservation = self._profiles.reserve_replacement(

@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from hermes_orchestrator.cells import ProjectCellService
+from hermes_orchestrator.cells import ProjectCellService, RotationBlocked
 from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
 from hermes_orchestrator.cmux import CmuxSurfaceRef
 from hermes_orchestrator.cmux_surfaces import (
@@ -688,3 +688,143 @@ async def test_fully_rotated_and_seated_is_a_noop_success(
     # turn, no second lease, and no second seat activation call.
     assert runner.start_count == start_count_after_first
     assert len(seater.calls) == calls_after_first
+
+
+def null_out_replacement_profile(database: Database, handoff_id: str) -> None:
+    """Regress an acknowledged row to its migration-era shape: rows
+    acknowledged before migration 0051 carry no replacement profile."""
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE handoffs SET replacement_profile_alias = NULL "
+            "WHERE handoff_id = ?",
+            (handoff_id,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_acknowledged_handoff_without_profile_makes_zero_runner_calls(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: CountingHandoffs,
+    runner: RecordingRunner,
+) -> None:
+    """Sol f0a5a403 P1, required test 1: an acknowledged handoff whose
+    replacement_profile_alias is NULL (migration-era row) must fail closed
+    with an actionable backfill message — never repeat selection and
+    acknowledgement by relaunching a lead."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    null_out_replacement_profile(database, handoff_id)
+    ack_calls_after_durable = handoffs.acknowledge_calls
+    assert runner.start_count == 1  # only the initial dispatch so far
+
+    with pytest.raises(RotationBlocked, match="re-acknowledg"):
+        await cells.rotate("cell-demo", handoff_id)
+
+    # ZERO runner calls: no relaunch, no resume, no retirement.
+    assert runner.start_count == 1
+    assert runner.resume_count == 0
+    assert runner.retired_sessions == []
+    assert handoffs.acknowledge_calls == ack_calls_after_durable
+    # The cell is untouched: still the incumbent session and profile.
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+    assert database.scalar(
+        "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "max-a"
+
+
+@pytest.mark.asyncio
+async def test_legacy_acknowledged_handoff_reserves_no_capacity_and_moves_no_lease(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: CountingHandoffs,
+    profiles: ProfilePool,
+) -> None:
+    """Sol f0a5a403 P1, required test 2: the same legacy row must produce
+    zero replacement-profile reservations and zero lease changes."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    null_out_replacement_profile(database, handoff_id)
+    reserve_calls: list[tuple[str, str]] = []
+    original_reserve = profiles.reserve_replacement
+
+    def counting_reserve(project_key: str, exclude_alias: str) -> object:
+        reserve_calls.append((project_key, exclude_alias))
+        return original_reserve(project_key, exclude_alias)
+
+    profiles.reserve_replacement = counting_reserve  # type: ignore[method-assign]
+
+    with pytest.raises(RotationBlocked):
+        await cells.rotate("cell-demo", handoff_id)
+
+    assert reserve_calls == []
+    lease_rows = database.execute(
+        "SELECT profile_alias, project_key FROM profile_leases"
+    ).fetchall()
+    assert [
+        (str(row["profile_alias"]), str(row["project_key"])) for row in lease_rows
+    ] == [("max-a", "demo")]
+    assert profiles.acquire("demo").profile_alias == "max-a"
+
+
+@pytest.mark.asyncio
+async def test_fully_identified_acknowledged_handoff_still_recovers_without_relaunch(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: CountingHandoffs,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Sol f0a5a403 P1, required test 3: an acknowledged handoff with BOTH
+    persisted identities keeps the direct transfer-and-seating recovery
+    path — zero relaunches, exactly one seat activation."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    ack_calls_after_durable = handoffs.acknowledge_calls
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+    assert report.profile == "max-b"
+    assert runner.start_count == 1  # the initial dispatch only — no relaunch
+    assert runner.resume_count == 0
+    assert handoffs.acknowledge_calls == ack_calls_after_durable
+    assert runner.retired_sessions == [SESSION_ID]
+    assert len(seater.calls) == 1
+    binding = bindings.active_lead("cell-demo")
+    assert binding is not None
+    assert binding.session_id == str(REPLACEMENT_SESSION)
+    assert database.scalar(
+        "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "max-b"

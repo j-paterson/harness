@@ -407,5 +407,3 @@ async def test_non_trivial_candidate_admits_with_no_packet_or_verifier_wiring(
     # Pure advisory pass-through: exactly what was supplied, nothing
     # appended by admission.
     assert manifest.verification == (("pytest", "advisory only"),)
-
-
