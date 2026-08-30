@@ -596,6 +596,30 @@ class LeadIntakeRouter:
 
     async def tick(self) -> tuple[str, ...]:
         announced: list[str] = []
+        # Repair first: a non-terminal delivery row whose packet was
+        # already consumed through another path (channel ACK, offer
+        # ack, operator action) is durable residue that could otherwise
+        # be offered again; supersede it against the packet ledgers.
+        stamp = datetime.now(UTC).isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE lead_intake_deliveries SET state = 'superseded', "
+                "updated_at = ? WHERE state IN "
+                "('claimed', 'attempted', 'announced', 'offered') AND ("
+                "(kind = 'HERMES_CORRECTION_READY' AND packet_id IN ("
+                "SELECT correction_id FROM lead_corrections "
+                "WHERE state != 'pending')) OR "
+                "(kind = 'HERMES_WORK_READY' AND packet_id IN ("
+                "SELECT wake_id FROM lead_terminal_wakes "
+                "WHERE state != 'pending')) OR "
+                "(kind = 'HERMES_ASSIGNMENT_READY' AND packet_id IN ("
+                "SELECT assignment_id FROM lead_assignments "
+                "WHERE state != 'published')) OR "
+                "(kind = 'HERMES_CONTROL_READY' AND packet_id IN ("
+                "SELECT operation_id FROM control_operations "
+                "WHERE state != 'published')))",
+                (stamp,),
+            )
         corrections = self._database.execute(
             "SELECT correction_id, project_key FROM lead_corrections "
             "WHERE state = 'pending' ORDER BY created_at ASC, rowid ASC"

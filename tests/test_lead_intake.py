@@ -911,3 +911,36 @@ class TestManualEmergencySignal:
                 session_id=SESSION,
             )
         assert port.signals == []
+
+
+@pytest.mark.asyncio
+async def test_the_router_fails_closed_residual_deliveries(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """A non-terminal delivery row whose packet was consumed through
+    another path is durable residue: the tick supersedes it against
+    the packet ledger so it can never be offered again."""
+
+    seed_active_cell(database)
+    seed_assignment(database)
+    seat(bindings)
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+    assert ASSIGNMENT_ID in await router.tick()  # row becomes 'announced'
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_assignments SET state = 'acknowledged' "
+            "WHERE assignment_id = ?",
+            (ASSIGNMENT_ID,),
+        )
+
+    await router.tick()
+
+    state = database.scalar(
+        "SELECT state FROM lead_intake_deliveries WHERE packet_id = ?",
+        (ASSIGNMENT_ID,),
+    )
+    assert str(state) == "superseded"
+    assert LeadIntakePoll(database=database).next_offer(SESSION) is None
