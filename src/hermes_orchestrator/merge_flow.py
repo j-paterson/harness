@@ -27,7 +27,7 @@ from hermes_orchestrator.codex_queue import CodexQueueDelivery
 from hermes_orchestrator.codex_rpc import CodexRpcClient, app_server_command
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.emission import CandidateEmitter
+from hermes_orchestrator.emission import CandidateEmitter, build_session_chain_lookup
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitRunner, GitVerifier, SubprocessGitRunner
 from hermes_orchestrator.github import (
@@ -222,6 +222,10 @@ def build_merge_flow(
         verifier=Verifier(
             database, events=events, state_dir=settings.state_dir
         ),
+        # INFRA-197 (plan v5.4): credited packets may span the cell's
+        # durably acknowledged rotation chain; sessions outside the
+        # recorded chain still fail closed.
+        session_chain=build_session_chain_lookup(database),
     )
     turns = MergerTurnService(
         database=database,

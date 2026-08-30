@@ -511,3 +511,33 @@ Enter literal and the state machine is its only caller.
 Lead-owned: interface contract between T1 and T2, CLI anchor/confirm
 commands, runtime wiring, seat-path hookup, integration gate, and the
 live anchor capture from tonight's manual trust events.
+
+## v5.4 amendment: rotation-chain delegation-evidence identity (operator decision, in-session, 2026-08-30)
+
+The first `candidate-ready` run exposed a structural conflict between
+two established policies: the INFRA-186 delegation-evidence gate
+requires every credited packet to share ONE exact
+(session, worktree, generation) identity, while operator rotation
+policy deliberately rotates lead sessions at safe boundaries with
+durable acknowledged handoffs — this branch was correctly built by
+four chained sessions. The operator approved clause 1 only: the gate
+accepts credited packets from any session in the candidate cell's
+MECHANICALLY VERIFIED rotation chain; the proposed one-shot
+grandfather clause for pre-gate-era uncovered paths is NOT approved.
+
+Mechanical chain rule (packet G1): all credited packets must share one
+worktree AND one cell_id, and every credited packet's session_id must
+be durably recorded for that exact cell — as the cell's current
+`project_cells.session_id`, as a `replacement_session_id` on an
+acknowledged `handoffs` row, as a `lead_assignments.session_id`, or in
+a `project_cell.rotated` event payload. Any credited session outside
+that recorded chain, any cell mixture, and any worktree mixture keep
+failing closed exactly as before; nothing else about the gate changes.
+
+| Packet | Boundary | Files (disjoint) | Tier | Wave |
+|---|---|---|---|---|
+| G1 | Rotation-chain identity acceptance, fail-closed tests for out-of-chain sessions, mixed cells, mixed worktrees | `src/hermes_orchestrator/emission.py`, `tests/test_emission.py` | Sonnet | 1 |
+
+Publication remains gated (operator correction, same message) on the
+outstanding live sequence: the bounded prompt recapture and the
+following no-computer-use auto-confirm restart.

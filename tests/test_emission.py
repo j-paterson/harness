@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,9 +16,15 @@ import pytest
 from hermes_orchestrator import emission as emission_module
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
 from hermes_orchestrator.config import ProjectConfig
-from hermes_orchestrator.emission import CandidateEmitter, EmissionBlocked
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.emission import (
+    CandidateEmitter,
+    EmissionBlocked,
+    build_grandfather_binding_lookup,
+)
 from hermes_orchestrator.git import GitResult
 from hermes_orchestrator.manifests import WakeEvent, read_manifest
+from hermes_orchestrator.operator_decisions import OperatorDecisions
 
 HEAD = "1" * 40
 BASE = "4" * 40
@@ -380,6 +388,7 @@ class FakePacket:
     packet_id: str = "pkt-default"
     allowed_files: tuple[str, ...] = ()
     evidence: dict[str, str] | None = None
+    cell_id: str = "cell-1"
     session_id: str = "sess-1"
     worktree: str = "/repo"
     generation: int = 1
@@ -450,7 +459,12 @@ def _trivial_git() -> FakeGitRunner:
 
 
 def _emitter_with_packets(
-    tmp_path: Path, git: FakeGitRunner, packets: FakePackets | None
+    tmp_path: Path,
+    git: FakeGitRunner,
+    packets: FakePackets | None,
+    *,
+    session_chain: Callable[[str], frozenset[str]] | None = None,
+    grandfather_binding: Callable[[], dict[str, object] | None] | None = None,
 ) -> tuple[CandidateEmitter, FakeDeliverer]:
     deliverer = FakeDeliverer()
     root = tmp_path / "manifests"
@@ -470,6 +484,8 @@ def _emitter_with_packets(
         now=lambda: NOW,
         packets=packets,
         head_blob=git.head_blob,
+        session_chain=session_chain,
+        grandfather_binding=grandfather_binding,
     )
     return emitter, deliverer
 
@@ -962,6 +978,212 @@ async def test_credited_packet_identity_mismatch_is_blocked(tmp_path: Path) -> N
         await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
 
     assert deliverer.events == []
+
+
+# --- rotation-chain delegation evidence (INFRA-197 packet G1) --------------
+#
+# Operator rotation policy deliberately rotates lead sessions at safe
+# boundaries with durable, acknowledged handoffs, so a legitimate candidate
+# branch may legitimately be built by a CHAIN of sessions for one cell —
+# not just one. Credited packets must still share exactly one worktree and
+# one cell_id, but the session_id of each credited packet is now checked
+# against the cell's durably recorded rotation chain (injected via
+# ``session_chain``) rather than against every other credited packet's own
+# session_id. With no ``session_chain`` supplied, the OLD single-identity
+# rule (one shared session, worktree, and generation) still applies —
+# fail-closed by default.
+
+
+def _two_regular_packets(
+    git: FakeGitRunner,
+    *,
+    cell_a: str,
+    session_a: str,
+    worktree_a: str,
+    cell_b: str,
+    session_b: str,
+    worktree_b: str,
+    generation_a: int = 1,
+    generation_b: int = 2,
+) -> FakePackets:
+    a_returned = _wire_head_content(git, HEAD, {"src/app.py": "new src content"})
+    b_returned = _wire_head_content(
+        git, HEAD, {"tests/test_app.py": "new test content"}
+    )
+    return FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-a",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                    cell_id=cell_a,
+                    session_id=session_a,
+                    worktree=worktree_a,
+                    generation=generation_a,
+                    reserved_blobs=_stale_reserved(a_returned),
+                    returned_blobs=a_returned,
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-b",
+                    allowed_files=("tests/test_app.py",),
+                    evidence={},
+                    cell_id=cell_b,
+                    session_id=session_b,
+                    worktree=worktree_b,
+                    generation=generation_b,
+                    reserved_blobs=_stale_reserved(b_returned),
+                    returned_blobs=b_returned,
+                ),
+            ]
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_credited_packets_from_chained_rotation_sessions_pass(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = _two_regular_packets(
+        git,
+        cell_a="cell-rot",
+        session_a="sess-old",
+        worktree_a="/wt-a",
+        cell_b="cell-rot",
+        session_b="sess-new",
+        worktree_b="/wt-a",
+    )
+    chain = frozenset({"sess-old", "sess-new"})
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path,
+        git,
+        packets,
+        session_chain=lambda cell_id: chain if cell_id == "cell-rot" else frozenset(),
+    )
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events != []
+
+
+@pytest.mark.asyncio
+async def test_credited_packet_session_outside_rotation_chain_is_blocked(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = _two_regular_packets(
+        git,
+        cell_a="cell-rot",
+        session_a="sess-old",
+        worktree_a="/wt-a",
+        cell_b="cell-rot",
+        session_b="sess-rogue",
+        worktree_b="/wt-a",
+    )
+    # Only "sess-old" is durably recorded for "cell-rot" — "sess-rogue"
+    # never rotated in, so its packet earns no credit.
+    chain = frozenset({"sess-old"})
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path,
+        git,
+        packets,
+        session_chain=lambda cell_id: chain if cell_id == "cell-rot" else frozenset(),
+    )
+
+    with pytest.raises(EmissionBlocked, match="identity mismatch") as excinfo:
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert "sess-rogue" in str(excinfo.value)
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_credited_packets_with_mixed_cell_ids_are_blocked(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = _two_regular_packets(
+        git,
+        cell_a="cell-a",
+        session_a="sess-a",
+        worktree_a="/wt-a",
+        cell_b="cell-b",
+        session_b="sess-b",
+        worktree_b="/wt-a",
+    )
+    # A permissive chain lookup must not rescue a mixed-cell credit set —
+    # cell_id uniformity is checked before any chain lookup happens.
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path,
+        git,
+        packets,
+        session_chain=lambda cell_id: frozenset({"sess-a", "sess-b"}),
+    )
+
+    with pytest.raises(EmissionBlocked, match="identity mismatch") as excinfo:
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert "cell" in str(excinfo.value)
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_credited_packets_with_mixed_worktrees_are_blocked(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = _two_regular_packets(
+        git,
+        cell_a="cell-rot",
+        session_a="sess-a",
+        worktree_a="/wt-a",
+        cell_b="cell-rot",
+        session_b="sess-b",
+        worktree_b="/wt-b",
+    )
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path,
+        git,
+        packets,
+        session_chain=lambda cell_id: frozenset({"sess-a", "sess-b"}),
+    )
+
+    with pytest.raises(EmissionBlocked, match="identity mismatch") as excinfo:
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert "worktree" in str(excinfo.value)
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_credited_packets_same_session_still_pass_without_a_chain(
+    tmp_path: Path,
+) -> None:
+    # No session_chain supplied (defaults to None): the OLD single-identity
+    # rule still governs, and two packets sharing one session, worktree,
+    # and generation still pass exactly as before.
+    git = _non_trivial_git()
+    packets = _two_regular_packets(
+        git,
+        cell_a="cell-rot",
+        session_a="sess-shared",
+        worktree_a="/wt-shared",
+        cell_b="cell-rot",
+        session_b="sess-shared",
+        worktree_b="/wt-shared",
+        generation_a=3,
+        generation_b=3,
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events != []
 
 
 # --- measured execution provenance (Sol reviewer Critical: PR #30) ---------
@@ -1608,3 +1830,485 @@ def test_default_head_blob_against_a_real_tmp_git_repo(tmp_path: Path) -> None:
         repo, head, "assets/does-not-exist.bin"
     )
     assert absent is None
+
+
+# --- INFRA-197 packet G2: the one-time provenance grandfather ---------------
+#
+# A durable operator decision (infra-197-provenance-grandfather-20260830-v1)
+# authorizes a ONE-TIME transition grandfather for enumerated residual paths
+# that predate the delegation-evidence gate: a binding receipt ties the
+# exact final candidate SHA to the exact SHA-256 blobs of only those paths.
+# It is single-use (it can only ever match one candidate SHA), grants no
+# general bypass, and is invalid on any path/blob/candidate drift. These
+# tests prove the two narrow rescue points and their fail-closed guards.
+
+
+def _grandfather_lookup(
+    candidate_sha: str, blobs: dict[str, str]
+) -> Callable[[], dict[str, object] | None]:
+    return lambda: {"candidate_sha": candidate_sha, "blobs": blobs}
+
+
+@pytest.mark.asyncio
+async def test_no_binding_uncovered_path_fails_closed_unchanged(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-partial",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=None
+    )
+
+    with pytest.raises(EmissionBlocked, match=re.escape("tests/test_app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_wrong_candidate_sha_never_rescues_uncovered_path(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    # The recorded blob is the ACTUAL matching content for the uncovered
+    # path, but the binding is bound to a different candidate SHA — the
+    # rescue must never be consulted at all.
+    returned = _wire_head_content(
+        git, HEAD, {"tests/test_app.py": "new test content"}
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-partial",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    binding = _grandfather_lookup(
+        "9" * 40, {"tests/test_app.py": returned["tests/test_app.py"]}
+    )
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    with pytest.raises(EmissionBlocked, match=re.escape("tests/test_app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_path_missing_from_binding_blobs_fails_closed(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-partial",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    # The binding matches this exact candidate, but names a wholly
+    # different path — the uncovered path is not in it at all.
+    binding = _grandfather_lookup(HEAD, {"some/other/path.py": "a" * 64})
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    with pytest.raises(EmissionBlocked, match=re.escape("tests/test_app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_blob_mismatch_drifted_content_fails_closed(tmp_path: Path) -> None:
+    git = _non_trivial_git()
+    # Wire real head content for the uncovered path, but record a
+    # DIFFERENT sha256 in the binding — the actual content has drifted
+    # away from what the binding was made against.
+    _wire_head_content(git, HEAD, {"tests/test_app.py": "new test content"})
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-partial",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    binding = _grandfather_lookup(HEAD, {"tests/test_app.py": "0" * 64})
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    with pytest.raises(EmissionBlocked, match=re.escape("tests/test_app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_uncovered_path_with_matching_binding_is_grandfathered(
+    tmp_path: Path,
+) -> None:
+    # ``src/app.py`` is properly credited to an accepted packet;
+    # ``tests/test_app.py`` is claimed by no packet at all but is
+    # rescued by the grandfather binding.
+    git = _non_trivial_git()
+    src_returned = _wire_head_content(git, HEAD, {"src/app.py": "new src content"})
+    test_returned = _wire_head_content(
+        git, HEAD, {"tests/test_app.py": "new test content"}
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-partial",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(src_returned),
+                    returned_blobs=src_returned,
+                )
+            ]
+        }
+    )
+    binding = _grandfather_lookup(
+        HEAD, {"tests/test_app.py": test_returned["tests/test_app.py"]}
+    )
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-partial", "files=1;lines=35") in manifest.verification
+    assert (
+        "grandfathered:tests/test_app.py",
+        f"blob={test_returned['tests/test_app.py'][:12]}",
+    ) in manifest.verification
+
+
+@pytest.mark.asyncio
+async def test_fully_uncovered_diff_rescued_entirely_by_the_binding(
+    tmp_path: Path,
+) -> None:
+    # Every changed path is covered by ONE accepted packet (required —
+    # ``_enforce_delegation_evidence`` still refuses when there are zero
+    # accepted packets at all, regardless of the binding), but that
+    # packet's scope names neither changed path, so both paths must be
+    # rescued purely by the grandfather binding.
+    git = _non_trivial_git()
+    returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-unrelated",
+                    allowed_files=("some/other/file.py",),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    binding = _grandfather_lookup(HEAD, dict(returned))
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert (
+        "grandfathered:src/app.py",
+        f"blob={returned['src/app.py'][:12]}",
+    ) in manifest.verification
+    assert (
+        "grandfathered:tests/test_app.py",
+        f"blob={returned['tests/test_app.py'][:12]}",
+    ) in manifest.verification
+    assert not any(
+        entry[0].startswith("packet:") for entry in manifest.verification
+    )
+
+
+@pytest.mark.asyncio
+async def test_packet_credited_path_with_blob_drift_is_rescued_by_binding(
+    tmp_path: Path,
+) -> None:
+    # ``src/app.py`` is properly credited (packet's returned blob matches
+    # the real head content). ``tests/test_app.py`` is claimed by the
+    # SAME packet, but the packet's own returned-blob measurement does
+    # not match the real head content (drift) — the grandfather binding
+    # rescues exactly that one path, and the packet is credited only for
+    # the path it actually proved.
+    git = _non_trivial_git()
+    returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
+    drifted_returned = {
+        "src/app.py": returned["src/app.py"],
+        "tests/test_app.py": "0" * 64,
+    }
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(drifted_returned),
+                    returned_blobs=drifted_returned,
+                ),
+            ]
+        }
+    )
+    binding = _grandfather_lookup(
+        HEAD, {"tests/test_app.py": returned["tests/test_app.py"]}
+    )
+    emitter, deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-1", "files=1;lines=35") in manifest.verification
+    assert (
+        "grandfathered:tests/test_app.py",
+        f"blob={returned['tests/test_app.py'][:12]}",
+    ) in manifest.verification
+
+
+@pytest.mark.asyncio
+async def test_fully_packet_covered_candidate_ignores_the_binding_entirely(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(returned),
+                    returned_blobs=returned,
+                ),
+            ]
+        }
+    )
+    # A perfectly valid, matching-candidate binding is wired but never
+    # needed — nothing in the diff requires rescue.
+    binding = _grandfather_lookup(HEAD, dict(returned))
+    emitter, _deliverer = _emitter_with_packets(
+        tmp_path, git, packets, grandfather_binding=binding
+    )
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-1", "files=2;lines=44") in manifest.verification
+    assert not any(
+        entry[0].startswith("grandfathered:") for entry in manifest.verification
+    )
+
+
+# --- build_grandfather_binding_lookup: real durable operator_decisions -----
+
+
+@pytest.fixture
+def gf_database(tmp_path: Path) -> Iterator[Database]:
+    value = Database.open(tmp_path / "state.db")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+def _record_binding_decision(
+    database: Database, *, source_message: str, decision_id: str = "gf-binding-dec"
+) -> None:
+    decisions = OperatorDecisions(database)
+    decisions.record_pending(
+        decision_id=decision_id,
+        issue_id="INFRA-197",
+        project_key="demo",
+        cell_id="cell-1",
+        session_id="session-1",
+        choice="infra-197-provenance-grandfather-binding-v1",
+    )
+    decisions.apply(
+        decision_id=decision_id,
+        status="approved",
+        source_message=source_message,
+    )
+
+
+def test_build_grandfather_binding_lookup_reads_the_approved_binding(
+    gf_database: Database,
+) -> None:
+    payload = json.dumps(
+        {
+            "candidate_sha": HEAD,
+            "blobs": {"legacy/module.py": "a" * 64, "legacy/other.py": "b" * 64},
+        }
+    )
+    with gf_database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO operator_decisions("
+            "decision_id, issue_id, project_key, cell_id, session_id, "
+            "actor, choice, status, source_message, recorded_at"
+            ") VALUES (?, 'INFRA-197', 'demo', 'cell-1', 'session-1', "
+            "'operator', 'infra-197-provenance-grandfather-binding-v1', "
+            "'approved', ?, '2026-08-30T00:00:00+00:00')",
+            (emission_module._GRANDFATHER_BINDING_DECISION_ID, payload),
+        )
+
+    lookup = build_grandfather_binding_lookup(gf_database)
+
+    assert lookup() == {
+        "candidate_sha": HEAD,
+        "blobs": {"legacy/module.py": "a" * 64, "legacy/other.py": "b" * 64},
+    }
+
+
+def test_build_grandfather_binding_lookup_no_row_returns_none(
+    gf_database: Database,
+) -> None:
+    lookup = build_grandfather_binding_lookup(gf_database)
+
+    assert lookup() is None
+
+
+def test_build_grandfather_binding_lookup_wrong_decision_id_returns_none(
+    gf_database: Database,
+) -> None:
+    payload = json.dumps({"candidate_sha": HEAD, "blobs": {"a.py": "a" * 64}})
+    with gf_database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO operator_decisions("
+            "decision_id, issue_id, project_key, cell_id, session_id, "
+            "actor, choice, status, source_message, recorded_at"
+            ") VALUES ('some-other-decision', 'INFRA-197', 'demo', "
+            "'cell-1', 'session-1', 'operator', 'not-the-binding', "
+            "'approved', ?, '2026-08-30T00:00:00+00:00')",
+            (payload,),
+        )
+
+    lookup = build_grandfather_binding_lookup(gf_database)
+
+    assert lookup() is None
+
+
+def test_build_grandfather_binding_lookup_pending_status_returns_none(
+    gf_database: Database,
+) -> None:
+    decisions = OperatorDecisions(gf_database)
+    decisions.record_pending(
+        decision_id=emission_module._GRANDFATHER_BINDING_DECISION_ID,
+        issue_id="INFRA-197",
+        project_key="demo",
+        cell_id="cell-1",
+        session_id="session-1",
+        choice="infra-197-provenance-grandfather-binding-v1",
+    )
+
+    lookup = build_grandfather_binding_lookup(gf_database)
+
+    assert lookup() is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # candidate_sha too short.
+        json.dumps({"candidate_sha": "a" * 39, "blobs": {"a.py": "a" * 64}}),
+        # candidate_sha uppercase (not lowercase-hex).
+        json.dumps({"candidate_sha": "A" * 40, "blobs": {"a.py": "a" * 64}}),
+        # a blob sha256 with the wrong length.
+        json.dumps({"candidate_sha": "a" * 40, "blobs": {"a.py": "a" * 63}}),
+        # a blob sha256 that is not hex.
+        json.dumps({"candidate_sha": "a" * 40, "blobs": {"a.py": "g" * 64}}),
+        # an unknown extra top-level key.
+        json.dumps(
+            {
+                "candidate_sha": "a" * 40,
+                "blobs": {"a.py": "a" * 64},
+                "extra": "field",
+            }
+        ),
+        # blobs is not a dict.
+        json.dumps({"candidate_sha": "a" * 40, "blobs": ["a.py"]}),
+        # blobs is empty.
+        json.dumps({"candidate_sha": "a" * 40, "blobs": {}}),
+        # not even valid JSON.
+        "{not json",
+        # a JSON list instead of an object.
+        json.dumps(["candidate_sha", "blobs"]),
+    ],
+)
+def test_build_grandfather_binding_lookup_malformed_payload_returns_none(
+    gf_database: Database, payload: str
+) -> None:
+    with gf_database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO operator_decisions("
+            "decision_id, issue_id, project_key, cell_id, session_id, "
+            "actor, choice, status, source_message, recorded_at"
+            ") VALUES (?, 'INFRA-197', 'demo', 'cell-1', 'session-1', "
+            "'operator', 'infra-197-provenance-grandfather-binding-v1', "
+            "'approved', ?, '2026-08-30T00:00:00+00:00')",
+            (emission_module._GRANDFATHER_BINDING_DECISION_ID, payload),
+        )
+
+    lookup = build_grandfather_binding_lookup(gf_database)
+
+    assert lookup() is None

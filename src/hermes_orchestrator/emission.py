@@ -12,6 +12,7 @@ registered wake deduplicates.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 from collections.abc import Callable, Mapping
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Protocol
 from hermes_orchestrator.ci_window import MergeWindowExhausted, PriorMergeFailed
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
 from hermes_orchestrator.config import ProjectConfig
+from hermes_orchestrator.db import Database
 from hermes_orchestrator.git import GitError, GitRunner
 from hermes_orchestrator.manifests import (
     MANIFEST_VERSION,
@@ -215,6 +217,156 @@ class EmissionResult:
     intake_reason: str = ""
 
 
+def _session_chain_from_database(database: Database, cell_id: str) -> frozenset[str]:
+    """The durable rotation chain of session ids recognized for one cell
+    (INFRA-197 packet G1): operator rotation policy deliberately rotates
+    lead sessions at safe boundaries with durable, acknowledged
+    handoffs, so a legitimate candidate branch may be built by a CHAIN
+    of sessions for one cell rather than just one.
+
+    Mechanically verified as the union, non-NULL only, of every
+    session_id durably recorded for ``cell_id`` across four independent
+    sources — none of them consulted alone is authoritative on its
+    own, but every session this cell has ever legitimately run under
+    appears in at least one:
+
+    - ``project_cells.session_id`` — the cell's own current session.
+    - ``handoffs.replacement_session_id`` where ``state = 'acknowledged'``
+      — a durably acknowledged rotation onto this cell.
+    - ``lead_assignments.session_id`` — a recorded lead assignment for
+      this cell.
+    - ``events`` rows with ``event_type = 'project_cell.rotated'`` and
+      ``aggregate_id = cell_id`` — the ``session_id`` key of the
+      rotation event's own payload.
+
+    A session absent from every source is not in the chain and earns
+    no credit — fail-closed.
+    """
+
+    sessions: set[str] = set()
+    for row in database.execute(
+        "SELECT session_id FROM project_cells "
+        "WHERE cell_id = ? AND session_id IS NOT NULL",
+        (cell_id,),
+    ).fetchall():
+        sessions.add(str(row["session_id"]))
+    for row in database.execute(
+        "SELECT replacement_session_id FROM handoffs "
+        "WHERE cell_id = ? AND state = 'acknowledged' "
+        "AND replacement_session_id IS NOT NULL",
+        (cell_id,),
+    ).fetchall():
+        sessions.add(str(row["replacement_session_id"]))
+    for row in database.execute(
+        "SELECT session_id FROM lead_assignments "
+        "WHERE cell_id = ? AND session_id IS NOT NULL",
+        (cell_id,),
+    ).fetchall():
+        sessions.add(str(row["session_id"]))
+    for row in database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'project_cell.rotated' AND aggregate_id = ?",
+        (cell_id,),
+    ).fetchall():
+        payload = json.loads(str(row["payload_json"]))
+        rotated_session_id = payload.get("session_id")
+        if rotated_session_id is not None:
+            sessions.add(str(rotated_session_id))
+    return frozenset(sessions)
+
+
+def build_session_chain_lookup(
+    database: Database,
+) -> Callable[[str], frozenset[str]]:
+    """Bind a live ``Database`` handle into the ``session_chain`` seam
+    :class:`CandidateEmitter` accepts, so a production construction can
+    wire the real rotation-chain lookup with one call:
+    ``CandidateEmitter(..., session_chain=build_session_chain_lookup(db))``.
+    """
+
+    return lambda cell_id: _session_chain_from_database(database, cell_id)
+
+
+# The fixed decision_id under which the INFRA-197 provenance-grandfather
+# binding is imported at freeze time (see the ``operator_decisions``
+# table). Fixed and singular by design: this is a ONE-TIME transition
+# grandfather, not a general mechanism, so there is exactly one binding
+# row to ever look for.
+_GRANDFATHER_BINDING_DECISION_ID = "infra-197-provenance-grandfather-binding-v1"
+
+_BLOB_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _parse_grandfather_binding(raw: str) -> dict[str, object] | None:
+    """Strictly validate one candidate binding payload, never raising.
+
+    The shape is exactly ``{"candidate_sha": <40-hex>, "blobs": {<path>:
+    <64-hex>, ...}}`` with a non-empty ``blobs`` map and no unknown
+    top-level keys — anything else (malformed JSON, wrong types, extra
+    keys, bad hex, an empty blob map) returns ``None`` so the caller
+    falls back to zero grandfather support, never a partially-trusted
+    binding.
+    """
+
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if set(parsed.keys()) != {"candidate_sha", "blobs"}:
+        return None
+    candidate_sha = parsed.get("candidate_sha")
+    if not isinstance(candidate_sha, str) or _SHA_PATTERN.match(candidate_sha) is None:
+        return None
+    blobs = parsed.get("blobs")
+    if not isinstance(blobs, dict) or not blobs:
+        return None
+    validated_blobs: dict[str, str] = {}
+    for path, blob_sha in blobs.items():
+        if not isinstance(path, str) or not isinstance(blob_sha, str):
+            return None
+        if _BLOB_SHA256_PATTERN.match(blob_sha) is None:
+            return None
+        validated_blobs[path] = blob_sha
+    return {"candidate_sha": candidate_sha, "blobs": validated_blobs}
+
+
+def _grandfather_binding_from_database(database: Database) -> dict[str, object] | None:
+    row = database.execute(
+        "SELECT source_message FROM operator_decisions "
+        "WHERE decision_id = ? AND status = 'approved'",
+        (_GRANDFATHER_BINDING_DECISION_ID,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["source_message"]
+    if not raw:
+        return None
+    return _parse_grandfather_binding(str(raw))
+
+
+def build_grandfather_binding_lookup(
+    database: Database,
+) -> Callable[[], dict[str, object] | None]:
+    """Bind a live ``Database`` handle into the ``grandfather_binding``
+    seam :class:`CandidateEmitter` accepts (INFRA-197 packet G2): a
+    production construction wires the durable one-time transition
+    grandfather with one call:
+    ``CandidateEmitter(..., grandfather_binding=build_grandfather_binding_lookup(db))``.
+
+    Reads the fixed, single-use ``operator_decisions`` row (decision_id
+    ``infra-197-provenance-grandfather-binding-v1``, status
+    ``approved``), parses and strictly validates its ``source_message``
+    JSON, and returns the validated binding or ``None`` — missing row,
+    non-approved status, and any malformed payload all collapse to
+    ``None``, never a raise. The grandfather is inherently single-use:
+    it can only ever match the one candidate SHA it was bound to.
+    """
+
+    return lambda: _grandfather_binding_from_database(database)
+
+
 class CandidateEmitter:
     """Publish one immutable candidate and wake the project's Merger."""
 
@@ -233,6 +385,8 @@ class CandidateEmitter:
         verifier: Verifier | None = None,
         candidate_gate_id: str = "candidate-full-gate",
         head_blob: Callable[[Path, str, str], bytes | None] | None = None,
+        session_chain: Callable[[str], frozenset[str]] | None = None,
+        grandfather_binding: Callable[[], dict[str, object] | None] | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -246,6 +400,22 @@ class CandidateEmitter:
         self._verifier = verifier
         self._candidate_gate_id = candidate_gate_id
         self._head_blob = head_blob if head_blob is not None else _default_head_blob
+        # ``None`` (the default) enforces the OLD single-identity rule —
+        # one shared (session_id, worktree, generation) — so existing
+        # constructions that never opted into rotation-chain evidence
+        # keep their exact prior fail-closed behavior. Only a caller
+        # that injects a real chain lookup (see
+        # :func:`build_session_chain_lookup`) gets the rotation-chain
+        # rule.
+        self._session_chain = session_chain
+        # ``None`` (the default) grants no general bypass whatsoever —
+        # every existing construction keeps its exact prior fail-closed
+        # behavior. Only a caller that injects the INFRA-197 one-time
+        # transition grandfather (see
+        # :func:`build_grandfather_binding_lookup`) gets the two narrow
+        # rescue points in ``_enforce_delegation_evidence``, and even
+        # then only for the exact candidate SHA the binding is bound to.
+        self._grandfather_binding = grandfather_binding
 
     async def emit(
         self,
@@ -428,7 +598,14 @@ class CandidateEmitter:
         closed, naming it. Each credited exception's paths and measured
         lines must stay inside both the fixed reviewer-fix scale and its
         own declared ``expected_lines``. Every credited packet must share
-        one ``(session_id, worktree, generation)`` identity.
+        one worktree and one cell_id. Session identity is then checked
+        one of two ways: with a ``session_chain`` lookup injected at
+        construction, each credited packet's session_id must be durably
+        recorded in that cell's rotation chain (any session a rotation
+        legitimately handed the cell to); with none injected (the
+        default), every credited packet must share the exact same
+        ``(session_id, generation)`` — the original single-identity
+        rule, unchanged and still fail-closed.
 
         Path coverage alone is not enough: every credited packet must
         also carry immutable, MEASURED execution provenance proving it
@@ -445,6 +622,21 @@ class CandidateEmitter:
         path's actual content at the candidate head, proven fresh via
         ``git show``. Never inferred — always proven from the durable
         ledger and the actual git diff and tree.
+
+        INFRA-197 packet G2: with a ``grandfather_binding`` lookup
+        injected at construction (see
+        :func:`build_grandfather_binding_lookup`), exactly two rescue
+        points are consulted — lazily, and only once the binding's own
+        ``candidate_sha`` equals this exact ``head`` — for an otherwise
+        fatal path: an uncovered changed path, and a credited packet
+        path whose returned blob does not match the head content.
+        Either rescue requires the path be named in the binding's
+        ``blobs`` map with a sha256 equal to the path's ACTUAL head
+        content; a rescued path is recorded as grandfathered evidence
+        instead, excluded from every per-packet check and from the
+        identity/chain checks. No binding, a wrong candidate SHA, or a
+        path/blob not in the binding all leave the original fail-closed
+        behavior completely unchanged.
         """
 
         numstat = self._run(repo, "diff", "--numstat", base, head)
@@ -508,6 +700,36 @@ class CandidateEmitter:
         def recency_key(packet: object) -> tuple[datetime, str]:
             return (self._packet_timestamp(packet), packet.packet_id)
 
+        # INFRA-197 packet G2: the one-time transition grandfather. The
+        # binding (durably imported at freeze time under the fixed
+        # decision_id ``infra-197-provenance-grandfather-binding-v1``,
+        # see :func:`build_grandfather_binding_lookup`) is consulted
+        # LAZILY — never called at all when no rescue is ever needed —
+        # and only ever trusted for the exact candidate SHA it names.
+        # Cached after the first lookup so a wrong-candidate binding (or
+        # no binding at all) is confirmed exactly once per emission.
+        grandfather_cache: dict[str, dict[str, str] | None] = {}
+
+        def grandfather_blobs() -> dict[str, str] | None:
+            if "blobs" not in grandfather_cache:
+                blobs: dict[str, str] | None = None
+                if self._grandfather_binding is not None:
+                    binding = self._grandfather_binding()
+                    if (
+                        isinstance(binding, dict)
+                        and binding.get("candidate_sha") == head
+                        and isinstance(binding.get("blobs"), dict)
+                    ):
+                        blobs = binding["blobs"]
+                grandfather_cache["blobs"] = blobs
+            return grandfather_cache["blobs"]
+
+        # Paths accepted purely on the strength of the grandfather
+        # binding, keyed to the actual (matching) head blob sha256 —
+        # never packet-credited, so excluded from every per-packet
+        # check (windows, lines) and from the identity/chain checks.
+        grandfathered: dict[str, str] = {}
+
         credited_by_path: dict[str, object] = {}
         for path in changed:
             regular_claimants = [p for p in regular if path in p.allowed_files]
@@ -523,6 +745,12 @@ class CandidateEmitter:
                     )
                 credited_by_path[path] = exception_claimants[0]
             else:
+                binding_blobs = grandfather_blobs()
+                if binding_blobs is not None and path in binding_blobs:
+                    head_blob = self._head_blob_hash(repo, head, path)
+                    if head_blob == binding_blobs[path]:
+                        grandfathered[path] = head_blob
+                        continue
                 raise EmissionBlocked(
                     "delegation evidence missing: "
                     f"{path!r} is not covered by any accepted subagent "
@@ -563,6 +791,7 @@ class CandidateEmitter:
                     f"packet {packet_id!r} lacks immutable execution "
                     "provenance: no measured reserved/returned blobs"
                 )
+            kept_paths: list[str] = []
             for path in paths:
                 returned_blob = packet.returned_blobs.get(path)
                 if not is_exception:
@@ -575,10 +804,32 @@ class CandidateEmitter:
                         )
                 head_blob = self._head_blob_hash(repo, head, path)
                 if returned_blob != head_blob:
+                    binding_blobs = grandfather_blobs()
+                    if (
+                        binding_blobs is not None
+                        and path in binding_blobs
+                        and binding_blobs[path] == head_blob
+                    ):
+                        grandfathered[path] = head_blob
+                        continue
                     raise EmissionBlocked(
                         f"packet {packet_id!r} returned blob for {path!r} "
                         "does not match the candidate head content"
                     )
+                kept_paths.append(path)
+            packet_paths[packet_id] = kept_paths
+
+        # A packet whose every credited path was rescued into
+        # grandfathered status now credits nothing at all — it drops
+        # out of ``packet_paths``/``packet_by_id`` entirely, so it
+        # contributes no evidence entry and is never subject to the
+        # identity/chain checks below.
+        packet_paths = {
+            packet_id: paths for packet_id, paths in packet_paths.items() if paths
+        }
+        packet_by_id = {
+            packet_id: packet_by_id[packet_id] for packet_id in packet_paths
+        }
 
         for packet in exceptions:
             paths = packet_paths.get(packet.packet_id)
@@ -609,26 +860,60 @@ class CandidateEmitter:
                     )
 
         credited_packets = list(packet_by_id.values())
-        identities = {
-            (packet.session_id, packet.worktree, packet.generation)
-            for packet in credited_packets
-        }
-        if len(identities) > 1:
+        worktrees = {packet.worktree for packet in credited_packets}
+        if len(worktrees) > 1:
             raise EmissionBlocked(
                 "delegation evidence identity mismatch: credited packets "
-                "do not share one session, worktree, and generation"
+                "do not share one worktree"
             )
-
-        return tuple(
-            sorted(
-                (
-                    f"packet:{packet_id}",
-                    f"files={len(paths)};lines="
-                    f"{sum(lines_by_path.get(path, 0) for path in paths)}",
+        cell_ids = {packet.cell_id for packet in credited_packets}
+        if len(cell_ids) > 1:
+            raise EmissionBlocked(
+                "delegation evidence identity mismatch: credited packets "
+                "do not share one cell"
+            )
+        if self._session_chain is None:
+            # No rotation-chain lookup injected: enforce the original
+            # single-identity rule unchanged (worktree already proven
+            # uniform above, so only session_id and generation remain).
+            identities = {
+                (packet.session_id, packet.generation)
+                for packet in credited_packets
+            }
+            if len(identities) > 1:
+                raise EmissionBlocked(
+                    "delegation evidence identity mismatch: credited "
+                    "packets do not share one session, worktree, and "
+                    "generation"
                 )
-                for packet_id, paths in packet_paths.items()
+        elif credited_packets:
+            # ``credited_packets`` can be empty when every changed path
+            # was rescued by the grandfather binding — nothing left to
+            # check identity for.
+            cell_id = next(iter(cell_ids))
+            chain = self._session_chain(cell_id)
+            for packet in credited_packets:
+                if packet.session_id not in chain:
+                    raise EmissionBlocked(
+                        "delegation evidence identity mismatch: credited "
+                        f"packet {packet.packet_id!r} session "
+                        f"{packet.session_id!r} is not durably recorded "
+                        f"in the rotation chain for cell {cell_id!r}"
+                    )
+
+        entries = [
+            (
+                f"packet:{packet_id}",
+                f"files={len(paths)};lines="
+                f"{sum(lines_by_path.get(path, 0) for path in paths)}",
             )
+            for packet_id, paths in packet_paths.items()
+        ]
+        entries.extend(
+            (f"grandfathered:{path}", f"blob={blob[:12]}")
+            for path, blob in grandfathered.items()
         )
+        return tuple(sorted(entries))
 
     @staticmethod
     def _packet_timestamp(packet: object) -> datetime:

@@ -6,15 +6,15 @@ the only place that touches the cmux CLI. Business services consume the
 :class:`CmuxControlPort` protocol with typed workspace/surface identities —
 never shell strings and never terminal screen content. The adapter builds
 argv lists from a fixed allow-list of metadata commands, so arbitrary
-screen reads, text, and keystroke injection remain structurally
-impossible; the only exceptions are three bounded fixed-shape operations
-— the closed-grammar intake envelope (INFRA-190), the read-only
-channel-prompt screen read, and the single non-parameterizable Enter of
-the channel-trust gate (INFRA-197 v5.1, operator decision
-infra-197-trusted-channel-auto-approval-20260830-v1) — none of which can
-carry caller-chosen keys or free text. It authenticates
-through the ``CMUX_SOCKET_PASSWORD`` environment variable only: the socket
-password never appears in argv, exceptions, logs, or durable payloads.
+screen reads, free text, and caller-chosen keystrokes remain structurally
+impossible except for three bounded fixed-shape operations:
+``deliver_intake_envelope`` (closed-grammar intake signal),
+``read_screen`` (read-only channel verification), and
+``confirm_channel_dialog`` (exactly one non-parameterizable Enter
+keypress for INFRA-197 v5.1 operator-decision approval). None can carry
+caller-chosen keys or free text. It authenticates through the
+``CMUX_SOCKET_PASSWORD`` environment variable only: the socket password
+never appears in argv, exceptions, logs, or durable payloads.
 """
 
 from __future__ import annotations
