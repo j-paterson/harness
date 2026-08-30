@@ -408,3 +408,47 @@ Durable rows for every step land in
 `912b9d93…`). Machine-managed `allowedChannelPlugins`
 provisioning, seat-grammar changes, and any fleet expansion are
 explicitly out of scope until this proof is green.
+
+## v5.1 amendment: trusted-build automatic confirmation (operator decision `infra-197-trusted-channel-auto-approval-20260830-v1`)
+
+### Authority
+
+Durable operator decision
+`infra-197-trusted-channel-auto-approval-20260830-v1` (status
+`approved`, receipt sha256 `8272377e9967b11e0a26268dee7a1336…`,
+applied 2026-08-30T16:35:35Z). It extends transport-v2: after ONE
+exact manual trust event of ONE exact `hermes-control` build, a
+narrowly scoped automatic confirmation may stand in for the
+per-launch dialog — and nothing broader.
+
+### The trust binding (all must match, exactly)
+
+An automatic confirmation is permitted only when every one of these
+matches the manually trusted build with no substitution:
+
+- canonical channel path and ownership, with no symlink swap;
+- plugin and marketplace identity;
+- manifest and version;
+- source or packaged digest;
+- build timestamp;
+- exact `claude` launch arguments;
+- exact cmux workspace, pane, Claude process, session, profile,
+  and prompt shape, with no second channel present.
+
+### Fail-closed rules
+
+- Every automatic confirmation writes a durable approval receipt.
+- Any mismatch or drift on any bound field fails closed as
+  `CHANNEL APPROVAL REQUIRED` — never an approval.
+- No generic keystroke-automation or prompt-approval capability is
+  created; this transition confirms exactly one identity-bound
+  channel build and nothing else.
+- Persistent Claude processes and `/clear` remain the normal
+  lifecycle; durable packet validation, exact ACK, replay,
+  deduplication, and the channel-as-signal-plane invariant remain
+  binding.
+- Official marketplace submission of `hermes-control` remains the
+  long-term solution; this transition is the bounded interim.
+
+The candidate proceeds through the existing Fable-to-Sol workflow;
+Fable does not merge.
