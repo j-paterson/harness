@@ -22,6 +22,12 @@ export interface HubClientOptions {
    * have to wait a full minute.
    */
   parkedRetryMs?: number;
+  /**
+   * Width of the per-connection-epoch coalescing window applied to
+   * repeated event_ids (see `forwardedAt` below). Defaults to 60s;
+   * overridable so tests don't have to wait a full minute.
+   */
+  coalesceMs?: number;
   onEvent: (kind: string, packetId: string, eventId: string) => void;
   onLog: (message: string) => void;
 }
@@ -36,6 +42,7 @@ const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
 const ACK_TIMEOUT_MS = 10000;
 const DEFAULT_PARKED_RETRY_MS = 60000;
+const DEFAULT_COALESCE_MS = 60000;
 
 // Refusals no single retry can cure from inside this process: the
 // wire protocol itself is wrong, or this process belongs to a
@@ -71,6 +78,15 @@ export class HubClient {
   private readonly pendingAcks = new Map<string, PendingAck>();
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /**
+   * event_id -> Date.now() of the last forward, scoped to the current
+   * connection epoch (cleared on every successful registration, see
+   * the "registered" case below). Bounds the visible burst from the
+   * hub's per-publish-pass resend without ever suppressing a genuinely
+   * lost event or a post-reconnect replay: see the "event" case for
+   * the coalescing rule itself.
+   */
+  private forwardedAt = new Map<string, number>();
 
   constructor(opts: HubClientOptions) {
     this.opts = opts;
@@ -200,6 +216,12 @@ export class HubClient {
       case "registered":
         this.state = "registered";
         this.backoff = INITIAL_BACKOFF_MS;
+        // A new connection epoch begins here, and the hub's replay
+        // follows: clear the coalescing map so every replayed event
+        // forwards immediately on this epoch, preserving retry after
+        // reconnect (see `forwardedAt` above and the "event" case
+        // below).
+        this.forwardedAt.clear();
         return true;
 
       case "refused": {
@@ -238,18 +260,36 @@ export class HubClient {
       case "event": {
         const validated = validateHubEvent(msg, this.opts.session);
         if (!validated) return false;
-        // The sidecar is transport only: it does not deduplicate by
-        // event_id. The hub re-sends every unacknowledged event on
-        // startup replay, on each publish pass, and again after a hub
-        // restart, precisely so that a notification lost on the
+        // The sidecar stays transport only: it never deduplicates by
+        // event_id across connection epochs. The hub re-sends every
+        // unacknowledged event on registration replay and again on
+        // EVERY publish pass (which fires per maintenance tick AND per
+        // outbox commit), precisely so that a notification lost on the
         // client side (e.g. delivered before the host's channel
         // handler is registered) self-heals on the next resend.
-        // Suppressing re-forwards here would defeat that design and
-        // can make a wake permanently invisible while the event stays
-        // durably unacknowledged. Exactly-once effect is enforced
-        // downstream, by the durable drain's dedup and the hub's ack
-        // compare-and-set — not here.
+        // Suppressing re-forwards outright would defeat that design
+        // and can make a wake permanently invisible while the event
+        // stays durably unacknowledged.
         //
+        // What it DOES do is coalesce repeats of the same event_id
+        // within one connection epoch inside a bounded window
+        // (`coalesceMs`, see `forwardedAt` above): a hub republish
+        // burst at cold start renders as one visible entry instead of
+        // three, while a genuinely lost, still-unacknowledged event
+        // re-surfaces the moment the window lapses, and a reconnect
+        // (new epoch, map cleared in the "registered" case above)
+        // replays immediately regardless of how recently it last
+        // forwarded. Exactly-once effect remains enforced downstream,
+        // by the durable drain's dedup and the hub's ack
+        // compare-and-set — not here.
+        const now = Date.now();
+        const last = this.forwardedAt.get(validated.event_id);
+        const coalesceMs = this.opts.coalesceMs ?? DEFAULT_COALESCE_MS;
+        if (last !== undefined && now - last < coalesceMs) {
+          return true;
+        }
+        this.forwardedAt.set(validated.event_id, now);
+
         // onEvent ultimately drives sending a notification to the
         // host over MCP stdio: it must never be allowed to take the
         // whole process down. Contain, log, and keep the socket (and

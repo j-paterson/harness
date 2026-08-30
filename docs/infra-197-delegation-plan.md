@@ -452,3 +452,27 @@ matches the manually trusted build with no substitution:
 
 The candidate proceeds through the existing Fable-to-Sol workflow;
 Fable does not merge.
+
+## v5.2 amendment: cold-start wake coalescing (operator directive, in-session, 2026-08-30)
+
+The transport-v2 live proof exposed an MVP-visibility defect: at cold
+start three distinct control packets were each visibly delivered three
+times before ACK. Cause: every commit-triggered `publish_pending` pass
+re-sends every pending event over the live connection, and the
+transport-only sidecar (v5 fix, packet `619e863a…`) forwards each
+send. The operator directed the narrowest readiness-aware /
+per-connection coalescing fix preserving retry after genuine loss or
+reconnect, plus a repeated cold-start proof showing one visible entry
+per event, before candidate publication.
+
+| Packet | Boundary | Files (disjoint) | Tier | Depends |
+|---|---|---|---|---|
+| S3 | Sidecar per-connection TTL coalescing: forward an event id at most once per coalesce window within a connection epoch; clear the map on each successful registration (reconnect retries immediately); window expiry re-forwards a still-unacked event (genuine-loss retry); env-tunable window, 60 s default | `channels/hermes-control/src/hub-client.ts`, `src/main.ts`, `test/events.test.ts`, `test/harness.ts` | Sonnet | S2 |
+
+Readiness note: the sidecar has no signal for when the host's channel
+handler is registered (observed 21 ms after MCP connect), so true
+readiness-awareness is unknowable at this layer; the coalescing window
+subsumes it — a forward lost to the startup race re-surfaces once the
+window lapses, instead of never (the pre-v5 defect) or every pass (the
+burst). Hub republish cadence is unchanged; exactly-once effect stays
+with the durable drain and ack CAS.
