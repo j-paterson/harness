@@ -6,6 +6,7 @@ import sys
 import types
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 
@@ -1614,6 +1615,59 @@ def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
     # it: with the project key, not the worktree path.
     calls[0]["worktree_state"]("demo")
     assert probed == [lead_worktree]
+
+
+def test_rotate_lead_seeds_the_profile_pool_before_reserving_a_replacement(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.profiles import ProfileHealth
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+
+    probed: list[str] = []
+
+    def _fake_check(self: object, alias: str) -> ProfileHealth:
+        probed.append(alias)
+        return ProfileHealth(
+            profile_alias=alias,
+            eligible=True,
+            reason="eligible",
+            last_checked_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(cli_module.ClaudeProfileProbe, "check", _fake_check)
+    report = _FakeRotationReport(
+        phase="seated",
+        cell_id="cell-1",
+        handoff_id="handoff-1",
+        replacement_session="22222222-2222-4222-8222-222222222222",
+        profile="max-b",
+        binding_id="binding-1",
+        failure=None,
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    # Every registry profile must be health-seeded into the pool the
+    # cell service receives — exactly once each — mirroring
+    # open_runtime's own startup loop; otherwise every slot stays at
+    # its default ineligible state and rotation can never reserve a
+    # replacement.
+    assert sorted(probed) == ["max-a", "max-b", "max-c", "max-d"]
 
 
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:

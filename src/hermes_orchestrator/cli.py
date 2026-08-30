@@ -71,6 +71,7 @@ from hermes_orchestrator.operator_decisions import (
 from hermes_orchestrator.packet_admission import PacketAdmission
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
+    ProfileHealth,
     ProfilePool,
     ProfileRegistry,
 )
@@ -783,6 +784,29 @@ def _open_rotation_collaborators(
     registry = ProfileRegistry.load(profile_path)
     environment = dict(os.environ)
     probe = ClaudeProfileProbe(registry, base_env=environment)
+    # Mirrors open_runtime's own startup seeding (runtime.py:453-458): a
+    # freshly built ProfilePool starts every slot ineligible, and only
+    # ``record_health`` ever flips one to eligible, so the pool this
+    # one-shot command hands to ``ProjectCellService`` must be seeded
+    # exactly like the daemon's before ``reserve_replacement`` can ever
+    # find a healthy profile. Unlike the daemon's startup assembly —
+    # which lets a probe failure abort the whole live runtime — this
+    # command probes four profiles for a single rotation, so one
+    # profile's probe failing must not crash the others: it is recorded
+    # as an ineligible, reasoned ``ProfileHealth`` instead of raising
+    # past this builder.
+    pool = ProfilePool(registry)
+    for profile in registry.profiles:
+        try:
+            health = probe.check(profile.alias)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            health = ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=False,
+                reason=f"probe_failed: {error}",
+                last_checked_at=datetime.now(UTC),
+            )
+        pool.record_health(health)
     project_paths: Mapping[str, Path] = {
         alias: project.repo_path for alias, project in settings.projects.items()
     }
@@ -812,7 +836,7 @@ def _open_rotation_collaborators(
         database=database,
         events=events,
         queue=runtime.queue,
-        profiles=ProfilePool(registry),
+        profiles=pool,
         runner=runner,
         linear=_NoDispatchLinear(),
         project_paths=project_paths,
