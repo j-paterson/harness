@@ -15,9 +15,10 @@ _FORBIDDEN_MARKERS = ("token", "password", "api_key", "secret", "keychain", "sig
 
 _ORCHESTRATOR_LABEL = "com.josystem.hermes-orchestrator"
 _OPERATIONS_LABEL = "com.josystem.hermes-operations"
-# The supervised daemon job's public label: the activation apply
-# protocol kickstarts exactly this job.
+# The supervised jobs' public labels: the activation apply protocol
+# restarts and health-verifies BOTH as one fleet.
 ORCHESTRATOR_LABEL = _ORCHESTRATOR_LABEL
+OPERATIONS_LABEL = _OPERATIONS_LABEL
 
 BOOTSTRAP_FILENAME = "hermes-bootstrap"
 

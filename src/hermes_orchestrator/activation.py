@@ -20,6 +20,7 @@ import re
 import subprocess
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -175,6 +176,76 @@ class RuntimeActivator:
         ).fetchone()
         return None if row is None else self._record(row)
 
+    def _commit_active_artifact(
+        self,
+        *,
+        binary_path: Path,
+        checkout_root: Path,
+        git_sha: str,
+        reason: str | None,
+    ) -> RuntimeActivation:
+        """Commit the ledger first, then publish the derived pointer.
+
+        No service may ever resolve an identity the ledger does not
+        name, so the pointer is written only after the activation row
+        is durably committed. A pointer publish that then fails is
+        compensated: the fresh row is marked ``failed`` and the prior
+        activation is restored ``active`` in one transaction, leaving
+        ledger, pointer, and running services coherent on the prior
+        generation. (A crash between commit and publish leaves a stale
+        pointer that the next confirmed startup self-heals from the
+        ledger.)
+        """
+
+        prior = self.current()
+        record = self._record_attempt(
+            state="active",
+            binary_path=binary_path,
+            checkout_root=checkout_root,
+            git_sha=git_sha,
+            reason=reason,
+        )
+        try:
+            self._write_active_pointer(checkout_root)
+        except Exception as error:
+            stamp = self._now().isoformat()
+            with self._database.transaction() as connection:
+                connection.execute(
+                    "UPDATE runtime_activations SET state = 'failed', "
+                    "reason = ?, updated_at = ? WHERE activation_id = ? "
+                    "AND state = 'active'",
+                    (
+                        f"ACTIVE pointer publish failed: {error}",
+                        stamp,
+                        record.activation_id,
+                    ),
+                )
+                if prior is not None:
+                    connection.execute(
+                        "UPDATE runtime_activations SET state = 'active', "
+                        "updated_at = ? WHERE activation_id = ? "
+                        "AND state = 'superseded'",
+                        (stamp, prior.activation_id),
+                    )
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="runtime_activation.failed",
+                        aggregate_type="runtime_activation",
+                        aggregate_id=record.activation_id,
+                        payload={
+                            "generation": record.generation,
+                            "reason": "ACTIVE pointer publish failed; "
+                            "prior activation restored",
+                        },
+                    ),
+                )
+            raise ActivationRefused(
+                f"the ACTIVE pointer could not be published ({error}); "
+                "the prior activation was restored"
+            ) from error
+        return record
+
     @staticmethod
     def _write_active_pointer(artifact: Path) -> None:
         """Refresh the derived ACTIVE pointer beside the artifacts.
@@ -206,7 +277,13 @@ class RuntimeActivator:
         return value if _SHA_PATTERN.match(value) else None
 
     def confirm_startup(
-        self, *, checkout_root: Path, binary_path: Path, pid: int
+        self,
+        *,
+        checkout_root: Path,
+        binary_path: Path,
+        pid: int,
+        service: str = "daemon",
+        bootstrap: bool = True,
     ) -> RuntimeActivation | None:
         """Journal the daemon's observed identity against the ledger.
 
@@ -224,13 +301,27 @@ class RuntimeActivator:
         """
 
         current = self.current()
-        if current is None:
+        if current is None and bootstrap:
             try:
                 current = self.activate(
                     checkout_root=checkout_root, binary_path=binary_path
                 )
             except ActivationRefused:
                 current = None
+        # Self-heal the derived pointer: a crash between the ledger
+        # commit and the pointer publish leaves the pointer stale; the
+        # next confirmed startup rewrites it from the ledger truth.
+        if current is not None:
+            active_root = Path(current.checkout_root)
+            if (active_root / "RUNTIME_SHA").is_file():
+                with suppress(Exception):
+                    pointer = active_root.parent / "ACTIVE"
+                    if (
+                        not pointer.is_file()
+                        or pointer.read_text(encoding="utf-8").strip()
+                        != str(active_root)
+                    ):
+                        self._write_active_pointer(active_root)
         observed = self.observed_sha(checkout_root)
         mismatches: list[str] = []
         if current is None:
@@ -249,7 +340,7 @@ class RuntimeActivator:
             self._events.append(
                 connection,
                 EventInput(
-                    event_type="daemon.started",
+                    event_type=f"{service}.started",
                     aggregate_type="runtime_activation",
                     aggregate_id=(
                         current.activation_id if current else "unactivated"
@@ -312,9 +403,7 @@ class RuntimeActivator:
                     reason=str(refusal),
                 )
                 raise refusal from error
-        self._write_active_pointer(artifact)
-        return self._record_attempt(
-            state="active",
+        return self._commit_active_artifact(
             binary_path=artifact / ".venv" / "bin" / "hermes-orchestrator",
             checkout_root=artifact,
             git_sha=git_sha,
@@ -348,10 +437,14 @@ class RuntimeActivator:
             )
         if not (prior_root / "RUNTIME_SHA").is_file():
             self._validate(prior_root)
-        else:
-            self._write_active_pointer(prior_root)
-        return self._record_attempt(
-            state="active",
+            return self._record_attempt(
+                state="active",
+                binary_path=Path(prior.binary_path),
+                checkout_root=prior_root,
+                git_sha=prior.git_sha,
+                reason=f"rollback to generation {prior.generation}",
+            )
+        return self._commit_active_artifact(
             binary_path=Path(prior.binary_path),
             checkout_root=prior_root,
             git_sha=prior.git_sha,
@@ -518,16 +611,16 @@ class RuntimeActivator:
             activated_at=stamp,
         )
 
-    def find_daemon_start(
-        self, *, generation: int, since: str
+    def find_service_start(
+        self, service: str, *, generation: int, since: str
     ) -> dict[str, object] | None:
-        """The durable proof a supervised daemon started on a generation."""
+        """The durable proof one supervised service started on a generation."""
 
         rows = self._database.execute(
             "SELECT payload_json FROM events "
-            "WHERE event_type = 'daemon.started' AND occurred_at >= ? "
+            "WHERE event_type = ? AND occurred_at >= ? "
             "ORDER BY sequence DESC LIMIT 20",
-            (since,),
+            (f"{service}.started", since),
         ).fetchall()
         import json as _json
 
@@ -536,6 +629,13 @@ class RuntimeActivator:
             if payload.get("activation_generation") == generation:
                 return payload
         return None
+
+    def find_daemon_start(
+        self, *, generation: int, since: str
+    ) -> dict[str, object] | None:
+        return self.find_service_start(
+            "daemon", generation=generation, since=since
+        )
 
     @staticmethod
     def _record(row: object) -> RuntimeActivation:
@@ -597,6 +697,7 @@ class ActivationApplier:
         sleep: Callable[[float], None] | None = None,
         verify_timeout_seconds: float = APPLY_VERIFY_TIMEOUT_SECONDS,
         poll_seconds: float = APPLY_POLL_SECONDS,
+        verify_services: tuple[str, ...] = ("daemon",),
     ) -> None:
         self._activator = activator
         self._database = database
@@ -606,6 +707,7 @@ class ActivationApplier:
         self._sleep = sleep or (lambda seconds: __import__("time").sleep(seconds))
         self._verify_timeout = verify_timeout_seconds
         self._poll = poll_seconds
+        self._verify_services = verify_services
 
     def apply(
         self,
@@ -660,7 +762,9 @@ class ActivationApplier:
         started_at = self._now().isoformat()
         self._kickstart()
         self._journal(apply_id, state="restarted")
-        proof = self._await_daemon(activation.generation, since=started_at)
+        # Every activation-bound service must prove the exact target
+        # generation, or the whole fleet rolls back together.
+        proof = self._await_services(activation.generation, since=started_at)
         if proof is not None:
             self._journal(apply_id, state="verified")
             return ApplyReport(
@@ -697,7 +801,7 @@ class ActivationApplier:
             ) from refusal
         rollback_started = self._now().isoformat()
         self._kickstart()
-        proof = self._await_daemon(
+        proof = self._await_services(
             restored.generation, since=rollback_started
         )
         if proof is None:
@@ -726,16 +830,25 @@ class ActivationApplier:
             reason="the new runtime never reported healthy",
         )
 
-    def _await_daemon(
+    def _await_services(
         self, generation: int, *, since: str
     ) -> dict[str, object] | None:
+        """Every configured service must durably prove the generation.
+
+        Returns the first (primary) service's proof once ALL proofs
+        exist; a partial fleet is a failure, never a success.
+        """
+
         waited = 0.0
         while True:
-            proof = self._activator.find_daemon_start(
-                generation=generation, since=since
-            )
-            if proof is not None:
-                return proof
+            proofs = [
+                self._activator.find_service_start(
+                    service, generation=generation, since=since
+                )
+                for service in self._verify_services
+            ]
+            if all(proof is not None for proof in proofs):
+                return proofs[0]
             if waited >= self._verify_timeout:
                 return None
             self._sleep(self._poll)

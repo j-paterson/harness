@@ -683,3 +683,248 @@ def test_activation_maintains_the_derived_active_pointer(
 
     activator.reactivate(prior)
     assert pointer.read_text().strip() == prior.checkout_root
+
+
+class TestFleetCoherence:
+    """Sol 3be95878: ledger, pointer, and supervised fleet move as one."""
+
+    def test_a_ledger_failure_leaves_the_pointer_on_the_prior_artifact(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """An injected activation-ledger failure after artifact
+        preparation must leave ACTIVE naming the prior artifact, so no
+        service can ever resolve the uncommitted target."""
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        events = EventStore(database)
+        activator = RuntimeActivator(database, events=events)
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+
+        class ExplodingEvents:
+            def append(self, connection, event):  # type: ignore[no-untyped-def]
+                if event.event_type == "runtime_activation.active":
+                    raise RuntimeError("ledger write refused")
+                return events.append(connection, event)
+
+        broken = RuntimeActivator(
+            database,
+            events=ExplodingEvents(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(RuntimeError, match="ledger write refused"):
+            broken.activate_artifact(
+                source_checkout=checkout, state_dir=state_dir
+            )
+
+        pointer = state_dir / "runtimes" / "ACTIVE"
+        assert pointer.read_text().strip() == prior.checkout_root
+        current = activator.current()
+        assert current is not None
+        assert current.activation_id == prior.activation_id
+
+    def test_a_pointer_publish_failure_restores_the_prior_activation(
+        self,
+        database: Database,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+
+        def refuse_pointer(_artifact: Path) -> None:
+            raise OSError("disk said no")
+
+        monkeypatch.setattr(
+            RuntimeActivator, "_write_active_pointer", staticmethod(refuse_pointer)
+        )
+        with pytest.raises(ActivationRefused, match="prior activation was restored"):
+            activator.activate_artifact(
+                source_checkout=checkout, state_dir=state_dir
+            )
+        monkeypatch.undo()
+
+        current = activator.current()
+        assert current is not None
+        assert current.activation_id == prior.activation_id
+        pointer = state_dir / "runtimes" / "ACTIVE"
+        assert pointer.read_text().strip() == prior.checkout_root
+        failed = database.scalar(
+            "SELECT COUNT(*) FROM runtime_activations "
+            "WHERE state = 'failed' AND reason LIKE '%pointer%'"
+        )
+        assert failed == 1
+
+    @staticmethod
+    def fleet_applier(
+        database: Database, activator: RuntimeActivator, kickstart
+    ):
+        from hermes_orchestrator.activation import ActivationApplier
+
+        return ActivationApplier(
+            activator,
+            database,
+            kickstart=kickstart,
+            sleep=lambda _s: None,
+            verify_timeout_seconds=0.0,
+            verify_services=("daemon", "console"),
+        )
+
+    def confirm_both(
+        self, activator: RuntimeActivator, root: Path, binary: Path
+    ) -> None:
+        activator.confirm_startup(
+            checkout_root=root, binary_path=binary, pid=100, service="daemon"
+        )
+        activator.confirm_startup(
+            checkout_root=root,
+            binary_path=binary,
+            pid=101,
+            service="console",
+            bootstrap=False,
+        )
+
+    def test_a_verified_apply_requires_both_services_on_the_target(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+
+        def kickstart() -> None:
+            active = activator.current()
+            assert active is not None
+            self.confirm_both(
+                activator,
+                Path(active.checkout_root),
+                Path(active.binary_path),
+            )
+
+        applier = self.fleet_applier(database, activator, kickstart)
+        report = applier.apply(
+            checkout_root=checkout, artifact_state_dir=state_dir
+        )
+
+        assert report.state == "verified"
+
+    def test_an_operations_failure_rolls_both_services_back(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """The daemon proves the target but the console never does:
+        the whole fleet rolls back to the prior activation, and the
+        rollback itself is verified on both services."""
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+        kicks: list[int] = []
+
+        def kickstart() -> None:
+            kicks.append(1)
+            active = activator.current()
+            assert active is not None
+            root = Path(active.checkout_root)
+            binary = Path(active.binary_path)
+            if len(kicks) == 1:
+                # Only the daemon comes up on the target generation.
+                activator.confirm_startup(
+                    checkout_root=root,
+                    binary_path=binary,
+                    pid=200,
+                    service="daemon",
+                )
+                return
+            self.confirm_both(activator, root, binary)
+
+        applier = self.fleet_applier(database, activator, kickstart)
+        report = applier.apply(
+            checkout_root=checkout, artifact_state_dir=state_dir
+        )
+
+        assert report.state == "rolled_back"
+        assert len(kicks) == 2
+        current = activator.current()
+        assert current is not None
+        assert current.git_sha == prior.git_sha
+
+    def test_an_unverifiable_fleet_rollback_is_ambiguous(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        from hermes_orchestrator.activation import ApplyFailed
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+
+        def kickstart() -> None:
+            active = activator.current()
+            assert active is not None
+            # The console never reports on either generation.
+            activator.confirm_startup(
+                checkout_root=Path(active.checkout_root),
+                binary_path=Path(active.binary_path),
+                pid=300,
+                service="daemon",
+            )
+
+        applier = self.fleet_applier(database, activator, kickstart)
+        with pytest.raises(ApplyFailed, match="ambiguous"):
+            applier.apply(
+                checkout_root=checkout, artifact_state_dir=state_dir
+            )
+
+    def test_serve_console_refuses_a_mismatched_identity(
+        self, database: Database, tmp_path: Path, capsys
+    ) -> None:
+        import argparse
+        from types import SimpleNamespace
+
+        from hermes_orchestrator import cli as cli_module
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        activator = RuntimeActivator(database, events=EventStore(database))
+        activator.activate(
+            checkout_root=checkout, binary_path=Path("/bin/other")
+        )
+        arguments = argparse.Namespace(host="127.0.0.1", port=8787)
+        settings = SimpleNamespace(
+            state_dir=tmp_path,
+            projects={},
+            repo_root=tmp_path,
+        )
+
+        code = cli_module._serve_console(arguments, settings)  # type: ignore[arg-type]
+
+        assert code == 1
+        assert "does not match the active activation" in (
+            capsys.readouterr().err
+        )
+        journaled = database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'console.started'"
+        ).fetchall()
+        assert len(journaled) == 1

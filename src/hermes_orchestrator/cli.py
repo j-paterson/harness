@@ -1378,21 +1378,26 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
         ApplyFailed,
         RuntimeActivator,
     )
-    from hermes_orchestrator.deploy.launchd import ORCHESTRATOR_LABEL
+    from hermes_orchestrator.deploy.launchd import (
+        OPERATIONS_LABEL,
+        ORCHESTRATOR_LABEL,
+    )
     from hermes_orchestrator.events import EventStore
 
     def kickstart() -> None:
-        subprocess_module.run(
-            (
-                "launchctl",
-                "kickstart",
-                "-k",
-                f"gui/{os.getuid()}/{ORCHESTRATOR_LABEL}",
-            ),
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
+        # The fleet restarts as one: both activation-bound jobs.
+        for label in (ORCHESTRATOR_LABEL, OPERATIONS_LABEL):
+            subprocess_module.run(
+                (
+                    "launchctl",
+                    "kickstart",
+                    "-k",
+                    f"gui/{os.getuid()}/{label}",
+                ),
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
 
     database = Database.open(settings.state_dir / "state.db")
     try:
@@ -1400,6 +1405,7 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
             RuntimeActivator(database, events=EventStore(database)),
             database,
             kickstart=kickstart,
+            verify_services=("daemon", "console"),
         )
         try:
             report = applier.apply(
@@ -1766,6 +1772,28 @@ def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
         return 2
     database = Database.open(settings.state_dir / "state.db")
     try:
+        # The console is activation-bound like the daemon: it confirms
+        # the complete runtime identity against the active ledger row
+        # (journaling console.started, the apply protocol's health
+        # signal) and refuses to serve from an unactivated or
+        # mismatched artifact.
+        from hermes_orchestrator.activation import RuntimeActivator
+
+        activator = RuntimeActivator(database, events=EventStore(database))
+        confirmed = activator.confirm_startup(
+            checkout_root=_code_checkout_root(),
+            binary_path=Path(sys.argv[0]).resolve(),
+            pid=os.getpid(),
+            service="console",
+            bootstrap=False,
+        )
+        if confirmed is None and activator.current() is not None:
+            print(
+                "serve-console refuses: this process's runtime identity "
+                "does not match the active activation",
+                file=sys.stderr,
+            )
+            return 1
         dependencies = build_console_dependencies(
             database=database,
             github_repos={
