@@ -66,10 +66,22 @@ now inverted):
 
 Environment context (same correction — the guard used to scrub the
 ``GIT_*`` family for its own subprocesses while the executed command
-still inherited it): every guard subprocess now REPLAYS the inherited
-environment identically, so resolution and snapshotting describe the
-same effective repository the guarded command will operate on, and the
-marker is required from THAT repository. Inherited context-changing
+still inherited it): every guard subprocess now REPLAYS the environment
+the guarded command will actually run under, so resolution and
+snapshotting describe the same effective repository the guarded command
+will operate on, and the marker is required from THAT repository. When
+the command line itself transforms the environment through the ``env``
+wrapper, the guard models the transformation exactly as env applies it
+— ``-i``/``-``/``--ignore-environment`` clears the inherited
+environment down to the command-line assignments, ``-u``/``--unset``
+of a context-inert name removes it, and assignments overlay — and every
+guard subprocess for that invocation receives the transformed
+environment, never ``os.environ``. Under a modeled clear no inherited
+``GIT_DIR``/``GIT_WORK_TREE`` survives, so resolution binds the
+repository the cleared command will actually operate on (typically the
+working directory). Removal of a context-affecting ``GIT_*`` or
+``GIT_CONFIG*`` name via ``env -u``/``--unset`` is rejected by name —
+never accepted — matching the ``unset`` builtin rule. Inherited context-changing
 ``GIT_CONFIG_*`` entries that command-line configuration could not
 model (``core.worktree``, ``core.bare``, includes, or an opaque
 ``GIT_CONFIG_PARAMETERS``) fail closed naming the variable. Inline
@@ -92,6 +104,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -236,12 +249,18 @@ class GitInvocation:
     ``-C`` steps from ``cd`` builtins plus the invocation's own ``-C``,
     ``--git-dir``, and ``--work-tree`` — exactly as git would apply
     them. ``unresolvable`` names the reason the effective target cannot
-    be proven, which fails the gate closed.
+    be proven, which fails the gate closed. ``env_ops`` holds the
+    ordered environment operations the command line applies before the
+    invocation runs — ``("clear",)``, ``("unset", name)``,
+    ``("set", name, value)`` — exactly as ``env`` would; the gate
+    replays them onto the inherited environment and resolves and
+    snapshots under the result.
     """
 
     subcommand: str
     context: tuple[tuple[str, str], ...] = ()
     unresolvable: str | None = None
+    env_ops: tuple[tuple[str, ...], ...] = ()
 
 
 def guarded_subcommand(command: object) -> str | None:
@@ -299,6 +318,7 @@ def _analyze_shell(
     text: str,
     context: tuple[tuple[str, str], ...] = (),
     problem: str | None = None,
+    env_ops: tuple[tuple[str, ...], ...] = (),
 ) -> tuple[GitInvocation, ...]:
     if not _TRIGGER.search(text):
         return ()
@@ -342,7 +362,7 @@ def _analyze_shell(
     state = {"problem": problem}
     found: list[GitInvocation] = []
     for segment in segments:
-        kind, value = _classify_segment(segment, chdirs, state)
+        kind, value = _classify_segment(segment, chdirs, state, env_ops)
         if kind == "blocked":
             return block(str(value))
         if kind == "guarded":
@@ -375,13 +395,19 @@ def _classify_segment(
     tokens: list[str],
     chdirs: list[tuple[str, str]],
     state: dict[str, str | None],
+    env_ops: tuple[tuple[str, ...], ...] = (),
 ) -> tuple[str, object]:
     """Prove one simple command safe, guarded, or blocked.
 
     ``chdirs`` and ``state`` persist across segments: ``cd`` steps in
     earlier segments select the directory later git invocations run in.
+    ``env_ops`` seeds the environment transformation an enclosing
+    wrapper already applies (e.g. ``env -i bash -c ...``); prefix
+    assignments and ``env`` wrappers in this segment extend it, and the
+    resulting operations travel with any guarded invocation found.
     """
 
+    ops: list[tuple[str, ...]] = list(env_ops)
     core: list[str] = []
     index = 0
     while index < len(tokens):
@@ -396,12 +422,13 @@ def _classify_segment(
 
     index = 0
     while index < len(core) and _ASSIGNMENT.match(core[index]):
-        name = core[index].split("=", 1)[0]
+        name, value = core[index].split("=", 1)
         if _context_env_name(name):
             return (
                 "blocked",
                 f"the {name} environment override changes the git context",
             )
+        ops.append(("set", name, value))
         index += 1
 
     while index < len(core):
@@ -422,7 +449,7 @@ def _classify_segment(
             index = outcome
             continue
         if base == "env":
-            outcome = _consume_env_wrapper(core, index)
+            outcome = _consume_env_wrapper(core, index, ops)
             if isinstance(outcome, tuple):
                 return outcome
             index = outcome
@@ -463,11 +490,11 @@ def _classify_segment(
             return _SAFE
         if program == "git" or program.endswith("/git"):
             return _prove_git(
-                core[index + 1 :], tuple(chdirs), state["problem"]
+                core[index + 1 :], tuple(chdirs), state["problem"], tuple(ops)
             )
         if base in _SHELLS:
             return _shell_runner(
-                core[index + 1 :], tuple(chdirs), state["problem"]
+                core[index + 1 :], tuple(chdirs), state["problem"], tuple(ops)
             )
         if base in _EXEC_WRAPPERS:
             return (
@@ -508,8 +535,17 @@ def _consume_command_wrapper(
     return -1 if query else index
 
 
-def _consume_env_wrapper(core: list[str], index: int) -> int | tuple[str, str]:
-    """Consume ``env``, its modeled options, and its assignments."""
+def _consume_env_wrapper(
+    core: list[str], index: int, ops: list[tuple[str, ...]]
+) -> int | tuple[str, str]:
+    """Consume ``env``, recording its transformation into ``ops``.
+
+    Every accepted form is appended to ``ops`` exactly as env applies
+    it, so the gate later replays the identical child environment.
+    Removal of a context-affecting name is rejected by name — guard
+    subprocesses must never retain context the executed command loses
+    (nor the reverse); exotic env options stay blocked unmodeled.
+    """
 
     index += 1
     while index < len(core):
@@ -518,26 +554,37 @@ def _consume_env_wrapper(core: list[str], index: int) -> int | tuple[str, str]:
             index += 1
             break
         if token in {"-i", "-", "--ignore-environment"}:
+            ops.append(("clear",))
             index += 1
             continue
-        if token == "-u":
-            if index + 1 >= len(core):
-                return "blocked", "env -u is missing its argument"
-            index += 2
-            continue
-        if token.startswith("--unset="):
-            index += 1
+        if token == "-u" or token.startswith("--unset="):
+            if token == "-u":
+                if index + 1 >= len(core):
+                    return "blocked", "env -u is missing its argument"
+                name = core[index + 1]
+                index += 2
+            else:
+                name = token.split("=", 1)[1]
+                index += 1
+            if _context_env_name(name):
+                return (
+                    "blocked",
+                    f"env-unsetting {name} desynchronizes the git context "
+                    "the gate verifies",
+                )
+            ops.append(("unset", name))
             continue
         if token.startswith("-"):
             return "blocked", f"the env option {token} is not modeled"
         if _ASSIGNMENT.match(token):
-            name = token.split("=", 1)[0]
+            name, value = token.split("=", 1)
             if _context_env_name(name):
                 return (
                     "blocked",
                     f"the {name} environment override changes the git "
                     "context",
                 )
+            ops.append(("set", name, value))
             index += 1
             continue
         break
@@ -562,6 +609,7 @@ def _shell_runner(
     arguments: list[str],
     context: tuple[tuple[str, str], ...],
     problem: str | None,
+    env_ops: tuple[tuple[str, ...], ...] = (),
 ) -> tuple[str, object]:
     """Prove a ``bash -c``-style invocation by recursing into the script."""
 
@@ -582,7 +630,7 @@ def _shell_runner(
             "a shell invocation without a provable -c script cannot be "
             "proven safe",
         )
-    inner = _analyze_shell(script, context, problem)
+    inner = _analyze_shell(script, context, problem, env_ops)
     if not inner:
         return _SAFE
     return "guarded", inner
@@ -592,6 +640,7 @@ def _prove_git(
     rest: list[str],
     context: tuple[tuple[str, str], ...],
     problem: str | None,
+    env_ops: tuple[tuple[str, ...], ...] = (),
 ) -> tuple[str, object]:
     """Prove one git invocation: every global option must be modeled."""
 
@@ -670,7 +719,9 @@ def _prove_git(
             "variable",
         )
     if subcommand in _GUARDED:
-        return "guarded", (GitInvocation(subcommand, tuple(selectors), problem),)
+        return "guarded", (
+            GitInvocation(subcommand, tuple(selectors), problem, env_ops),
+        )
     if subcommand in _SAFE_GIT_SUBCOMMANDS:
         return _SAFE
     return (
@@ -680,33 +731,57 @@ def _prove_git(
     )
 
 
-def _inherited_config_problem() -> str | None:
-    """Context-changing GIT_CONFIG_* inherited from the environment.
+def _transformed_env(
+    ops: tuple[tuple[str, ...], ...],
+) -> dict[str, str] | None:
+    """The exact child environment ``env`` would hand the command.
 
-    The rest of the ``GIT_*`` family is replayed identically into every
-    guard subprocess, so resolution and snapshotting already describe
-    the repository the command will operate on. Command-line-equivalent
-    configuration entries that would change the context are rejected by
-    name instead, matching the ``-c`` rules.
+    ``None`` when no transformation applies — subprocesses then inherit
+    the process environment unchanged, as before. Otherwise the ops are
+    replayed in order onto a copy of the inherited environment: a clear
+    keeps only later assignments, an unset removes a name, a set
+    overlays one — exactly env's own semantics.
     """
 
-    if os.environ.get("GIT_CONFIG_PARAMETERS"):
+    if not ops:
+        return None
+    env = dict(os.environ)
+    for op in ops:
+        if op[0] == "clear":
+            env = {}
+        elif op[0] == "unset":
+            env.pop(op[1], None)
+        else:
+            env[op[1]] = op[2]
+    return env
+
+
+def _inherited_config_problem(env: Mapping[str, str]) -> str | None:
+    """Context-changing GIT_CONFIG_* the invocation's environment carries.
+
+    ``env`` is the environment the guarded invocation will actually run
+    under (the transformed child environment when the command line
+    transforms it). The rest of the ``GIT_*`` family is replayed
+    identically into every guard subprocess, so resolution and
+    snapshotting already describe the repository the command will
+    operate on. Command-line-equivalent configuration entries that
+    would change the context are rejected by name instead, matching the
+    ``-c`` rules.
+    """
+
+    if env.get("GIT_CONFIG_PARAMETERS"):
         return (
             "the inherited GIT_CONFIG_PARAMETERS configuration cannot be "
             "modeled"
         )
-    count = os.environ.get("GIT_CONFIG_COUNT")
+    count = env.get("GIT_CONFIG_COUNT")
     if count:
         try:
             entries = int(count)
         except ValueError:
             return "the inherited GIT_CONFIG_COUNT value is not an integer"
         for position in range(entries):
-            key = (
-                os.environ.get(f"GIT_CONFIG_KEY_{position}", "")
-                .strip()
-                .lower()
-            )
+            key = env.get(f"GIT_CONFIG_KEY_{position}", "").strip().lower()
             if _context_config_key(key):
                 return (
                     f"the inherited GIT_CONFIG_KEY_{position}={key} "
@@ -716,25 +791,35 @@ def _inherited_config_problem() -> str | None:
 
 
 def _git(args: list[str], env: dict[str, str] | None = None) -> bytes:
-    # env=None inherits the process environment unchanged: the guard
-    # replays the exact context the guarded command will run under.
-    result = subprocess.run(
-        ["git", *args], capture_output=True, check=False, env=env
-    )
+    # env=None inherits the process environment unchanged; otherwise
+    # the guard replays the exact (possibly transformed) environment
+    # the guarded command will run under.
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, check=False, env=env
+        )
+    except OSError as error:
+        raise GuardError(f"git {' '.join(args)} failed: {error}") from error
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip()
         raise GuardError(f"git {' '.join(args)} failed: {detail}")
     return result.stdout
 
 
-def _resolve_target(context_args: list[str]) -> tuple[Path, Path]:
+def _resolve_target(
+    context_args: list[str], env: dict[str, str] | None = None
+) -> tuple[Path, Path]:
     """The (top level, absolute git dir) a git context operates on."""
 
     toplevel = (
-        _git([*context_args, "rev-parse", "--show-toplevel"]).decode().strip()
+        _git([*context_args, "rev-parse", "--show-toplevel"], env=env)
+        .decode()
+        .strip()
     )
     git_dir = (
-        _git([*context_args, "rev-parse", "--absolute-git-dir"]).decode().strip()
+        _git([*context_args, "rev-parse", "--absolute-git-dir"], env=env)
+        .decode()
+        .strip()
     )
     return Path(toplevel), Path(git_dir)
 
@@ -746,25 +831,32 @@ def _invocation_context(base: Path, invocation: GitInvocation) -> list[str]:
     return args
 
 
-def _snapshot(toplevel: Path, git_dir: Path) -> tuple[str, bool]:
+def _snapshot(
+    toplevel: Path, git_dir: Path, env: dict[str, str] | None = None
+) -> tuple[str, bool]:
     """(canonical snapshot hash, whether the candidate matches HEAD).
 
     Both tree ids come from ``git write-tree`` against temporary index
     files, so the real index is never modified; ``git add -A`` into the
     scratch index writes only loose objects, which git prunes. The
-    inherited environment is replayed identically, with only
-    ``GIT_INDEX_FILE`` overridden to the scratch index.
+    invocation's environment — inherited, or the modeled child
+    environment when the command line transforms it — is replayed
+    identically, with only ``GIT_INDEX_FILE`` overridden to the scratch
+    index.
     """
 
+    base_env = dict(os.environ) if env is None else env
     ctx = ["-C", str(toplevel), "--git-dir", str(git_dir)]
-    head_tree = _git([*ctx, "rev-parse", "HEAD^{tree}"]).decode().strip()
+    head_tree = _git([*ctx, "rev-parse", "HEAD^{tree}"], env=env).decode().strip()
     index_path = Path(
-        _git([*ctx, "rev-parse", "--git-path", "index"]).decode().strip()
+        _git([*ctx, "rev-parse", "--git-path", "index"], env=env)
+        .decode()
+        .strip()
     )
     if not index_path.is_absolute():
         index_path = toplevel / index_path
     with tempfile.TemporaryDirectory() as scratch:
-        worktree_env = dict(os.environ)
+        worktree_env = dict(base_env)
         worktree_env["GIT_INDEX_FILE"] = str(Path(scratch) / "worktree-index")
         _git([*ctx, "read-tree", "HEAD"], env=worktree_env)
         _git([*ctx, "add", "-A"], env=worktree_env)
@@ -774,7 +866,7 @@ def _snapshot(toplevel: Path, git_dir: Path) -> tuple[str, bool]:
         index_copy = Path(scratch) / "index-copy"
         if index_path.exists():
             shutil.copy2(index_path, index_copy)
-        index_env = dict(os.environ)
+        index_env = dict(base_env)
         index_env["GIT_INDEX_FILE"] = str(index_copy)
         index_tree = _git([*ctx, "write-tree"], env=index_env).decode().strip()
     digest = hashlib.sha256(
@@ -839,16 +931,6 @@ def evaluate_command(command: object, repo: Path) -> GuardDecision:
     invocations = guarded_invocations(command)
     if not invocations:
         return GuardDecision(allowed=True, reason="not a guarded git command")
-    inherited = _inherited_config_problem()
-    if inherited is not None:
-        return GuardDecision(
-            allowed=False,
-            reason=(
-                f"ponytail-review gate: git {invocations[0].subcommand} is "
-                f"blocked: {inherited}; the reviewed target cannot be "
-                "proven, so the gate fails closed."
-            ),
-        )
     all_clean = True
     for invocation in invocations:
         if invocation.unresolvable is not None:
@@ -860,11 +942,24 @@ def evaluate_command(command: object, repo: Path) -> GuardDecision:
                     "cannot be proven, so the gate fails closed."
                 ),
             )
+        env = _transformed_env(invocation.env_ops)
+        config_problem = _inherited_config_problem(
+            os.environ if env is None else env
+        )
+        if config_problem is not None:
+            return GuardDecision(
+                allowed=False,
+                reason=(
+                    f"ponytail-review gate: git {invocation.subcommand} is "
+                    f"blocked: {config_problem}; the reviewed target cannot "
+                    "be proven, so the gate fails closed."
+                ),
+            )
         try:
             toplevel, git_dir = _resolve_target(
-                _invocation_context(Path(repo), invocation)
+                _invocation_context(Path(repo), invocation), env
             )
-            digest, clean = _snapshot(toplevel, git_dir)
+            digest, clean = _snapshot(toplevel, git_dir, env)
         except GuardError as error:
             return GuardDecision(
                 allowed=False,

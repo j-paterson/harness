@@ -619,6 +619,117 @@ def test_context_changing_config_includes_fail_closed(
     assert evaluate_command("git commit -am 'x'", repo).allowed is True
 
 
+# Sol 165f5ee6 packet 1 test 1: with inherited GIT_DIR/GIT_WORK_TREE
+# selecting reviewed repo B and dirty repo A as cwd, `env -i git commit`
+# and push validate A (the repository the cleared command actually
+# operates on) — B's review cannot authorize them.
+def test_env_clear_validates_the_cwd_repo_not_the_inherited_context(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reviewed_b = _make_repo(tmp_path / "reviewed-b")
+    (reviewed_b / "module.py").write_text("print('b')\n", encoding="utf-8")
+    record_review(reviewed_b)
+    dirty(repo)  # repo A: dirty, unreviewed
+
+    monkeypatch.setenv("GIT_DIR", str(reviewed_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reviewed_b))
+
+    # Sanity: without env clearing the effective repository is B, whose
+    # review stands.
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    # env -i strips the inherited context: the executed command runs
+    # against A, so the guard validates A — dirty and unreviewed.
+    for command in (
+        "env -i PATH=/usr/bin:/bin git commit -am 'x'",
+        "env -i PATH=/usr/bin:/bin git push origin main",
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert "@ponytail-review" in decision.reason, command
+
+    # Reviewing A itself (not B) is what opens the gate for the cleared
+    # form: the guard bound the transformed environment to A.
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_WORK_TREE")
+    record_review(repo)
+    monkeypatch.setenv("GIT_DIR", str(reviewed_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reviewed_b))
+    assert evaluate_command(
+        "env -i PATH=/usr/bin:/bin git commit -am 'x'", repo
+    ).allowed
+
+
+# Sol 165f5ee6 packet 1 test 2: `env -` and `env --ignore-environment`
+# cannot authorize against the inherited context either.
+def test_env_dash_forms_cannot_authorize_against_inherited_context(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reviewed_b = _make_repo(tmp_path / "reviewed-b")
+    (reviewed_b / "module.py").write_text("print('b')\n", encoding="utf-8")
+    record_review(reviewed_b)
+    dirty(repo)
+
+    monkeypatch.setenv("GIT_DIR", str(reviewed_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reviewed_b))
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    for command in (
+        "env - git commit -am 'x'",
+        "env --ignore-environment git commit -am 'x'",
+        "env - git push origin main",
+        "env --ignore-environment git push origin main",
+    ):
+        assert evaluate_command(command, repo).allowed is False, command
+
+
+# Sol 165f5ee6 packet 1 test 3: env -u / --unset of a context-affecting
+# name is rejected by name — it cannot authorize against context the
+# guard would otherwise retain, review or no review.
+def test_env_unset_of_git_context_fails_closed_by_name(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reviewed_b = _make_repo(tmp_path / "reviewed-b")
+    (reviewed_b / "module.py").write_text("print('b')\n", encoding="utf-8")
+    record_review(reviewed_b)
+    dirty(repo)
+    record_review(repo)  # even with both repositories reviewed
+    monkeypatch.setenv("GIT_DIR", str(reviewed_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reviewed_b))
+
+    for command, named in (
+        ("env -u GIT_DIR git commit -am 'x'", "GIT_DIR"),
+        ("env --unset=GIT_WORK_TREE git push origin main", "GIT_WORK_TREE"),
+        ("env -u GIT_WORK_TREE -u GIT_DIR git commit -am 'x'", "GIT_WORK_TREE"),
+        ("env --unset=GIT_CONFIG_COUNT git commit -am 'x'", "GIT_CONFIG_COUNT"),
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert named in decision.reason, command
+        assert "fails closed" in decision.reason, command
+
+
+# Sol 165f5ee6 packet 1 test 4: context-inert env assignments and unsets
+# stay accepted — gated before review, allowed once reviewed.
+def test_context_inert_env_transformations_stay_accepted(repo: Path) -> None:
+    dirty(repo)
+
+    inert = (
+        "env FOO=bar git commit -am 'x'",
+        "env -u SOME_VAR git commit -am 'x'",
+        "env --unset=SOME_VAR FOO=bar git push origin main",
+        "env -u SOME_VAR FOO=bar env BAR=baz git commit -am 'x'",
+    )
+    for command in inert:
+        code, reason = sol_hook_exit(repo, command)
+        assert code == BLOCK_EXIT_CODE, command
+        assert "@ponytail-review" in reason, command
+
+    record_review(repo)
+    for command in inert:
+        assert evaluate_command(command, repo).allowed is True, command
+
+
 def test_outside_a_repository_the_gate_fails_closed(tmp_path: Path) -> None:
     bare = tmp_path / "not-a-repo"
     bare.mkdir()

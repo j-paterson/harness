@@ -791,6 +791,86 @@ async def test_lost_turn_completion_settles_at_the_next_boundary(
 
 
 @pytest.mark.asyncio
+async def test_replaced_channel_keeps_the_approved_settlement_non_settling(
+    flow: ProductionShapedFlow,
+) -> None:
+    """Sol 165f5ee6 packet 3 required test 1, production-shaped.
+
+    An approved generation-1 review and its durable settlement survive a
+    crash before the merge; the reviewer channel is replaced with
+    generation 2; the daemon's startup recovery (the unfiltered
+    ``resume_settlements`` pass) refuses with zero merge calls and zero
+    merge effects, stably — the settlement stays resumable but
+    non-settling until a fresh generation-bound submission re-approves.
+    """
+
+    import json as jsonlib
+
+    from hermes_orchestrator.verdicts import VerdictBinding, parse_verdict
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    admitted = flow.admission.admit("demo", emitted.event, received_generation=1)
+    verdict = parse_verdict(
+        jsonlib.dumps(
+            {
+                "verdict": "approved",
+                "repository": REPOSITORY,
+                "branch": branch,
+                "pr_number": 14,
+                "reviewed_sha": SHA_A,
+                "packets": [],
+            }
+        ),
+        expected=VerdictBinding(
+            repository=REPOSITORY, branch=branch, pr_number=14, reviewed_sha=SHA_A
+        ),
+    )
+    record = await flow.reviews.record_verdict(admitted, "ENG-9", verdict)
+    assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
+    assert flow.settlements.get(record.review_id).state == "recorded"
+    flow.merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_legacy",
+        expected_generation=1,
+        reason="reviewer channel rotated",
+    )
+    flow.merger.complete_replacement(
+        "demo",
+        expected_thread_id="thr_legacy",
+        expected_generation=1,
+        new_thread_id="thr_new",
+    )
+
+    outcomes = await flow.reviews.resume_settlements()
+
+    assert [outcome.state for outcome in outcomes] == ["stale_settlement"]
+    assert "non-settling" in outcomes[0].reason
+    assert flow.github.merge_calls == []
+    assert int(flow.database.scalar("SELECT COUNT(*) FROM ci_merge_ledger")) == 0
+    assert (
+        int(flow.database.scalar("SELECT COUNT(*) FROM github_merge_effects")) == 0
+    )
+    settlement = flow.settlements.get(record.review_id)
+    assert settlement.state == "recorded"
+    assert (settlement.thread_id, settlement.thread_generation) == ("thr_legacy", 1)
+    review_state = flow.database.scalar(
+        "SELECT state FROM reviews WHERE review_id = ?", (record.review_id,)
+    )
+    assert str(review_state) == "approved"
+    assert flow.queue.get("ENG-9").state is IssueState.REVIEW
+    assert flow.linear.targets == [("ENG-9", "Review", "operator")]
+    # Stable: a second startup pass refuses identically, and the row is
+    # still resumable for the day the binding is restored or superseded.
+    again = await flow.reviews.resume_settlements()
+    assert [outcome.state for outcome in again] == ["stale_settlement"]
+    assert flow.github.merge_calls == []
+    [resumable] = flow.settlements.resumable("demo")
+    assert resumable.settlement_id == record.review_id
+
+
+@pytest.mark.asyncio
 async def test_a_direct_sol_merge_reconciles_at_the_next_intake_boundary(
     flow: ProductionShapedFlow,
 ) -> None:

@@ -26,6 +26,16 @@ identity or proven ancestry finalizes the intent-bound manifest
 exactly once, an exactly-unchanged expected head aborts retryably, and
 anything unprovable parks durably as ``reconciliation_required``,
 which keeps blocking further fixes and never aborts.
+
+The helper is invoked as an outer command containing neither ``commit``
+nor ``push``, so the session-level Ponytail hook never sees its Git
+mutations. The Ponytail snapshot decision therefore runs inside the
+helper at both mutation boundaries: the complete staged/worktree
+candidate must carry a matching recorded review marker before the
+labeled commit runs, and the committed publish state is revalidated
+against its required marker again before the push. An absent, stale, or
+unverifiable review marker fails closed with a refusal, before the
+boundary is crossed and before any publication intent exists.
 """
 
 from __future__ import annotations
@@ -40,6 +50,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from hermes_orchestrator import codex_ponytail_guard
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import EmissionBlocked, run_freeze_gate
@@ -133,6 +144,8 @@ class ReviewerFixHelper:
         now: Callable[[], datetime] | None = None,
         ids: Callable[[], str] | None = None,
         lease_seconds: int = LEASE_SECONDS,
+        snapshot_hash: Callable[[Path], str] | None = None,
+        reviewed_hash: Callable[[Path], str | None] | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -143,6 +156,11 @@ class ReviewerFixHelper:
         self._now = now or (lambda: datetime.now(UTC))
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._lease_seconds = lease_seconds
+        # The Ponytail snapshot decision, injected so tests can script
+        # it; production reuses the guard's own canonical two-tree
+        # snapshot and its single review-marker convention.
+        self._snapshot_hash = snapshot_hash or codex_ponytail_guard.snapshot_hash
+        self._reviewed_hash = reviewed_hash or codex_ponytail_guard.reviewed_hash
 
     # -- the one fix -------------------------------------------------------
 
@@ -209,6 +227,14 @@ class ReviewerFixHelper:
         self._run(repo, "add", "--all")
         try:
             files, changed_lines = self._eligibility(repo)
+            # The commit boundary of the Ponytail gate: the complete
+            # staged/worktree candidate must carry a matching recorded
+            # review marker, or the labeled commit never runs.
+            self._require_ponytail_review(
+                repo,
+                boundary="commit",
+                consequence="the fix was unstaged and nothing was committed",
+            )
         except ReviewerFixRefused:
             self._run(repo, "reset")
             raise
@@ -246,6 +272,18 @@ class ReviewerFixHelper:
             raise ReviewerFixRefused(
                 "the gate proved a different HEAD than the fix commit"
             )
+
+        # The push boundary of the Ponytail gate: the push publishes
+        # exactly the committed candidate (the freeze gate just proved
+        # the tree clean at the fix commit), so the post-commit state
+        # is revalidated against its required review marker before any
+        # publication intent exists. A refusal here journals nothing
+        # and leaves the labeled commit local.
+        self._require_ponytail_review(
+            repo,
+            boundary="push",
+            consequence="the labeled fix commit remains local and unpublished",
+        )
 
         # The complete manifest — event id, canonical payload, digest —
         # is prevalidated and bound into the durable intent BEFORE the
@@ -387,6 +425,38 @@ class ReviewerFixHelper:
         return int(value)  # type: ignore[arg-type]
 
     # -- internals ---------------------------------------------------------
+
+    def _require_ponytail_review(
+        self, repo: Path, *, boundary: str, consequence: str
+    ) -> None:
+        """Apply the Ponytail snapshot decision at one mutation boundary.
+
+        The guard's canonical candidate snapshot (the two-tree hash
+        over the staged index and the add-all worktree) must exactly
+        match the single recorded review marker of this repository. An
+        absent marker, a marker recorded for a different snapshot, or
+        review state that cannot be read at all refuses before the
+        boundary is crossed — the gate only ever fails closed.
+        """
+
+        try:
+            current = self._snapshot_hash(repo)
+            reviewed = self._reviewed_hash(repo)
+        except codex_ponytail_guard.GuardError as error:
+            raise ReviewerFixRefused(
+                "the candidate snapshot could not be verified at the "
+                f"{boundary} boundary ({error}); {consequence}"
+            ) from error
+        if reviewed is None:
+            raise ReviewerFixRefused(
+                f"the candidate at the {boundary} boundary has no recorded "
+                f"ponytail review; {consequence}"
+            )
+        if reviewed != current:
+            raise ReviewerFixRefused(
+                f"the candidate at the {boundary} boundary changed after "
+                f"its ponytail review (stale marker); {consequence}"
+            )
 
     def _settle_owned_attempt(
         self, project: ProjectConfig, fix_id: str

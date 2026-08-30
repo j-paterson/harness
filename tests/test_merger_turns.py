@@ -735,6 +735,105 @@ async def test_replacement_after_persistence_refuses_direct_settlement(
     assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
 
 
+async def _approved_settlement(
+    flow: ProductionShapedFlow, issue_id: str, sha: str, branch: str, number: int
+) -> Any:
+    """An approved review + settlement durably bound to generation 1."""
+
+    from hermes_orchestrator.verdicts import VerdictBinding, parse_verdict
+
+    emitted = await flow.emitter.emit("demo", issue_id, verification=(("t", "ok"),))
+    admitted = flow.admission.admit("demo", emitted.event, received_generation=1)
+    verdict = parse_verdict(
+        flow.verdict(sha, branch, number),
+        expected=VerdictBinding(
+            repository="j-paterson/demo",
+            branch=branch,
+            pr_number=number,
+            reviewed_sha=sha,
+        ),
+    )
+    record = await flow.reviews.record_verdict(admitted, issue_id, verdict)
+    return emitted, record
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_boundary_refuses_the_stale_settlement(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 165f5ee6 packet 3 required test 2 (intake recovery): an
+    # approved generation-1 settlement whose wake already completed is
+    # re-driven by handle_turn's boundary resume after the channel is
+    # replaced — the settlement-claim fence refuses, the row stays
+    # recorded, and nothing crosses the GitHub boundary.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-3", SHA_C, pr_number=16)
+    emitted, record = await _approved_settlement(flow, "ENG-3", SHA_C, branch, 16)
+    assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
+    _replace_channel(flow)
+
+    boundary = await flow.turns.handle_turn("demo")
+
+    assert boundary.kind == "no_outstanding_wake"
+    settlement = flow.settlements.get(record.review_id)
+    assert settlement.state == "recorded"
+    assert (settlement.thread_id, settlement.thread_generation) == ("thr_legacy", 1)
+    assert flow.github.merge_calls == []
+    assert _review_count(flow) == 1
+    review_state = flow.database.scalar(
+        "SELECT state FROM reviews WHERE review_id = ?", (record.review_id,)
+    )
+    assert str(review_state) == "approved"
+    # The refusal is stable across repeated boundaries.
+    again = await flow.turns.handle_turn("demo")
+    assert again.kind == "no_outstanding_wake"
+    assert flow.settlements.get(record.review_id).state == "recorded"
+    assert flow.github.merge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_generation_submission_supersedes_the_stale_settlement(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 165f5ee6 packet 3 required test 4: generation-1 approval and
+    # settlement survive a crash; the channel is replaced; every
+    # recovery refuses; then a fresh generation-2 submission supersedes
+    # both stale rows (submitted verdict and settlement binding) and
+    # settles exactly once.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    document = flow.verdict(SHA_A, branch, 14)
+    emitted, record = await _approved_settlement(flow, "ENG-9", SHA_A, branch, 14)
+    _persist_submitted_row(flow, emitted.event.event_id, "ENG-9", SHA_A, document)
+    _replace_channel(flow)
+
+    outcomes = await flow.turns.recover_outstanding()
+    assert [outcome.kind for outcome in outcomes] == ["stale_submission"]
+    assert flow.settlements.get(record.review_id).state == "recorded"
+    assert flow.github.merge_calls == []
+
+    fresh = {
+        **_submission(emitted.event.event_id, "ENG-9", SHA_A, document),
+        "reviewed_thread_id": "thr_new",
+        "reviewed_generation": 2,
+    }
+    outcome = await flow.turns.submit_review("demo", **fresh)
+
+    assert outcome.kind == "merged"
+    assert outcome.merge_sha == merge_sha_for(SHA_A)
+    assert len(flow.github.merge_calls) == 1
+    settlement = flow.settlements.get(record.review_id)
+    assert settlement.state == "settled"
+    assert (settlement.thread_id, settlement.thread_generation) == ("thr_new", 2)
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "settled", document)
+    ]
+    # Exactly once: an identical duplicate replays the settled result.
+    duplicate = await flow.turns.submit_review("demo", **fresh)
+    assert duplicate == outcome
+    assert len(flow.github.merge_calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_duplicates_idempotent_only_for_the_current_binding(
     flow: ProductionShapedFlow,
