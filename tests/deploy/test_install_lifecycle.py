@@ -303,7 +303,7 @@ def test_install_plan_argv_details_and_compensations() -> None:
     steps = _install_plan()
     probes = [step for step in steps if step.code == "probe_entrypoint"]
     assert [step.argv for step in probes] == [
-        (str(BINARY), "daemon", "--help"),
+        (str(BINARY), "runtime-exec", "--help"),
         (str(BINARY), "serve-console", "--help"),
     ]
     lints = [step.argv for step in steps if step.code == "probe_plutil_lint"]
@@ -593,7 +593,9 @@ def _fs_runner(rendered: Path, **kwargs) -> FilesystemRunner:
         funnel_status_argv(),
         RunResult(returncode=0, stdout="No serve config", stderr=""),
     )
-    for label, subcommand in zip(LABELS, ("daemon", "serve-console"), strict=True):
+    for label, subcommand in zip(
+        LABELS, ("runtime-exec", "serve-console"), strict=True
+    ):
         runner.script(
             (str(BINARY), subcommand, "--help"),
             RunResult(returncode=0, stdout="usage", stderr=""),

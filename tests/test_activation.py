@@ -162,3 +162,251 @@ def test_checkout_migration_max_reads_filename_prefixes(
 
     assert checkout_migration_max(tmp_path) == 42
     assert checkout_migration_max(tmp_path / "missing") == 0
+
+
+class TestApplyProtocol:
+    """Journaled apply with proven process rollback (Sol 032cd4a5)."""
+
+    @staticmethod
+    def build(
+        database: Database, tmp_path: Path, name: str, *, schema: int
+    ) -> Path:
+        checkout = tmp_path / name
+        migrations = checkout / "src" / "hermes_orchestrator" / "migrations"
+        migrations.mkdir(parents=True)
+        for version in (1, schema):
+            (migrations / f"{version:04d}_x.sql").write_text("-- x\n")
+        (checkout / "pyproject.toml").write_text("[project]\nname='x'\n")
+        git(checkout, "init", "-q")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "init")
+        return checkout
+
+    @staticmethod
+    def applier_for(
+        database: Database, kickstart: object
+    ) -> tuple[RuntimeActivator, object]:
+        from hermes_orchestrator.activation import ActivationApplier
+
+        activator = RuntimeActivator(database, events=EventStore(database))
+        applier = ActivationApplier(
+            activator,
+            database,
+            kickstart=kickstart,  # type: ignore[arg-type]
+            sleep=lambda _seconds: None,
+            verify_timeout_seconds=0.0,
+        )
+        return activator, applier
+
+    def journal_state(self, database: Database) -> str:
+        return str(
+            database.scalar(
+                "SELECT state FROM activation_applies "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            )
+        )
+
+    def test_a_healthy_apply_is_journaled_and_verified(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = self.build(
+            database, tmp_path, "co-a", schema=database.schema_version()
+        )
+        holder: dict[str, object] = {}
+
+        def kickstart() -> None:
+            # The freshly supervised daemon proves itself durably.
+            holder["activator"].confirm_startup(  # type: ignore[attr-defined]
+                checkout_root=checkout,
+                binary_path=Path("/bin/hermes"),
+                pid=4242,
+            )
+
+        activator, applier = self.applier_for(database, kickstart)
+        holder["activator"] = activator
+
+        report = applier.apply(  # type: ignore[attr-defined]
+            checkout_root=checkout, binary_path=Path("/bin/hermes")
+        )
+
+        assert report.state == "verified"
+        assert report.verified_pid == 4242
+        assert self.journal_state(database) == "verified"
+        current = activator.current()
+        assert current is not None
+        assert current.generation == report.target_generation
+
+    def test_a_dead_new_runtime_rolls_back_with_proof(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout_a = self.build(
+            database, tmp_path, "co-a", schema=database.schema_version()
+        )
+        checkout_b = self.build(
+            database, tmp_path, "co-b", schema=database.schema_version()
+        )
+        holder: dict[str, object] = {}
+        kicks: list[int] = []
+
+        def kickstart() -> None:
+            kicks.append(1)
+            if len(kicks) == 1:
+                return  # the new runtime never comes up
+            # The rollback restart proves the restored identity.
+            holder["activator"].confirm_startup(  # type: ignore[attr-defined]
+                checkout_root=checkout_a,
+                binary_path=Path("/bin/a"),
+                pid=777,
+            )
+
+        activator, applier = self.applier_for(database, kickstart)
+        holder["activator"] = activator
+        prior = activator.activate(
+            checkout_root=checkout_a, binary_path=Path("/bin/a")
+        )
+
+        report = applier.apply(  # type: ignore[attr-defined]
+            checkout_root=checkout_b, binary_path=Path("/bin/b")
+        )
+
+        assert report.state == "rolled_back"
+        assert len(kicks) == 2
+        assert self.journal_state(database) == "rolled_back"
+        current = activator.current()
+        assert current is not None
+        assert current.checkout_root == str(checkout_a)
+        assert current.git_sha == prior.git_sha
+        assert current.generation > prior.generation
+
+    def test_an_unprovable_rollback_is_ambiguous_and_fails_closed(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        from hermes_orchestrator.activation import ApplyFailed
+
+        checkout_a = self.build(
+            database, tmp_path, "co-a", schema=database.schema_version()
+        )
+        checkout_b = self.build(
+            database, tmp_path, "co-b", schema=database.schema_version()
+        )
+        activator, applier = self.applier_for(
+            database, lambda: None
+        )
+        activator.activate(
+            checkout_root=checkout_a, binary_path=Path("/bin/a")
+        )
+
+        with pytest.raises(ApplyFailed, match="ambiguous"):
+            applier.apply(  # type: ignore[attr-defined]
+                checkout_root=checkout_b, binary_path=Path("/bin/b")
+            )
+
+        assert self.journal_state(database) == "ambiguous"
+
+    def test_a_refused_target_journals_and_never_touches_the_process(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = tmp_path / "not-a-repo"
+        checkout.mkdir()
+        kicks: list[int] = []
+        _activator, applier = self.applier_for(
+            database, lambda: kicks.append(1)
+        )
+
+        with pytest.raises(ActivationRefused):
+            applier.apply(  # type: ignore[attr-defined]
+                checkout_root=checkout, binary_path=Path("/bin/a")
+            )
+
+        assert kicks == []
+        assert self.journal_state(database) == "refused"
+
+
+class TestConfirmStartup:
+    def test_bootstrap_activates_and_journals_the_start(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = TestApplyProtocol.build(
+            database, tmp_path, "co-a", schema=database.schema_version()
+        )
+        activator = RuntimeActivator(database, events=EventStore(database))
+
+        confirmed = activator.confirm_startup(
+            checkout_root=checkout, binary_path=Path("/bin/a"), pid=101
+        )
+
+        assert confirmed is not None
+        assert confirmed.checkout_root == str(checkout)
+        started = database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'daemon.started'"
+        ).fetchall()
+        assert len(started) == 1
+
+    def test_a_mismatched_daemon_never_self_activates(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """A daemon running foreign code must not supersede the active
+        activation — that would silently undo a rollback."""
+
+        checkout_a = TestApplyProtocol.build(
+            database, tmp_path, "co-a", schema=database.schema_version()
+        )
+        checkout_b = TestApplyProtocol.build(
+            database, tmp_path, "co-b", schema=database.schema_version()
+        )
+        activator = RuntimeActivator(database, events=EventStore(database))
+        active = activator.activate(
+            checkout_root=checkout_a, binary_path=Path("/bin/a")
+        )
+
+        confirmed = activator.confirm_startup(
+            checkout_root=checkout_b, binary_path=Path("/bin/b"), pid=102
+        )
+
+        assert confirmed is None
+        current = activator.current()
+        assert current is not None
+        assert current.activation_id == active.activation_id
+
+
+def test_runtime_exec_resolves_the_active_checkout(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The supervised entry point execs the daemon from the durable
+    active activation, falling back to the configured repo root only
+    when nothing was ever activated."""
+
+    import argparse
+
+    from hermes_orchestrator import cli as cli_module
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli_module.os,
+        "execvp",
+        lambda file, argv: captured.update(file=file, argv=list(argv)),
+    )
+    arguments = argparse.Namespace(
+        state_dir=tmp_path, repo_root=tmp_path / "stable", interval=30
+    )
+
+    assert cli_module._runtime_exec(arguments) == 1
+    argv = captured["argv"]
+    assert argv[argv.index("--project") + 1] == str(tmp_path / "stable")
+
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO runtime_activations("
+            "activation_id, schema_version, generation, binary_path, "
+            "checkout_root, git_sha, database_schema, state, reason, "
+            "activated_at, updated_at) VALUES ('act-1', 1, 1, '/bin/h', "
+            "?, ?, 44, 'active', NULL, 't0', 't0')",
+            (str(tmp_path / "live"), "f" * 40),
+        )
+
+    assert cli_module._runtime_exec(arguments) == 1
+    argv = captured["argv"]
+    assert argv[argv.index("--project") + 1] == str(tmp_path / "live")
+    assert argv[argv.index("--repo-root") + 1] == str(tmp_path / "stable")
+    assert argv[-2:] == ["--interval", "30"]

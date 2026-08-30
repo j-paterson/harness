@@ -1,4 +1,5 @@
-"""Durable child accounting and exactly-once reactivation (INFRA-195)."""
+"""Identity-exact child accounting and reactivation (INFRA-195,
+Sol correction 032cd4a5)."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from hermes_orchestrator.lead_children import LeadChildTracker
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 SESSION = "11111111-2222-4333-8444-555555555555"
+FOREIGN_SESSION = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 
 
 @pytest.fixture
@@ -51,102 +53,136 @@ def seed_active_cell(database: Database) -> None:
         )
 
 
-def test_a_stop_with_live_children_records_the_continuation(
+def reactivations(database: Database) -> int:
+    value = database.scalar(
+        "SELECT COUNT(*) FROM control_operations "
+        "WHERE kind = 'children.completed'"
+    )
+    return int(value)  # type: ignore[arg-type]
+
+
+def test_a_duplicated_completion_never_reactivates_early(
     database: Database, tracker: LeadChildTracker
 ) -> None:
+    """Two distinct children; the first child's completion arrives
+    twice. No reactivation may fire until the second distinct child
+    completes."""
+
     seed_active_cell(database)
-    tracker.child_started(SESSION)
-    tracker.child_started(SESSION)
-    tracker.child_completed(SESSION)
+    tracker.child_started(SESSION, "child-a")
+    tracker.child_started(SESSION, "child-b")
+    assert tracker.record_turn_stop(SESSION) is not None
 
-    continuation = tracker.record_turn_stop(SESSION)
+    assert tracker.child_completed(SESSION, "child-a") is None
+    assert tracker.child_completed(SESSION, "child-a") is None
+    assert reactivations(database) == 0
 
-    assert continuation is not None
-    assert continuation.state == "waiting"
-    assert continuation.cell_id == "cell-demo"
-    assert "1 background child(ren) outstanding" in continuation.condition
-    # A second Stop at the same boundary refreshes, never duplicates.
-    again = tracker.record_turn_stop(SESSION)
-    assert again is not None
-    assert again.continuation_id == continuation.continuation_id
+    reactivation = tracker.child_completed(SESSION, "child-b")
+
+    assert reactivation is not None
+    assert reactivation.result["completed_children"] == 2
+    assert reactivations(database) == 1
+
+
+def test_replayed_hooks_record_exactly_one_start_and_completion(
+    database: Database, tracker: LeadChildTracker
+) -> None:
+    assert tracker.child_started(SESSION, "child-a") is True
+    assert tracker.child_started(SESSION, "child-a") is False
     assert (
-        database.scalar("SELECT COUNT(*) FROM lead_continuations") == 1
+        database.scalar("SELECT COUNT(*) FROM lead_children") == 1
     )
+
+    seed_active_cell(database)
+    assert tracker.child_completed(SESSION, "child-a") is None
+    state = database.scalar(
+        "SELECT state FROM lead_children WHERE child_id = 'child-a'"
+    )
+    assert str(state) == "completed"
+    # The replayed completion is refused without touching anything.
+    assert tracker.child_completed(SESSION, "child-a") is None
+    assert (
+        database.scalar("SELECT COUNT(*) FROM lead_children") == 1
+    )
+
+
+def test_unmatched_completions_are_refused_without_progress(
+    database: Database, tracker: LeadChildTracker
+) -> None:
+    """Completion before start, a foreign session, and an identity-less
+    event each fail closed: outstanding work never shrinks."""
+
+    seed_active_cell(database)
+    tracker.child_started(SESSION, "child-a")
+    assert tracker.record_turn_stop(SESSION) is not None
+
+    assert tracker.child_completed(SESSION, "never-started") is None
+    assert tracker.child_completed(FOREIGN_SESSION, "child-a") is None
+    assert tracker.child_completed(SESSION, "") is None
+    assert tracker.child_started(SESSION, " ") is False
+
+    outstanding = database.scalar(
+        "SELECT COUNT(*) FROM lead_children "
+        "WHERE session_id = ? AND state = 'started'",
+        (SESSION,),
+    )
+    assert outstanding == 1
+    assert reactivations(database) == 0
+    continuation_state = database.scalar(
+        "SELECT state FROM lead_continuations WHERE session_id = ?",
+        (SESSION,),
+    )
+    assert str(continuation_state) == "waiting"
+
+
+def test_retried_boundaries_emit_exactly_one_reactivation(
+    database: Database, tracker: LeadChildTracker
+) -> None:
+    """Crash-and-retry at every hook boundary: repeated starts, stops,
+    and completions converge on exactly one children.completed, fired
+    only once the distinct outstanding set is empty."""
+
+    seed_active_cell(database)
+    tracker.child_started(SESSION, "child-a")
+    tracker.child_started(SESSION, "child-a")
+    first_stop = tracker.record_turn_stop(SESSION)
+    second_stop = tracker.record_turn_stop(SESSION)
+    assert first_stop is not None and second_stop is not None
+    assert first_stop.continuation_id == second_stop.continuation_id
+
+    reactivation = tracker.child_completed(SESSION, "child-a")
+    assert reactivation is not None
+    # Retries after the boundary settle as durable no-ops.
+    assert tracker.child_completed(SESSION, "child-a") is None
+    assert reactivations(database) == 1
+    state = database.scalar(
+        "SELECT state FROM lead_continuations WHERE continuation_id = ?",
+        (first_stop.continuation_id,),
+    )
+    assert str(state) == "reactivated"
 
 
 def test_a_stop_with_no_outstanding_children_promises_nothing(
     database: Database, tracker: LeadChildTracker
 ) -> None:
     seed_active_cell(database)
-    tracker.child_started(SESSION)
-    tracker.child_completed(SESSION)
+    tracker.child_started(SESSION, "child-a")
+    tracker.child_completed(SESSION, "child-a")
 
     assert tracker.record_turn_stop(SESSION) is None
     assert database.scalar("SELECT COUNT(*) FROM lead_continuations") == 0
 
 
-def test_the_last_child_completion_reactivates_exactly_once(
-    database: Database,
-    tracker: LeadChildTracker,
-    control: ControlOperations,
-) -> None:
-    seed_active_cell(database)
-    tracker.child_started(SESSION)
-    tracker.child_started(SESSION)
-    continuation = tracker.record_turn_stop(SESSION)
-    assert continuation is not None
-
-    assert tracker.child_completed(SESSION) is None
-    reactivation = tracker.child_completed(SESSION)
-
-    assert reactivation is not None
-    assert reactivation.kind == "children.completed"
-    assert reactivation.result["started"] == 2
-    assert reactivation.result["completed"] == 2
-    state = database.scalar(
-        "SELECT state FROM lead_continuations WHERE continuation_id = ?",
-        (continuation.continuation_id,),
-    )
-    assert str(state) == "reactivated"
-    # A duplicate completion (a retried hook, a lost ACK) is a no-op:
-    # exactly one reactivation exists.
-    assert tracker.child_completed(SESSION) is None
-    assert (
-        database.scalar(
-            "SELECT COUNT(*) FROM control_operations "
-            "WHERE kind = 'children.completed'"
-        )
-        == 1
-    )
-
-
-def test_a_completion_with_no_waiting_continuation_stays_silent(
-    database: Database, tracker: LeadChildTracker
-) -> None:
-    seed_active_cell(database)
-    tracker.child_started(SESSION)
-
-    assert tracker.child_completed(SESSION) is None
-    assert (
-        database.scalar("SELECT COUNT(*) FROM control_operations") == 0
-    )
-
-
 def test_a_stale_promise_is_superseded_once_children_settle(
     database: Database, tracker: LeadChildTracker
 ) -> None:
-    """A continuation whose children finished before any reactivation
-    could fire (e.g. counters settled during a crash window) is
-    superseded at the next Stop instead of reactivating a lead that
-    owes nothing."""
-
     seed_active_cell(database)
-    tracker.child_started(SESSION)
+    tracker.child_started(SESSION, "child-a")
     continuation = tracker.record_turn_stop(SESSION)
     assert continuation is not None
     with database.transaction() as connection:
         connection.execute(
-            "UPDATE lead_child_activity SET completed = started "
+            "UPDATE lead_children SET state = 'completed' "
             "WHERE session_id = ?",
             (SESSION,),
         )

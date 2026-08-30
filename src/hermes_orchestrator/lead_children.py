@@ -1,14 +1,18 @@
-"""Durable child accounting and exactly-once lead reactivation.
+"""Durable, identity-exact child accounting and lead reactivation.
 
-INFRA-195: a classic lead turn that ends while background children are
-still running must resume without an operator prompt. The
-PreToolUse(Agent) hook counts each child start, the SubagentStop hook
-counts each completion, and the Stop hook records the continuation
-condition durably when children are still outstanding. The completion
-that settles the last outstanding child compare-and-swaps the waiting
-continuation and queues exactly one ``children.completed`` control
-operation (deduplicated by the continuation id), which wakes the exact
-lead through the dedicated channel.
+INFRA-195 (hardened by Sol correction 032cd4a5): a classic lead turn
+that ends while background children are still running must resume
+without an operator prompt — and never resume early. Child activity is
+keyed by the stable hook-provided child identity, so a start records
+exactly once per (session, child), a completion compare-and-swaps that
+exact identity (a duplicate, a reordered delivery, a foreign session,
+or an identity-less event is refused without advancing progress), and
+outstanding work is the set of distinct started-but-uncompleted
+children. The Stop hook records the continuation condition durably;
+the completion that empties the outstanding set compare-and-swaps the
+waiting continuation and queues exactly one ``children.completed``
+control operation (deduplicated by the continuation id), which wakes
+the exact lead through the dedicated channel.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ class LeadContinuation:
 
 
 class LeadChildTracker:
-    """Count child starts/stops; reactivate a waiting lead exactly once."""
+    """Track child identities; reactivate a waiting lead exactly once."""
 
     def __init__(
         self,
@@ -53,53 +57,61 @@ class LeadChildTracker:
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or (lambda: datetime.now(UTC))
 
-    def child_started(self, session_id: str) -> int:
-        """Durably count one child start; returns the started total."""
+    def child_started(self, session_id: str, child_id: str) -> bool:
+        """Record one distinct child start; a duplicate is a no-op.
 
-        stamp = self._now().isoformat()
-        with self._database.transaction() as connection:
-            connection.execute(
-                "INSERT INTO lead_child_activity("
-                "session_id, started, completed, updated_at) "
-                "VALUES (?, 1, 0, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET "
-                "started = started + 1, updated_at = excluded.updated_at",
-                (session_id, stamp),
-            )
-            row = connection.execute(
-                "SELECT started FROM lead_child_activity "
-                "WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        return int(row["started"])
-
-    def child_completed(self, session_id: str) -> ControlOperation | None:
-        """Durably count one completion; fire the one reactivation.
-
-        The reactivation control operation and the continuation's
-        compare-and-swap commit in a single transaction, so a crash can
-        never separate them, and the continuation-id dedup key makes a
-        duplicate completion (or a lost-ACK retry) a durable no-op.
+        An identity-less start fails closed: nothing is recorded, so it
+        can never create outstanding work no completion could settle.
         """
 
+        if not child_id.strip():
+            return False
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO lead_children("
+                "session_id, child_id, state, started_at, completed_at) "
+                "VALUES (?, ?, 'started', ?, NULL)",
+                (session_id, child_id.strip(), stamp),
+            )
+        return cursor.rowcount == 1
+
+    def child_completed(
+        self, session_id: str, child_id: str
+    ) -> ControlOperation | None:
+        """Settle one exact child; fire the one reactivation when the
+        distinct outstanding set becomes empty.
+
+        The completion is a compare-and-swap on the exact (session,
+        child) identity in the ``started`` state: a duplicate, a
+        completion that precedes its start, a foreign session, or an
+        identity-less event changes nothing and never advances
+        progress. The reactivation control operation and the
+        continuation's compare-and-swap commit in one transaction, so a
+        crash can never separate them, and the continuation-id dedup
+        key makes any retry a durable no-op.
+        """
+
+        if not child_id.strip():
+            return None
         stamp = self._now().isoformat()
         operation: ControlOperation | None = None
         with self._database.transaction() as connection:
-            connection.execute(
-                "INSERT INTO lead_child_activity("
-                "session_id, started, completed, updated_at) "
-                "VALUES (?, 0, 1, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET "
-                "completed = completed + 1, "
-                "updated_at = excluded.updated_at",
-                (session_id, stamp),
+            settled = connection.execute(
+                "UPDATE lead_children SET state = 'completed', "
+                "completed_at = ? "
+                "WHERE session_id = ? AND child_id = ? "
+                "AND state = 'started'",
+                (stamp, session_id, child_id.strip()),
             )
-            activity = connection.execute(
-                "SELECT started, completed FROM lead_child_activity "
-                "WHERE session_id = ?",
+            if settled.rowcount != 1:
+                return None
+            outstanding = connection.execute(
+                "SELECT COUNT(*) AS outstanding FROM lead_children "
+                "WHERE session_id = ? AND state = 'started'",
                 (session_id,),
             ).fetchone()
-            if int(activity["completed"]) < int(activity["started"]):
+            if int(outstanding["outstanding"]) > 0:
                 return None
             waiting = connection.execute(
                 "SELECT continuation_id, project_key, cell_id, condition "
@@ -117,6 +129,11 @@ class LeadChildTracker:
             )
             if reactivated.rowcount != 1:
                 return None
+            completed = connection.execute(
+                "SELECT COUNT(*) AS completed FROM lead_children "
+                "WHERE session_id = ? AND state = 'completed'",
+                (session_id,),
+            ).fetchone()
             operation = self._control.record_in(
                 connection,
                 kind="children.completed",
@@ -124,8 +141,7 @@ class LeadChildTracker:
                 cell_id=str(waiting["cell_id"]),
                 session_id=session_id,
                 result={
-                    "started": int(activity["started"]),
-                    "completed": int(activity["completed"]),
+                    "completed_children": int(completed["completed"]),
                     "continuation": str(waiting["condition"]),
                 },
                 dedup_key=(
@@ -139,22 +155,24 @@ class LeadChildTracker:
     def record_turn_stop(self, session_id: str) -> LeadContinuation | None:
         """At a Stop boundary, durably promise the outstanding work.
 
-        With children still outstanding, one waiting continuation per
-        session is recorded (idempotently); with none, any stale
-        waiting continuation is superseded so it can never reactivate a
-        lead that owes nothing.
+        With distinct children still outstanding, one waiting
+        continuation per session is recorded (idempotently); with none,
+        any stale waiting continuation is superseded so it can never
+        reactivate a lead that owes nothing.
         """
 
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
-            activity = connection.execute(
-                "SELECT started, completed FROM lead_child_activity "
+            counts = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN state = 'started' THEN 1 ELSE 0 END) "
+                "AS outstanding, "
+                "COUNT(*) AS total FROM lead_children "
                 "WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            outstanding = 0 if activity is None else (
-                int(activity["started"]) - int(activity["completed"])
-            )
+            outstanding = int(counts["outstanding"] or 0)
+            total = int(counts["total"] or 0)
             if outstanding <= 0:
                 connection.execute(
                     "UPDATE lead_continuations SET state = 'superseded', "
@@ -179,7 +197,7 @@ class LeadChildTracker:
             ).fetchone()
             condition = (
                 f"{outstanding} background child(ren) outstanding "
-                f"({activity['completed']}/{activity['started']} complete)"
+                f"({total - outstanding}/{total} complete)"
             )
             if existing is not None:
                 connection.execute(

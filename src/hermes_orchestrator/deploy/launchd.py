@@ -15,6 +15,9 @@ _FORBIDDEN_MARKERS = ("token", "password", "api_key", "secret", "keychain", "sig
 
 _ORCHESTRATOR_LABEL = "com.josystem.hermes-orchestrator"
 _OPERATIONS_LABEL = "com.josystem.hermes-operations"
+# The supervised daemon job's public label: the activation apply
+# protocol kickstarts exactly this job.
+ORCHESTRATOR_LABEL = _ORCHESTRATOR_LABEL
 
 
 class UnsafeServiceSpec(Exception):
@@ -122,11 +125,16 @@ def standard_inventory(
     )
     orchestrator = ServiceSpec(
         label=_ORCHESTRATOR_LABEL,
-        program_arguments=(*common, "daemon", "--interval", "30"),
+        # The externally supervised job resolves the durable active
+        # runtime activation and execs the daemon from that exact
+        # checkout (INFRA-195): launchd owns the process lifetime,
+        # while which code runs is decided by the validated activation
+        # ledger, never by which pane or worktree launched something.
+        program_arguments=(*common, "runtime-exec", "--interval", "30"),
         working_directory=state_dir,
         log_dir=log_dir,
         listener=None,
-        entrypoint_subcommand="daemon",
+        entrypoint_subcommand="runtime-exec",
     )
     operations = ServiceSpec(
         label=_OPERATIONS_LABEL,

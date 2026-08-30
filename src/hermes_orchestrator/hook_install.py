@@ -1,18 +1,25 @@
-"""Idempotent Hermes hook installation for classic Claude profiles.
+"""Idempotent, atomic Hermes hook installation for classic profiles.
 
-INFRA-195: every eligible classic profile must run the Hermes Stop and
-SubagentStop hooks (plus the PreToolUse Agent hook that counts child
-starts) in addition to whatever presentation hooks it already carries.
-Installation is a pure settings.json merge: foreign hooks are
-preserved byte-for-byte in meaning, a missing Hermes hook is added
-under its exact event and matcher, and a duplicated Hermes hook is
-repaired down to one occurrence. Running the installer twice is a
-no-op.
+INFRA-195 (hardened by Sol correction 032cd4a5): every eligible
+classic profile must run the Hermes Stop and SubagentStop hooks (plus
+the PreToolUse Agent hook that records child starts) in addition to
+whatever presentation hooks it already carries. Each required hook
+exists exactly once under its exact event *and matcher* — a Hermes
+command found under any other matcher is misplaced and is repaired
+into the one canonical binding, duplicates are collapsed, and foreign
+hooks are preserved. The settings file is replaced atomically: the
+merged document is validated, written to a temporary file in the same
+directory, fsynced, moved over settings.json with its permissions
+preserved, and the directory is fsynced — an interruption at any point
+leaves the original file complete and parseable. Running the installer
+twice is a no-op.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +34,7 @@ class HookCommandSet:
     child_start: str
 
 
-# (settings event, matcher, HookCommandSet attribute)
+# (settings event, exact matcher, HookCommandSet attribute)
 _HOOK_SPECS: tuple[tuple[str, str, str], ...] = (
     ("Stop", "*", "stop"),
     ("SubagentStop", "*", "subagent_stop"),
@@ -56,6 +63,14 @@ class ProfileHookReport:
             "repaired": list(self.repaired),
             "changed": self.changed,
         }
+
+
+def _is_our_hook(hook: object, command: str) -> bool:
+    return (
+        isinstance(hook, dict)
+        and hook.get("type") == "command"
+        and hook.get("command") == command
+    )
 
 
 class HookInstaller:
@@ -96,7 +111,12 @@ class HookInstaller:
                 raise ValueError(
                     f"{path} carries a non-list {event} hook section"
                 )
-            occurrences = 0
+            # Canonicalize: strip every occurrence of our command from
+            # this event — wherever and under whatever matcher it sits
+            # — while counting exact-matcher hits, then bind exactly
+            # one occurrence under the required matcher.
+            exact = 0
+            misplaced = 0
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
@@ -105,16 +125,12 @@ class HookInstaller:
                     continue
                 kept = []
                 for hook in entry_hooks:
-                    if (
-                        isinstance(hook, dict)
-                        and hook.get("type") == "command"
-                        and hook.get("command") == command
-                    ):
-                        occurrences += 1
-                        if occurrences > 1:
-                            # A duplicated Hermes hook would fire twice
-                            # per boundary; repair down to one.
-                            continue
+                    if _is_our_hook(hook, command):
+                        if entry.get("matcher") == matcher:
+                            exact += 1
+                        else:
+                            misplaced += 1
+                        continue
                     kept.append(hook)
                 entry["hooks"] = kept
             hooks[event] = [
@@ -122,15 +138,15 @@ class HookInstaller:
                 for entry in entries
                 if not isinstance(entry, dict) or entry.get("hooks")
             ]
-            if occurrences == 0:
-                hooks[event].append(
-                    {
-                        "matcher": matcher,
-                        "hooks": [{"type": "command", "command": command}],
-                    }
-                )
+            hooks[event].append(
+                {
+                    "matcher": matcher,
+                    "hooks": [{"type": "command", "command": command}],
+                }
+            )
+            if exact == 0 and misplaced == 0:
                 installed.append(event)
-            elif occurrences > 1:
+            elif exact != 1 or misplaced > 0:
                 repaired.append(event)
         report = ProfileHookReport(
             alias=alias,
@@ -140,8 +156,36 @@ class HookInstaller:
         )
         if report.changed:
             config_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(settings, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            self._write_atomic(path, settings)
         return report
+
+    @staticmethod
+    def _write_atomic(path: Path, settings: dict[str, object]) -> None:
+        """Validated temp file, fsync, atomic replace, directory fsync.
+
+        The original settings.json stays complete and parseable through
+        any interruption; its permissions survive the replacement.
+        """
+
+        payload = json.dumps(settings, indent=2, sort_keys=True) + "\n"
+        json.loads(payload)  # the document must round-trip before it lands
+        mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".settings-", suffix=".tmp", dir=path.parent
+        )
+        try:
+            os.write(descriptor, payload.encode("utf-8"))
+            os.fsync(descriptor)
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
+        try:
+            os.replace(temporary, path)
+        except BaseException:
+            os.unlink(temporary)
+            raise
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)

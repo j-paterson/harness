@@ -28,6 +28,9 @@ from hermes_orchestrator.events import EventInput, EventStore
 
 ACTIVATION_SCHEMA_VERSION = 1
 
+APPLY_VERIFY_TIMEOUT_SECONDS = 60.0
+APPLY_POLL_SECONDS = 1.0
+
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _MIGRATION_NAME = re.compile(r"^(\d{4})_.+\.sql$")
 
@@ -88,6 +91,75 @@ class RuntimeActivator:
             "SELECT * FROM runtime_activations WHERE state = 'active'"
         ).fetchone()
         return None if row is None else self._record(row)
+
+    def confirm_startup(
+        self, *, checkout_root: Path, binary_path: Path, pid: int
+    ) -> RuntimeActivation | None:
+        """Journal the daemon's observed identity against the ledger.
+
+        The started daemon never self-activates over an existing
+        activation (that would silently undo a rollback): with no
+        activation at all it bootstraps one; with a matching activation
+        it confirms it; with a mismatched activation it journals the
+        mismatch and returns None so the caller fails closed. Every
+        outcome appends a durable ``daemon.started`` event carrying the
+        pid and generation — the health signal the apply protocol
+        verifies.
+        """
+
+        current = self.current()
+        if current is None:
+            try:
+                current = self.activate(
+                    checkout_root=checkout_root, binary_path=binary_path
+                )
+            except ActivationRefused:
+                current = None
+        matches = current is not None and (
+            current.checkout_root == str(checkout_root)
+        )
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="daemon.started",
+                    aggregate_type="runtime_activation",
+                    aggregate_id=(
+                        current.activation_id if current else "unactivated"
+                    ),
+                    payload={
+                        "pid": pid,
+                        "checkout_root": str(checkout_root),
+                        "binary_path": str(binary_path),
+                        "activation_generation": (
+                            current.generation if matches and current else None
+                        ),
+                        "matches_active": matches,
+                    },
+                ),
+            )
+        return current if matches else None
+
+    def reactivate(self, prior: RuntimeActivation) -> RuntimeActivation:
+        """Reinstate a prior activation's identity as a new generation.
+
+        The prior checkout is revalidated (a rollback target that no
+        longer proves out must fail closed, not silently run).
+        """
+
+        git_sha = self._validate(Path(prior.checkout_root))
+        if git_sha != prior.git_sha:
+            raise ActivationRefused(
+                f"{prior.checkout_root} no longer sits at the prior "
+                f"activation's commit {prior.git_sha[:12]}"
+            )
+        return self._record_attempt(
+            state="active",
+            binary_path=Path(prior.binary_path),
+            checkout_root=Path(prior.checkout_root),
+            git_sha=git_sha,
+            reason=f"rollback to generation {prior.generation}",
+        )
 
     def activate(
         self, *, checkout_root: Path, binary_path: Path
@@ -249,6 +321,25 @@ class RuntimeActivator:
             activated_at=stamp,
         )
 
+    def find_daemon_start(
+        self, *, generation: int, since: str
+    ) -> dict[str, object] | None:
+        """The durable proof a supervised daemon started on a generation."""
+
+        rows = self._database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'daemon.started' AND occurred_at >= ? "
+            "ORDER BY sequence DESC LIMIT 20",
+            (since,),
+        ).fetchall()
+        import json as _json
+
+        for row in rows:
+            payload = _json.loads(str(row["payload_json"]))
+            if payload.get("activation_generation") == generation:
+                return payload
+        return None
+
     @staticmethod
     def _record(row: object) -> RuntimeActivation:
         return RuntimeActivation(
@@ -267,3 +358,205 @@ class RuntimeActivator:
             ),
             activated_at=str(row["activated_at"]),  # type: ignore[index]
         )
+
+
+class ApplyFailed(RuntimeError):
+    """The apply protocol could not prove a healthy outcome."""
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyReport:
+    """The proven outcome of one activation apply."""
+
+    apply_id: str
+    state: str
+    target_generation: int | None
+    verified_pid: int | None
+    reason: str | None
+
+
+class ActivationApplier:
+    """Journaled activation apply with proven process rollback.
+
+    Intent is durable before any process changes; the supervised job is
+    restarted only after the ledger holds the new activation; success
+    is proven exclusively by the freshly started daemon's own durable
+    ``daemon.started`` event carrying the exact target generation. A
+    startup that never proves out triggers a rollback that reinstates
+    the prior activation, restarts the job again, and health-verifies
+    the prior identity the same way before the rollback is recorded
+    successful — anything unprovable is journaled ``ambiguous`` and
+    fails closed.
+    """
+
+    def __init__(
+        self,
+        activator: RuntimeActivator,
+        database: Database,
+        *,
+        kickstart: Callable[[], None],
+        ids: Callable[[], str] | None = None,
+        now: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        verify_timeout_seconds: float = APPLY_VERIFY_TIMEOUT_SECONDS,
+        poll_seconds: float = APPLY_POLL_SECONDS,
+    ) -> None:
+        self._activator = activator
+        self._database = database
+        self._kickstart = kickstart
+        self._ids = ids or (lambda: uuid.uuid4().hex)
+        self._now = now or (lambda: datetime.now(UTC))
+        self._sleep = sleep or (lambda seconds: __import__("time").sleep(seconds))
+        self._verify_timeout = verify_timeout_seconds
+        self._poll = poll_seconds
+
+    def apply(
+        self, *, checkout_root: Path, binary_path: Path
+    ) -> ApplyReport:
+        apply_id = self._ids()
+        prior = self._activator.current()
+        self._journal(
+            apply_id,
+            state="intended",
+            target_checkout=str(checkout_root),
+            prior_generation=None if prior is None else prior.generation,
+            target_generation=None,
+            reason=None,
+            insert=True,
+        )
+        try:
+            activation = self._activator.activate(
+                checkout_root=checkout_root, binary_path=binary_path
+            )
+        except ActivationRefused as refusal:
+            self._journal(
+                apply_id, state="refused", reason=str(refusal)
+            )
+            raise
+        self._journal(
+            apply_id,
+            state="activated",
+            target_generation=activation.generation,
+        )
+        started_at = self._now().isoformat()
+        self._kickstart()
+        self._journal(apply_id, state="restarted")
+        proof = self._await_daemon(activation.generation, since=started_at)
+        if proof is not None:
+            self._journal(apply_id, state="verified")
+            return ApplyReport(
+                apply_id=apply_id,
+                state="verified",
+                target_generation=activation.generation,
+                verified_pid=int(proof.get("pid", 0)) or None,
+                reason=None,
+            )
+        # The new runtime never proved out: reinstate the prior
+        # activation and prove the prior executable is actually
+        # running again before calling the rollback successful.
+        if prior is None:
+            self._journal(
+                apply_id,
+                state="ambiguous",
+                reason="no prior activation exists to roll back to",
+            )
+            raise ApplyFailed(
+                "the new runtime never reported healthy and no prior "
+                "activation exists; the apply is ambiguous"
+            )
+        try:
+            restored = self._activator.reactivate(prior)
+        except ActivationRefused as refusal:
+            self._journal(
+                apply_id,
+                state="ambiguous",
+                reason=f"rollback target refused revalidation: {refusal}",
+            )
+            raise ApplyFailed(
+                "the new runtime never reported healthy and the prior "
+                "activation no longer validates; the apply is ambiguous"
+            ) from refusal
+        rollback_started = self._now().isoformat()
+        self._kickstart()
+        proof = self._await_daemon(
+            restored.generation, since=rollback_started
+        )
+        if proof is None:
+            self._journal(
+                apply_id,
+                state="ambiguous",
+                reason="the rolled-back runtime never reported healthy",
+            )
+            raise ApplyFailed(
+                "neither the new nor the restored runtime reported "
+                "healthy; the apply is ambiguous"
+            )
+        self._journal(
+            apply_id,
+            state="rolled_back",
+            reason=(
+                f"generation {restored.generation} restored prior "
+                f"identity {prior.git_sha[:12]}"
+            ),
+        )
+        return ApplyReport(
+            apply_id=apply_id,
+            state="rolled_back",
+            target_generation=restored.generation,
+            verified_pid=int(proof.get("pid", 0)) or None,
+            reason="the new runtime never reported healthy",
+        )
+
+    def _await_daemon(
+        self, generation: int, *, since: str
+    ) -> dict[str, object] | None:
+        waited = 0.0
+        while True:
+            proof = self._activator.find_daemon_start(
+                generation=generation, since=since
+            )
+            if proof is not None:
+                return proof
+            if waited >= self._verify_timeout:
+                return None
+            self._sleep(self._poll)
+            waited += self._poll
+
+    def _journal(
+        self,
+        apply_id: str,
+        *,
+        state: str,
+        target_checkout: str | None = None,
+        prior_generation: int | None = None,
+        target_generation: int | None = None,
+        reason: str | None = None,
+        insert: bool = False,
+    ) -> None:
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            if insert:
+                connection.execute(
+                    "INSERT INTO activation_applies("
+                    "apply_id, target_checkout, prior_generation, "
+                    "target_generation, state, reason, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        apply_id,
+                        target_checkout,
+                        prior_generation,
+                        target_generation,
+                        state,
+                        reason,
+                        stamp,
+                        stamp,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE activation_applies SET state = ?, "
+                    "target_generation = COALESCE(?, target_generation), "
+                    "reason = COALESCE(?, reason), updated_at = ? "
+                    "WHERE apply_id = ?",
+                    (state, target_generation, reason, stamp, apply_id),
+                )

@@ -245,6 +245,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     child_start.add_argument("--session", default=None)
+    child_start.add_argument("--child", default=None)
 
     child_stop = commands.add_parser(
         "child-stop",
@@ -255,6 +256,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     child_stop.add_argument("--session", default=None)
+    child_stop.add_argument("--child", default=None)
 
     runtime_activate = commands.add_parser(
         "runtime-activate",
@@ -265,6 +267,25 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     runtime_activate.add_argument("--json", action="store_true")
+    runtime_activate.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "journaled apply: activate, restart the supervised launchd "
+            "job, verify the new daemon reports this exact generation, "
+            "and perform a proven process rollback on failure"
+        ),
+    )
+
+    runtime_exec = commands.add_parser(
+        "runtime-exec",
+        help=(
+            "resolve the durable active runtime activation and exec "
+            "the daemon from that exact checkout (the supervised "
+            "launchd entry point)"
+        ),
+    )
+    runtime_exec.add_argument("--interval", type=int, default=30)
 
     hooks_install = commands.add_parser(
         "hooks-install",
@@ -1152,6 +1173,60 @@ def _intake_state_dir(args: argparse.Namespace) -> Path:
     )
 
 
+def _code_checkout_root() -> Path:
+    """The checkout this process's code actually runs from.
+
+    Distinct from the configured repo root (the stable config anchor):
+    under the supervised runtime-exec entry point the code checkout is
+    whatever the active activation resolved, and identity must come
+    from the running package, never from configuration.
+    """
+
+    import hermes_orchestrator
+
+    return Path(hermes_orchestrator.__file__).resolve().parents[2]
+
+
+def _runtime_exec(args: argparse.Namespace) -> int:
+    """Exec the daemon from the durable active activation's checkout.
+
+    This is the supervised launchd entry point: launchd owns the
+    process lifetime while the activation ledger owns which checkout
+    runs. With no activation recorded yet, the configured repo root is
+    the bootstrap fallback.
+    """
+
+    import shutil
+
+    state_dir = _intake_state_dir(args)
+    database = Database.open(state_dir / "state.db")
+    try:
+        row = database.execute(
+            "SELECT checkout_root FROM runtime_activations "
+            "WHERE state = 'active'"
+        ).fetchone()
+    finally:
+        database.close()
+    project = str(row["checkout_root"]) if row is not None else str(args.repo_root)
+    uv_binary = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    argv = [
+        uv_binary,
+        "run",
+        "--project",
+        project,
+        "hermes-orchestrator",
+        "--repo-root",
+        str(args.repo_root),
+        "--state-dir",
+        str(state_dir),
+        "daemon",
+        "--interval",
+        str(args.interval),
+    ]
+    os.execvp(argv[0], argv)
+    return 1  # pragma: no cover — exec never returns
+
+
 def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
     """Deliberate approved-version activation with safe rollback."""
 
@@ -1161,12 +1236,14 @@ def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
     )
     from hermes_orchestrator.events import EventStore
 
+    if args.apply:
+        return _runtime_apply(args, settings)
     database = Database.open(settings.state_dir / "state.db")
     try:
         activator = RuntimeActivator(database, events=EventStore(database))
         try:
             activation = activator.activate(
-                checkout_root=settings.repo_root,
+                checkout_root=_code_checkout_root(),
                 binary_path=Path(sys.argv[0]).resolve(),
             )
         except ActivationRefused as error:
@@ -1205,6 +1282,73 @@ def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
         ),
     )
     return 0
+
+
+def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
+    """Journaled apply: activate, kickstart, verify, or proven rollback."""
+
+    import subprocess as subprocess_module
+
+    from hermes_orchestrator.activation import (
+        ActivationApplier,
+        ActivationRefused,
+        ApplyFailed,
+        RuntimeActivator,
+    )
+    from hermes_orchestrator.deploy.launchd import ORCHESTRATOR_LABEL
+    from hermes_orchestrator.events import EventStore
+
+    def kickstart() -> None:
+        subprocess_module.run(
+            (
+                "launchctl",
+                "kickstart",
+                "-k",
+                f"gui/{os.getuid()}/{ORCHESTRATOR_LABEL}",
+            ),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+
+    database = Database.open(settings.state_dir / "state.db")
+    try:
+        applier = ActivationApplier(
+            RuntimeActivator(database, events=EventStore(database)),
+            database,
+            kickstart=kickstart,
+        )
+        try:
+            report = applier.apply(
+                checkout_root=_code_checkout_root(),
+                binary_path=Path(sys.argv[0]).resolve(),
+            )
+        except (ActivationRefused, ApplyFailed) as error:
+            _print(
+                {"applied": False, "reason": str(error)},
+                json_output=args.json,
+                human=f"apply failed closed: {error}",
+            )
+            return 1
+    finally:
+        database.close()
+    _print(
+        {
+            "applied": report.state == "verified",
+            "apply_id": report.apply_id,
+            "state": report.state,
+            "generation": report.target_generation,
+            "verified_pid": report.verified_pid,
+            "reason": report.reason,
+        },
+        json_output=args.json,
+        human=(
+            f"apply {report.apply_id}: {report.state} "
+            f"(generation {report.target_generation}, "
+            f"pid {report.verified_pid})"
+        ),
+    )
+    return 0 if report.state == "verified" else 1
 
 
 def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
@@ -1268,11 +1412,19 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     """
 
     session = args.session
-    if session is None:
+    child = args.child
+    if session is None or child is None:
         with suppress(Exception):
             payload = json.loads(sys.stdin.read() or "{}")
-            session = payload.get("session_id")
-    if not session:
+            session = session or payload.get("session_id")
+            # The stable hook-provided child identity; an event that
+            # carries none fails closed and never advances progress.
+            child = child or (
+                payload.get("tool_use_id")
+                or payload.get("agent_id")
+                or payload.get("agent_session_id")
+            )
+    if not session or not child:
         return 0
     with suppress(Exception):
         from hermes_orchestrator.events import EventStore
@@ -1287,9 +1439,9 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
                 ),
             )
             if completed:
-                tracker.child_completed(str(session))
+                tracker.child_completed(str(session), str(child))
             else:
-                tracker.child_started(str(session))
+                tracker.child_started(str(session), str(child))
         finally:
             database.close()
     return 0
@@ -1576,6 +1728,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _child_event(args, completed=False)
     if args.command == "child-stop":
         return _child_event(args, completed=True)
+    if args.command == "runtime-exec":
+        return _runtime_exec(args)
     settings = load_settings(args.repo_root, args.state_dir)
     if args.command == "serve-console":
         return _serve_console(args, settings)
@@ -1772,9 +1926,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
         if args.command == "daemon":
             # The running identity is a durable record, not terminal
-            # lore: a clean, schema-matched checkout activates (or the
-            # attempt is durably recorded 'failed' and the prior
-            # activation stays authoritative — the safe rollback).
+            # lore. The daemon never self-activates over an existing
+            # activation (that would silently undo a rollback): it
+            # bootstraps one only when none exists, confirms a match,
+            # and journals a daemon.started event either way — the
+            # exact health signal the apply protocol verifies.
             activation = None
             with suppress(Exception):
                 from hermes_orchestrator.activation import RuntimeActivator
@@ -1782,9 +1938,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 activation = RuntimeActivator(
                     runtime.database,
                     events=EventStore(runtime.database),
-                ).activate(
-                    checkout_root=settings.repo_root,
+                ).confirm_startup(
+                    checkout_root=_code_checkout_root(),
                     binary_path=Path(sys.argv[0]).resolve(),
+                    pid=os.getpid(),
                 )
             supervisor = asyncio.run(
                 _run_daemon(
