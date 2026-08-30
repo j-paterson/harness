@@ -1,4 +1,34 @@
-# INFRA-186 delegation plan
+# INFRA-186 delegation plan — v2
+
+Plan v2, authored and signed by the selected lead after the
+authoritative Linear refresh of 2026-08-30T01:48Z (wake
+`66aae39c7af240eba590aa8c32538adb`): **lead identity** session
+`5158cb1c-4ff8-41be-a686-5ace1a81e2a2`, profile `max-c`, model Fable
+(the most competent currently available lead model, selected
+independent of implementation cost). Worker routing under v2 begins
+only from this frozen version.
+
+## v2 delta: trusted verification receipts
+
+Focused test execution must produce a Hermes-owned, content-addressed
+verification receipt — bound to the exact tree/dirty-patch hash,
+normalized gate id and command, dependency/lockfile hashes, runner
+fingerprint, exit code, test counts, duration, and output hash;
+attestable by the runner, never authored by a model. Receipts are
+reused while fresh, invalidated on tree/dependency/command/
+environment/runner change, wave integration reruns only affected
+cross-packet gates, candidate readiness runs the mandatory complete
+gate once and publishes its final receipt, and Sol consumes receipts
+and reruns only adversarial, affected, or missing/stale checks.
+
+New packets: **P8** (Sonnet, wave 3-parallel; fully disjoint) — the
+`verification_receipts` migration 0046 plus the `verifier.py` trusted
+runner and validation; **P9** (lead-integrated after P5 returns, since
+it extends P5's files) — receipt hooks in the candidate gate and
+wave-gate selection. **Invalidation assessment**: no unstarted packet
+is affected — P5/P6 were reserved before v2 and their scope is
+unchanged (the receipt hook lands as P9 on top of P5's seams); P1–P4,
+P7 are accepted and untouched by the delta.
 
 Assignment `3d251e70268e491eb2b597a08969a3df` (exactly-ACKed). The
 Fable lead orchestrates; implementation is delegated to the smallest
