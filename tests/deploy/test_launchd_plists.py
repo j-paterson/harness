@@ -251,6 +251,10 @@ class TestStandardInventory:
             )
 
     def test_orchestrator_shape(self) -> None:
+        """INFRA-195: the supervised job execs the durable active
+        activation via runtime-exec, so launchd owns lifetime while
+        the activation ledger owns which checkout runs."""
+
         orchestrator = make_inventory()[0]
         assert orchestrator.program_arguments == (
             str(BINARY),
@@ -258,13 +262,13 @@ class TestStandardInventory:
             str(CONFIG_REPO),
             "--state-dir",
             str(STATE_DIR),
-            "daemon",
+            "runtime-exec",
             "--interval",
             "30",
         )
         assert orchestrator.listener is None
         assert orchestrator.depends_on == ()
-        assert orchestrator.entrypoint_subcommand == "daemon"
+        assert orchestrator.entrypoint_subcommand == "runtime-exec"
         assert orchestrator.log_dir == LOG_DIR
 
     def test_operations_shape(self) -> None:

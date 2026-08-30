@@ -25,6 +25,7 @@ class EligibleProfileCommand(JsonCommand):
             "loggedIn": True,
             "authMethod": "claude.ai",
             "apiProvider": "firstParty",
+            "subscriptionType": "max",
             "email": "must-not-be-persisted@example.test",
         }
 

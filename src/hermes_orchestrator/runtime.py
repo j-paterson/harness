@@ -38,6 +38,7 @@ from hermes_orchestrator.cmux_surfaces import (
 )
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import WorktreeGit
@@ -48,6 +49,7 @@ from hermes_orchestrator.github import (
 )
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.keychain import Keychain
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_intake import (
     LeadIntakeRouter,
     LeadIntakeTransport,
@@ -174,6 +176,7 @@ class Runtime:
     lead_intake: LeadIntakeRouter | None = None
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
+    control_operations: ControlOperations | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -275,6 +278,8 @@ def open_runtime(
         checkpoints = CheckpointRequests(database, events)
         resets = ScheduledResets(database, events)
         lead_wakes = LeadTerminalWakes(database=database, events=events)
+        lead_assignments = LeadAssignments(database, events=events)
+        control_operations = ControlOperations(database, events=events)
         cmux_bindings = CmuxSurfaceBindings(database=database, events=events)
         queue = QueueService(database, events, settings.projects)
         worktree_git = WorktreeGit()
@@ -453,9 +458,12 @@ def open_runtime(
                     bindings=cmux_bindings,
                     capabilities=channel_capabilities,
                     socket_path=hub_socket_path(settings.state_dir),
+                    control=control_operations,
                 )
                 channel_router = ChannelPacketRouter(channel_hub)
                 channel_router.attach(lead_wakes)
+                channel_router.attach(lead_assignments)
+                channel_router.attach(control_operations)
                 channel_router.attach(merge_flow.outbox)
                 node_binary = shutil.which("node")
                 channel_launcher = (
@@ -482,6 +490,7 @@ def open_runtime(
                     # logged-in first-party Max subscription.
                     auth_probe=lambda alias: probe.check(alias).eligible,
                     channel_launch=channel_launcher,
+                    control=control_operations,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,
@@ -541,6 +550,7 @@ def open_runtime(
                     and cmux_seater is not None
                 ),
                 decisions=OperatorDecisions(database),
+                assignments=lead_assignments,
             )
             dispatch = cells.dispatch
 
@@ -595,6 +605,7 @@ def open_runtime(
             lead_intake=lead_intake,
             channel_hub=channel_hub,
             channel_capabilities=channel_capabilities,
+            control_operations=control_operations,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

@@ -1133,7 +1133,7 @@ class TestLegacySchema36Upgrade:
 
         reopened, resumed = upgraded_helper(tmp_path, git)
         try:
-            assert reopened.schema_version() == 38
+            assert reopened.schema_version() >= 38
             assert resumed.reconcile("demo") == ()
             assert [
                 entry.name

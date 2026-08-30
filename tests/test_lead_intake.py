@@ -28,6 +28,8 @@ LEAD = CmuxSurfaceRef(
 )
 WAKE_ID = "a" * 32
 CORRECTION_ID = "b" * 32
+ASSIGNMENT_ID = "c" * 32
+OPERATION_ID = "d" * 32
 
 
 @pytest.fixture
@@ -264,6 +266,102 @@ async def test_post_stop_race_wakes_through_polling_not_injection(
     )
     assert await restarted.tick() == ()
     assert port.signals == []
+
+
+def seed_assignment(database: Database) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_assignments("
+            "assignment_id, schema_version, project_key, issue_id, "
+            "cell_id, session_id, profile_alias, instruction_id, "
+            "queue_transition, state, created_at, updated_at, "
+            "acknowledged_at) VALUES (?, 1, 'demo', 'ENG-9', "
+            "'cell-demo', ?, 'max-b', 'chat-ENG-9', "
+            "'queued->in_development', 'published', ?, ?, NULL)",
+            (ASSIGNMENT_ID, SESSION, NOW.isoformat(), NOW.isoformat()),
+        )
+
+
+def test_the_poll_offers_a_published_assignment_and_ack_settles_it(
+    database: Database,
+) -> None:
+    """INFRA-195: the fallback drain offers the assignment envelope,
+    and the lead's exact acknowledgement settles both the delivery row
+    and the assignment ledger in one transaction."""
+
+    seed_active_cell(database)
+    seed_assignment(database)
+    poll = LeadIntakePoll(database=database)
+
+    offer = poll.next_offer(SESSION)
+
+    assert offer is not None
+    assert offer.kind == "HERMES_ASSIGNMENT_READY"
+    assert offer.envelope == f"HERMES_ASSIGNMENT_READY {ASSIGNMENT_ID}"
+    assert poll.acknowledge(
+        session_id=SESSION,
+        packet_id=offer.packet_id,
+        offer_token=offer.offer_token,
+    )
+    state = database.scalar(
+        "SELECT state FROM lead_assignments WHERE assignment_id = ?",
+        (ASSIGNMENT_ID,),
+    )
+    assert str(state) == "acknowledged"
+    # Settled means gone: nothing further is offered.
+    assert poll.next_offer(SESSION) is None
+
+
+def test_the_poll_offers_a_control_operation_and_ack_settles_it(
+    database: Database,
+) -> None:
+    seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, reason, state, "
+            "created_at, updated_at, acknowledged_at) VALUES "
+            "(?, 1, 'channel.replayed', 'demo', 'cell-demo', ?, "
+            "'channel.replayed:' || ?, '{\"replay_count\": 0}', NULL, "
+            "'published', ?, ?, NULL)",
+            (OPERATION_ID, SESSION, SESSION, NOW.isoformat(), NOW.isoformat()),
+        )
+    poll = LeadIntakePoll(database=database)
+
+    offer = poll.next_offer(SESSION)
+
+    assert offer is not None
+    assert offer.envelope == f"HERMES_CONTROL_READY {OPERATION_ID}"
+    assert poll.acknowledge(
+        session_id=SESSION,
+        packet_id=offer.packet_id,
+        offer_token=offer.offer_token,
+    )
+    state = database.scalar(
+        "SELECT state FROM control_operations WHERE operation_id = ?",
+        (OPERATION_ID,),
+    )
+    assert str(state) == "acknowledged"
+    assert poll.next_offer(SESSION) is None
+
+
+@pytest.mark.asyncio
+async def test_the_router_announces_a_published_assignment_once(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    seed_active_cell(database)
+    seed_assignment(database)
+    seat(bindings)
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    announced = await router.tick()
+
+    assert ASSIGNMENT_ID in announced
+    assert ASSIGNMENT_ID not in await router.tick()
 
 
 @pytest.mark.asyncio
@@ -813,3 +911,36 @@ class TestManualEmergencySignal:
                 session_id=SESSION,
             )
         assert port.signals == []
+
+
+@pytest.mark.asyncio
+async def test_the_router_fails_closed_residual_deliveries(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """A non-terminal delivery row whose packet was consumed through
+    another path is durable residue: the tick supersedes it against
+    the packet ledger so it can never be offered again."""
+
+    seed_active_cell(database)
+    seed_assignment(database)
+    seat(bindings)
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+    assert ASSIGNMENT_ID in await router.tick()  # row becomes 'announced'
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_assignments SET state = 'acknowledged' "
+            "WHERE assignment_id = ?",
+            (ASSIGNMENT_ID,),
+        )
+
+    await router.tick()
+
+    state = database.scalar(
+        "SELECT state FROM lead_intake_deliveries WHERE packet_id = ?",
+        (ASSIGNMENT_ID,),
+    )
+    assert str(state) == "superseded"
+    assert LeadIntakePoll(database=database).next_offer(SESSION) is None

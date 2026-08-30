@@ -28,6 +28,7 @@ from hermes_orchestrator.cmux import (
     CmuxError,
     CmuxSurfaceRef,
 )
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 
@@ -1249,6 +1250,7 @@ class CmuxLeadSeater:
         profile_dirs: ProfileDirectory,
         auth_probe: Callable[[str], bool] | None = None,
         channel_launch: ChannelLaunchSource | None = None,
+        control: ControlOperations | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
@@ -1256,6 +1258,7 @@ class CmuxLeadSeater:
         self._profile_dirs = profile_dirs
         self._auth_probe = auth_probe
         self._channel_launch = channel_launch
+        self._control = control
 
     async def ensure(
         self,
@@ -1320,12 +1323,14 @@ class CmuxLeadSeater:
         except (KeyError, ValueError):
             return None
         if classic_command is not None and self._channel_launch is not None:
-            # Best-effort channel attachment for the new pane: the
-            # session-scoped config and capability are generated under
-            # the private state directory and only the sanitized
-            # extension grammar can carry them. Any launcher failure
-            # falls back to the plain classic command — a seat without
-            # its channel still drains through the Stop-hook poll.
+            # Channel attachment for the new pane: the session-scoped
+            # config and capability are generated under the private
+            # state directory and only the sanitized extension grammar
+            # can carry them. A launcher failure still falls back to
+            # the plain classic command — a seat without its channel
+            # drains through the Stop-hook poll — but never silently:
+            # one durable, actionable channel.blocked receipt records
+            # exactly why the channel is absent.
             try:
                 config = self._channel_launch.generate(
                     project_key=project_key,
@@ -1339,8 +1344,23 @@ class CmuxLeadSeater:
                     resume="--resume" in classic_command,
                     channel_config=config,
                 )
-            except Exception:
-                pass
+            except Exception as error:
+                if self._control is not None:
+                    with suppress(Exception):
+                        self._control.record(
+                            kind="channel.blocked",
+                            project_key=project_key,
+                            cell_id=cell_id,
+                            session_id=session_id,
+                            result={"launcher_error": str(error)[:200]},
+                            reason=(
+                                "the channel config could not be "
+                                "generated for this seat; the lead "
+                                "runs channel-less on the Stop-hook "
+                                "drain until hooks or the sidecar "
+                                "build are repaired"
+                            ),
+                        )
         bound = await _activate_lead_seat(
             self._port,
             self._bindings,

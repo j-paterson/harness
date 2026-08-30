@@ -19,6 +19,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.operator_decisions import OperatorDecisions
@@ -2941,6 +2942,64 @@ async def test_classic_seat_dispatch_never_spawns_a_stream_shadow(
         "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
     )
     assert str(cell_state) == "active"
+
+
+@pytest.mark.asyncio
+async def test_classic_dispatch_commits_a_bound_assignment_packet(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-195: the queue transition and the versioned assignment
+    packet commit in one transaction, bound to the exact project,
+    issue, cell, session, profile, instruction id, and transition; a
+    re-dispatch is a durable no-op with no duplicate packet."""
+
+    class RecordingSeater:
+        async def ensure(self, **identity: object) -> object:
+            return object()
+
+    events = EventStore(database)
+    assignments = LeadAssignments(database, events=events)
+    committed: list[object] = []
+    assignments.subscribe(committed.append)
+    admit(queue, "ENG-9")
+    service = ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        surfaces=RecordingSeater(),
+        classic_seats=True,
+        assignments=assignments,
+    )
+
+    result = await service.dispatch("ENG-9")
+
+    assert result.status == "seated"
+    [packet] = assignments.pending_for_session(str(SESSION_ID))
+    assert packet.project_key == "demo"
+    assert packet.issue_id == "ENG-9"
+    assert packet.cell_id == "cell-demo"
+    assert packet.profile_alias == "max-a"
+    assert packet.instruction_id == "chat-ENG-9"
+    assert packet.queue_transition == "queued->in_development"
+    assert committed == [packet]
+
+    again = await service.dispatch("ENG-9")
+
+    assert again.status == "seated"
+    assert database.scalar("SELECT COUNT(*) FROM lead_assignments") == 1
+    assert committed == [packet]
 
 
 @pytest.mark.asyncio

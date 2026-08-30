@@ -135,12 +135,33 @@ def test_probe_rejects_bedrock_even_when_logged_in(registry: ProfileRegistry) ->
     assert "CLAUDE_CODE_USE_BEDROCK" not in command.calls[0][1]
 
 
+def test_a_non_max_subscription_is_not_a_preserved_identity(
+    registry: ProfileRegistry,
+) -> None:
+    """INFRA-195: the profile identity Hermes preserves is exactly a
+    first-party Claude Max login; anything else is ineligible."""
+
+    command = RecordingCommand(
+        {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "pro",
+        }
+    )
+
+    health = ClaudeProfileProbe(registry, command, base_env={}).check("max-a")
+
+    assert health.eligible is False
+
+
 def test_probe_keeps_only_redacted_health_state(registry: ProfileRegistry) -> None:
     command = RecordingCommand(
         {
             "loggedIn": True,
             "authMethod": "claude.ai",
             "apiProvider": "firstParty",
+            "subscriptionType": "max",
             "account": {"email": "must-not-be-stored@example.com"},
         }
     )

@@ -15,6 +15,51 @@ _FORBIDDEN_MARKERS = ("token", "password", "api_key", "secret", "keychain", "sig
 
 _ORCHESTRATOR_LABEL = "com.josystem.hermes-orchestrator"
 _OPERATIONS_LABEL = "com.josystem.hermes-operations"
+# The supervised jobs' public labels: the activation apply protocol
+# restarts and health-verifies BOTH as one fleet.
+ORCHESTRATOR_LABEL = _ORCHESTRATOR_LABEL
+OPERATIONS_LABEL = _OPERATIONS_LABEL
+
+BOOTSTRAP_FILENAME = "hermes-bootstrap"
+
+# launchd provides a minimal environment; the rendered bootstrap pins
+# the operator PATH the runtime needs (claude, uv, codex, git).
+BOOTSTRAP_PATH = (
+    "/Applications/Codex.app/Contents/Resources:"
+    "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+    "/usr/bin:/bin:/usr/sbin:/sbin"
+)
+
+
+def render_bootstrap(
+    *,
+    uv_binary: PurePosixPath,
+    config_repo: PurePosixPath,
+    state_dir: PurePosixPath,
+) -> str:
+    """Render the durable, worktree-independent launchd entry script.
+
+    The script reads the derived ACTIVE pointer the activator maintains
+    beside the immutable runtime artifacts (the WAL state database is
+    not shell-readable; runtime-exec re-resolves the durable ledger
+    read-only anyway) and execs the CLI from that artifact; with no
+    activation yet, the durable config clone is the bootstrap fallback.
+    It never references any disposable issue worktree.
+    """
+
+    return (
+        "#!/bin/sh\n"
+        "# Rendered by hermes-orchestrator deploy-render; installed by\n"
+        "# deploy-install. Do not edit by hand.\n"
+        f"export PATH={BOOTSTRAP_PATH}\n"
+        f'ACTIVE=$(cat "{state_dir}/runtimes/ACTIVE" 2>/dev/null || true)\n'
+        f'PROJECT="{config_repo}"\n'
+        'if [ -n "$ACTIVE" ] && [ -f "$ACTIVE/pyproject.toml" ]; then\n'
+        '  PROJECT="$ACTIVE"\n'
+        "fi\n"
+        f'exec {uv_binary} run --project "$PROJECT" hermes-orchestrator '
+        '"$@"\n'
+    )
 
 
 class UnsafeServiceSpec(Exception):
@@ -122,11 +167,16 @@ def standard_inventory(
     )
     orchestrator = ServiceSpec(
         label=_ORCHESTRATOR_LABEL,
-        program_arguments=(*common, "daemon", "--interval", "30"),
+        # The externally supervised job resolves the durable active
+        # runtime activation and execs the daemon from that exact
+        # checkout (INFRA-195): launchd owns the process lifetime,
+        # while which code runs is decided by the validated activation
+        # ledger, never by which pane or worktree launched something.
+        program_arguments=(*common, "runtime-exec", "--interval", "30"),
         working_directory=state_dir,
         log_dir=log_dir,
         listener=None,
-        entrypoint_subcommand="daemon",
+        entrypoint_subcommand="runtime-exec",
     )
     operations = ServiceSpec(
         label=_OPERATIONS_LABEL,

@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
 from hermes_orchestrator.deploy.launchd import (
+    BOOTSTRAP_FILENAME,
     ServiceSpec,
     render_newsyslog_conf,
     render_plist,
@@ -147,17 +148,27 @@ def plan_install(
     launch_agents_dir: PurePosixPath,
     uid: int,
     console_port: int,
+    bootstrap_target: PurePosixPath | None = None,
+    bootstrap_identity: str | None = None,
 ) -> tuple[CommandStep, ...]:
     del console_port  # serve exposure moved to plan_serve_enable
     steps: list[CommandStep] = []
+    if bootstrap_target is not None and bootstrap_identity is None:
+        raise ValueError(
+            "a bootstrap install requires its plan-time identity"
+        )
     for spec in inventory:
+        # With a bootstrap in the plan, the entrypoint proof runs the
+        # RENDERED bootstrap (the exact bytes about to be installed),
+        # so every probe still precedes every mutation.
+        entry = (
+            str(rendered_dir / BOOTSTRAP_FILENAME)
+            if bootstrap_target is not None
+            else str(spec.program_arguments[0])
+        )
         steps.append(
             CommandStep(
-                argv=(
-                    str(spec.program_arguments[0]),
-                    spec.entrypoint_subcommand,
-                    "--help",
-                ),
+                argv=(entry, spec.entrypoint_subcommand, "--help"),
                 kind="probe",
                 code="probe_entrypoint",
             )
@@ -194,6 +205,39 @@ def plan_install(
     steps.append(
         CommandStep(funnel_status_argv(), kind="probe", code="probe_funnel_state")
     )
+    if bootstrap_target is not None:
+        installed_bootstrap = str(bootstrap_target)
+        # Content-idempotent ownership: absent installs; present with
+        # the exact rendered identity is already ours and reinstalls
+        # the same bytes; any other content refuses fail-closed so a
+        # failed attempt can never clobber a prior operable bootstrap.
+        steps.append(
+            CommandStep(
+                argv=("shasum", "-a", "256", installed_bootstrap),
+                kind="probe",
+                code="probe_bootstrap_state",
+                identity=bootstrap_identity,
+            )
+        )
+        steps.append(
+            CommandStep(
+                argv=(
+                    "cp",
+                    str(rendered_dir / BOOTSTRAP_FILENAME),
+                    installed_bootstrap,
+                ),
+                kind="mutate",
+                code="mutate_install_bootstrap",
+                compensation_argv=("rm", installed_bootstrap),
+                compensation_code="compensate_remove_bootstrap",
+                reconcile_argv=("test", "-e", installed_bootstrap),
+                reconcile_code="reconcile_install_bootstrap",
+                resource=installed_bootstrap,
+                identity=bootstrap_identity,
+                identity_argv=("shasum", "-a", "256", installed_bootstrap),
+                identity_code="identity_install_bootstrap",
+            )
+        )
     for spec in inventory:
         installed = _installed_plist(launch_agents_dir, spec)
         # The exact bytes this plan installs are pure renderer output, so
@@ -333,6 +377,13 @@ def _step_refusal(
         if normalized not in _FUNNEL_OFF_MARKERS:
             return "funnel_state_uncertain"
         return None
+    if step.code == "probe_bootstrap_state":
+        if result.returncode != 0:
+            return None  # absent: this attempt may install it
+        observed = result.stdout.split()[0] if result.stdout.split() else ""
+        if observed == step.identity:
+            return None  # already exactly ours: reinstalling is a no-op
+        return "bootstrap_conflict"
     if step.code == "probe_plist_absent":
         outcome = _classify_absence_probe(step.argv, result)
         if outcome == "present":
@@ -881,10 +932,21 @@ def _render_runbook(
 
 
 def render_artifacts(
-    inventory: Sequence[ServiceSpec], output_dir: Path, *, console_port: int
+    inventory: Sequence[ServiceSpec],
+    output_dir: Path,
+    *,
+    console_port: int,
+    bootstrap: str | None = None,
 ) -> tuple[Path, ...]:
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
+    if bootstrap is not None:
+        bootstrap_path = output_dir / BOOTSTRAP_FILENAME
+        bootstrap_path.write_text(bootstrap, encoding="utf-8")
+        # cp preserves the source mode, so the executable bit installs
+        # with the file and no separate chmod mutation is needed.
+        bootstrap_path.chmod(0o755)
+        paths.append(bootstrap_path)
     for spec in inventory:
         plist_path = output_dir / f"{spec.label}.plist"
         plist_path.write_bytes(render_plist(spec))
