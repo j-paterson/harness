@@ -68,7 +68,6 @@ export class HubClient {
   private state: State = "connecting";
   private backoff = INITIAL_BACKOFF_MS;
   private recvBuffer: Buffer = Buffer.alloc(0);
-  private readonly seenEventIds = new Set<string>();
   private readonly pendingAcks = new Map<string, PendingAck>();
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -239,19 +238,28 @@ export class HubClient {
       case "event": {
         const validated = validateHubEvent(msg, this.opts.session);
         if (!validated) return false;
-        if (!this.seenEventIds.has(validated.event_id)) {
-          this.seenEventIds.add(validated.event_id);
-          // onEvent ultimately drives sending a notification to the
-          // host over MCP stdio: it must never be allowed to take the
-          // whole process down. Contain, log, and keep the socket
-          // (and the stdio channel) alive for the next event.
-          try {
-            this.opts.onEvent(validated.kind, validated.packet_id, validated.event_id);
-          } catch (err) {
-            this.safeLog(
-              `hermes-control: internal error handling event ${validated.event_id}: ${String(err)}`
-            );
-          }
+        // The sidecar is transport only: it does not deduplicate by
+        // event_id. The hub re-sends every unacknowledged event on
+        // startup replay, on each publish pass, and again after a hub
+        // restart, precisely so that a notification lost on the
+        // client side (e.g. delivered before the host's channel
+        // handler is registered) self-heals on the next resend.
+        // Suppressing re-forwards here would defeat that design and
+        // can make a wake permanently invisible while the event stays
+        // durably unacknowledged. Exactly-once effect is enforced
+        // downstream, by the durable drain's dedup and the hub's ack
+        // compare-and-set — not here.
+        //
+        // onEvent ultimately drives sending a notification to the
+        // host over MCP stdio: it must never be allowed to take the
+        // whole process down. Contain, log, and keep the socket (and
+        // the stdio channel) alive for the next event.
+        try {
+          this.opts.onEvent(validated.kind, validated.packet_id, validated.event_id);
+        } catch (err) {
+          this.safeLog(
+            `hermes-control: internal error handling event ${validated.event_id}: ${String(err)}`
+          );
         }
         return true;
       }

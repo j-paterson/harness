@@ -10,58 +10,55 @@ async function registerAndGetConn(fx: Awaited<ReturnType<typeof startFixture>>) 
   return conn;
 }
 
-test("valid event produces exactly one notification; replayed event_id is deduped", async () => {
+test("valid event produces a notification; a replayed event_id is re-forwarded, not deduped", async () => {
   const fx = await startFixture();
   try {
     await initializeSidecar(fx.sidecar);
     const conn = await registerAndGetConn(fx);
 
-    conn.send({
-      op: "event",
-      event_id: "evt-1",
-      kind: "HERMES_WORK_READY",
-      packet_id: "a".repeat(32),
-      session_id: fx.session,
-    });
+    const sendEvent = () =>
+      conn.send({
+        op: "event",
+        event_id: "evt-1",
+        kind: "HERMES_WORK_READY",
+        packet_id: "a".repeat(32),
+        session_id: fx.session,
+      });
 
-    const notif = await fx.sidecar.nextMessage(
+    sendEvent();
+
+    const notif1 = await fx.sidecar.nextMessage(
       (m) => m.method === "notifications/claude/channel"
     );
     // The client contract: a required string `content` (the bounded
     // envelope) plus identifier-keyed string meta. A missing `content`
     // is a live-proven ProtocolError that drops the whole connection.
-    assert.equal(notif.params.content, `HERMES_WORK_READY ${"a".repeat(32)}`);
-    assert.deepEqual(notif.params.meta, {
+    assert.equal(notif1.params.content, `HERMES_WORK_READY ${"a".repeat(32)}`);
+    assert.deepEqual(notif1.params.meta, {
       kind: "HERMES_WORK_READY",
       packet_id: "a".repeat(32),
       event_id: "evt-1",
     });
-    for (const key of Object.keys(notif.params)) {
+    for (const key of Object.keys(notif1.params)) {
       assert.ok(["content", "meta"].includes(key), `unexpected param ${key}`);
     }
-    for (const [key, value] of Object.entries(notif.params.meta)) {
+    for (const [key, value] of Object.entries(notif1.params.meta)) {
       assert.match(key, /^[A-Za-z0-9_]+$/);
       assert.equal(typeof value, "string");
     }
 
-    // Replay the same event_id: must not produce a second notification.
-    conn.send({
-      op: "event",
-      event_id: "evt-1",
-      kind: "HERMES_WORK_READY",
-      packet_id: "a".repeat(32),
-      session_id: fx.session,
-    });
+    // The hub re-sends every unacknowledged event on each registration and
+    // each publish pass, by design, so that a notification dropped on the
+    // client side (e.g. lost to a startup race) self-heals on the next
+    // resend. The sidecar is transport only: it must forward the replay
+    // again rather than suppress it by event_id.
+    sendEvent();
 
-    // Prove no second notification arrives by racing a ping response, which
-    // is guaranteed to come after anything already in flight.
-    fx.sidecar.send({ jsonrpc: "2.0", id: 99, method: "ping" });
-    await fx.sidecar.nextMessage((m) => m.id === 99);
-
-    await assert.rejects(
-      () => fx.sidecar.nextMessage((m) => m.method === "notifications/claude/channel", 300),
-      /timed out/
+    const notif2 = await fx.sidecar.nextMessage(
+      (m) => m.method === "notifications/claude/channel"
     );
+    assert.deepEqual(notif2.params.meta, notif1.params.meta);
+    assert.equal(notif2.params.content, notif1.params.content);
   } finally {
     await fx.teardown();
   }
