@@ -132,6 +132,31 @@ it; its structured log is the per-event record.
   executing the generation's artifact. The final apply recorded in the
   emission manifest repeats the proof at the exact candidate SHA.
 
+## 8. Live fault injection: partial fleet restart (Sol ff45468d)
+
+- A kickstart exception after target activation now enters the same
+  journaled rollback protocol as a missing health proof, with a
+  terminal-state guarantee for every post-activation exception path
+  (`TestFleetRestartExceptions`, five injected variants).
+- **Live injection, first run** (apply `97463c17579f4893b7e2b9dafc190443`):
+  the daemon restarted onto the target, the operations restart was
+  withheld by injection, and the rollback kickstart then hit a REAL
+  fault — launchd's 30-second ThrottleInterval blocked the client past
+  its timeout — so the protocol journaled **ambiguous** and raised,
+  exactly the fail-closed contract; launchd processed the queued
+  restart moments later and both chains converged on the prior
+  artifact. The throttle finding is fixed (client timeout now exceeds
+  the throttle floor) and recorded in the journal row's reason.
+- **Live injection, second run** (apply `db00ca270095449fa6e32a62050f0c72`):
+  target generation 14 activated, the daemon restarted, the injected
+  operations failure fired, and the protocol reactivated the prior
+  identity as generation 15, restarted BOTH launchd jobs, verified
+  both durable proofs (PID 99454), and recorded **rolled_back** — with
+  `ps` showing both process chains on the exact prior artifact
+  `6c9de9323a0b`. The subsequent clean apply
+  `5d6e14a509b04dd2b3873e25b3a7acfb` (generation 16) verified the
+  fixed code fleet-wide.
+
 ## Notes
 
 - Killing cmux and this model session itself was not exercised
