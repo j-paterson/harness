@@ -35,6 +35,7 @@ from hermes_orchestrator.cmux_surfaces import (
 )
 from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.control_operations import ControlOperations
+from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
@@ -527,10 +528,16 @@ async def _run_daemon(
     channel_hub: ChannelHub | None = None,
     control_operations: ControlOperations | None = None,
     activation: object | None = None,
+    dashboard_refresh: DashboardRefreshAction | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
+        if dashboard_refresh is not None:
+            # tick() contains its own failures and the pane no-ops off
+            # a TTY, so the dashboard refresh rides the maintenance
+            # slot unconditionally.
+            await dashboard_refresh.tick()
         if lead_intake is not None:
             # Restart-safe by derivation: every tick re-routes any
             # durable pending correction or wake whose envelope has
@@ -555,6 +562,7 @@ async def _run_daemon(
                 cmux_hibernation is None
                 and lead_intake is None
                 and channel_hub is None
+                and dashboard_refresh is None
             )
             else _maintenance
         ),
@@ -601,6 +609,12 @@ async def _run_daemon(
         # Deliver any envelope a crash separated from its published
         # packet before the first supervised tick.
         await lead_intake.tick()
+    if dashboard_refresh is not None:
+        # Establish the dashboard pane the moment the daemon starts (and
+        # after any restart): the pane's idempotent fresh-writer
+        # establishment is the whole recovery story, and tick() never
+        # raises.
+        await dashboard_refresh.tick()
     if once:
         try:
             await supervisor.run_once()
@@ -2465,6 +2479,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     lead_intake=runtime.lead_intake,
                     channel_hub=runtime.channel_hub,
                     control_operations=runtime.control_operations,
+                    dashboard_refresh=runtime.dashboard_refresh,
                 )
             )
             payload = {

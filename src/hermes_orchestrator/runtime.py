@@ -39,6 +39,7 @@ from hermes_orchestrator.cmux_surfaces import (
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
+from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import WorktreeGit
@@ -178,6 +179,7 @@ class Runtime:
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
     control_operations: ControlOperations | None = None
+    dashboard_refresh: DashboardRefreshAction | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -386,6 +388,7 @@ def open_runtime(
         lead_intake: LeadIntakeRouter | None = None
         channel_hub: ChannelHub | None = None
         channel_capabilities: ChannelCapabilities | None = None
+        dashboard_refresh: DashboardRefreshAction | None = None
 
         if enable_live:
             assert reader is not None
@@ -409,6 +412,14 @@ def open_runtime(
                 pool.record_health(health)
                 checked.append(health)
             profile_health = tuple(checked)
+
+            # The dashboard reads only durable rows and the loaded
+            # registry; every other collaborator stays defaulted per the
+            # Optional=None convention. Without a registry (observe
+            # mode) the field stays None: no dashboard, never a crash.
+            dashboard_refresh = DashboardRefreshAction(
+                database=database, registry=registry
+            )
 
             linear = build_linear_router(
                 settings, database=database, queue=queue, keychain=reader
@@ -609,6 +620,7 @@ def open_runtime(
             channel_hub=channel_hub,
             channel_capabilities=channel_capabilities,
             control_operations=control_operations,
+            dashboard_refresh=dashboard_refresh,
             _daemon_lock=daemon_lock,
         )
     except BaseException:
