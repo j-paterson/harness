@@ -1180,3 +1180,206 @@ class TestConsumedPacketRepair:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(sidecar.reader.readline(), timeout=0.3)
         await sidecar.close()
+
+
+def active_registration_id(database: Database, session_id: str = SESSION) -> str:
+    value = database.scalar(
+        "SELECT registration_id FROM channel_registrations "
+        "WHERE session_id = ? AND state = 'active' "
+        "ORDER BY connected_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    )
+    assert value is not None
+    return str(value)
+
+
+def registration_row(database: Database, registration_id: str) -> object:
+    row = database.execute(
+        "SELECT state, close_reason FROM channel_registrations "
+        "WHERE registration_id = ?",
+        (registration_id,),
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+def close_events(database: Database, registration_id: str) -> list[dict[str, object]]:
+    rows = database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'channel.closed' AND aggregate_id = ?",
+        (registration_id,),
+    ).fetchall()
+    return [json.loads(str(row["payload_json"])) for row in rows]
+
+
+class _DeadWriter:
+    """A minimal stand-in for a StreamWriter whose transport already
+    reports closing — used only to reproduce, deterministically, the
+    race where a new registration arrives before the hub has finished
+    processing an old peer's death (no real socket or task involved,
+    so there is nothing left to race)."""
+
+    def is_closing(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+class TestCloseReasons:
+    """INFRA-197: durable, precise lifecycle truth on every close.
+
+    ``close_reason`` used to be a single free-text 'disconnected' for
+    every closed registration, and every close was silent — no
+    journaled event. Live forensics needs to tell a peer's own
+    disconnect apart from a supersede, a dead-transport reconnect, and
+    a daemon shutdown, from the durable record alone.
+    """
+
+    async def test_a_peer_disconnect_records_disconnected_and_journals(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        sidecar = await registered_sidecar(hub, capabilities)
+        registration_id = active_registration_id(database)
+
+        await sidecar.close()
+        # The disconnect is processed by the hub's own connection task,
+        # asynchronously with respect to this test — poll for it
+        # rather than assume any particular number of loop iterations.
+        deadline = asyncio.get_event_loop().time() + 2
+        row = registration_row(database, registration_id)
+        while str(row["state"]) != "closed":
+            assert asyncio.get_event_loop().time() < deadline, (
+                "the disconnect was never processed"
+            )
+            await asyncio.sleep(0.01)
+            row = registration_row(database, registration_id)
+
+        assert str(row["close_reason"]) == "disconnected"
+        [payload] = close_events(database, registration_id)
+        assert payload == {
+            "session_id": SESSION,
+            "cell_id": "cell-demo",
+            "generation": 1,
+            "close_reason": "disconnected",
+        }
+
+    async def test_a_live_supersede_records_superseded_and_closes_the_old_writer(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        first = await registered_sidecar(hub, capabilities)
+        first_id = active_registration_id(database)
+
+        second = await registered_sidecar(hub, capabilities)
+
+        # The still-live prior transport is the one the hub itself
+        # terminates as part of the supersede.
+        await first.expect_closed()
+        row = registration_row(database, first_id)
+        assert str(row["state"]) == "superseded"
+        assert str(row["close_reason"]) == "superseded"
+        [payload] = close_events(database, first_id)
+        assert payload["close_reason"] == "superseded"
+        assert payload["session_id"] == SESSION
+        assert payload["cell_id"] == "cell-demo"
+        assert payload["generation"] == 1
+        await second.close()
+
+    async def test_a_replace_over_a_dead_transport_records_replaced_dead(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        """The common healthy reconnect: the old socket already died,
+        but the hub's own disconnect task for it has not yet run, so
+        the row is still 'active' and the hub's tracked writer is the
+        only place the transport's death is visible. Swapping in a
+        writer whose transport reports already-closing, without
+        touching the real connection or its task at all, reproduces
+        this exact race deterministically instead of depending on
+        socket-close scheduling."""
+
+        seat(bindings)
+        first = await registered_sidecar(hub, capabilities)
+        first_id = active_registration_id(database)
+
+        hub._connections[SESSION] = _DeadWriter()  # type: ignore[assignment]
+
+        second = await registered_sidecar(hub, capabilities)
+
+        row = registration_row(database, first_id)
+        assert str(row["state"]) == "superseded"
+        assert str(row["close_reason"]) == "replaced_dead"
+        [payload] = close_events(database, first_id)
+        assert payload["close_reason"] == "replaced_dead"
+        assert payload["session_id"] == SESSION
+
+        await second.close()
+        await first.close()
+
+    async def test_stop_marks_open_registrations_hub_stopped_then_unlinks(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        await registered_sidecar(hub, capabilities)
+        registration_id = active_registration_id(database)
+
+        await hub.stop()
+
+        row = registration_row(database, registration_id)
+        assert str(row["state"]) == "closed"
+        assert str(row["close_reason"]) == "hub_stopped"
+        [payload] = close_events(database, registration_id)
+        assert payload["close_reason"] == "hub_stopped"
+        assert not hub.socket_path.exists()
+
+    async def test_pending_events_replay_after_a_superseded_close(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        seed_packets(database)
+        await hub.publish(
+            kind="HERMES_CORRECTION_READY",
+            packet_id=CORRECTION_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+        first = await registered_sidecar(hub, capabilities)
+        pending = await first.receive()
+        assert pending["packet_id"] == CORRECTION_ID
+
+        second = await registered_sidecar(hub, capabilities)
+        await first.expect_closed()
+
+        replayed = await second.receive()
+        assert replayed["event_id"] == pending["event_id"]
+        assert replayed["packet_id"] == CORRECTION_ID
+
+        close_reason = database.scalar(
+            "SELECT close_reason FROM channel_registrations "
+            "WHERE session_id = ? AND state = 'superseded'",
+            (SESSION,),
+        )
+        assert str(close_reason) == "superseded"
+        await second.close()

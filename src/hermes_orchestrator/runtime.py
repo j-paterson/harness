@@ -214,6 +214,46 @@ def cmux_password_source(
     return read
 
 
+def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
+    """Resolve the hermes-control sidecar's launch entry point.
+
+    The sidecar build (``channels/hermes-control/dist/``) is compiled
+    JS output that Git never tracks, so a plain ``repo_root`` checkout
+    may carry none — the historical location the daemon has always
+    launched from when it runs directly out of a checkout. Runtime
+    activation (see ``activation.materialize_artifact``) now copies a
+    proven sidecar build into every immutable runtime artifact, so the
+    ACTIVE artifact's own build — read via the ``runtimes/ACTIVE``
+    pointer the same way the shell bootstrap does — is preferred when
+    it exists. A resolution where neither path exists is not itself an
+    error here: the caller's
+    ``shutil.which("node")`` guard and ultimately
+    :class:`~hermes_orchestrator.channel_hub.ChannelLauncher` still
+    fail closed exactly as before when the resolved path is not a
+    real file.
+    """
+
+    fallback = (
+        repo_root / "channels" / "hermes-control" / "dist" / "src" / "main.js"
+    )
+    pointer = state_dir / "runtimes" / "ACTIVE"
+    try:
+        recorded = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback
+    if not recorded:
+        return fallback
+    candidate = (
+        Path(recorded)
+        / "channels"
+        / "hermes-control"
+        / "dist"
+        / "src"
+        / "main.js"
+    )
+    return candidate if candidate.is_file() else fallback
+
+
 def build_linear_router(
     settings: Settings,
     *,
@@ -474,9 +514,9 @@ def open_runtime(
                     else ChannelLauncher(
                         state_dir=settings.state_dir,
                         capabilities=channel_capabilities,
-                        sidecar_entry=(
-                            settings.repo_root
-                            / "channels/hermes-control/dist/src/main.js"
+                        sidecar_entry=resolve_sidecar_entry(
+                            repo_root=settings.repo_root,
+                            state_dir=settings.state_dir,
                         ),
                         node_binary=Path(node_binary),
                     )

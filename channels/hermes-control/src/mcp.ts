@@ -1,5 +1,5 @@
 import readline from "node:readline";
-import { validateAckArgs } from "./validate.js";
+import { composeNotificationContent, validateAckArgs } from "./validate.js";
 import type { HubClient } from "./hub-client.js";
 
 const SERVER_NAME = "hermes-control";
@@ -37,52 +37,94 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 export class McpServer {
   private readonly hub: HubClient;
   private readonly onLog: (message: string) => void;
+  private readonly writeLine: (line: string) => void;
   private rl: readline.Interface | null = null;
 
-  constructor(hub: HubClient, onLog: (message: string) => void) {
+  constructor(
+    hub: HubClient,
+    onLog: (message: string) => void,
+    writeLine: (line: string) => void = (line) => {
+      process.stdout.write(line);
+    }
+  ) {
     this.hub = hub;
     this.onLog = onLog;
+    this.writeLine = writeLine;
   }
 
   start(onStdioClosed: () => void): void {
     this.rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
     this.rl.on("line", (line: string) => {
-      this.handleLine(line);
+      // A throw anywhere in request handling must never take the
+      // whole stdio connection (and with it, the host's only wake
+      // channel) down. Contain it, log it, and keep serving.
+      try {
+        this.handleLine(line);
+      } catch (err) {
+        this.safeLog(`hermes-control: internal error handling client message: ${String(err)}`);
+      }
     });
     // Fail closed with the host: once the MCP stdio pipe is gone the
     // channel cannot reach Claude, so lingering would only hold a live
     // hub registration that masks the outage. Exiting drops the hub
     // socket, closes the registration, and lets pending packets fall
-    // back to the Stop-hook poll.
+    // back to the Stop-hook poll. This is the ONLY exit path left in
+    // the sidecar.
     this.rl.on("close", onStdioClosed);
     process.stdin.on("error", onStdioClosed);
     process.stdout.on("error", onStdioClosed);
   }
 
   notifyChannelEvent(kind: string, packetId: string, eventId: string): void {
-    // The client contract for notifications/claude/channel requires a
-    // string `content` plus optional string-valued `meta` whose keys
-    // are identifiers (anything else is dropped, and a missing
-    // `content` is a ProtocolError that kills the stdio connection —
-    // the exact live failure this shape now prevents). `content` is
-    // the bounded envelope and nothing more; meta carries the ids the
-    // lead needs to fetch the durable packet and call the ACK tool.
-    this.writeMessage({
-      jsonrpc: "2.0",
-      method: "notifications/claude/channel",
-      params: {
-        content: `${kind} ${packetId}`,
-        meta: {
-          kind,
-          packet_id: packetId,
-          event_id: eventId,
+    try {
+      // The client contract for notifications/claude/channel requires
+      // a string `content` plus optional string-valued `meta` whose
+      // keys are identifiers (anything else is dropped, and a missing
+      // or malformed `content` is a ProtocolError that kills the
+      // whole stdio connection — a live-observed failure). Validate
+      // the exact envelope grammar before ever composing the message:
+      // a hub event that would violate it is logged and dropped here
+      // rather than sent, and — since the sidecar never auto-acks —
+      // it stays pending and replayable on the hub side rather than
+      // being lost.
+      const content = composeNotificationContent(kind, packetId);
+      if (content === null) {
+        this.safeLog(
+          `hermes-control: refusing to send malformed channel notification for event ${eventId} ` +
+            `(kind=${JSON.stringify(kind)}, packet_id=${JSON.stringify(packetId)}); leaving it unacknowledged`
+        );
+        return;
+      }
+
+      this.writeMessage({
+        jsonrpc: "2.0",
+        method: "notifications/claude/channel",
+        params: {
+          content,
+          meta: {
+            kind,
+            packet_id: packetId,
+            event_id: eventId,
+          },
         },
-      },
-    });
+      });
+    } catch (err) {
+      this.safeLog(
+        `hermes-control: internal error sending channel notification for event ${eventId}: ${String(err)}`
+      );
+    }
+  }
+
+  private safeLog(message: string): void {
+    try {
+      this.onLog(message);
+    } catch {
+      // Best-effort logging only.
+    }
   }
 
   private writeMessage(msg: unknown): void {
-    process.stdout.write(JSON.stringify(msg) + "\n");
+    this.writeLine(JSON.stringify(msg) + "\n");
   }
 
   private writeResult(id: unknown, result: unknown): void {
@@ -230,12 +272,16 @@ export class McpServer {
         }
       })
       .catch((err: unknown) => {
-        this.onLog(`mcp: unexpected error during ack: ${String(err)}`);
-        if (hasId) {
-          this.writeResult(id, {
-            content: [{ type: "text", text: "internal error while acknowledging" }],
-            isError: true,
-          });
+        this.safeLog(`hermes-control: unexpected error during ack: ${String(err)}`);
+        try {
+          if (hasId) {
+            this.writeResult(id, {
+              content: [{ type: "text", text: "internal error while acknowledging" }],
+              isError: true,
+            });
+          }
+        } catch (writeErr) {
+          this.safeLog(`hermes-control: internal error reporting ack failure: ${String(writeErr)}`);
         }
       });
   }

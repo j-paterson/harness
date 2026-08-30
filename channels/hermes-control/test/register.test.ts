@@ -61,8 +61,12 @@ test("a transient refusal retries registration with a fresh capability read", as
   }
 });
 
-test("a terminal refusal exits the sidecar with no reconnect", async () => {
-  const fx = await startFixture();
+test("a terminal refusal parks instead of exiting: MCP stdio stays alive and registration keeps retrying on the slow cadence", async () => {
+  // The host never respawns a dead stdio MCP server mid-session, so an
+  // exit here would permanently sever the channel for the rest of the
+  // session. A terminal refusal must park instead: stay alive, keep
+  // stdio fully responsive, and keep retrying registration.
+  const fx = await startFixture({ HERMES_CONTROL_PARK_RETRY_MS: "50" });
   try {
     await initializeSidecar(fx.sidecar);
 
@@ -70,15 +74,105 @@ test("a terminal refusal exits the sidecar with no reconnect", async () => {
     await conn.waitForLine((m) => m.op === "register");
     conn.send({ op: "refused", reason: "stale binding generation" });
 
-    // This process belongs to a superseded seat generation: no retry
-    // can cure it, so it exits and the host surfaces the failed
-    // server while the hub's durable blocked receipt carries recovery.
-    const deadline = Date.now() + 3000;
-    while (fx.sidecar.child.exitCode === null && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    assert.notEqual(fx.sidecar.child.exitCode, null);
-    assert.equal(fx.hub.connections.length, 1);
+    // The MCP server must remain fully responsive while parked.
+    fx.sidecar.send({ jsonrpc: "2.0", id: 501, method: "ping" });
+    const pong = await fx.sidecar.nextMessage((m) => m.id === 501);
+    assert.deepEqual(pong.result, {});
+    assert.equal(fx.sidecar.child.exitCode, null);
+
+    // It keeps retrying registration on the slow cadence with no
+    // manual reconnect, re-reading the capability each attempt.
+    const second = await fx.hub.nextConnection();
+    const reregister = await second.waitForLine((m) => m.op === "register");
+    assert.equal(reregister.capability, fx.capability);
+
+    assert.equal(fx.sidecar.child.exitCode, null);
+
+    const stderrText = fx.sidecar.stderr.join("");
+    assert.match(stderrText, /park/i);
+  } finally {
+    await fx.teardown();
+  }
+});
+
+test("a second terminal refusal while parked stays parked: no exit, no fast-backoff storm", async () => {
+  const fx = await startFixture({ HERMES_CONTROL_PARK_RETRY_MS: "80" });
+  try {
+    await initializeSidecar(fx.sidecar);
+
+    const first = await fx.hub.nextConnection();
+    await first.waitForLine((m) => m.op === "register");
+    first.send({ op: "refused", reason: "stale binding generation" });
+
+    const second = await fx.hub.nextConnection();
+    await second.waitForLine((m) => m.op === "register");
+    second.send({ op: "refused", reason: "unsupported protocol version" });
+
+    // Wait several multiples of the slow cadence. A fast-backoff storm
+    // (the 250ms-doubling reconnect path) would produce far more
+    // connections in this window than the slow cadence would.
+    await new Promise((resolve) => setTimeout(resolve, 80 * 4));
+    assert.ok(
+      fx.hub.connections.length <= 5,
+      `expected a slow trickle of reconnects while parked, got ${fx.hub.connections.length}`
+    );
+    assert.equal(fx.sidecar.child.exitCode, null);
+  } finally {
+    await fx.teardown();
+  }
+});
+
+test("after parking, a subsequent successful registration restores normal event flow", async () => {
+  const fx = await startFixture({ HERMES_CONTROL_PARK_RETRY_MS: "50" });
+  try {
+    await initializeSidecar(fx.sidecar);
+
+    const first = await fx.hub.nextConnection();
+    await first.waitForLine((m) => m.op === "register");
+    first.send({ op: "refused", reason: "stale binding generation" });
+
+    const second = await fx.hub.nextConnection();
+    await second.waitForLine((m) => m.op === "register");
+    second.send({ op: "registered", proto: 1 });
+
+    const packetId = "a".repeat(32);
+    second.send({
+      op: "event",
+      event_id: "evt-park-1",
+      kind: "HERMES_WORK_READY",
+      packet_id: packetId,
+      session_id: fx.session,
+    });
+
+    const notif = await fx.sidecar.nextMessage(
+      (m) => m.method === "notifications/claude/channel"
+    );
+    assert.equal(notif.params.content, `HERMES_WORK_READY ${packetId}`);
+
+    fx.sidecar.send({
+      jsonrpc: "2.0",
+      id: 502,
+      method: "tools/call",
+      params: {
+        name: "hermes_acknowledge_intake",
+        arguments: { packet_id: packetId, event_id: "evt-park-1" },
+      },
+    });
+
+    const ackLine = await second.waitForLine((m) => m.op === "ack");
+    assert.deepEqual(ackLine, {
+      op: "ack",
+      event_id: "evt-park-1",
+      packet_id: packetId,
+      session_id: fx.session,
+    });
+    second.send({ op: "ack_ok", event_id: "evt-park-1" });
+
+    const resp = await fx.sidecar.nextMessage((m) => m.id === 502);
+    assert.equal(resp.result.isError, undefined);
+    assert.deepEqual(resp.result.content, [
+      { type: "text", text: "acknowledged evt-park-1" },
+    ]);
   } finally {
     await fx.teardown();
   }

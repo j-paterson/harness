@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import uuid
 from collections.abc import Callable
@@ -120,6 +121,7 @@ def materialize_artifact(
             raise ActivationRefused(
                 f"could not extract the {git_sha[:12]} artifact"
             )
+        _materialize_sidecar(source=checkout_root, staging=staging)
         (staging / "RUNTIME_SHA").write_text(
             git_sha + "\n", encoding="ascii"
         )
@@ -133,10 +135,47 @@ def materialize_artifact(
     finally:
         archive.unlink(missing_ok=True)
         if staging.is_dir() and staging != target:
-            import shutil as _shutil
-
-            _shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
     return target
+
+
+def _materialize_sidecar(*, source: Path, staging: Path) -> None:
+    """Copy the built hermes-control sidecar into a staging artifact.
+
+    The sidecar's ``dist/`` is compiled JS output that Git never tracks
+    (it is gitignored), so ``git archive`` — the export this function
+    runs after — never carries it; it must be copied straight from the
+    disposable source checkout's filesystem. An artifact without a
+    proven sidecar build must never be silently accepted as complete:
+    a missing ``dist/`` or ``PROTOCOL.md`` refuses materialization the
+    same way a failed export or extract does, so the caller sees a
+    durable ``failed`` attempt (via :meth:`RuntimeActivator.activate_artifact`)
+    rather than a channel-less runtime discovered later at launch time.
+    """
+
+    sidecar_source = source / "channels" / "hermes-control"
+    dist_source = sidecar_source / "dist"
+    protocol_source = sidecar_source / "PROTOCOL.md"
+    if not dist_source.is_dir():
+        raise ActivationRefused(
+            f"{source} carries no built hermes-control sidecar "
+            "(channels/hermes-control/dist is missing); refusing to "
+            "materialize an artifact without a sidecar build"
+        )
+    if not protocol_source.is_file():
+        raise ActivationRefused(
+            f"{source} is missing channels/hermes-control/PROTOCOL.md; "
+            "refusing to materialize an artifact without the sidecar "
+            "wire contract"
+        )
+    sidecar_target = staging / "channels" / "hermes-control"
+    # ``channels/hermes-control`` itself may already exist from tracked
+    # sibling files the git-archive export just extracted (PROTOCOL.md,
+    # package.json, ...); only ``dist/`` — always gitignored — must be
+    # exclusively ours to create.
+    sidecar_target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(dist_source, sidecar_target / "dist")
+    shutil.copy2(protocol_source, sidecar_target / "PROTOCOL.md")
 
 
 def checkout_migration_max(checkout_root: Path) -> int:

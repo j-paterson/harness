@@ -31,6 +31,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -43,6 +44,7 @@ from hermes_orchestrator.control_operations import (
     ControlOperations,
 )
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_assignments import ASSIGNMENT_READY
 from hermes_orchestrator.lead_intake import CORRECTION_READY, WORK_READY
 
@@ -236,6 +238,7 @@ class ChannelHub:
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or _utc_now
         self._control = control
+        self._events = EventStore(database)
         self._server: asyncio.AbstractServer | None = None
         self._connections: dict[str, asyncio.StreamWriter] = {}
         self._peers: set[asyncio.StreamWriter] = set()
@@ -258,6 +261,11 @@ class ChannelHub:
         os.chmod(self._socket_path, 0o600)
 
     async def stop(self) -> None:
+        # The daemon shutting down is a distinct, durable fact from a
+        # peer disconnect or a supersede: record it before anything
+        # else moves, so a still-open registration's exact fate is
+        # never mistaken for one of those.
+        self._close_all_registrations(reason="hub_stopped")
         # Close every peer, registered or not: a connection still
         # blocked in its first read would otherwise keep the server's
         # wait_closed() from ever returning.
@@ -518,8 +526,15 @@ class ChannelHub:
                         await self._write(writer, {"op": "refused", "reason": reason})
                         return
                     session = str(message["session_id"])
-                    self._record_registration(message)
+                    # Probe the outgoing registration's transport
+                    # before it is superseded: whether it was still
+                    # live or already dying is the entire difference
+                    # between a genuine supersede and a routine dead
+                    # reconnect the hub simply hadn't noticed yet.
+                    # Behavior is unchanged either way — the new
+                    # registration always wins.
                     prior = self._connections.get(session)
+                    self._record_registration(message, prior_writer=prior)
                     self._connections[session] = writer
                     if prior is not None and prior is not writer:
                         prior.close()
@@ -627,9 +642,26 @@ class ChannelHub:
                 ),
             )
 
-    def _record_registration(self, message: dict[str, object]) -> None:
+    @staticmethod
+    def _supersede_reason(prior_writer: asyncio.StreamWriter | None) -> str:
+        """``superseded`` only when the outgoing transport was still
+        live; a writer that is already closing (or was never tracked
+        at all — an orphaned row from before a hub restart) is the
+        common healthy reconnect, not a genuine live supersede."""
+
+        if prior_writer is None or prior_writer.is_closing():
+            return "replaced_dead"
+        return "superseded"
+
+    def _record_registration(
+        self,
+        message: dict[str, object],
+        *,
+        prior_writer: asyncio.StreamWriter | None,
+    ) -> None:
         stamp = self._now().isoformat()
         session_id = str(message["session_id"])
+        supersede_reason = self._supersede_reason(prior_writer)
         with self._database.transaction() as connection:
             prior = connection.execute(
                 "SELECT COUNT(*) FROM channel_registrations "
@@ -645,12 +677,27 @@ class ChannelHub:
                 "AND kind = 'channel.blocked' AND state = 'published'",
                 (stamp, session_id),
             )
+            superseded_rows = connection.execute(
+                "SELECT registration_id, cell_id, generation "
+                "FROM channel_registrations "
+                "WHERE session_id = ? AND state = 'active'",
+                (session_id,),
+            ).fetchall()
             connection.execute(
                 "UPDATE channel_registrations SET state = 'superseded', "
-                "closed_at = ?, close_reason = 'superseded' "
+                "closed_at = ?, close_reason = ? "
                 "WHERE session_id = ? AND state = 'active'",
-                (stamp, session_id),
+                (stamp, supersede_reason, session_id),
             )
+            for row in superseded_rows:
+                self._journal_close(
+                    connection,
+                    registration_id=str(row["registration_id"]),
+                    session_id=session_id,
+                    cell_id=str(row["cell_id"]),
+                    generation=int(row["generation"]),
+                    close_reason=supersede_reason,
+                )
             connection.execute(
                 "INSERT INTO channel_registrations("
                 "registration_id, project_key, cell_id, session_id, "
@@ -683,13 +730,93 @@ class ChannelHub:
                 )
 
     def _close_registration(self, session_id: str, *, reason: str) -> None:
+        stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            rows = connection.execute(
+                "SELECT registration_id, cell_id, generation "
+                "FROM channel_registrations "
+                "WHERE session_id = ? AND state = 'active'",
+                (session_id,),
+            ).fetchall()
             connection.execute(
                 "UPDATE channel_registrations SET state = 'closed', "
                 "closed_at = ?, close_reason = ? "
                 "WHERE session_id = ? AND state = 'active'",
-                (self._now().isoformat(), reason, session_id),
+                (stamp, reason, session_id),
             )
+            for row in rows:
+                self._journal_close(
+                    connection,
+                    registration_id=str(row["registration_id"]),
+                    session_id=session_id,
+                    cell_id=str(row["cell_id"]),
+                    generation=int(row["generation"]),
+                    close_reason=reason,
+                )
+
+    def _close_all_registrations(self, *, reason: str) -> None:
+        """Close every still-active registration for one shutdown fact.
+
+        Used only by ``stop()``: daemon shutdown is not scoped to one
+        session, so every open registration gets the same durable
+        close reason and its own journaled event.
+        """
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            rows = connection.execute(
+                "SELECT registration_id, session_id, cell_id, generation "
+                "FROM channel_registrations WHERE state = 'active'"
+            ).fetchall()
+            if not rows:
+                return
+            connection.execute(
+                "UPDATE channel_registrations SET state = 'closed', "
+                "closed_at = ?, close_reason = ? WHERE state = 'active'",
+                (stamp, reason),
+            )
+            for row in rows:
+                self._journal_close(
+                    connection,
+                    registration_id=str(row["registration_id"]),
+                    session_id=str(row["session_id"]),
+                    cell_id=str(row["cell_id"]),
+                    generation=int(row["generation"]),
+                    close_reason=reason,
+                )
+
+    def _journal_close(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        registration_id: str,
+        session_id: str,
+        cell_id: str,
+        generation: int,
+        close_reason: str,
+    ) -> None:
+        """Durable forensic record of one registration's exact close.
+
+        Never the payload or capability — only the identity and the
+        precise reason (``disconnected`` / ``superseded`` /
+        ``replaced_dead`` / ``hub_stopped``), so live outages can be
+        diagnosed from the journal instead of log archaeology.
+        """
+
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="channel.closed",
+                aggregate_type="channel_registration",
+                aggregate_id=registration_id,
+                payload={
+                    "session_id": session_id,
+                    "cell_id": cell_id,
+                    "generation": generation,
+                    "close_reason": close_reason,
+                },
+            ),
+        )
 
     def _acknowledge(
         self, session: str, message: dict[str, object]

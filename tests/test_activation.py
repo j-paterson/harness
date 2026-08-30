@@ -52,17 +52,43 @@ def git(checkout: Path, *args: str) -> None:
     )
 
 
-def build_checkout(root: Path, *, schema: int) -> Path:
+def build_checkout(
+    root: Path, *, schema: int, include_sidecar: bool = True
+) -> Path:
     checkout = root / "checkout"
     migrations = checkout / "src" / "hermes_orchestrator" / "migrations"
     migrations.mkdir(parents=True)
     for version in (1, schema):
         (migrations / f"{version:04d}_x.sql").write_text("-- x\n")
     (checkout / "pyproject.toml").write_text("[project]\nname='x'\n")
+    # Real sidecar builds (``dist/``) are gitignored, so a checkout that
+    # later re-runs ``git add -A`` (as several tests do, to advance the
+    # commit) must never pick it up either.
+    (checkout / ".gitignore").write_text(
+        "channels/hermes-control/dist/\n", encoding="utf-8"
+    )
     git(checkout, "init", "-q")
     git(checkout, "add", "-A")
     git(checkout, "commit", "-qm", "init")
+    if include_sidecar:
+        add_fake_sidecar(checkout)
     return checkout
+
+
+def add_fake_sidecar(checkout: Path, *, content: bytes = b"// sidecar\n") -> Path:
+    """Materialize a fake built hermes-control sidecar under ``checkout``.
+
+    The real sidecar build (``dist/``) is compiled JS output that Git
+    never tracks, so it is written directly to the filesystem rather
+    than committed — matching how the real checkout carries it.
+    """
+
+    sidecar = checkout / "channels" / "hermes-control"
+    entry = sidecar / "dist" / "src" / "main.js"
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_bytes(content)
+    (sidecar / "PROTOCOL.md").write_text("# protocol\n", encoding="utf-8")
+    return entry
 
 
 def test_a_clean_matched_checkout_activates_with_full_identity(
@@ -527,6 +553,73 @@ class TestImmutableArtifacts:
             git_sha=activation.git_sha,
         )
         assert again == artifact
+
+    def test_materialize_artifact_copies_the_sidecar_build_byte_identical(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """INFRA-197: the daemon can only launch the hermes-control
+        sidecar from an artifact that actually carries the build."""
+
+        from hermes_orchestrator.activation import materialize_artifact
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        head = subprocess.run(
+            ("git", "-C", str(checkout), "rev-parse", "HEAD"),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        artifact = materialize_artifact(
+            state_dir=state_dir, checkout_root=checkout, git_sha=head
+        )
+
+        source_entry = (
+            checkout / "channels" / "hermes-control" / "dist" / "src" / "main.js"
+        )
+        artifact_entry = (
+            artifact / "channels" / "hermes-control" / "dist" / "src" / "main.js"
+        )
+        assert artifact_entry.read_bytes() == source_entry.read_bytes()
+        source_protocol = (
+            checkout / "channels" / "hermes-control" / "PROTOCOL.md"
+        )
+        artifact_protocol = (
+            artifact / "channels" / "hermes-control" / "PROTOCOL.md"
+        )
+        assert artifact_protocol.read_bytes() == source_protocol.read_bytes()
+
+    def test_materialize_artifact_without_a_sidecar_build_is_refused(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """A source checkout that never built the sidecar must refuse
+        materialization rather than silently produce an artifact that
+        will later fail to launch the channel (channel.blocked)."""
+
+        from hermes_orchestrator.activation import materialize_artifact
+
+        checkout = build_checkout(
+            tmp_path, schema=database.schema_version(), include_sidecar=False
+        )
+        state_dir = tmp_path / "state"
+        head = subprocess.run(
+            ("git", "-C", str(checkout), "rev-parse", "HEAD"),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        with pytest.raises(ActivationRefused, match="sidecar"):
+            materialize_artifact(
+                state_dir=state_dir, checkout_root=checkout, git_sha=head
+            )
+
+        # A refused materialization never leaves a complete artifact
+        # behind: no RUNTIME_SHA marker, no partial staging directory.
+        target = state_dir / "runtimes" / head
+        assert not target.exists()
+        assert list((state_dir / "runtimes").glob(".*")) == []
 
     def test_rollback_survives_the_source_worktree_moving(
         self, database: Database, tmp_path: Path

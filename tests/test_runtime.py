@@ -7,7 +7,11 @@ import pytest
 import hermes_orchestrator.runtime as runtime_module
 from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.profiles import JsonCommand
-from hermes_orchestrator.runtime import DaemonAlreadyRunning, open_runtime
+from hermes_orchestrator.runtime import (
+    DaemonAlreadyRunning,
+    open_runtime,
+    resolve_sidecar_entry,
+)
 
 
 class EligibleProfileCommand(JsonCommand):
@@ -405,3 +409,81 @@ def test_observation_runtime_exposes_bindings_without_a_cmux_port(
         assert runtime.cmux_hibernation is None
     finally:
         runtime.close()
+
+
+class TestResolveSidecarEntry:
+    """INFRA-197: the sidecar build must be resolved where the daemon
+    can actually launch it — the ACTIVE runtime artifact, when one
+    exists, over the historical (and gitignored, so often absent)
+    repo_root build."""
+
+    def test_prefers_the_active_artifacts_own_sidecar_build(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        repo_entry = (
+            repo_root / "channels/hermes-control/dist/src/main.js"
+        )
+        repo_entry.parent.mkdir(parents=True)
+        repo_entry.write_text("// repo_root build\n", encoding="utf-8")
+
+        state_dir = tmp_path / "state"
+        artifact = state_dir / "runtimes" / "deadbeef"
+        artifact_entry = (
+            artifact / "channels/hermes-control/dist/src/main.js"
+        )
+        artifact_entry.parent.mkdir(parents=True)
+        artifact_entry.write_text("// artifact build\n", encoding="utf-8")
+        (state_dir / "runtimes" / "ACTIVE").write_text(
+            str(artifact) + "\n", encoding="utf-8"
+        )
+
+        resolved = resolve_sidecar_entry(
+            repo_root=repo_root, state_dir=state_dir
+        )
+
+        assert resolved == artifact_entry
+
+    def test_falls_back_to_repo_root_when_the_active_artifact_lacks_one(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        repo_entry = (
+            repo_root / "channels/hermes-control/dist/src/main.js"
+        )
+        repo_entry.parent.mkdir(parents=True)
+        repo_entry.write_text("// repo_root build\n", encoding="utf-8")
+
+        state_dir = tmp_path / "state"
+        artifact = state_dir / "runtimes" / "deadbeef"
+        artifact.mkdir(parents=True)  # no channels/ inside this artifact
+        (state_dir / "runtimes" / "ACTIVE").write_text(
+            str(artifact) + "\n", encoding="utf-8"
+        )
+
+        resolved = resolve_sidecar_entry(
+            repo_root=repo_root, state_dir=state_dir
+        )
+
+        assert resolved == repo_entry
+
+    def test_yields_the_repo_root_path_when_neither_build_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """No ACTIVE pointer at all (a daemon that never activated an
+        artifact): the resolved path is the historical repo_root
+        location even though nothing exists there — the existing
+        shutil.which("node") / ChannelLauncher file-exists guard is
+        the fail-closed boundary, unchanged."""
+
+        repo_root = tmp_path / "repo"
+        state_dir = tmp_path / "state"
+
+        resolved = resolve_sidecar_entry(
+            repo_root=repo_root, state_dir=state_dir
+        )
+
+        assert resolved == (
+            repo_root / "channels/hermes-control/dist/src/main.js"
+        )
+        assert not resolved.exists()
