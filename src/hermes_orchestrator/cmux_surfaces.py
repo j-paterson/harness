@@ -63,22 +63,31 @@ class SeatAuthRefused(RuntimeError):
 
 # The complete grammar of a classic in-pane lead command: the native
 # interactive Claude TUI addressing exactly one session — never a
-# prompt, flag soup, or credential. Exactly two extensions are
-# permitted, mutually exclusive: the controller-generated
-# session-scoped MCP config plus the fixed hermes-control
-# development-channel entry (kept for any future environment that can
-# load it unattended), or the fixed official fakechat channel plugin
-# literal (INFRA-197 v4 amendment — the substitute that actually
-# launches unattended on a personal Max account). Arbitrary flags,
-# commands, and user-selected paths remain structurally impossible.
+# prompt, flag soup, or credential. Immediately after the session UUID
+# sits the fixed ``--dangerously-skip-permissions`` literal (INFRA-197
+# operator decision infra-197-managed-claude-skip-permissions-20260830-
+# v1: every Hermes-managed classic launch carries it) — it is not
+# caller-supplied, sits before any channel extension so every extended
+# command inherits it by construction, and no grammar position lets a
+# caller express a different or additional flag there. Exactly two
+# extensions are permitted after it, mutually exclusive: the
+# controller-generated session-scoped MCP config plus the fixed
+# hermes-control development-channel entry (kept for any future
+# environment that can load it unattended), or the fixed official
+# fakechat channel plugin literal (INFRA-197 v4 amendment — the
+# substitute that actually launches unattended on a personal Max
+# account). Arbitrary flags, commands, and user-selected paths remain
+# structurally impossible.
 _UUID_PATTERN = (
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 CHANNEL_ENTRY = "server:hermes-control"
 FAKECHAT_CHANNEL_ENTRY = "plugin:fakechat@claude-plugins-official"
+SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 _CLASSIC_COMMAND = re.compile(
-    r"^claude --(resume|session-id) " + _UUID_PATTERN + r"("
+    r"^claude --(resume|session-id) " + _UUID_PATTERN
+    + " " + re.escape(SKIP_PERMISSIONS_FLAG) + r"("
     r" --mcp-config /[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
     r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY)
     + r"| --channels " + re.escape(FAKECHAT_CHANNEL_ENTRY)
@@ -94,12 +103,17 @@ def classic_resume_command(session_id: str, *, resume: bool) -> str:
 
     ``--resume`` reattaches an existing session; ``--session-id`` starts
     a new one under the exact preassigned identity. The session id must
-    parse as a UUID, so nothing else can ever ride along.
+    parse as a UUID, so nothing else can ever ride along. The fixed
+    ``--dangerously-skip-permissions`` literal (INFRA-197 operator
+    decision infra-197-managed-claude-skip-permissions-20260830-v1)
+    always follows the UUID, before any channel extension, so every
+    Hermes-managed classic launch — and every command built on top of
+    this one — carries it by construction; it is never caller-supplied.
     """
 
     canonical = str(uuid.UUID(str(session_id)))
     flag = "--resume" if resume else "--session-id"
-    return f"claude {flag} {canonical}"
+    return f"claude {flag} {canonical} {SKIP_PERMISSIONS_FLAG}"
 
 
 def classic_channel_command(
@@ -111,7 +125,9 @@ def classic_channel_command(
     metacharacter-free path whose filename is exactly this session's
     canonical UUID plus ``.mcp.json`` — and the fixed
     ``server:hermes-control`` entry. Anything else refuses before any
-    command exists.
+    command exists. The base command from :func:`classic_resume_command`
+    already carries the fixed ``--dangerously-skip-permissions`` literal
+    ahead of this extension.
     """
 
     base = classic_resume_command(session_id, resume=resume)
@@ -1162,7 +1178,9 @@ async def _activate_lead_seat(
             await port.close_workspace(ref.workspace_uuid)
         raise
     try:
-        await port.set_surface_resume(ref, f"claude --resume {session_id}")
+        await port.set_surface_resume(
+            ref, classic_resume_command(session_id, resume=True)
+        )
         active = bindings.activate_residual(
             pending.binding_id, replacing=replacing, reason=replace_reason
         )

@@ -15,6 +15,7 @@ from hermes_orchestrator.claude import (
     ClaudeEventParser,
     LeadTurnRequest,
 )
+from hermes_orchestrator.cmux_surfaces import SKIP_PERMISSIONS_FLAG
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
@@ -2936,7 +2937,7 @@ async def test_classic_seat_dispatch_never_spawns_a_stream_shadow(
     assert runner.resume_count == 0
     [ensured] = seater.ensured
     assert ensured["classic_command"] == (
-        f"claude --session-id {SESSION_ID}"
+        f"claude --session-id {SESSION_ID} {SKIP_PERMISSIONS_FLAG}"
     )
     assert ("ENG-9", "In Development", "operator") in linear.targets
     cell_state = database.scalar(

@@ -19,9 +19,11 @@ from hermes_orchestrator.cmux_surfaces import (
     _CLASSIC_COMMAND,
     CHANNEL_ENTRY,
     FAKECHAT_CHANNEL_ENTRY,
+    SKIP_PERMISSIONS_FLAG,
     CmuxLeadSeater,
     CmuxSurfaceBindings,
     classic_fakechat_command,
+    classic_resume_command,
 )
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
@@ -718,7 +720,8 @@ def test_classic_fakechat_command_is_exact_and_grammar_bound() -> None:
     command = classic_fakechat_command(LEAD_SESSION, resume=True)
 
     assert command == (
-        f"claude --resume {LEAD_SESSION} --channels {FAKECHAT_CHANNEL_ENTRY}"
+        f"claude --resume {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
+        f"--channels {FAKECHAT_CHANNEL_ENTRY}"
     )
     assert _CLASSIC_COMMAND.fullmatch(command) is not None
 
@@ -727,7 +730,8 @@ def test_classic_fakechat_command_canonicalizes_the_session_uuid() -> None:
     command = classic_fakechat_command(LEAD_SESSION.upper(), resume=False)
 
     assert command == (
-        f"claude --session-id {LEAD_SESSION} --channels {FAKECHAT_CHANNEL_ENTRY}"
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
+        f"--channels {FAKECHAT_CHANNEL_ENTRY}"
     )
     with pytest.raises(ValueError):
         classic_fakechat_command("not-a-uuid", resume=True)
@@ -745,8 +749,53 @@ def test_classic_fakechat_grammar_rejects_anything_extra() -> None:
         base + f" --channels {FAKECHAT_CHANNEL_ENTRY}",
         base + "; rm -rf /",
         base.replace("claude ", "bash -c 'claude '"),
+        # The fixed flag cannot be dropped, duplicated, or displaced —
+        # a caller-supplied command missing it (the pre-INFRA-197 shape)
+        # or repeating it must fail closed too.
+        base.replace(f" {SKIP_PERMISSIONS_FLAG}", ""),
+        base.replace(
+            f" {SKIP_PERMISSIONS_FLAG}",
+            f" {SKIP_PERMISSIONS_FLAG} {SKIP_PERMISSIONS_FLAG}",
+        ),
+        (
+            f"claude --resume {LEAD_SESSION} "
+            f"--channels {FAKECHAT_CHANNEL_ENTRY} {SKIP_PERMISSIONS_FLAG}"
+        ),
     ):
         assert _CLASSIC_COMMAND.fullmatch(rogue) is None
+
+
+def test_classic_resume_command_carries_the_fixed_flag_before_extensions() -> None:
+    # INFRA-197 operator decision
+    # infra-197-managed-claude-skip-permissions-20260830-v1: every
+    # Hermes-managed classic launch carries the fixed flag, positioned
+    # immediately after the UUID so every extension built on top of the
+    # builder inherits it by construction.
+    assert classic_resume_command(LEAD_SESSION, resume=True) == (
+        f"claude --resume {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}"
+    )
+    assert classic_resume_command(LEAD_SESSION, resume=False) == (
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}"
+    )
+    assert _CLASSIC_COMMAND.fullmatch(
+        classic_resume_command(LEAD_SESSION, resume=True)
+    ) is not None
+    # No caller input reaches this builder except the session id
+    # (already required to parse as a UUID); the flag itself is never a
+    # parameter, so nothing expressible through this function's
+    # signature can change, remove, or duplicate it.
+    assert "resume" not in SKIP_PERMISSIONS_FLAG
+
+
+def test_classic_command_without_the_fixed_flag_no_longer_validates() -> None:
+    # The pre-INFRA-197 shape (no flag at all) must be refused now that
+    # the grammar requires it.
+    for legacy in (
+        f"claude --resume {LEAD_SESSION}",
+        f"claude --session-id {LEAD_SESSION}",
+        f"claude --resume {LEAD_SESSION} --channels {FAKECHAT_CHANNEL_ENTRY}",
+    ):
+        assert _CLASSIC_COMMAND.fullmatch(legacy) is None
 
 
 @pytest.mark.asyncio
@@ -762,13 +811,14 @@ async def test_ensure_prefers_fakechat_when_signal_ports_present(
         cell_id=LEAD_CELL,
         session_id=LEAD_SESSION,
         profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION}",
+        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
     )
 
     assert seat is not None
     [created] = port.created
     assert created["command"] == (
-        f"claude --session-id {LEAD_SESSION} --channels {FAKECHAT_CHANNEL_ENTRY}"
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
+        f"--channels {FAKECHAT_CHANNEL_ENTRY}"
     )
     assert created["env"] == {
         "CLAUDE_CONFIG_DIR": "/profiles/max-a",
@@ -798,14 +848,17 @@ async def test_signal_port_issue_failure_falls_back_and_records_one_receipt(
         cell_id=LEAD_CELL,
         session_id=LEAD_SESSION,
         profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION}",
+        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
     )
 
     # The failure never raises past ensure(): the seat still comes up,
-    # channel-less, on the plain classic command.
+    # channel-less, on the plain classic command — which still carries
+    # the fixed flag, since the fallback never touches it.
     assert seat is not None
     [created] = port.created
-    assert created["command"] == f"claude --session-id {LEAD_SESSION}"
+    assert created["command"] == (
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}"
+    )
     assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
     [receipt] = control.pending_for_session(LEAD_SESSION)
     assert receipt.kind == "channel.blocked"
@@ -829,13 +882,13 @@ async def test_signal_ports_none_preserves_the_dev_channel_launch(
         cell_id=LEAD_CELL,
         session_id=LEAD_SESSION,
         profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION}",
+        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
     )
 
     assert seat is not None
     [created] = port.created
     assert created["command"] == (
-        f"claude --session-id {LEAD_SESSION} "
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
         f"--mcp-config /state/channels/{LEAD_SESSION}.mcp.json "
         f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
     )
@@ -854,7 +907,7 @@ async def test_rotation_retires_the_fakechat_port_row(
         cell_id=LEAD_CELL,
         session_id=LEAD_SESSION,
         profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION}",
+        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
     )
 
     await ensure.ensure(
@@ -862,7 +915,9 @@ async def test_rotation_retires_the_fakechat_port_row(
         cell_id=LEAD_CELL,
         session_id=ROTATED_SESSION,
         profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {ROTATED_SESSION}",
+        classic_command=(
+            f"claude --session-id {ROTATED_SESSION} {SKIP_PERMISSIONS_FLAG}"
+        ),
     )
 
     assert signal_ports.retired == [LEAD_SESSION]

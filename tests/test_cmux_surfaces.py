@@ -16,6 +16,7 @@ from hermes_orchestrator.cmux import (
     CmuxUnavailable,
 )
 from hermes_orchestrator.cmux_surfaces import (
+    SKIP_PERMISSIONS_FLAG,
     CmuxBindingConflict,
     CmuxHibernationGate,
     CmuxSurfaceBindings,
@@ -357,7 +358,9 @@ async def test_stale_lead_surface_is_replaced_with_exact_identity(
     assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
     assert str(created["title"]).startswith("demo lead")
     assert port.titles[FRESH.workspace_uuid] == "demo lead"
-    assert port.resumes == [(FRESH, f"claude --resume {SESSION}")]
+    assert port.resumes == [
+        (FRESH, f"claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG}")
+    ]
 
 
 @pytest.mark.asyncio
@@ -573,7 +576,9 @@ async def test_seater_creates_one_seat_and_reuses_it(
     assert second.binding_id == first.binding_id
     assert len(port.created) == 1
     assert port.created[0]["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
-    assert port.resumes == [(LEAD, f"claude --resume {SESSION}")]
+    assert port.resumes == [
+        (LEAD, f"claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG}")
+    ]
     # The displayed issue follows dispatch; the durable binding does not.
     assert port.statuses == [
         (LEAD.workspace_uuid, "issue", "ENG-9"),
@@ -616,7 +621,9 @@ async def test_seater_retires_the_old_seat_on_session_rotation(
     assert bindings.active_lead("cell-demo").binding_id == second.binding_id
     assert second.session_id == rotated
     assert second.generation == first.generation + 1
-    assert port.resumes[-1] == (FRESH, f"claude --resume {rotated}")
+    assert port.resumes[-1] == (
+        FRESH, f"claude --resume {rotated} {SKIP_PERMISSIONS_FLAG}"
+    )
     assert event_types(database) == [
         "cmux_binding.residual",
         "cmux_binding.bound",
@@ -1437,10 +1444,10 @@ class TestClassicSeats:
         from hermes_orchestrator.cmux_surfaces import classic_resume_command
 
         assert classic_resume_command(SESSION, resume=True) == (
-            f"claude --resume {SESSION}"
+            f"claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG}"
         )
         assert classic_resume_command(SESSION, resume=False) == (
-            f"claude --session-id {SESSION}"
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
         )
         with pytest.raises(ValueError):
             classic_resume_command("nonsense; rm -rf /", resume=True)
@@ -1453,16 +1460,22 @@ class TestClassicSeats:
 
         seat = await seater(bindings, port).ensure(
             **demo_seat(),
-            classic_command=f"claude --session-id {SESSION}",
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
         )
 
         assert seat is not None
         [created] = port.created
-        # The pane runs exactly the sanitized native TUI command.
-        assert created["command"] == f"claude --session-id {SESSION}"
+        # The pane runs exactly the sanitized native TUI command, and it
+        # carries the fixed INFRA-197 flag immediately after the UUID.
+        assert created["command"] == (
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+        )
         assert bindings.is_classic(seat.binding_id, SESSION) is True
-        # The restore path still carries the sanitized resume command.
-        assert port.resumes == [(LEAD, f"claude --resume {SESSION}")]
+        # The restore path still carries the sanitized resume command,
+        # itself carrying the fixed flag.
+        assert port.resumes == [
+            (LEAD, f"claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG}")
+        ]
 
     @pytest.mark.asyncio
     async def test_arbitrary_classic_commands_are_refused_before_create(
@@ -1474,8 +1487,19 @@ class TestClassicSeats:
         for command in (
             "claude --resume abc; rm -rf /",
             "claude -p --output-format=stream-json",
-            f"claude --resume {rogue}",
-            f"bash -c 'claude --resume {SESSION}'",
+            f"claude --resume {rogue} {SKIP_PERMISSIONS_FLAG}",
+            f"bash -c 'claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG}'",
+            # The pre-INFRA-197 shape for the exact right session is no
+            # longer sufficient: the fixed flag is now mandatory, not
+            # optional, so a command missing it must still refuse.
+            f"claude --session-id {SESSION}",
+            # Nor can a caller supply anything in place of the fixed
+            # literal, or repeat/relocate it.
+            f"claude --session-id {SESSION} --dangerously-skip-something-else",
+            (
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG} "
+                f"{SKIP_PERMISSIONS_FLAG}"
+            ),
         ):
             with pytest.raises(CmuxBindingConflict):
                 await seater(bindings, port).ensure(
@@ -1510,7 +1534,9 @@ class TestClassicSeats:
         with pytest.raises(SeatAuthRefused):
             await ensure.ensure(
                 **demo_seat(),
-                classic_command=f"claude --session-id {SESSION}",
+                classic_command=(
+                    f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+                ),
             )
 
         # The read-only probe ran under the leased profile and nothing
@@ -1555,7 +1581,8 @@ class TestChannelLaunch:
         command = classic_channel_command(SESSION, resume=False, channel_config=config)
 
         assert command == (
-            f"claude --session-id {SESSION} --mcp-config {config} "
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG} "
+            f"--mcp-config {config} "
             "--dangerously-load-development-channels server:hermes-control"
         )
 
@@ -1584,13 +1611,13 @@ class TestChannelLaunch:
 
         seat = await seater(bindings, port, channel_launch=launch).ensure(
             **demo_seat(),
-            classic_command=f"claude --session-id {SESSION}",
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
         )
 
         assert seat is not None
         [created] = port.created
         assert created["command"] == (
-            f"claude --session-id {SESSION} "
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG} "
             f"--mcp-config /state/channels/{SESSION}.mcp.json "
             "--dangerously-load-development-channels server:hermes-control"
         )
@@ -1608,12 +1635,14 @@ class TestChannelLaunch:
 
         seat = await seater(bindings, port, channel_launch=launch).ensure(
             **demo_seat(),
-            classic_command=f"claude --session-id {SESSION}",
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
         )
 
         assert seat is not None
         [created] = port.created
-        assert created["command"] == f"claude --session-id {SESSION}"
+        assert created["command"] == (
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+        )
 
     @pytest.mark.asyncio
     async def test_a_launcher_failure_records_a_blocked_receipt(
@@ -1635,7 +1664,7 @@ class TestChannelLaunch:
             bindings, port, channel_launch=launch, control=control
         ).ensure(
             **demo_seat(),
-            classic_command=f"claude --session-id {SESSION}",
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
         )
 
         assert seat is not None
@@ -1654,13 +1683,15 @@ class TestChannelLaunch:
         ensure = seater(bindings, port, channel_launch=launch)
         await ensure.ensure(
             **demo_seat(),
-            classic_command=f"claude --session-id {SESSION}",
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
         )
         launch.config = Path(f"/state/channels/{replacement}.mcp.json")
 
         await ensure.ensure(
             **demo_seat(session_id=replacement),
-            classic_command=f"claude --session-id {replacement}",
+            classic_command=(
+                f"claude --session-id {replacement} {SKIP_PERMISSIONS_FLAG}"
+            ),
         )
 
         # The rotated-away session's config and capability were
