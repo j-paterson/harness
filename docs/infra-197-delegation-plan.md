@@ -237,3 +237,98 @@ Operator-directed integration path (all holds lifted for it):
    carry the session until a new seat/session restores a channel —
    no Computer Use, no manual reconnects, no raw cmux text, no
    surrogate-only evidence.
+
+## v4 amendment: approved signal-plane substitute (operator control `516006a4…`)
+
+### Confirmed constraint (the real failure, recorded as evidence)
+
+Unattended launch of the custom `hermes-control` development
+channel is impossible on a personal Max account during the
+channels research preview. Operator probe receipts `98cf7f4e…`
+and `3d8ddb9c…`: `--dangerously-load-development-channels`
+blocks on a full-screen interactive confirmation before the
+sidecar starts (`channel_registration_count: 0`); an
+"approved"-flag variant exited and the workspace vanished.
+Official docs confirm the dialog is per-launch, `--channels`
+accepts only the Anthropic-curated allowlist during the preview,
+and `allowedChannelPlugins` is Team/Enterprise managed settings
+— a Max account cannot allowlist a custom channel. Per the same
+operator control, the following are NOT remedies and are not
+pursued: asking a human to approve the dialog per launch, or
+broadening Bash/permission rules to force the launch through.
+H1–H3 remain committed and correct — the stdio hub stays intact
+for any future environment that can load the channel — but the
+live signal plane for this fleet must substitute.
+
+### Substitute: official `fakechat` channel as a bounded wake plane
+
+Source-verified facts (`external_plugins/fakechat/server.ts`,
+claude-plugins-official): binds `127.0.0.1` only; port from
+`FAKECHAT_PORT` (default 8787); `POST /upload` takes multipart
+`id` (required) + `text`, answers 204, and injects
+`notifications/claude/channel` with the text as content; a bind
+conflict crashes the process (no recovery inside fakechat); the
+server dies when the host closes stdio; no sender auth beyond
+the loopback bind. Division of labor is unchanged in kind:
+fakechat carries ONLY the bounded `HERMES_* <32hex>` wake
+envelope — the same grammar the announcer and Stop-hook drain
+already enforce — while durable state remains the sole payload
+source and `hermes-orchestrator intake-poll` / `intake-ack`
+remains the exactly-once ACK. A forged local POST can therefore
+only trigger a drain of durable rows (a no-op when nothing is
+pending): the wake is a signal, never a payload, which is the
+injection-containment invariant this design keeps.
+
+### Required checks (operator-listed) — provability
+
+1. **Exact session/binding-to-port ownership** — provable: a
+   durable per-session port row committed with the seat binding
+   (generation-bound, one live row per cell, migration adds the
+   table); the sender refuses any port not owned by the exact
+   active session/binding it is waking.
+2. **Loopback-only** — provable: fakechat's `127.0.0.1` bind is
+   source-verified; the sender connects only to `127.0.0.1` and
+   never configures another interface.
+3. **Schema-only bounded envelope** — provable: the sender
+   validates against the existing envelope regex before any
+   send; anything else refuses fail-closed. `id` carries the
+   delivery id for idempotent re-sends.
+4. **Stale/orphan port recovery** — provable in Hermes even
+   though fakechat itself has none: connection-refused, timeout,
+   or non-204 leaves the durable delivery non-terminal for the
+   existing Stop-hook drain and journals one control receipt;
+   seat rotation retires the port row with the binding, and a
+   fresh seat is issued a fresh probed-free port.
+5. **Restart recovery** — provable: the sender is daemon-side,
+   stateless HTTP over durable rows, so a daemon restart
+   re-derives everything and the existing `publish_pending`
+   replay re-attempts unsent envelopes; a host restart kills
+   fakechat with the host and resolves through check 4 plus a
+   fresh seat's fresh port.
+6. **No browser or Computer Use** — provable: `POST /upload`
+   only; the UI is never opened; the wake arrives in-session as
+   the injected channel event.
+
+### Decision and packet map
+
+All six checks are provable: bounded delegation proceeds.
+
+| Packet | Boundary | Files (disjoint) | Tier | Depends |
+|---|---|---|---|---|
+| H5 | Fakechat signal adapter: durable port ownership (new table + migration), envelope-validated loopback sender, failure fallback receipts, replay wiring | `src/hermes_orchestrator/fakechat_signal.py`, `tests/test_fakechat_signal.py`, migration | Sonnet | — |
+| H6 | Seat launch path: classic command grammar gains the fixed `--channels plugin:fakechat@claude-plugins-official` literal; `FAKECHAT_PORT` joins the workspace env; dev-channel command retired from live launches | `src/hermes_orchestrator/cmux_surfaces.py`, `tests/test_cmux.py` | Sonnet | H5 |
+| H4 | Live acceptance, rescoped: (a) idle wake — Hermes POSTs the envelope, the real host wakes and drains via exact CLI ACK; (b) daemon kickstart mid-window — durable deliveries survive, replay re-attempts, wake lands post-restart; (c) host exit — POST fails, one durable receipt journals the loss, the Stop-hook drain carries the session | `docs/infra-197-live-acceptance.md` (packet `143260f2…`, already reserved pre-work) | Fable (lead) | H5, H6 |
+
+### Preconditions and recorded risks
+
+- Bun and an installed `fakechat@claude-plugins-official` plugin
+  are one-time provisioning for the seat profile — setup, not a
+  per-launch confirmation, hence compliant with the operator's
+  prohibition. Verified at H4 launch; absence fails the launch
+  closed with a `channel.blocked`-class receipt.
+- `--channels` syntax may change during the research preview;
+  acceptance evidence pins the working invocation.
+- The `/upload` file field and shared
+  `~/.claude/channels/fakechat` state dir are unused by Hermes;
+  the loopback-only bind bounds that surface to local users, and
+  the wake-not-payload invariant contains any forged text.
