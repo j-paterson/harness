@@ -9,7 +9,7 @@ from uuid import UUID
 
 import pytest
 
-from hermes_orchestrator.cells import ProjectCellService
+from hermes_orchestrator.cells import ProjectCell, ProjectCellService
 from hermes_orchestrator.claude import (
     ClaudeEvent,
     ClaudeEventParser,
@@ -29,6 +29,7 @@ from hermes_orchestrator.profiles import (
     ProfileRegistry,
 )
 from hermes_orchestrator.queue import QueueService
+from hermes_orchestrator.subagent_packets import SubagentPacket
 
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
@@ -3058,3 +3059,261 @@ async def test_dispatch_waits_while_an_operator_decision_is_pending(
 
     assert resumed.status == "working"
     assert runner.start_count == 1
+
+
+# INFRA-186 P4: exactly-once worker-lease release and packet settlement
+# when a subagent reaches a terminal event (subagent.completed/failed).
+
+
+def _terminal_cell() -> ProjectCell:
+    return ProjectCell(
+        cell_id="cell-demo",
+        project_key="demo",
+        state="active",
+        profile_alias="max-a",
+        session_id=SESSION_ID,
+    )
+
+
+def _started_event(tool_use_id: str) -> ClaudeEvent:
+    return ClaudeEvent(
+        kind="subagent.started",
+        original_type="assistant",
+        session_id=SESSION_ID,
+        parent_tool_use_id=tool_use_id,
+        timestamp="2026-08-29T12:00:00Z",
+        usage={},
+    )
+
+
+def _terminal_event(
+    kind: str,
+    tool_use_id: str | None,
+    *,
+    packet_id: str | None = None,
+) -> ClaudeEvent:
+    return ClaudeEvent(
+        kind=kind,
+        original_type="result",
+        session_id=SESSION_ID,
+        parent_tool_use_id=tool_use_id,
+        timestamp="2026-08-29T12:00:01Z",
+        usage={},
+        packet_id=packet_id,
+    )
+
+
+def _lease_state(database: Database, lease_id: str) -> str | None:
+    row = database.execute(
+        "SELECT state FROM worker_leases WHERE lease_id = ?",
+        (lease_id,),
+    ).fetchone()
+    return None if row is None else str(row["state"])
+
+
+def _reserved_packet(database: Database, *, tool_use_id: str) -> SubagentPacket:
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    packets = SubagentPackets(database, events=EventStore(database))
+    packet = packets.create(
+        issue_id="INFRA-186",
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=str(SESSION_ID),
+        generation=1,
+        model_tier="sonnet",
+        effort="medium",
+        allowed_files=("src/hermes_orchestrator/foo.py",),
+        worktree="/work/demo",
+        red_test="tests/test_foo.py::test_red",
+        verification=("uv run pytest tests/test_foo.py -q",),
+        invariants="never touch bar.py",
+        resource_note="single worker",
+    )
+    return packets.reserve(
+        packet.packet_id, session_id=str(SESSION_ID), tool_use_id=tool_use_id
+    )
+
+
+def test_subagent_completed_releases_the_lease_exactly_once(
+    cell_service: ProjectCellService, database: Database
+) -> None:
+    cell = _terminal_cell()
+    cell_service.record(cell, _started_event("toolu-1"))
+    assert _lease_state(database, "toolu-1") == "active"
+
+    cell_service.record(cell, _terminal_event("subagent.completed", "toolu-1"))
+    assert _lease_state(database, "toolu-1") == "released"
+
+    # A duplicate completed event finds rowcount 0 and does nothing further.
+    cell_service.record(cell, _terminal_event("subagent.completed", "toolu-1"))
+    assert _lease_state(database, "toolu-1") == "released"
+
+
+def test_subagent_failed_releases_the_lease_and_settles_failed(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    packets = SubagentPackets(database, events=EventStore(database))
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        packets=packets,
+    )
+    reserved = _reserved_packet(database, tool_use_id="toolu-1")
+    cell = _terminal_cell()
+    service.record(cell, _started_event("toolu-1"))
+
+    service.record(
+        cell,
+        _terminal_event("subagent.failed", "toolu-1", packet_id=reserved.packet_id),
+    )
+
+    assert _lease_state(database, "toolu-1") == "released"
+    assert packets.get(reserved.packet_id).state == "failed"
+
+
+def test_completed_with_wired_packets_settles_a_reserved_packet(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    packets = SubagentPackets(database, events=EventStore(database))
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        packets=packets,
+    )
+    reserved = _reserved_packet(database, tool_use_id="toolu-1")
+    cell = _terminal_cell()
+    service.record(cell, _started_event("toolu-1"))
+
+    service.record(
+        cell,
+        _terminal_event(
+            "subagent.completed", "toolu-1", packet_id=reserved.packet_id
+        ),
+    )
+
+    assert _lease_state(database, "toolu-1") == "released"
+    assert packets.get(reserved.packet_id).state == "returned"
+
+
+def test_replayed_completed_leaves_a_settled_packet_unchanged(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    packets = SubagentPackets(database, events=EventStore(database))
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        packets=packets,
+    )
+    reserved = _reserved_packet(database, tool_use_id="toolu-1")
+    cell = _terminal_cell()
+    service.record(cell, _started_event("toolu-1"))
+    service.record(
+        cell,
+        _terminal_event(
+            "subagent.completed", "toolu-1", packet_id=reserved.packet_id
+        ),
+    )
+    assert packets.get(reserved.packet_id).state == "returned"
+
+    # A replayed terminal event (duplicate delivery) is a durable no-op:
+    # no exception, and the already-settled packet is left untouched.
+    service.record(
+        cell,
+        _terminal_event(
+            "subagent.completed", "toolu-1", packet_id=reserved.packet_id
+        ),
+    )
+
+    assert packets.get(reserved.packet_id).state == "returned"
+
+
+def test_completed_without_packets_only_releases_the_lease(
+    cell_service: ProjectCellService, database: Database
+) -> None:
+    # cell_service is wired with packets=None (the default).
+    cell = _terminal_cell()
+    cell_service.record(cell, _started_event("toolu-1"))
+    cell_service.record(cell, _terminal_event("subagent.completed", "toolu-1"))
+    assert _lease_state(database, "toolu-1") == "released"
+
+
+def test_completed_with_wired_packets_but_no_packet_id_only_releases_the_lease(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    packets = SubagentPackets(database, events=EventStore(database))
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        packets=packets,
+    )
+    cell = _terminal_cell()
+    service.record(cell, _started_event("toolu-2"))
+
+    # packet_id is None even though packets is wired: only the lease releases.
+    service.record(
+        cell, _terminal_event("subagent.completed", "toolu-2", packet_id=None)
+    )
+
+    assert _lease_state(database, "toolu-2") == "released"
+    assert database.scalar("SELECT COUNT(*) FROM subagent_packets") == 0

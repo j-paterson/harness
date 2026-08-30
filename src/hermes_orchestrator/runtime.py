@@ -89,6 +89,7 @@ from hermes_orchestrator.resources import ResourceSampler
 from hermes_orchestrator.scheduler import Scheduler
 from hermes_orchestrator.service import OrchestratorService
 from hermes_orchestrator.stalls import ScheduledResets
+from hermes_orchestrator.subagent_packets import SubagentPackets
 from hermes_orchestrator.worktrees import WorktreeCustodian, WorktreeLeases
 
 Dispatch = Callable[[str], Awaitable[DispatchResult]]
@@ -280,6 +281,7 @@ def open_runtime(
         lead_wakes = LeadTerminalWakes(database=database, events=events)
         lead_assignments = LeadAssignments(database, events=events)
         control_operations = ControlOperations(database, events=events)
+        subagent_packets = SubagentPackets(database, events=events)
         cmux_bindings = CmuxSurfaceBindings(database=database, events=events)
         queue = QueueService(database, events, settings.projects)
         worktree_git = WorktreeGit()
@@ -551,6 +553,7 @@ def open_runtime(
                 ),
                 decisions=OperatorDecisions(database),
                 assignments=lead_assignments,
+                packets=subagent_packets,
             )
             dispatch = cells.dispatch
 

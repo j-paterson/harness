@@ -75,6 +75,18 @@ allowed set before staging anything.
 
 ## Packet ledger for this issue (updated as waves land)
 
-Recorded durably in the new `subagent_packets` table once P1 lands;
-until then this table row-for-row mirrors it: P1 planned, P7 planned;
-P2–P6 blocked on dependencies.
+Mirrored here and recorded in the live `subagent_packets` table in one
+batch at final integration (before candidate publication, so the new
+delegation-evidence gate judges this issue by its own ledger):
+
+- P1 **accepted** (Sonnet): red `ModuleNotFoundError` →
+  19 green packet tests, ruff clean; scope exactly its three files;
+  interface conformant; integrated in `8b70b39`.
+- P7 **accepted** (Haiku): red `ModuleNotFoundError` → 16 green tests,
+  ruff clean; scope exactly its three files; integrated in `8b70b39`.
+- Lead direct-work exception (documented, reviewer-fix scale): the
+  two-field `ClaudeEvent` interface stub enabling wave-2 parallelism
+  (`dc4d83b`, 5 lines, one file).
+- P2, P3, P4 **reserved** (Sonnet, wave 2, disjoint files) — in
+  flight.
+- P5, P6 planned (wave 3, blocked on wave-2 integration).
