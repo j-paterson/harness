@@ -30,6 +30,7 @@ from hermes_orchestrator.channel_hub import (
 from hermes_orchestrator.checkpoints import CheckpointDispatcher
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
+    CHANNEL_ENTRY,
     CmuxHibernationDriver,
     CmuxSurfaceReconciler,
 )
@@ -2501,11 +2502,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ),
                 )
                 return 1
-            if anchor.prompt_pattern is None and args.capture_prompt:
-                # The one bounded recapture: bind the prompt evidence
-                # from the LIVE dialog. The operator-recorded normalized
-                # structure must be present or this refuses; no key is
-                # ever pressed here.
+            entry_path = resolve_sidecar_entry(
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            )
+            if args.capture_prompt and (
+                anchor.prompt_pattern is None
+                or anchor.canonical_entry_path != str(entry_path)
+            ):
+                # The one bounded recapture: this launch's manual Enter
+                # IS a full manual trust event (v5.1), so the anchor is
+                # (re)bound to the exact LIVE identity showing the
+                # dialog — never merely patched onto a stale build. The
+                # operator-recorded normalized structure must be present
+                # or this refuses; no key is ever pressed here.
                 markers = (
                     "Loading development channels",
                     "server:hermes-control",
@@ -2531,13 +2541,39 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 pattern = r"[\s\S]{0,4000}?".join(
                     re.escape(marker) for marker in markers
                 )
+                live_argv = _live_claude_argv(str(binding.session_id))
+                if not live_argv:
+                    _print(
+                        {"error": "no unique live claude process argv"},
+                        json_output=args.json,
+                        human=(
+                            "prompt capture refused: no unique live "
+                            "claude process for this session."
+                        ),
+                    )
+                    return 1
                 try:
-                    anchors.complete_prompt(anchor.anchor_id, pattern)
+                    if anchor.canonical_entry_path != str(entry_path):
+                        anchors.retire(anchor.anchor_id)
+                        anchor = anchors.capture(
+                            cell_id=args.cell,
+                            profile_alias=str(binding.profile_alias),
+                            entry_path=entry_path,
+                            package_root=entry_path.parents[2],
+                            channel_entry=CHANNEL_ENTRY,
+                            launch_argv_template=live_argv,
+                            workspace_uuid=binding.ref.workspace_uuid,
+                            surface_uuid=binding.ref.surface_uuid,
+                            session_id=str(binding.session_id),
+                            prompt_pattern=pattern,
+                        )
+                    else:
+                        anchors.complete_prompt(anchor.anchor_id, pattern)
                 except TrustRefused as error:
                     _print(
                         {"error": str(error)},
                         json_output=args.json,
-                        human=f"prompt binding refused: {error}",
+                        human=f"trust (re)binding refused: {error}",
                     )
                     return 1
                 _print(
@@ -2548,16 +2584,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     },
                     json_output=args.json,
                     human=(
-                        "Prompt evidence bound from the live dialog; "
-                        "this launch still requires the one manual "
-                        "Enter. The next launch auto-confirms."
+                        "Trust anchor bound to the live launch "
+                        "identity with prompt evidence; this launch "
+                        "still requires the one manual Enter. The "
+                        "next launch auto-confirms."
                     ),
                 )
                 return 0
-            entry_path = resolve_sidecar_entry(
-                repo_root=settings.repo_root,
-                state_dir=settings.state_dir,
-            )
             gate = ChannelTrustGate(
                 database,
                 events=events,
