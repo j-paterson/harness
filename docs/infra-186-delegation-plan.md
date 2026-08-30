@@ -267,6 +267,22 @@ unparsable measurement refuses BEFORE any packet is created — and
 their recorded hashes must match the candidate head for credited
 paths. Agent-authored evidence JSON is never consulted for credit.
 
+### Correction `f717338d…` (head-blob verification fails closed)
+
+- E1 **accepted** (Sonnet, `f7bb9718…`, full measured provenance —
+  reserved and returned blobs both recorded, all paths changed
+  within the reservation window): `_head_blob_hash` no longer maps
+  every git failure to the absent sentinel. A `head_blob` seam
+  (default: subprocess `git ls-tree --full-tree` for positively
+  proven presence/absence, then `git cat-file blob` read as raw
+  bytes, 60s timeout) classifies outcomes explicitly — absence only
+  on exit 0 with empty ls-tree output; corruption, unknown objects,
+  timeouts, and generic failures raise `EmissionBlocked` before any
+  manifest or delivery side effect; blob hashing is byte-for-byte
+  with no text decoding, proven against a real tmp git repo with
+  binary content. Red: 7 failing tests; green: 46 emission tests,
+  full suite 2037, ruff clean.
+
 ### Bootstrap consequence (reported, not bypassed)
 
 Under these rules every packet accepted before migration 0047 lacks

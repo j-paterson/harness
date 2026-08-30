@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from hermes_orchestrator import emission as emission_module
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.emission import CandidateEmitter, EmissionBlocked
@@ -29,6 +31,16 @@ class FakeGitRunner:
     calls: list[tuple[str, ...]] = field(default_factory=list)
     cwds: list[Path] = field(default_factory=list)
     common_dirs: dict[Path, str] = field(default_factory=dict)
+    # The INFRA-194 head-blob seam (a raw ``(repo, head, path) -> bytes |
+    # None`` callable, deliberately separate from the text-mode ``run``
+    # seam above): ``head_blobs`` wires a present path's exact bytes or
+    # an ``None`` for a positively-proven absence, ``head_blob_errors``
+    # wires a failure that must raise instead (corruption, timeout, any
+    # other unproven outcome). A path present in neither dict is an
+    # unwired stub and also fails closed, the same as an unwired ``run``
+    # invocation above.
+    head_blobs: dict[tuple[str, str], bytes | None] = field(default_factory=dict)
+    head_blob_errors: dict[tuple[str, str], Exception] = field(default_factory=dict)
 
     def run(self, args: tuple[str, ...], cwd: Path) -> GitResult:
         self.calls.append(args)
@@ -43,6 +55,16 @@ class FakeGitRunner:
         if key not in self.responses:
             return GitResult(128, "", "fatal")
         return GitResult(0, self.responses[key], "")
+
+    def head_blob(self, repo: Path, head: str, path: str) -> bytes | None:
+        key = (head, path)
+        if key in self.head_blob_errors:
+            raise self.head_blob_errors[key]
+        if key not in self.head_blobs:
+            raise EmissionBlocked(
+                f"no head-blob stub wired for {path!r} at {head}"
+            )
+        return self.head_blobs[key]
 
 
 @dataclass
@@ -380,24 +402,27 @@ class FakePackets:
 
 
 def _blob_hash(content: str) -> str:
-    """Mirror ``CandidateEmitter._head_blob_hash``'s encoding invariant so
-    test fixtures can compute a returned blob that matches a given
-    ``git show`` stub's content exactly."""
+    """Mirror ``CandidateEmitter._head_blob_hash``'s hashing invariant
+    (raw bytes, no text round-trip) so test fixtures can compute a
+    returned blob that matches a given head-blob stub's content
+    exactly."""
 
-    return hashlib.sha256(content.encode("utf-8", errors="surrogateescape")).hexdigest()
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _wire_head_content(
     git: FakeGitRunner, head: str, contents: dict[str, str]
 ) -> dict[str, str]:
-    """Stub ``git show <head>:<path>`` for each path in ``contents`` and
-    return the matching ``{path: sha256-hexdigest}`` map — the correct
-    ``returned_blobs`` for a packet credited on exactly those paths."""
+    """Stub the ``head_blob`` seam (``git.head_blob``) for each path in
+    ``contents`` and return the matching ``{path: sha256-hexdigest}``
+    map — the correct ``returned_blobs`` for a packet credited on
+    exactly those paths."""
 
     returned: dict[str, str] = {}
     for path, content in contents.items():
-        git.responses[("show", f"{head}:{path}")] = content
-        returned[path] = _blob_hash(content)
+        raw = content.encode("utf-8")
+        git.head_blobs[(head, path)] = raw
+        returned[path] = hashlib.sha256(raw).hexdigest()
     return returned
 
 
@@ -444,6 +469,7 @@ def _emitter_with_packets(
         delivery=deliverer,
         now=lambda: NOW,
         packets=packets,
+        head_blob=git.head_blob,
     )
     return emitter, deliverer
 
@@ -989,8 +1015,8 @@ async def test_returned_blob_mismatching_head_content_is_rejected(
     tmp_path: Path,
 ) -> None:
     git = _non_trivial_git()
-    git.responses[("show", f"{HEAD}:src/app.py")] = "actual head content"
-    git.responses[("show", f"{HEAD}:tests/test_app.py")] = "actual test content"
+    git.head_blobs[(HEAD, "src/app.py")] = b"actual head content"
+    git.head_blobs[(HEAD, "tests/test_app.py")] = b"actual test content"
     returned = {
         "src/app.py": _blob_hash("a fragment that is not actually at head"),
         "tests/test_app.py": _blob_hash("actual test content"),
@@ -1170,7 +1196,7 @@ async def test_exception_packet_with_mismatching_returned_blob_is_rejected(
 ) -> None:
     git = _custom_git((("reg.py", 5, 5), ("exc.py", 15, 15)))
     reg_returned = _wire_head_content(git, HEAD, {"reg.py": "reg new content"})
-    git.responses[("show", f"{HEAD}:exc.py")] = "actual exc head content"
+    git.head_blobs[(HEAD, "exc.py")] = b"actual exc head content"
     exc_returned = {"exc.py": _blob_hash("a totally different fragment")}
     packets = FakePackets(
         by_issue={
@@ -1349,3 +1375,236 @@ async def test_no_verifier_wired_skips_the_final_gate_receipt_check(
 
     assert result.delivery.delivered is True
     assert deliverer.events == [("demo", result.event)]
+
+
+# --- head-blob verification must fail closed (Sol reviewer finding, PR #30) -
+#
+# ``_head_blob_hash`` must never conflate a genuinely deleted candidate
+# path with any other git failure (corruption, an invalid object, a
+# timeout, or anything else): only a git-proven absence may match the
+# ledger's own ``"absent"`` sentinel, and it must hash raw bytes, never
+# text-decoded content.
+
+
+@pytest.mark.asyncio
+async def test_deleted_candidate_path_matches_absent_sentinel_and_is_admitted(
+    tmp_path: Path,
+) -> None:
+    # "gone.py" was deleted entirely (40 lines removed, none added) —
+    # non-trivial by line count alone. The packet's returned blob for
+    # it is the ledger's own "absent" sentinel, and the head-blob seam
+    # positively proves the path is gone (returns ``None``), so the two
+    # measurements agree and the candidate is admitted.
+    git = _custom_git((("gone.py", 0, 40),))
+    git.head_blobs[(HEAD, "gone.py")] = None
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("gone.py",),
+                    evidence={},
+                    reserved_blobs={"gone.py": _blob_hash("content before deletion")},
+                    returned_blobs={"gone.py": "absent"},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-1", "files=1;lines=40") in manifest.verification
+
+
+@pytest.mark.asyncio
+async def test_timeout_reading_claimed_deleted_path_blocks_emission(
+    tmp_path: Path,
+) -> None:
+    # The packet claims "gone.py" was deleted (returned blob is the
+    # "absent" sentinel), but the head-blob seam cannot actually prove
+    # that — it raises, as the real seam would on a timeout. A raised
+    # failure must never be silently treated as proof of absence.
+    git = _custom_git((("gone.py", 0, 40),))
+    git.head_blob_errors[(HEAD, "gone.py")] = EmissionBlocked(
+        "could not read 'gone.py' at " + HEAD + ": TimeoutExpired"
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("gone.py",),
+                    evidence={},
+                    reserved_blobs={"gone.py": _blob_hash("content before deletion")},
+                    returned_blobs={"gone.py": "absent"},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="TimeoutExpired"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_generic_head_blob_failure_on_a_present_path_blocks_with_no_side_effects(
+    tmp_path: Path,
+) -> None:
+    # A generic git failure distinct from proven absence — e.g. the
+    # candidate object itself is unreadable — while verifying a path
+    # the packet claims it actually changed (a real hash, not
+    # "absent"). This must block before any manifest write or delivery.
+    git = _custom_git((("src/app.py", 20, 15),))
+    git.head_blob_errors[(HEAD, "src/app.py")] = EmissionBlocked(
+        "git cat-file failed for 'src/app.py' at " + HEAD + " with exit "
+        "code 128: fatal: unable to read blob object"
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py",),
+                    evidence={},
+                    reserved_blobs={"src/app.py": "before-hash"},
+                    returned_blobs={"src/app.py": _blob_hash("new content")},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="unable to read blob object"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_binary_head_content_is_hashed_byte_for_byte_without_text_decoding(
+    tmp_path: Path,
+) -> None:
+    # The head-blob seam returns raw, non-UTF8 bytes (never text-mode
+    # git output). Credit is earned exactly when the packet's returned
+    # blob is the sha256 of those exact raw bytes — no decode/re-encode
+    # round-trip involved.
+    git = _custom_git((("bin.dat", 20, 15),))
+    raw = b"\x00\xff\xfe"
+    git.head_blobs[(HEAD, "bin.dat")] = raw
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("bin.dat",),
+                    evidence={},
+                    reserved_blobs={"bin.dat": "before-hash"},
+                    returned_blobs={"bin.dat": hashlib.sha256(raw).hexdigest()},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-1", "files=1;lines=35") in manifest.verification
+
+
+def test_default_head_blob_ls_tree_nonzero_exit_blocks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Repository corruption / an unknown candidate object: ``git
+    # ls-tree`` itself fails (nonzero exit). This must never be
+    # confused with "path absent" — absence is proven ONLY by exit 0
+    # with empty stdout.
+    def fake_run(
+        args: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args, 128, stdout=b"", stderr=b"fatal: not a valid object name"
+        )
+
+    monkeypatch.setattr(emission_module.subprocess, "run", fake_run)
+
+    with pytest.raises(EmissionBlocked, match="ls-tree failed"):
+        emission_module._default_head_blob(tmp_path, "d" * 40, "some/path.py")
+
+
+def test_default_head_blob_cat_file_nonzero_exit_blocks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The path is proven present by ``ls-tree``, but the follow-up
+    # ``git cat-file`` read fails — a generic git failure distinct
+    # from path absence, which must still fail closed.
+    def fake_run(
+        args: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args[3] == "ls-tree":
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=b"100644 blob " + b"a" * 40 + b"\tsome/path.py\n",
+                stderr=b"",
+            )
+        return subprocess.CompletedProcess(
+            args, 1, stdout=b"", stderr=b"fatal: unable to read blob object"
+        )
+
+    monkeypatch.setattr(emission_module.subprocess, "run", fake_run)
+
+    with pytest.raises(EmissionBlocked, match="cat-file failed"):
+        emission_module._default_head_blob(tmp_path, "d" * 40, "some/path.py")
+
+
+def test_default_head_blob_against_a_real_tmp_git_repo(tmp_path: Path) -> None:
+    # Integration-style: a REAL git repository (init'd inside tmp_path,
+    # which is permitted — this mutates only the disposable tmp repo,
+    # never the actual clone), a committed binary file read back
+    # exactly byte-for-byte through the default seam, and a
+    # nonexistent path proven absent.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *args: subprocess.run(  # noqa: E731
+        ("git", *args), cwd=repo, check=True, capture_output=True
+    )
+    run("init", "-q")
+    run("config", "user.email", "a@example.com")
+    run("config", "user.name", "Test")
+    binary_path = repo / "assets" / "img.bin"
+    binary_path.parent.mkdir(parents=True)
+    raw = b"\x00\xff\xfeBINARY\x01\x02\xfd"
+    binary_path.write_bytes(raw)
+    run("add", "-A")
+    run("commit", "-q", "-m", "add binary asset")
+    head = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    content = emission_module._default_head_blob(repo, head, "assets/img.bin")
+    assert content == raw
+
+    absent = emission_module._default_head_blob(
+        repo, head, "assets/does-not-exist.bin"
+    )
+    assert absent is None

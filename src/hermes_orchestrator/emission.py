@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -133,6 +134,74 @@ class EmissionBlocked(RuntimeError):
 # an implementation detail of the ledger module.
 _ABSENT_BLOB = "absent"
 
+# Bounded runtime for each head-blob git invocation (INFRA-194 Sol finding,
+# PR #30): a hang while proving a candidate's head content must fail
+# closed, never block emission forever.
+_HEAD_BLOB_TIMEOUT = 60.0
+
+
+def _default_head_blob(repo: Path, head: str, path: str) -> bytes | None:
+    """Prove ``path``'s content at ``head``, or its positive absence.
+
+    This is a raw ``subprocess.run`` seam — deliberately NOT the
+    text-mode ``self._run``/``GitRunner`` seam — because the credit
+    decision this feeds must be binary-safe and must classify every
+    outcome explicitly:
+
+    - presence is proven with ``git ls-tree --full-tree <head> --
+      <path>``: a nonzero exit (bad head, corrupt repository, unknown
+      object) is repository failure, never absence, and fails closed;
+      exit 0 with empty stdout is the ONLY positive proof of absence.
+    - content is then read with ``git cat-file blob <head>:<path>``,
+      captured with no text decoding at all so the returned bytes are
+      exactly the blob's raw bytes, comparable byte-for-byte against
+      the ledger's own raw-bytes sha256 measurement.
+
+    A timeout, an ``OSError`` launching git, or a nonzero exit from
+    either command raises :class:`EmissionBlocked` — this function
+    never silently degrades an unproven outcome into "absent".
+    """
+
+    try:
+        presence = subprocess.run(
+            ("git", "-C", str(repo), "ls-tree", "--full-tree", head, "--", path),
+            capture_output=True,
+            timeout=_HEAD_BLOB_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise EmissionBlocked(
+            f"could not determine whether {path!r} exists at {head}: "
+            f"{type(error).__name__}"
+        ) from error
+    if presence.returncode != 0:
+        stderr = presence.stderr.decode("utf-8", errors="replace")[:200]
+        raise EmissionBlocked(
+            f"git ls-tree failed for {path!r} at {head} with exit code "
+            f"{presence.returncode}: {stderr}"
+        )
+    if not presence.stdout.strip():
+        return None
+
+    try:
+        content = subprocess.run(
+            ("git", "-C", str(repo), "cat-file", "blob", f"{head}:{path}"),
+            capture_output=True,
+            timeout=_HEAD_BLOB_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise EmissionBlocked(
+            f"could not read {path!r} at {head}: {type(error).__name__}"
+        ) from error
+    if content.returncode != 0:
+        stderr = content.stderr.decode("utf-8", errors="replace")[:200]
+        raise EmissionBlocked(
+            f"git cat-file failed for {path!r} at {head} with exit code "
+            f"{content.returncode}: {stderr}"
+        )
+    return content.stdout
+
 
 @dataclass(frozen=True, slots=True)
 class EmissionResult:
@@ -163,6 +232,7 @@ class CandidateEmitter:
         packets: SubagentPackets | None = None,
         verifier: Verifier | None = None,
         candidate_gate_id: str = "candidate-full-gate",
+        head_blob: Callable[[Path, str, str], bytes | None] | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -175,6 +245,7 @@ class CandidateEmitter:
         self._packets = packets
         self._verifier = verifier
         self._candidate_gate_id = candidate_gate_id
+        self._head_blob = head_blob if head_blob is not None else _default_head_blob
 
     async def emit(
         self,
@@ -605,28 +676,24 @@ class CandidateEmitter:
         fresh from git and comparable against the ledger's raw-byte
         measurement.
 
-        INVARIANT: the ledger (``SubagentPackets``) measures the sha256
-        of each allowed file's raw bytes read directly off disk, while
-        ``self._run`` returns ``str`` — the git seam's already-decoded
-        subprocess stdout. To keep the two measurements comparable, the
-        shown content is re-encoded as UTF-8 with
-        ``errors="surrogateescape"`` before hashing: this is the exact
-        inverse of the decode step the git seam already performed, so
-        for any content the seam could decode at all, hashing the
-        re-encoded bytes reproduces the hash of the original blob bytes.
-        A path whose head content cannot be shown at all (deleted at
-        head, or any other git failure) is treated as the ledger's own
-        ``"absent"`` sentinel, so it can only match a packet's own
-        ``"absent"`` returned blob.
+        This defers entirely to the ``head_blob`` seam
+        (:func:`_default_head_blob` unless overridden), which returns
+        the path's raw blob bytes when present, ``None`` ONLY when git
+        has positively proven the path absent at ``head``, and raises
+        :class:`EmissionBlocked` for every other outcome (repository
+        corruption, an invalid head, a timeout, or any other git
+        failure). Only a positively-proven absence maps to the ledger's
+        own ``"absent"`` sentinel; every unproven outcome propagates as
+        a raised failure and never reaches this return at all, so it
+        can never be mistaken for absence. The bytes are hashed as-is —
+        no text decoding — so this is directly comparable, byte for
+        byte, against the ledger's own raw-bytes sha256 measurement.
         """
 
-        try:
-            content = self._run(repo, "show", f"{head}:{path}")
-        except EmissionBlocked:
+        content = self._head_blob(repo, head, path)
+        if content is None:
             return _ABSENT_BLOB
-        return hashlib.sha256(
-            content.encode("utf-8", errors="surrogateescape")
-        ).hexdigest()
+        return hashlib.sha256(content).hexdigest()
 
     def _run(self, repo: Path, *args: str) -> str:
         try:
