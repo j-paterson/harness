@@ -928,3 +928,188 @@ class TestFleetCoherence:
             "WHERE event_type = 'console.started'"
         ).fetchall()
         assert len(journaled) == 1
+
+
+class TestFleetRestartExceptions:
+    """Sol ff45468d: every partial fleet-restart failure enters the
+    same journaled rollback protocol as a missing health proof."""
+
+    @staticmethod
+    def setup_fleet(
+        database: Database, tmp_path: Path
+    ) -> tuple[RuntimeActivator, Path, Path, object]:
+        activator = RuntimeActivator(database, events=EventStore(database))
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+        return activator, checkout, state_dir, prior
+
+    @staticmethod
+    def confirm_fleet(activator: RuntimeActivator) -> None:
+        active = activator.current()
+        assert active is not None
+        for pid, service in ((900, "daemon"), (901, "console")):
+            activator.confirm_startup(
+                checkout_root=Path(active.checkout_root),
+                binary_path=Path(active.binary_path),
+                pid=pid,
+                service=service,
+                bootstrap=False,
+            )
+
+    def applier(self, database, activator, kickstart):
+        return TestFleetCoherence.fleet_applier(
+            database, activator, kickstart
+        )
+
+    def last_state(self, database: Database) -> str:
+        return str(
+            database.scalar(
+                "SELECT state FROM activation_applies "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            )
+        )
+
+    def test_a_partial_target_restart_rolls_the_fleet_back(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """The daemon kickstarted but the operations restart raised:
+        both services restart onto the prior generation and the apply
+        records rolled_back."""
+
+        activator, checkout, state_dir, prior = self.setup_fleet(
+            database, tmp_path
+        )
+        kicks: list[int] = []
+
+        def kickstart() -> None:
+            kicks.append(1)
+            if len(kicks) == 1:
+                active = activator.current()
+                assert active is not None
+                activator.confirm_startup(
+                    checkout_root=Path(active.checkout_root),
+                    binary_path=Path(active.binary_path),
+                    pid=800,
+                    service="daemon",
+                    bootstrap=False,
+                )
+                raise RuntimeError("operations kickstart refused")
+            self.confirm_fleet(activator)
+
+        report = self.applier(database, activator, kickstart).apply(
+            checkout_root=checkout, artifact_state_dir=state_dir
+        )
+
+        assert report.state == "rolled_back"
+        assert len(kicks) == 2
+        current = activator.current()
+        assert current is not None
+        assert current.git_sha == prior.git_sha  # type: ignore[attr-defined]
+        assert self.last_state(database) == "rolled_back"
+
+    def test_a_total_target_restart_failure_restores_the_prior(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        activator, checkout, state_dir, prior = self.setup_fleet(
+            database, tmp_path
+        )
+        kicks: list[int] = []
+
+        def kickstart() -> None:
+            kicks.append(1)
+            if len(kicks) == 1:
+                raise RuntimeError("launchctl refused entirely")
+            self.confirm_fleet(activator)
+
+        report = self.applier(database, activator, kickstart).apply(
+            checkout_root=checkout, artifact_state_dir=state_dir
+        )
+
+        assert report.state == "rolled_back"
+        current = activator.current()
+        assert current is not None
+        assert current.git_sha == prior.git_sha  # type: ignore[attr-defined]
+
+    def test_a_failed_rollback_restart_is_ambiguous(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        from hermes_orchestrator.activation import ApplyFailed
+
+        activator, checkout, state_dir, _prior = self.setup_fleet(
+            database, tmp_path
+        )
+
+        def kickstart() -> None:
+            raise RuntimeError("launchctl always refuses")
+
+        with pytest.raises(ApplyFailed, match="ambiguous"):
+            self.applier(database, activator, kickstart).apply(
+                checkout_root=checkout, artifact_state_dir=state_dir
+            )
+
+        assert self.last_state(database) == "ambiguous"
+
+    def test_incomplete_prior_proofs_after_target_failure_are_ambiguous(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        from hermes_orchestrator.activation import ApplyFailed
+
+        activator, checkout, state_dir, _prior = self.setup_fleet(
+            database, tmp_path
+        )
+        kicks: list[int] = []
+
+        def kickstart() -> None:
+            kicks.append(1)
+            if len(kicks) == 1:
+                raise RuntimeError("target restart refused")
+            active = activator.current()
+            assert active is not None
+            # Only the daemon proves the restored generation.
+            activator.confirm_startup(
+                checkout_root=Path(active.checkout_root),
+                binary_path=Path(active.binary_path),
+                pid=810,
+                service="daemon",
+                bootstrap=False,
+            )
+
+        with pytest.raises(ApplyFailed, match="ambiguous"):
+            self.applier(database, activator, kickstart).apply(
+                checkout_root=checkout, artifact_state_dir=state_dir
+            )
+
+        assert self.last_state(database) == "ambiguous"
+
+    def test_every_post_activation_exception_ends_terminal(
+        self, database: Database, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Even an unexpected internal failure after activation leaves
+        activation_applies terminal, never activated or restarted."""
+
+        from hermes_orchestrator.activation import ApplyFailed
+
+        activator, checkout, state_dir, _prior = self.setup_fleet(
+            database, tmp_path
+        )
+        applier = self.applier(database, activator, lambda: None)
+        monkeypatch.setattr(
+            applier,
+            "_await_services",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                OSError("verification substrate failed")
+            ),
+        )
+
+        with pytest.raises(ApplyFailed, match="ambiguous"):
+            applier.apply(
+                checkout_root=checkout, artifact_state_dir=state_dir
+            )
+
+        assert self.last_state(database) == "ambiguous"

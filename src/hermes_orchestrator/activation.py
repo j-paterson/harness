@@ -759,12 +759,52 @@ class ActivationApplier:
             state="activated",
             target_generation=activation.generation,
         )
+        # From here on, every exception path must end in a terminal
+        # apply state (verified, rolled_back, or ambiguous): after the
+        # target activation is committed, nothing may escape with the
+        # fleet split or an unverified generation active.
+        try:
+            return self._restart_and_verify(
+                apply_id, prior=prior, activation=activation
+            )
+        except ApplyFailed:
+            raise
+        except BaseException as error:
+            self._journal(
+                apply_id,
+                state="ambiguous",
+                reason=f"unexpected failure after activation: {error}",
+            )
+            raise ApplyFailed(
+                "an unexpected failure interrupted the apply after "
+                "activation; the apply is ambiguous"
+            ) from error
+
+    def _restart_and_verify(
+        self,
+        apply_id: str,
+        *,
+        prior: RuntimeActivation | None,
+        activation: RuntimeActivation,
+    ) -> ApplyReport:
         started_at = self._now().isoformat()
-        self._kickstart()
-        self._journal(apply_id, state="restarted")
-        # Every activation-bound service must prove the exact target
-        # generation, or the whole fleet rolls back together.
-        proof = self._await_services(activation.generation, since=started_at)
+        # A kickstart is a structured fleet operation: a per-service
+        # exception (e.g. the daemon restarted but the operations job
+        # refused) is captured and enters the SAME journaled rollback
+        # protocol as a missing health proof — never a raw escape.
+        target_failure: str | None = None
+        try:
+            self._kickstart()
+        except Exception as error:
+            target_failure = f"target fleet restart failed: {error}"
+        self._journal(apply_id, state="restarted", reason=target_failure)
+        proof = None
+        if target_failure is None:
+            # Every activation-bound service must prove the exact
+            # target generation, or the whole fleet rolls back.
+            proof = self._await_services(
+                activation.generation, since=started_at
+            )
         if proof is not None:
             self._journal(apply_id, state="verified")
             return ApplyReport(
@@ -774,9 +814,10 @@ class ActivationApplier:
                 verified_pid=int(proof.get("pid", 0)) or None,
                 reason=None,
             )
-        # The new runtime never proved out: reinstate the prior
-        # activation and prove the prior executable is actually
-        # running again before calling the rollback successful.
+        # The new runtime never proved out (or its restart failed
+        # partway): reinstate the prior activation and prove the prior
+        # fleet is actually running again before calling the rollback
+        # successful.
         if prior is None:
             self._journal(
                 apply_id,
@@ -800,7 +841,18 @@ class ActivationApplier:
                 "activation no longer validates; the apply is ambiguous"
             ) from refusal
         rollback_started = self._now().isoformat()
-        self._kickstart()
+        try:
+            self._kickstart()
+        except Exception as error:
+            self._journal(
+                apply_id,
+                state="ambiguous",
+                reason=f"rollback fleet restart failed: {error}",
+            )
+            raise ApplyFailed(
+                "the rollback fleet restart failed; the apply is "
+                "ambiguous"
+            ) from error
         proof = self._await_services(
             restored.generation, since=rollback_started
         )
