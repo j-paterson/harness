@@ -72,6 +72,11 @@ class ClaudeEvent:
     error_code: str | None = None
     restated_next_action: str | None = None
     limit_kind: str | None = None
+    # INFRA-186 redacted subagent orchestration metadata: only the
+    # packet id carried in the Agent description and the enumerated
+    # model tier — never prompt or response text.
+    packet_id: str | None = None
+    model_tier: str | None = None
 
 
 class ClaudeStreamError(ValueError):
