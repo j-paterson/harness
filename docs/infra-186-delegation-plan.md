@@ -30,6 +30,28 @@ is affected — P5/P6 were reserved before v2 and their scope is
 unchanged (the receipt hook lands as P9 on top of P5's seams); P1–P4,
 P7 are accepted and untouched by the delta.
 
+## v3 amendment: shared verifier ownership (before P8 acceptance)
+
+Authoritative Linear changed again at 2026-08-30T02:03:45Z (wake
+`e131fd57645942808f3ebc0aab3e3b16`); this amendment reconciles the
+active P8 packet to the v3 contract WITHOUT silently redesigning it:
+
+- **Any agent initiates**: a Fable lead, an implementation subagent,
+  or the Sol reviewer may invoke the shared verifier. P8's module was
+  already requester-agnostic (nothing in `Verifier` binds to a session
+  or role); the any-agent invocation surface is a CLI `verify` /
+  `verify-check` pair, which was ALREADY outside P8's allowed files
+  and lands in the P9/lead integration scope. P8's in-flight contract
+  is therefore unchanged.
+- **Trust source**: attestation plus runner-measured bound inputs
+  only — exactly P8's design (the runner computes every binding
+  itself and HMAC-attests the canonical document; a requester or
+  Hermes cannot author a validating receipt). No change.
+- **Hermes's role**: tracks and validates receipts at transitions
+  (P8's `validate`/`find_fresh` are the validation API Hermes and the
+  candidate gate consume) but need not execute tests itself. No
+  change to P8; the consuming hooks remain P9.
+
 Assignment `3d251e70268e491eb2b597a08969a3df` (exactly-ACKed). The
 Fable lead orchestrates; implementation is delegated to the smallest
 capable Claude subagents in disjoint, test-first packets. Base:
