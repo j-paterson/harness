@@ -242,6 +242,11 @@ def _happy_install_runner() -> FakeRunner:
             ("launchctl", "print", f"gui/{UID}/{label}"),
             RunResult(returncode=113, stdout="", stderr="not found"),
         )
+    # The bootstrap target is absent on a clean install.
+    runner.script(
+        ("shasum", "-a", "256", str(BINARY)),
+        RunResult(returncode=1, stdout="", stderr="No such file"),
+    )
     return runner
 
 
@@ -564,12 +569,32 @@ def test_unsafe_post_enable_state_triggers_serve_reset_before_report() -> None:
     assert report.residual_codes == ()
 
 
+def _bootstrap_script() -> str:
+    """The exact bootstrap the CLI would render for these spec flags."""
+    import argparse
+
+    return cli._deploy_bootstrap_script(
+        argparse.Namespace(
+            config_repo=CONFIG_REPO, service_state_dir=STATE_DIR
+        )
+    )
+
+
+def _fs_binary(rendered: Path) -> str:
+    """A writable bootstrap-install target beside the rendered dir."""
+    bin_dir = rendered.parent / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    return str(bin_dir / "hermes-orchestrator")
+
+
 def _fs_dirs(tmp_path: Path) -> tuple[Path, Path]:
     """Create rendered artifacts and an empty launch-agents dir on disk."""
     rendered = tmp_path / "rendered"
     agents = tmp_path / "agents"
     agents.mkdir()
-    render_artifacts(_inventory(), rendered, console_port=8787)
+    render_artifacts(
+        _inventory(), rendered, console_port=8787, bootstrap=_bootstrap_script()
+    )
     return rendered, agents
 
 
@@ -598,6 +623,11 @@ def _fs_runner(rendered: Path, **kwargs) -> FilesystemRunner:
     ):
         runner.script(
             (str(BINARY), subcommand, "--help"),
+            RunResult(returncode=0, stdout="usage", stderr=""),
+        )
+        # The CLI plan probes the rendered bootstrap's entry points.
+        runner.script(
+            (str(rendered / "hermes-bootstrap"), subcommand, "--help"),
             RunResult(returncode=0, stdout="usage", stderr=""),
         )
         runner.script(
@@ -925,6 +955,7 @@ def test_cli_deploy_render_writes_artifacts(tmp_path: Path, capsys) -> None:
         str(output / name)
         for name in (
             *(f"{label}.plist" for label in LABELS),
+            "hermes-bootstrap",
             "hermes-newsyslog.conf",
             "serve-plan.json",
             "OPERATOR.md",
@@ -1087,10 +1118,32 @@ class _DiedMidAttempt(Exception):
     """Models a process killed mid-attempt: no compensation ever runs."""
 
 
+def _fs_cli_plan(rendered: Path, agents: Path):
+    """The exact plan the CLI builds for the filesystem flags."""
+    import hashlib as hashlib_module
+
+    return plan_install(
+        standard_inventory(
+            binary=PurePosixPath(_fs_binary(rendered)),
+            config_repo=CONFIG_REPO,
+            state_dir=STATE_DIR,
+            log_dir=LOG_DIR,
+        ),
+        rendered_dir=PurePosixPath(rendered),
+        launch_agents_dir=PurePosixPath(agents),
+        uid=UID,
+        console_port=8787,
+        bootstrap_target=PurePosixPath(_fs_binary(rendered)),
+        bootstrap_identity=hashlib_module.sha256(
+            _bootstrap_script().encode("utf-8")
+        ).hexdigest(),
+    )
+
+
 def _fs_cli_flags(rendered: Path, agents: Path) -> list[str]:
     return [
         "--binary",
-        str(BINARY),
+        _fs_binary(rendered),
         "--config-repo",
         str(CONFIG_REPO),
         "--service-state-dir",
@@ -1190,7 +1243,7 @@ def test_restart_after_claimed_plist_recovers_and_completes(
         assert (agents / f"{label}.plist").exists()
         assert label in second.loaded
     states = _journal_states(journal_path)
-    assert len(states) == 4
+    assert len(states) == 5  # two plists, two jobs, one bootstrap
     assert set(states.values()) == {"installed"}
 
 
@@ -1236,7 +1289,7 @@ def test_restart_after_applied_plist_compensates_exact_recorded_resource(
         assert (agents / f"{label}.plist").exists()
         assert label in second.loaded
     states = _journal_states(journal_path)
-    assert len(states) == 4
+    assert len(states) == 5  # two plists, two jobs, one bootstrap
     assert set(states.values()) == {"installed"}
 
 
@@ -1266,7 +1319,7 @@ def test_restart_after_applied_bootstrap_recovers_and_preserves_unowned(
     # Recovery touches exactly the recorded resources in reverse claim order
     # (each applied one only after its identity is verified), then the
     # unmodified real plan runs in full.
-    plan = _fs_install_plan(rendered, agents)
+    plan = _fs_cli_plan(rendered, agents)
     assert second.calls == [
         ("test", "-e", dst2),
         ("launchctl", "print", label1),
@@ -1283,7 +1336,7 @@ def test_restart_after_applied_bootstrap_recovers_and_preserves_unowned(
     assert report["residual_codes"] == []
     assert unowned.read_bytes() == unowned_bytes
     states = _journal_states(journal_path)
-    assert len(states) == 4
+    assert len(states) == 5  # two plists, two jobs, one bootstrap
     assert set(states.values()) == {"installed"}
 
 
@@ -1788,7 +1841,7 @@ def test_restart_compensates_applied_entries_in_reverse_order(
     ]
     # Recovery finished clean, so the fresh plan then runs to completion.
     states = _journal_states(journal_path)
-    assert len(states) == 4
+    assert len(states) == 5  # two plists, two jobs, one bootstrap
     assert set(states.values()) == {"installed"}
 
 

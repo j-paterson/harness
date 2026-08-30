@@ -15,6 +15,7 @@ that last proved out.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import uuid
@@ -55,6 +56,88 @@ class RuntimeActivation:
     activated_at: str
 
 
+def materialize_artifact(
+    *,
+    state_dir: Path,
+    checkout_root: Path,
+    git_sha: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> Path:
+    """Materialize one immutable runtime artifact for an exact commit.
+
+    The exact tree of ``git_sha`` is exported into
+    ``<state_dir>/runtimes/<sha>/`` with a ``RUNTIME_SHA`` marker,
+    built in a temporary sibling and atomically renamed, so the
+    artifact either exists completely or not at all; an existing
+    complete artifact is reused (idempotent). Artifacts never depend
+    on the disposable checkout they were exported from.
+    """
+
+    runner = run or subprocess.run
+    runtimes = state_dir / "runtimes"
+    target = runtimes / git_sha
+    marker = target / "RUNTIME_SHA"
+    if marker.is_file():
+        if marker.read_text(encoding="ascii").strip() != git_sha:
+            raise ActivationRefused(
+                f"runtime artifact {target} carries a foreign RUNTIME_SHA"
+            )
+        return target
+    runtimes.mkdir(parents=True, exist_ok=True)
+    staging = runtimes / f".{git_sha}.tmp-{os.getpid()}"
+    archive = runtimes / f".{git_sha}.tar-{os.getpid()}"
+    try:
+        staging.mkdir()
+        exported = runner(
+            (
+                "git",
+                "-C",
+                str(checkout_root),
+                "archive",
+                "--format=tar",
+                "-o",
+                str(archive),
+                git_sha,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if exported.returncode != 0:
+            raise ActivationRefused(
+                f"could not export {git_sha[:12]} from {checkout_root}"
+            )
+        extracted = runner(
+            ("tar", "-xf", str(archive), "-C", str(staging)),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if extracted.returncode != 0:
+            raise ActivationRefused(
+                f"could not extract the {git_sha[:12]} artifact"
+            )
+        (staging / "RUNTIME_SHA").write_text(
+            git_sha + "\n", encoding="ascii"
+        )
+        try:
+            staging.rename(target)
+        except OSError:
+            # A concurrent materialization won the rename; the complete
+            # existing artifact is authoritative.
+            if not marker.is_file():
+                raise
+    finally:
+        archive.unlink(missing_ok=True)
+        if staging.is_dir() and staging != target:
+            import shutil as _shutil
+
+            _shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
 def checkout_migration_max(checkout_root: Path) -> int:
     """The highest migration a checkout carries; 0 when it has none."""
 
@@ -92,6 +175,20 @@ class RuntimeActivator:
         ).fetchone()
         return None if row is None else self._record(row)
 
+    def observed_sha(self, checkout_root: Path) -> str | None:
+        """The running code's commit identity: an immutable artifact's
+        RUNTIME_SHA marker, or the checkout's git HEAD."""
+
+        marker = checkout_root / "RUNTIME_SHA"
+        if marker.is_file():
+            value = marker.read_text(encoding="ascii").strip()
+            return value if _SHA_PATTERN.match(value) else None
+        head = self._git(checkout_root, "rev-parse", "HEAD")
+        if head is None:
+            return None
+        value = head.strip()
+        return value if _SHA_PATTERN.match(value) else None
+
     def confirm_startup(
         self, *, checkout_root: Path, binary_path: Path, pid: int
     ) -> RuntimeActivation | None:
@@ -99,9 +196,12 @@ class RuntimeActivator:
 
         The started daemon never self-activates over an existing
         activation (that would silently undo a rollback): with no
-        activation at all it bootstraps one; with a matching activation
-        it confirms it; with a mismatched activation it journals the
-        mismatch and returns None so the caller fails closed. Every
+        activation at all it bootstraps one; otherwise it confirms only
+        when the COMPLETE immutable identity matches the active row —
+        checkout root, exact commit SHA (a mutable checkout that
+        advanced past the activated commit fails), resolved binary
+        path, and the live database schema. A mismatch journals the
+        observation and returns None so the caller fails closed. Every
         outcome appends a durable ``daemon.started`` event carrying the
         pid and generation — the health signal the apply protocol
         verifies.
@@ -115,9 +215,20 @@ class RuntimeActivator:
                 )
             except ActivationRefused:
                 current = None
-        matches = current is not None and (
-            current.checkout_root == str(checkout_root)
-        )
+        observed = self.observed_sha(checkout_root)
+        mismatches: list[str] = []
+        if current is None:
+            mismatches.append("no active activation")
+        else:
+            if current.checkout_root != str(checkout_root):
+                mismatches.append("checkout_root")
+            if observed is None or observed != current.git_sha:
+                mismatches.append("git_sha")
+            if current.binary_path != str(binary_path):
+                mismatches.append("binary_path")
+            if current.database_schema != self._database.schema_version():
+                mismatches.append("database_schema")
+        matches = current is not None and not mismatches
         with self._database.transaction() as connection:
             self._events.append(
                 connection,
@@ -131,33 +242,75 @@ class RuntimeActivator:
                         "pid": pid,
                         "checkout_root": str(checkout_root),
                         "binary_path": str(binary_path),
+                        "observed_sha": observed,
                         "activation_generation": (
                             current.generation if matches and current else None
                         ),
                         "matches_active": matches,
+                        "mismatches": mismatches,
                     },
                 ),
             )
         return current if matches else None
 
+    def activate_artifact(
+        self, *, source_checkout: Path, state_dir: Path
+    ) -> RuntimeActivation:
+        """Prove the source checkout, then activate its immutable artifact.
+
+        The runtime identity that becomes active is the exported
+        artifact under the state directory — independent of the
+        disposable checkout it came from — with the artifact's own
+        interpreter entry point as the recorded binary.
+        """
+
+        git_sha = self._validate(source_checkout)
+        artifact = materialize_artifact(
+            state_dir=state_dir,
+            checkout_root=source_checkout,
+            git_sha=git_sha,
+            run=self._run,
+        )
+        return self._record_attempt(
+            state="active",
+            binary_path=artifact / ".venv" / "bin" / "hermes-orchestrator",
+            checkout_root=artifact,
+            git_sha=git_sha,
+            reason=f"artifact of {source_checkout}",
+        )
+
     def reactivate(self, prior: RuntimeActivation) -> RuntimeActivation:
         """Reinstate a prior activation's identity as a new generation.
 
-        The prior checkout is revalidated (a rollback target that no
-        longer proves out must fail closed, not silently run).
+        An immutable artifact revalidates by its marker; a plain
+        checkout revalidates fully. Either way the exact commit must
+        still be observable and the live database schema must still be
+        the one the prior runtime proved against — a rollback across a
+        schema advance needs the matching database snapshot restored
+        first, and fails closed here.
         """
 
-        git_sha = self._validate(Path(prior.checkout_root))
-        if git_sha != prior.git_sha:
+        prior_root = Path(prior.checkout_root)
+        observed = self.observed_sha(prior_root)
+        if observed != prior.git_sha:
             raise ActivationRefused(
-                f"{prior.checkout_root} no longer sits at the prior "
+                f"{prior.checkout_root} no longer carries the prior "
                 f"activation's commit {prior.git_sha[:12]}"
             )
+        if prior.database_schema != self._database.schema_version():
+            raise ActivationRefused(
+                f"the prior runtime proved against schema "
+                f"{prior.database_schema} but the live database is at "
+                f"{self._database.schema_version()}; restore the matching "
+                "database snapshot before rolling back"
+            )
+        if not (prior_root / "RUNTIME_SHA").is_file():
+            self._validate(prior_root)
         return self._record_attempt(
             state="active",
             binary_path=Path(prior.binary_path),
-            checkout_root=Path(prior.checkout_root),
-            git_sha=git_sha,
+            checkout_root=prior_root,
+            git_sha=prior.git_sha,
             reason=f"rollback to generation {prior.generation}",
         )
 
@@ -411,7 +564,12 @@ class ActivationApplier:
         self._poll = poll_seconds
 
     def apply(
-        self, *, checkout_root: Path, binary_path: Path
+        self,
+        *,
+        checkout_root: Path,
+        binary_path: Path | None = None,
+        artifact_state_dir: Path | None = None,
+        prepare: Callable[[Path], None] | None = None,
     ) -> ApplyReport:
         apply_id = self._ids()
         prior = self._activator.current()
@@ -425,9 +583,23 @@ class ActivationApplier:
             insert=True,
         )
         try:
-            activation = self._activator.activate(
-                checkout_root=checkout_root, binary_path=binary_path
-            )
+            if artifact_state_dir is not None:
+                # The activated identity is the immutable exported
+                # artifact, never the disposable source checkout.
+                activation = self._activator.activate_artifact(
+                    source_checkout=checkout_root,
+                    state_dir=artifact_state_dir,
+                )
+            else:
+                if binary_path is None:
+                    raise ActivationRefused(
+                        "a direct activation requires the binary path"
+                    )
+                activation = self._activator.activate(
+                    checkout_root=checkout_root, binary_path=binary_path
+                )
+            if prepare is not None:
+                prepare(Path(activation.checkout_root))
         except ActivationRefused as refusal:
             self._journal(
                 apply_id, state="refused", reason=str(refusal)

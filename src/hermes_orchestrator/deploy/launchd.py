@@ -19,6 +19,49 @@ _OPERATIONS_LABEL = "com.josystem.hermes-operations"
 # protocol kickstarts exactly this job.
 ORCHESTRATOR_LABEL = _ORCHESTRATOR_LABEL
 
+BOOTSTRAP_FILENAME = "hermes-bootstrap"
+
+# launchd provides a minimal environment; the rendered bootstrap pins
+# the operator PATH the runtime needs (claude, uv, codex, git).
+BOOTSTRAP_PATH = (
+    "/Applications/Codex.app/Contents/Resources:"
+    "$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+    "/usr/bin:/bin:/usr/sbin:/sbin"
+)
+
+
+def render_bootstrap(
+    *,
+    uv_binary: PurePosixPath,
+    config_repo: PurePosixPath,
+    state_dir: PurePosixPath,
+) -> str:
+    """Render the durable, worktree-independent launchd entry script.
+
+    The script resolves the durable active runtime activation from the
+    state database READ-ONLY (never migrating anything) and execs the
+    CLI from that immutable artifact; with no activation yet, the
+    durable config clone is the bootstrap fallback. It never references
+    any disposable issue worktree.
+    """
+
+    return (
+        "#!/bin/sh\n"
+        "# Rendered by hermes-orchestrator deploy-render; installed by\n"
+        "# deploy-install. Do not edit by hand.\n"
+        f"export PATH={BOOTSTRAP_PATH}\n"
+        "ACTIVE=$(/usr/bin/sqlite3 -readonly "
+        f'"{state_dir}/state.db" '
+        '"SELECT checkout_root FROM runtime_activations '
+        "WHERE state = 'active'\" 2>/dev/null || true)\n"
+        f'PROJECT="{config_repo}"\n'
+        'if [ -n "$ACTIVE" ] && [ -f "$ACTIVE/pyproject.toml" ]; then\n'
+        '  PROJECT="$ACTIVE"\n'
+        "fi\n"
+        f'exec {uv_binary} run --project "$PROJECT" hermes-orchestrator '
+        '"$@"\n'
+    )
+
 
 class UnsafeServiceSpec(Exception):
     """A service specification violated a safety invariant; static code only."""

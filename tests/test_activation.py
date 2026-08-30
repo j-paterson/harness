@@ -410,3 +410,248 @@ def test_runtime_exec_resolves_the_active_checkout(
     assert argv[argv.index("--project") + 1] == str(tmp_path / "live")
     assert argv[argv.index("--repo-root") + 1] == str(tmp_path / "stable")
     assert argv[-2:] == ["--interval", "30"]
+
+
+class TestFullIdentityConfirmation:
+    """Sol 70e2dcf7: startup confirms only the complete identity."""
+
+    def activate_at(
+        self, database: Database, checkout: Path
+    ) -> tuple[RuntimeActivator, object]:
+        activator = RuntimeActivator(database, events=EventStore(database))
+        activation = activator.activate(
+            checkout_root=checkout, binary_path=Path("/bin/hermes")
+        )
+        return activator, activation
+
+    def test_the_exact_recorded_identity_confirms(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        activator, activation = self.activate_at(database, checkout)
+
+        confirmed = activator.confirm_startup(
+            checkout_root=checkout,
+            binary_path=Path("/bin/hermes"),
+            pid=1,
+        )
+
+        assert confirmed is not None
+        assert confirmed.activation_id == activation.activation_id  # type: ignore[attr-defined]
+
+    def test_an_advanced_head_at_the_same_path_fails_confirmation(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """The live worktree is mutable: changed code at the same path
+        must never confirm an obsolete generation."""
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        activator, _activation = self.activate_at(database, checkout)
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+
+        confirmed = activator.confirm_startup(
+            checkout_root=checkout,
+            binary_path=Path("/bin/hermes"),
+            pid=2,
+        )
+
+        assert confirmed is None
+
+    def test_a_changed_binary_path_fails_confirmation(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        activator, _activation = self.activate_at(database, checkout)
+
+        assert (
+            activator.confirm_startup(
+                checkout_root=checkout,
+                binary_path=Path("/somewhere/else"),
+                pid=3,
+            )
+            is None
+        )
+
+    def test_a_changed_database_schema_fails_confirmation(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        activator, _activation = self.activate_at(database, checkout)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (9999, CURRENT_TIMESTAMP)"
+            )
+
+        assert (
+            activator.confirm_startup(
+                checkout_root=checkout,
+                binary_path=Path("/bin/hermes"),
+                pid=4,
+            )
+            is None
+        )
+
+
+class TestImmutableArtifacts:
+    """Sol 70e2dcf7: activations run immutable exported artifacts."""
+
+    def test_activate_artifact_exports_and_marks_the_exact_commit(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        from hermes_orchestrator.activation import materialize_artifact
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+
+        activation = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+
+        artifact = Path(activation.checkout_root)
+        assert artifact == state_dir / "runtimes" / activation.git_sha
+        assert (artifact / "RUNTIME_SHA").read_text().strip() == (
+            activation.git_sha
+        )
+        assert (artifact / "pyproject.toml").exists()
+        assert activation.binary_path == str(
+            artifact / ".venv" / "bin" / "hermes-orchestrator"
+        )
+        # Materialization is idempotent for the same commit.
+        again = materialize_artifact(
+            state_dir=state_dir,
+            checkout_root=checkout,
+            git_sha=activation.git_sha,
+        )
+        assert again == artifact
+
+    def test_rollback_survives_the_source_worktree_moving(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        import shutil
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+        activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        shutil.rmtree(checkout)  # the disposable worktree disappears
+
+        restored = activator.reactivate(prior)
+
+        assert restored.checkout_root == prior.checkout_root
+        assert restored.git_sha == prior.git_sha
+        current = activator.current()
+        assert current is not None
+        assert current.activation_id == restored.activation_id
+
+    def test_a_schema_advancing_rollback_fails_closed(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (9999, CURRENT_TIMESTAMP)"
+            )
+
+        with pytest.raises(ActivationRefused, match="database snapshot"):
+            activator.reactivate(prior)
+
+    def test_a_schema_advancing_target_is_refused_before_migration(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """A target carrying migrations beyond the live schema is
+        refused before anything irreversible; the journal records the
+        refusal and no process is touched."""
+
+        from hermes_orchestrator.activation import ActivationApplier
+
+        checkout = build_checkout(
+            tmp_path, schema=database.schema_version() + 3
+        )
+        state_dir = tmp_path / "state"
+        kicks: list[int] = []
+        activator = RuntimeActivator(database, events=EventStore(database))
+        applier = ActivationApplier(
+            activator,
+            database,
+            kickstart=lambda: kicks.append(1),
+            sleep=lambda _s: None,
+            verify_timeout_seconds=0.0,
+        )
+
+        with pytest.raises(ActivationRefused, match="mismatched"):
+            applier.apply(
+                checkout_root=checkout, artifact_state_dir=state_dir
+            )
+
+        assert kicks == []
+        state = database.scalar(
+            "SELECT state FROM activation_applies "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        )
+        assert str(state) == "refused"
+
+    def test_a_failed_artifact_target_restores_the_prior_artifact(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """Distinct target failure causes a supervised restart with an
+        exact prior-identity proof before rollback is recorded."""
+
+        from hermes_orchestrator.activation import ActivationApplier
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+        kicks: list[int] = []
+
+        def kickstart() -> None:
+            kicks.append(1)
+            if len(kicks) == 1:
+                return  # the distinct new artifact never comes up
+            activator.confirm_startup(
+                checkout_root=Path(prior.checkout_root),
+                binary_path=Path(prior.binary_path),
+                pid=555,
+            )
+
+        applier = ActivationApplier(
+            activator,
+            database,
+            kickstart=kickstart,
+            sleep=lambda _s: None,
+            verify_timeout_seconds=0.0,
+        )
+
+        report = applier.apply(
+            checkout_root=checkout, artifact_state_dir=state_dir
+        )
+
+        assert report.state == "rolled_back"
+        assert len(kicks) == 2
+        current = activator.current()
+        assert current is not None
+        assert current.checkout_root == prior.checkout_root
+        assert current.git_sha == prior.git_sha

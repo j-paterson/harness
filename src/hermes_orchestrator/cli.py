@@ -1065,9 +1065,28 @@ def _deploy_inventory(args: argparse.Namespace):
     )
 
 
+def _deploy_bootstrap_script(args: argparse.Namespace) -> str:
+    """The exact bootstrap this deployment renders and installs."""
+
+    import shutil
+    from pathlib import PurePosixPath
+
+    from hermes_orchestrator.deploy.launchd import render_bootstrap
+
+    uv_binary = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    return render_bootstrap(
+        uv_binary=PurePosixPath(uv_binary),
+        config_repo=args.config_repo,
+        state_dir=args.service_state_dir,
+    )
+
+
 def _deploy_render(args: argparse.Namespace) -> int:
     paths = lifecycle.render_artifacts(
-        _deploy_inventory(args), args.output_dir, console_port=args.console_port
+        _deploy_inventory(args),
+        args.output_dir,
+        console_port=args.console_port,
+        bootstrap=_deploy_bootstrap_script(args),
     )
     print(json.dumps({"artifacts": [str(path) for path in paths]}, indent=2))
     return 0
@@ -1120,12 +1139,20 @@ def _run_deploy_plan(
 def _deploy_install(
     args: argparse.Namespace, runner: lifecycle.CommandRunner | None = None
 ) -> int:
+    import hashlib as hashlib_module
+
     steps = lifecycle.plan_install(
         _deploy_inventory(args),
         rendered_dir=args.rendered_dir,
         launch_agents_dir=args.launch_agents_dir,
         uid=args.uid,
         console_port=args.console_port,
+        # The worktree-independent bootstrap installs to the exact
+        # binary path both launchd jobs execute.
+        bootstrap_target=args.binary,
+        bootstrap_identity=hashlib_module.sha256(
+            _deploy_bootstrap_script(args).encode("utf-8")
+        ).hexdigest(),
     )
     journal: lifecycle.MutationJournal | None = None
     if args.execute:
@@ -1197,17 +1224,25 @@ def _runtime_exec(args: argparse.Namespace) -> int:
     """
 
     import shutil
+    import sqlite3 as sqlite3_module
 
     state_dir = _intake_state_dir(args)
-    database = Database.open(state_dir / "state.db")
-    try:
-        row = database.execute(
-            "SELECT checkout_root FROM runtime_activations "
-            "WHERE state = 'active'"
-        ).fetchone()
-    finally:
-        database.close()
-    project = str(row["checkout_root"]) if row is not None else str(args.repo_root)
+    project = str(args.repo_root)
+    # Resolution is strictly read-only: the entry point must never
+    # migrate the database (that is a deliberate activation concern).
+    with suppress(Exception):
+        connection = sqlite3_module.connect(
+            f"file:{state_dir / 'state.db'}?mode=ro", uri=True
+        )
+        try:
+            row = connection.execute(
+                "SELECT checkout_root FROM runtime_activations "
+                "WHERE state = 'active'"
+            ).fetchone()
+            if row is not None:
+                project = str(row[0])
+        finally:
+            connection.close()
     uv_binary = shutil.which("uv") or "/opt/homebrew/bin/uv"
     argv = [
         uv_binary,
@@ -1242,9 +1277,9 @@ def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
     try:
         activator = RuntimeActivator(database, events=EventStore(database))
         try:
-            activation = activator.activate(
-                checkout_root=_code_checkout_root(),
-                binary_path=Path(sys.argv[0]).resolve(),
+            activation = activator.activate_artifact(
+                source_checkout=_code_checkout_root(),
+                state_dir=settings.state_dir,
             )
         except ActivationRefused as error:
             current = activator.current()
@@ -1287,6 +1322,7 @@ def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
 def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
     """Journaled apply: activate, kickstart, verify, or proven rollback."""
 
+    import shutil as shutil_module
     import subprocess as subprocess_module
 
     from hermes_orchestrator.activation import (
@@ -1318,10 +1354,28 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
             database,
             kickstart=kickstart,
         )
+        def warm(artifact: Path) -> None:
+            # Prove the artifact runnable (and build its environment)
+            # before the supervised job is pointed at it.
+            subprocess_module.run(
+                (
+                    shutil_module.which("uv") or "/opt/homebrew/bin/uv",
+                    "run",
+                    "--project",
+                    str(artifact),
+                    "hermes-orchestrator",
+                    "--help",
+                ),
+                check=True,
+                capture_output=True,
+                timeout=300,
+            )
+
         try:
             report = applier.apply(
                 checkout_root=_code_checkout_root(),
-                binary_path=Path(sys.argv[0]).resolve(),
+                artifact_state_dir=settings.state_dir,
+                prepare=warm,
             )
         except (ActivationRefused, ApplyFailed) as error:
             _print(
@@ -1417,13 +1471,12 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
         with suppress(Exception):
             payload = json.loads(sys.stdin.read() or "{}")
             session = session or payload.get("session_id")
-            # The stable hook-provided child identity; an event that
-            # carries none fails closed and never advances progress.
-            child = child or (
-                payload.get("tool_use_id")
-                or payload.get("agent_id")
-                or payload.get("agent_session_id")
-            )
+            # Strictly the shared lifecycle identity: SubagentStart
+            # and SubagentStop carry the same agent_id. A tool_use_id
+            # (a PreToolUse invocation identity) or any other field
+            # can never satisfy it; an event without agent_id fails
+            # closed and never advances progress.
+            child = child or payload.get("agent_id")
     if not session or not child:
         return 0
     with suppress(Exception):

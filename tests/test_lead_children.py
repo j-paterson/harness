@@ -193,3 +193,60 @@ def test_a_stale_promise_is_superseded_once_children_settle(
         (continuation.continuation_id,),
     )
     assert str(state) == "superseded"
+
+
+def run_child_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+    *,
+    completed: bool,
+) -> int:
+    import argparse
+    import io
+    import json
+
+    from hermes_orchestrator import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module.sys, "stdin", io.StringIO(json.dumps(payload))
+    )
+    arguments = argparse.Namespace(
+        session=None, child=None, state_dir=tmp_path
+    )
+    return cli_module._child_event(arguments, completed=completed)
+
+
+def test_the_hook_cli_keys_strictly_on_the_shared_agent_id(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SubagentStart and SubagentStop share agent_id; a PreToolUse
+    tool_use_id can never replace or satisfy the lifecycle identity."""
+
+    start = {"session_id": SESSION, "agent_id": "agent-1"}
+    stop = {"session_id": SESSION, "agent_id": "agent-1"}
+    assert run_child_event(tmp_path, monkeypatch, start, completed=False) == 0
+    assert run_child_event(tmp_path, monkeypatch, stop, completed=True) == 0
+
+    row = database.execute(
+        "SELECT child_id, state FROM lead_children WHERE session_id = ?",
+        (SESSION,),
+    ).fetchone()
+    assert str(row["child_id"]) == "agent-1"
+    assert str(row["state"]) == "completed"
+
+
+def test_a_tool_use_id_cannot_satisfy_the_lifecycle_identity(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation = {"session_id": SESSION, "tool_use_id": "toolu_123"}
+    assert (
+        run_child_event(tmp_path, monkeypatch, invocation, completed=False)
+        == 0
+    )
+    assert (
+        run_child_event(tmp_path, monkeypatch, invocation, completed=True)
+        == 0
+    )
+
+    assert database.scalar("SELECT COUNT(*) FROM lead_children") == 0

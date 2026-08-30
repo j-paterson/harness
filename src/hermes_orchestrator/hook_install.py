@@ -34,11 +34,15 @@ class HookCommandSet:
     child_start: str
 
 
-# (settings event, exact matcher, HookCommandSet attribute)
+# (settings event, exact matcher, HookCommandSet attribute).
+# Child starts install on SubagentStart — the lifecycle event that
+# shares its agent_id namespace with SubagentStop — never on
+# PreToolUse, whose tool_use_id identifies the invocation, not the
+# spawned agent lifecycle.
 _HOOK_SPECS: tuple[tuple[str, str, str], ...] = (
     ("Stop", "*", "stop"),
     ("SubagentStop", "*", "subagent_stop"),
-    ("PreToolUse", "Agent", "child_start"),
+    ("SubagentStart", "*", "child_start"),
 )
 
 
@@ -104,6 +108,43 @@ class HookInstaller:
             raise ValueError(f"{path} carries a non-object hooks section")
         installed: list[str] = []
         repaired: list[str] = []
+        # Cross-event sweep first: a Hermes command parked under any
+        # event other than its home (e.g. a stale child-start left on
+        # PreToolUse) is removed there and repaired into the canonical
+        # binding below.
+        home_events = {
+            getattr(self._commands, attribute): event
+            for event, _matcher, attribute in _HOOK_SPECS
+        }
+        crossed: set[str] = set()
+        for event_name, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_hooks = entry.get("hooks")
+                if not isinstance(entry_hooks, list):
+                    continue
+                kept = []
+                for hook in entry_hooks:
+                    command = (
+                        hook.get("command")
+                        if isinstance(hook, dict)
+                        and hook.get("type") == "command"
+                        else None
+                    )
+                    home = home_events.get(command)
+                    if home is not None and home != event_name:
+                        crossed.add(home)
+                        continue
+                    kept.append(hook)
+                entry["hooks"] = kept
+            hooks[event_name] = [
+                entry
+                for entry in entries
+                if not isinstance(entry, dict) or entry.get("hooks")
+            ]
         for event, matcher, attribute in _HOOK_SPECS:
             command = getattr(self._commands, attribute)
             entries = hooks.setdefault(event, [])
@@ -144,7 +185,9 @@ class HookInstaller:
                     "hooks": [{"type": "command", "command": command}],
                 }
             )
-            if exact == 0 and misplaced == 0:
+            if event in crossed:
+                repaired.append(event)
+            elif exact == 0 and misplaced == 0:
                 installed.append(event)
             elif exact != 1 or misplaced > 0:
                 repaired.append(event)

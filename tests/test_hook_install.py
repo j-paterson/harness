@@ -49,23 +49,24 @@ def test_a_fresh_profile_gets_all_three_exact_bindings(
 
     [report] = installer({"max-a": config_dir}).install()
 
-    assert report.installed == ("Stop", "SubagentStop", "PreToolUse")
+    assert report.installed == ("Stop", "SubagentStop", "SubagentStart")
     assert report.repaired == ()
     settings = read_settings(config_dir)
     assert bindings_for(settings, "Stop") == [("*", COMMANDS.stop)]
     assert bindings_for(settings, "SubagentStop") == [
         ("*", COMMANDS.subagent_stop)
     ]
-    assert bindings_for(settings, "PreToolUse") == [
-        ("Agent", COMMANDS.child_start)
+    assert bindings_for(settings, "SubagentStart") == [
+        ("*", COMMANDS.child_start)
     ]
 
 
-def test_a_command_under_the_wrong_matcher_is_repaired(
+def test_a_command_under_the_wrong_event_or_matcher_is_repaired(
     tmp_path: Path,
 ) -> None:
-    """A Hermes command parked under another matcher does not satisfy
-    the requirement: it is moved into the one exact binding."""
+    """A Hermes command parked under another event (a stale child-start
+    on PreToolUse) or another matcher does not satisfy the
+    requirement: it is moved into the one exact home binding."""
 
     config_dir = tmp_path / "max-b"
     config_dir.mkdir()
@@ -75,7 +76,7 @@ def test_a_command_under_the_wrong_matcher_is_repaired(
                 "hooks": {
                     "PreToolUse": [
                         {
-                            "matcher": "Bash",
+                            "matcher": "Agent",
                             "hooks": [
                                 {
                                     "type": "command",
@@ -115,14 +116,17 @@ def test_a_command_under_the_wrong_matcher_is_repaired(
     [report] = installer({"max-b": config_dir}).install()
 
     assert sorted(report.repaired) == [
-        "PreToolUse",
         "Stop",
+        "SubagentStart",
         "SubagentStop",
     ]
     settings = read_settings(config_dir)
+    # The foreign PreToolUse hook survives; the stale Hermes one is gone.
     assert bindings_for(settings, "PreToolUse") == [
-        ("Bash", "/usr/local/bin/audit.sh"),
-        ("Agent", COMMANDS.child_start),
+        ("Agent", "/usr/local/bin/audit.sh"),
+    ]
+    assert bindings_for(settings, "SubagentStart") == [
+        ("*", COMMANDS.child_start)
     ]
     assert bindings_for(settings, "Stop") == [("*", COMMANDS.stop)]
     assert bindings_for(settings, "SubagentStop") == [
