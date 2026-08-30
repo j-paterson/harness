@@ -38,6 +38,8 @@ CONTROL_KINDS = frozenset(
         "signal.failed",
         "channel.auto_confirmed",
         "channel.approval_required",
+        "channel.confirm_claimed",
+        "channel.confirm_ambiguous",
         "lead.launch_failed",
     }
 )

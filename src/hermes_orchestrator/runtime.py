@@ -45,10 +45,6 @@ from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
-from hermes_orchestrator.fakechat_signal import (
-    FakechatSignalPorts,
-    FakechatSignalSender,
-)
 from hermes_orchestrator.git import WorktreeGit
 from hermes_orchestrator.github import (
     GitHubClient,
@@ -186,6 +182,10 @@ class Runtime:
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
     control_operations: ControlOperations | None = None
+    # Sol correction b4b545f3 (v5): production composition no longer
+    # builds a fakechat wake plane, so this is always None from
+    # open_runtime; the field survives only because the CLI supervisor
+    # threads it through and treats None as "no fakechat routing".
     fakechat_router: FakechatWakeRouter | None = None
     _daemon_lock: _DaemonLock | None = None
 
@@ -435,7 +435,6 @@ def open_runtime(
         lead_intake: LeadIntakeRouter | None = None
         channel_hub: ChannelHub | None = None
         channel_capabilities: ChannelCapabilities | None = None
-        fakechat_router: FakechatWakeRouter | None = None
 
         if enable_live:
             assert reader is not None
@@ -520,24 +519,11 @@ def open_runtime(
                 channel_router.attach(lead_assignments)
                 channel_router.attach(control_operations)
                 channel_router.attach(merge_flow.outbox)
-                # The fakechat wake plane (plan v4): the same committed
-                # packets also wake an idle host through one bounded
-                # loopback POST to the session's durably owned port —
-                # the announcements and the Stop-hook poll remain the
-                # authoritative drain, exactly as with the hub.
-                fakechat_ports = FakechatSignalPorts(database=database)
-                fakechat_router = FakechatWakeRouter(
-                    database=database,
-                    sender=FakechatSignalSender(
-                        database=database,
-                        ports=fakechat_ports,
-                        control=control_operations,
-                    ),
-                )
-                fakechat_router.attach(lead_wakes)
-                fakechat_router.attach(lead_assignments)
-                fakechat_router.attach(control_operations)
-                fakechat_router.attach(merge_flow.outbox)
+                # Sol correction b4b545f3 (v5): the fakechat wake plane
+                # (the v4 substitute) is retired from production
+                # composition — the hermes-control channel is the wake
+                # accelerator, and the announcements plus the Stop-hook
+                # poll remain the authoritative drain.
                 node_binary = shutil.which("node")
                 channel_launcher = (
                     None
@@ -564,7 +550,6 @@ def open_runtime(
                     auth_probe=lambda alias: probe.check(alias).eligible,
                     channel_launch=channel_launcher,
                     control=control_operations,
-                    signal_ports=fakechat_ports,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,
@@ -681,7 +666,7 @@ def open_runtime(
             channel_hub=channel_hub,
             channel_capabilities=channel_capabilities,
             control_operations=control_operations,
-            fakechat_router=fakechat_router,
+            fakechat_router=None,
             _daemon_lock=daemon_lock,
         )
     except BaseException:

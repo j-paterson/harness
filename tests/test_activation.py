@@ -29,6 +29,26 @@ def database(tmp_path: Path) -> Iterator[Database]:
         value.close()
 
 
+@pytest.fixture(autouse=True)
+def _fake_default_sidecar_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Materialization builds dist from the exported candidate source.
+
+    Tests never run node tooling: the production npm builder is
+    replaced with a deterministic fake whose output matches the fresh
+    build ``add_fake_sidecar`` seeds into checkouts. Tests exercising
+    the build contract itself inject their own builder explicitly.
+    """
+
+    def fake_build(sidecar: Path, **_kwargs: object) -> None:
+        entry = sidecar / "dist" / "src" / "main.js"
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_bytes(b"// sidecar\n")
+
+    monkeypatch.setattr(
+        "hermes_orchestrator.activation._npm_sidecar_build", fake_build
+    )
+
+
 @pytest.fixture
 def activator(database: Database) -> RuntimeActivator:
     return RuntimeActivator(
@@ -1021,6 +1041,111 @@ class TestFleetCoherence:
             "WHERE event_type = 'console.started'"
         ).fetchall()
         assert len(journaled) == 1
+
+
+class TestSidecarBuildContract:
+    """Operator scope correction 344b2274: the materialized dist is
+    built from the exported candidate source by an injected builder;
+    the mutable checkout's dist is never packaged."""
+
+    @staticmethod
+    def head(checkout: Path) -> str:
+        return subprocess.run(
+            ("git", "-C", str(checkout), "rev-parse", "HEAD"),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_a_stale_checkout_dist_is_never_packaged(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """The exported candidate source is built and that build's
+        output is materialized; the checkout's own (stale) dist bytes
+        are ignored entirely."""
+
+        from hermes_orchestrator.activation import materialize_artifact
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        # Tracked sidecar build inputs at the candidate commit.
+        entry = checkout / "channels" / "hermes-control" / "src" / "main.ts"
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text("export const version = 2\n", encoding="utf-8")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "sidecar source")
+        # The mutable checkout dist is stale relative to that source.
+        add_fake_sidecar(checkout, content=b"// stale local build\n")
+        built_from: list[Path] = []
+
+        def build(sidecar: Path, **_kwargs: object) -> None:
+            built_from.append(sidecar)
+            source = (sidecar / "src" / "main.ts").read_text(encoding="utf-8")
+            out = sidecar / "dist" / "src" / "main.js"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("// built\n" + source, encoding="utf-8")
+
+        state_dir = tmp_path / "state"
+        artifact = materialize_artifact(
+            state_dir=state_dir,
+            checkout_root=checkout,
+            git_sha=self.head(checkout),
+            build_sidecar=build,
+        )
+
+        packaged = (
+            artifact / "channels" / "hermes-control" / "dist" / "src" / "main.js"
+        ).read_text(encoding="utf-8")
+        assert packaged == "// built\nexport const version = 2\n"
+        assert packaged.encode() != b"// stale local build\n"
+        # The build ran exactly once, against the exported candidate
+        # source under the state directory — never the mutable checkout.
+        assert len(built_from) == 1
+        assert not str(built_from[0]).startswith(str(checkout))
+        assert str(built_from[0]).startswith(str(state_dir))
+
+    def test_a_failed_candidate_build_aborts_before_activation(
+        self, database: Database, tmp_path: Path
+    ) -> None:
+        """A candidate-side build failure records a durable failed
+        attempt and leaves the prior activation (and its derived ACTIVE
+        pointer) untouched — the existing safe-rollback pattern."""
+
+        checkout = build_checkout(tmp_path, schema=database.schema_version())
+        state_dir = tmp_path / "state"
+        activator = RuntimeActivator(database, events=EventStore(database))
+        prior = activator.activate_artifact(
+            source_checkout=checkout, state_dir=state_dir
+        )
+        (checkout / "pyproject.toml").write_text("[project]\nname='y'\n")
+        git(checkout, "add", "-A")
+        git(checkout, "commit", "-qm", "advance")
+
+        def broken_build(sidecar: Path, **_kwargs: object) -> None:
+            raise RuntimeError("tsc exited 2")
+
+        failing = RuntimeActivator(
+            database,
+            events=EventStore(database),
+            sidecar_build=broken_build,
+        )
+        with pytest.raises(ActivationRefused, match="sidecar build"):
+            failing.activate_artifact(
+                source_checkout=checkout, state_dir=state_dir
+            )
+
+        # The prior activation stays active; the refusal is durable.
+        current = activator.current()
+        assert current is not None
+        assert current.activation_id == prior.activation_id
+        failed = database.scalar(
+            "SELECT COUNT(*) FROM runtime_activations WHERE state = 'failed'"
+        )
+        assert failed == 1
+        # No artifact — complete or partial — exists for the failed
+        # candidate, and the ACTIVE pointer still names the prior one.
+        assert not (state_dir / "runtimes" / self.head(checkout)).exists()
+        pointer = state_dir / "runtimes" / "ACTIVE"
+        assert pointer.read_text().strip() == prior.checkout_root
 
 
 class TestFleetRestartExceptions:

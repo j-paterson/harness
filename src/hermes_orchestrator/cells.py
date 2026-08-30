@@ -786,6 +786,25 @@ class ProjectCellService:
         if getattr(handoff, "cell_id", None) != cell_id:
             raise RotationBlocked("handoff belongs to another project cell")
         current = self._get_cell(cell_id)
+        persisted_session = getattr(handoff, "replacement_session_id", None)
+        persisted_profile = getattr(handoff, "replacement_profile_alias", None)
+        already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
+        if (
+            already_acknowledged
+            and persisted_session is not None
+            and persisted_profile is not None
+        ):
+            # Sol correction b4b545f3 P2: the acknowledgement already
+            # persisted the exact replacement identities, so recovery
+            # reconstructs them — no lead-runner call, no capacity
+            # reselection.
+            return await self._recover_acknowledged_rotation(
+                current,
+                handoff_id,
+                replacement_session=UUID(str(persisted_session)),
+                replacement_profile=str(persisted_profile),
+            )
+
         reservation = self._profiles.reserve_replacement(
             current.project_key,
             current.profile_alias,
@@ -796,9 +815,11 @@ class ProjectCellService:
             if refusal:
                 message = f"{message}: {refusal}"
             raise RotationBlocked(message)
-        replacement_session = getattr(handoff, "replacement_session_id", None)
-        already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
-        if not isinstance(replacement_session, UUID):
+        if persisted_session is not None:
+            # The durable column is TEXT; parse rather than minting a new
+            # session id for an acknowledgement that already named one.
+            replacement_session = UUID(str(persisted_session))
+        else:
             replacement_session = self._replacement_session_ids()
 
         request = LeadTurnRequest(
@@ -832,10 +853,13 @@ class ProjectCellService:
                         and event.session_id == replacement_session
                         and event.restated_next_action
                     ):
+                        # One durable transition persists the acknowledged
+                        # state together with BOTH selected identities.
                         self._handoffs.acknowledge(
                             handoff_id,
                             replacement_session,
                             event.restated_next_action,
+                            profile_alias=reservation.profile_alias,
                         )
                         acknowledged = True
             finally:
@@ -850,12 +874,73 @@ class ProjectCellService:
             self._profiles.cancel_replacement(current.project_key)
             raise RotationBlocked("handoff was not acknowledged by the replacement")
 
+        return await self._finalize_transfer(
+            current,
+            handoff_id,
+            replacement_session=replacement_session,
+            replacement_profile=reservation.profile_alias,
+            recovering=False,
+        )
+
+    async def _recover_acknowledged_rotation(
+        self,
+        current: ProjectCell,
+        handoff_id: str,
+        *,
+        replacement_session: UUID,
+        replacement_profile: str,
+    ) -> ProjectCell:
+        """Complete an acknowledged-but-untransferred rotation from the
+        identities persisted at acknowledgement (Sol b4b545f3 P2): never
+        call the lead runner again and never reselect capacity."""
+
+        if (
+            current.session_id == replacement_session
+            and current.profile_alias == replacement_profile
+        ):
+            # The transfer transaction already committed on a prior pass;
+            # only the pool's in-memory affinity may still need resyncing
+            # to the durable rows.
+            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.restore(
+                current.project_key, replacement_profile, self._aware_now()
+            )
+            return current
+        conflict = self._database.execute(
+            "SELECT project_key FROM profile_leases WHERE profile_alias = ?",
+            (replacement_profile,),
+        ).fetchone()
+        if conflict is not None:
+            raise RotationBlocked(
+                f"recovered replacement profile {replacement_profile!r} "
+                "already holds a profile lease "
+                f"(project {str(conflict['project_key'])!r})"
+            )
+        return await self._finalize_transfer(
+            current,
+            handoff_id,
+            replacement_session=replacement_session,
+            replacement_profile=replacement_profile,
+            recovering=True,
+        )
+
+    async def _finalize_transfer(
+        self,
+        current: ProjectCell,
+        handoff_id: str,
+        *,
+        replacement_session: UUID,
+        replacement_profile: str,
+        recovering: bool,
+    ) -> ProjectCell:
+        """Run the one transactional lease/cell transfer and its follow-ups."""
+
         now = self._aware_now().isoformat()
         rotated = ProjectCell(
             cell_id=current.cell_id,
             project_key=current.project_key,
             state="active",
-            profile_alias=reservation.profile_alias,
+            profile_alias=replacement_profile,
             session_id=replacement_session,
         )
         try:
@@ -896,12 +981,22 @@ class ProjectCellService:
                     ),
                 )
         except BaseException:
-            self._profiles.cancel_replacement(current.project_key)
+            if not recovering:
+                self._profiles.cancel_replacement(current.project_key)
             raise
-        self._profiles.commit_rotation(
-            current.project_key,
-            current.profile_alias,
-        )
+        if recovering:
+            # No in-memory reservation exists on recovery: rebuild the
+            # pool's affinity from the durable identities instead of
+            # committing a reservation that was never re-made.
+            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.restore(
+                current.project_key, replacement_profile, self._aware_now()
+            )
+        else:
+            self._profiles.commit_rotation(
+                current.project_key,
+                current.profile_alias,
+            )
         if self._safety is not None:
             self._safety.invalidate(rotated.cell_id, reason="session_rotated")
         if self._context is not None:

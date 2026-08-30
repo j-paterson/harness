@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from hermes_orchestrator.cli import _run_daemon, main
+from hermes_orchestrator.cli import _listen_for_merger_turns, _run_daemon, main
+from hermes_orchestrator.codex_rpc import RpcNotification
+from hermes_orchestrator.merger_turns import TurnOutcome
 from tests.test_supervisor import FakeService
 
 
@@ -69,7 +71,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 50
+    assert json.loads(result.stdout)["schema_version"] == 51
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -2076,3 +2078,216 @@ def test_verify_check_is_fresh_then_stale_after_a_tree_change(
     payload = json.loads(stale.stdout)
     assert payload["valid"] is False
     assert payload["reason"] == "stale: tree changed"
+
+
+# INFRA-197 fast-lane a3aa8cd8: an idle thread/status/changed for the
+# project-bound Merger thread with an outstanding (delivered or admitted)
+# wake must settle through the existing merger-turn path exactly once.
+
+
+def _status_changed(thread_id: str, status_type: str) -> RpcNotification:
+    return RpcNotification(
+        "thread/status/changed",
+        {"threadId": thread_id, "status": {"type": status_type}},
+    )
+
+
+def _turn_completed(thread_id: str) -> RpcNotification:
+    return RpcNotification("turn/completed", {"threadId": thread_id})
+
+
+class _ListenerRpc:
+    """Finite notification feed; the listener returns when it drains."""
+
+    def __init__(self, notifications: list[RpcNotification]) -> None:
+        self._notifications = notifications
+
+    async def notifications(self):
+        for notification in self._notifications:
+            yield notification
+
+
+class _ListenerMerger:
+    """Read-only project-bound reviewer channels."""
+
+    def __init__(self, channels: dict[str, str]) -> None:
+        self._channels = channels
+
+    def read_channel(self, project_key: str) -> types.SimpleNamespace | None:
+        thread_id = self._channels.get(project_key)
+        if thread_id is None:
+            return None
+        return types.SimpleNamespace(thread_id=thread_id)
+
+
+class _ListenerTurns:
+    """Honest stand-in for MergerTurnService's single settlement path.
+
+    ``handle_turn`` is the one entry point: the first call for an
+    outstanding wake settles the completed structured verdict (recorded
+    in ``settlements``) and consumes the wake, exactly like the durable
+    claim; every later call finds no outstanding wake and no-ops. A
+    duplicate invocation is therefore visible as an extra entry in
+    ``handle_calls`` without an extra entry in ``settlements``, and a
+    parallel settlement architecture would show up as settlements not
+    produced by ``handle_turn``.
+    """
+
+    def __init__(
+        self,
+        merger: _ListenerMerger,
+        projects: tuple[str, ...],
+        outstanding: dict[str, str | None],
+    ) -> None:
+        self._merger = merger
+        self._projects = projects
+        self._outstanding = outstanding
+        self.handle_calls: list[str] = []
+        self.settlements: list[str] = []
+
+    def outstanding_wake(
+        self, project_key: str
+    ) -> tuple[types.SimpleNamespace, str] | None:
+        state = self._outstanding.get(project_key)
+        if state is None:
+            return None
+        return (types.SimpleNamespace(event_id="evt-1"), state)
+
+    async def handle_turn(self, project_key: str) -> TurnOutcome:
+        self.handle_calls.append(project_key)
+        if self._outstanding.get(project_key) is None:
+            return TurnOutcome(
+                project_key,
+                "no_outstanding_wake",
+                None,
+                None,
+                "no delivered candidate wake; terminal idle",
+            )
+        self._outstanding[project_key] = None
+        self.settlements.append(project_key)
+        return TurnOutcome(
+            project_key,
+            "corrections_required",
+            "evt-1",
+            "ENG-1",
+            "structured corrections_required verdict settled",
+        )
+
+    async def on_notification(
+        self, notification: RpcNotification
+    ) -> TurnOutcome | None:
+        if notification.method not in ("turn/completed", "thread/turn/completed"):
+            return None
+        thread_id = notification.params.get("threadId")
+        for project_key in self._projects:
+            channel = self._merger.read_channel(project_key)
+            if channel is not None and channel.thread_id == thread_id:
+                return await self.handle_turn(project_key)
+        return None
+
+
+def _listener_flow(
+    *,
+    channels: dict[str, str],
+    outstanding: dict[str, str | None],
+    notifications: list[RpcNotification],
+) -> types.SimpleNamespace:
+    merger = _ListenerMerger(channels)
+    return types.SimpleNamespace(
+        rpc=_ListenerRpc(notifications),
+        merger=merger,
+        turns=_ListenerTurns(merger, tuple(channels), outstanding),
+    )
+
+
+async def _run_listener(flow: types.SimpleNamespace, projects: tuple[str, ...]) -> str:
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        await _listen_for_merger_turns(flow, projects)
+    return stdout.getvalue()
+
+
+def _settled_lines(output: str) -> list[dict[str, object]]:
+    lines = [json.loads(line) for line in output.splitlines()]
+    return [line for line in lines if line.get("merger_turn") == "corrections_required"]
+
+
+@pytest.mark.asyncio
+async def test_idle_status_with_delivered_wake_settles_once() -> None:
+    flow = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "delivered"},
+        notifications=[_status_changed("thread-1", "idle")],
+    )
+
+    output = await _run_listener(flow, ("demo",))
+
+    assert flow.turns.handle_calls == ["demo"]
+    assert flow.turns.settlements == ["demo"]
+    settled = _settled_lines(output)
+    assert len(settled) == 1
+    assert settled[0]["event_id"] == "evt-1"
+    assert settled[0]["issue_id"] == "ENG-1"
+
+
+@pytest.mark.asyncio
+async def test_idle_status_with_admitted_wake_settles_once() -> None:
+    flow = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "admitted"},
+        notifications=[_status_changed("thread-1", "idle")],
+    )
+
+    output = await _run_listener(flow, ("demo",))
+
+    assert flow.turns.handle_calls == ["demo"]
+    assert flow.turns.settlements == ["demo"]
+    assert len(_settled_lines(output)) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_idle_and_turn_completed_settle_exactly_once() -> None:
+    flow = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "delivered"},
+        notifications=[
+            _status_changed("thread-1", "idle"),
+            _status_changed("thread-1", "idle"),
+            _turn_completed("thread-1"),
+        ],
+    )
+
+    output = await _run_listener(flow, ("demo",))
+
+    # Exactly one settlement: no duplicate review, correction,
+    # projection, or merge from the replayed notifications.
+    assert flow.turns.settlements == ["demo"]
+    assert len(_settled_lines(output)) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_without_wake_and_non_idle_statuses_no_op() -> None:
+    no_wake = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": None},
+        notifications=[_status_changed("thread-1", "idle")],
+    )
+
+    await _run_listener(no_wake, ("demo",))
+
+    assert no_wake.turns.handle_calls == []
+    assert no_wake.turns.settlements == []
+
+    non_idle = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "delivered"},
+        notifications=[
+            _status_changed("thread-1", "active"),
+            _status_changed("thread-9", "idle"),
+        ],
+    )
+
+    await _run_listener(non_idle, ("demo",))
+
+    assert non_idle.turns.handle_calls == []
+    assert non_idle.turns.settlements == []

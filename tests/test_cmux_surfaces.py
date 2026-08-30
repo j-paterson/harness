@@ -1627,6 +1627,27 @@ class TestChannelLaunch:
         assert bindings.is_classic(seat.binding_id, SESSION) is True
 
     @pytest.mark.asyncio
+    async def test_the_channel_seat_carries_no_fakechat_material(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        """Sol correction b4b545f3 (v5): the production classic-seat
+        path adds no fakechat channel command and no fakechat port
+        environment — hermes-control is the only channel extension."""
+
+        port = FakePort(next_refs=[LEAD])
+        launch = FakeChannelLaunch(config=Path(f"/state/channels/{SESSION}.mcp.json"))
+
+        seat = await seater(bindings, port, channel_launch=launch).ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
+        )
+
+        assert seat is not None
+        [created] = port.created
+        assert "fakechat" not in str(created["command"])
+        assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
+
+    @pytest.mark.asyncio
     async def test_a_launcher_failure_falls_back_to_the_bare_command(
         self, database: Database, bindings: CmuxSurfaceBindings
     ) -> None:

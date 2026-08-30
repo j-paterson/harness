@@ -61,6 +61,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.merger_turns import TurnOutcome
 from hermes_orchestrator.migration_gate import (
     MigrationGate,
     jo_loans_commands,
@@ -512,42 +513,78 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _listen_for_merger_turns(flow: MergeFlow) -> None:
+def _print_merger_turn(outcome: TurnOutcome) -> None:
+    print(
+        json.dumps(
+            {
+                "merger_turn": outcome.kind,
+                "project_key": outcome.project_key,
+                "issue_id": outcome.issue_id,
+                "event_id": outcome.event_id,
+                "reason": outcome.reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
+async def _settle_idle_merger_thread(
+    flow: MergeFlow, projects: Sequence[str], thread_id: str
+) -> TurnOutcome | None:
+    """Settle a project-bound Merger thread that went idle with a wake owed.
+
+    Fast-lane a3aa8cd8: a completed Merger turn can surface only as a
+    ``thread/status/changed`` idle report when its ``turn/completed``
+    notification is lost. When the idle thread is a project's bound
+    reviewer channel and that project's wake is outstanding (delivered
+    or admitted), the existing merger-turn settlement path is invoked
+    exactly once; its durable claim keeps a racing or replayed
+    notification idempotent. No new settlement or polling machinery.
+    """
+
+    for project_key in projects:
+        channel = flow.merger.read_channel(project_key)
+        if channel is None or channel.thread_id != thread_id:
+            continue
+        if flow.turns.outstanding_wake(project_key) is None:
+            return None
+        return await flow.turns.handle_turn(project_key)
+    return None
+
+
+async def _listen_for_merger_turns(
+    flow: MergeFlow, projects: Sequence[str] = ()
+) -> None:
     """Settle Merger turns as the App Server reports them; never poll."""
 
     async for notification in flow.rpc.notifications():
         if notification.method == "thread/status/changed":
             status = notification.params.get("status")
+            status_type = status.get("type") if isinstance(status, dict) else None
+            thread_id = notification.params.get("threadId")
             print(
                 json.dumps(
                     {
-                        "thread_status": (
-                            status.get("type") if isinstance(status, dict) else None
-                        ),
-                        "thread_id": notification.params.get("threadId"),
+                        "thread_status": status_type,
+                        "thread_id": thread_id,
                     },
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
                 flush=True,
             )
+            if status_type == "idle" and isinstance(thread_id, str):
+                outcome = await _settle_idle_merger_thread(
+                    flow, projects, thread_id
+                )
+                if outcome is not None:
+                    _print_merger_turn(outcome)
             continue
         outcome = await flow.turns.on_notification(notification)
         if outcome is not None:
-            print(
-                json.dumps(
-                    {
-                        "merger_turn": outcome.kind,
-                        "project_key": outcome.project_key,
-                        "issue_id": outcome.issue_id,
-                        "event_id": outcome.event_id,
-                        "reason": outcome.reason,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                flush=True,
-            )
+            _print_merger_turn(outcome)
 
 
 async def _start_merge_flow(flow: MergeFlow, projects: Sequence[str]) -> bool:
@@ -686,7 +723,9 @@ async def _run_daemon(
         # was lost: the delivered wake and the thread report are
         # durable, so one boundary pass settles them exactly once.
         await merge_flow.turns.recover_outstanding(tuple(projects))
-        listener = asyncio.create_task(_listen_for_merger_turns(merge_flow))
+        listener = asyncio.create_task(
+            _listen_for_merger_turns(merge_flow, tuple(projects))
+        )
     stop = shutdown_event or asyncio.Event()
     registered_signals: list[signal.Signals] = []
     if shutdown_event is None:

@@ -9,12 +9,12 @@ def test_database_applies_migration_once(tmp_path: Path) -> None:
     database_path = tmp_path / "state.db"
 
     database = Database.open(database_path)
-    assert database.schema_version() == 50
+    assert database.schema_version() == 51
     database.close()
 
     reopened = Database.open(database_path)
     try:
-        assert reopened.schema_version() == 50
+        assert reopened.schema_version() == 51
         assert reopened.scalar("PRAGMA integrity_check") == "ok"
         assert reopened.scalar("PRAGMA foreign_keys") == 1
         assert reopened.scalar("PRAGMA journal_mode") == "wal"
@@ -82,7 +82,7 @@ def test_migration_0050_applies_on_a_schema_49_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 50
+        assert database.schema_version() == 51
         assert database.scalar("PRAGMA integrity_check") == "ok"
         assert (
             database.scalar(
@@ -91,5 +91,69 @@ def test_migration_0050_applies_on_a_schema_49_database(tmp_path: Path) -> None:
             )
             == 1
         )
+    finally:
+        database.close()
+
+
+def test_migration_0051_pins_handoff_replacement_identity(tmp_path: Path) -> None:
+    # Sol correction b4b545f3 P2: rotation recovery reconstructs the exact
+    # replacement identities persisted at acknowledgement, so the handoffs
+    # row carries the selected profile alongside the selected session.
+    database = Database.open(tmp_path / "state.db")
+    try:
+        columns = {
+            str(row["name"]): (str(row["type"]), int(row["notnull"]))
+            for row in database.execute("PRAGMA table_info(handoffs)").fetchall()
+        }
+        assert columns == {
+            "handoff_id": ("TEXT", 0),
+            "cell_id": ("TEXT", 1),
+            "state": ("TEXT", 1),
+            "document_json": ("TEXT", 1),
+            "markdown": ("TEXT", 1),
+            "replacement_session_id": ("TEXT", 0),
+            "restated_next_action": ("TEXT", 0),
+            "created_at": ("TEXT", 1),
+            "updated_at": ("TEXT", 1),
+            "replacement_profile_alias": ("TEXT", 0),
+        }
+    finally:
+        database.close()
+
+
+def test_migration_0051_applies_on_a_schema_50_database(tmp_path: Path) -> None:
+    # A live database left at schema 50 must upgrade additively, keeping
+    # every acknowledged handoff row (its new column simply reads NULL).
+    database_path = tmp_path / "state.db"
+    migrations = Path(hermes_orchestrator.db.__file__).with_name("migrations")
+    connection = sqlite3.connect(database_path)
+    try:
+        for migration_path in sorted(migrations.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+            version = int(migration_path.name.split("_", maxsplit=1)[0])
+            if version >= 51:
+                continue
+            connection.executescript(migration_path.read_text(encoding="utf-8"))
+        connection.executescript(
+            "INSERT INTO handoffs("
+            "handoff_id, cell_id, state, document_json, markdown, "
+            "replacement_session_id, restated_next_action, created_at, updated_at"
+            ") VALUES ('handoff-legacy', 'cell-demo', 'acknowledged', '{}', '# h', "
+            "'22222222-2222-4222-8222-222222222222', 'Run the failing test.', "
+            "'2026-08-26T12:00:00+00:00', '2026-08-26T12:00:00+00:00');"
+        )
+    finally:
+        connection.close()
+
+    database = Database.open(database_path)
+    try:
+        assert database.schema_version() == 51
+        assert database.scalar("PRAGMA integrity_check") == "ok"
+        row = database.execute(
+            "SELECT state, replacement_session_id, replacement_profile_alias "
+            "FROM handoffs WHERE handoff_id = 'handoff-legacy'"
+        ).fetchone()
+        assert str(row["state"]) == "acknowledged"
+        assert str(row["replacement_session_id"]).startswith("22222222")
+        assert row["replacement_profile_alias"] is None
     finally:
         database.close()

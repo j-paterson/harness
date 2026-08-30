@@ -27,7 +27,7 @@ from hermes_orchestrator.codex_queue import CodexQueueDelivery
 from hermes_orchestrator.codex_rpc import CodexRpcClient, app_server_command
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.emission import CandidateEmitter, build_session_chain_lookup
+from hermes_orchestrator.emission import CandidateEmitter
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitRunner, GitVerifier, SubprocessGitRunner
 from hermes_orchestrator.github import (
@@ -47,8 +47,6 @@ from hermes_orchestrator.review_intake import (
 )
 from hermes_orchestrator.reviews import LinearProjector, ReviewService
 from hermes_orchestrator.settlement import MergeSettlements
-from hermes_orchestrator.subagent_packets import SubagentPackets
-from hermes_orchestrator.verifier import Verifier
 
 GITHUB_KEYCHAIN_SERVICE = "hermes-orchestrator-github"
 CIRCLECI_KEYCHAIN_SERVICE = "hermes-orchestrator-circleci"
@@ -213,19 +211,12 @@ def build_merge_flow(
         intake_gate=intake_gate,
         lead=outbox,
         issue_for_failure=reviews.issue_for_candidate,
-        # INFRA-186: a non-trivial candidate must carry delegation
-        # evidence from the durable packet ledger, or fail closed.
-        packets=SubagentPackets(database, events=events),
-        # INFRA-186: the mandatory complete gate must have a fresh
-        # attested receipt for exactly the candidate tree, or fail
-        # closed before any side effect.
-        verifier=Verifier(
-            database, events=events, state_dir=settings.state_dir
-        ),
-        # INFRA-197 (plan v5.4): credited packets may span the cell's
-        # durably acknowledged rotation chain; sessions outside the
-        # recorded chain still fail closed.
-        session_chain=build_session_chain_lookup(database),
+        # Operator directive (2026-08-30, admission relaxation):
+        # candidate admission requires only the freeze gate (clean
+        # pushed sha), the immutable manifest, and Sol intake — no
+        # delegation-evidence ledger and no mandatory verifier
+        # receipt. Test results are advisory; Sol and CI own
+        # verification.
     )
     turns = MergerTurnService(
         database=database,

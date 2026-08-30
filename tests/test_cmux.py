@@ -685,7 +685,10 @@ async def test_screen_and_key_ops_stay_out_of_the_general_vocabulary() -> None:
 
 
 # ---------------------------------------------------------------------------
-# H6 (INFRA-197 v4 amendment): CmuxLeadSeater's fakechat channel launch path.
+# H6 (INFRA-197, Sol correction b4b545f3 v5): the fakechat seat-command
+# substitution is retired — hermes-control channel launch is the primary
+# classic-seat path. The fakechat command builder and its grammar
+# alternative survive only so legacy commands stay validate-or-refuse.
 # ---------------------------------------------------------------------------
 
 LEAD_SESSION = "99999999-9999-4999-8999-999999999999"
@@ -701,11 +704,6 @@ ROTATED_WORKSPACE = CmuxSurfaceRef(
     workspace_uuid="66666666-6666-4666-8666-666666666666",
     surface_uuid="66666666-6666-4666-8666-777777777777",
 )
-
-
-@dataclass(frozen=True)
-class FakeIssuedPort:
-    port: int
 
 
 @dataclass
@@ -774,42 +772,6 @@ class FakeProfileDirs:
         return self._dirs[alias]
 
 
-@dataclass
-class FakeSignalPorts:
-    """Records fakechat port issuance/retirement like FakechatSignalPorts,
-    without any durable storage of its own."""
-
-    port: int = 40123
-    error: Exception | None = None
-    issued: list[dict[str, object]] = field(default_factory=list)
-    retired: list[str] = field(default_factory=list)
-
-    def issue(
-        self,
-        *,
-        cell_id: str,
-        session_id: str,
-        binding_id: str,
-        generation: int,
-        port: int | None = None,
-    ) -> FakeIssuedPort:
-        self.issued.append(
-            {
-                "cell_id": cell_id,
-                "session_id": session_id,
-                "binding_id": binding_id,
-                "generation": generation,
-                "port": port,
-            }
-        )
-        if self.error is not None:
-            raise self.error
-        return FakeIssuedPort(self.port)
-
-    def retire(self, session_id: str) -> None:
-        self.retired.append(session_id)
-
-
 class FakeChannelLaunch:
     """Records dev-channel launch-material generation and retirement."""
 
@@ -850,7 +812,6 @@ def make_seater(
     bindings: CmuxSurfaceBindings,
     port: FakeSeaterPort,
     *,
-    signal_ports: FakeSignalPorts | None = None,
     channel_launch: FakeChannelLaunch | None = None,
     control: ControlOperations | None = None,
 ) -> CmuxLeadSeater:
@@ -859,7 +820,6 @@ def make_seater(
         port=port,
         project_paths={LEAD_PROJECT: Path("/repos/demo")},
         profile_dirs=FakeProfileDirs({LEAD_PROFILE: Path("/profiles/max-a")}),
-        signal_ports=signal_ports,
         channel_launch=channel_launch,
         control=control,
     )
@@ -947,79 +907,22 @@ def test_classic_command_without_the_fixed_flag_no_longer_validates() -> None:
         assert _CLASSIC_COMMAND.fullmatch(legacy) is None
 
 
+def test_seater_accepts_no_fakechat_signal_ports_collaborator() -> None:
+    """Sol correction b4b545f3 (v5): the seat-command substitution is
+    structurally gone — CmuxLeadSeater exposes no signal_ports port
+    source, so no composition can ever re-enable the fakechat form."""
+
+    parameters = inspect.signature(CmuxLeadSeater.__init__).parameters
+    assert "signal_ports" not in parameters
+    assert "channel_launch" in parameters
+
+
 @pytest.mark.asyncio
-async def test_ensure_prefers_fakechat_when_signal_ports_present(
+async def test_channel_launch_is_the_primary_classic_seat_path(
     seater_bindings: CmuxSurfaceBindings,
 ) -> None:
-    port = FakeSeaterPort(next_refs=[LEAD_WORKSPACE])
-    signal_ports = FakeSignalPorts(port=40123)
-    ensure = make_seater(seater_bindings, port, signal_ports=signal_ports)
-
-    seat = await ensure.ensure(
-        project_key=LEAD_PROJECT,
-        cell_id=LEAD_CELL,
-        session_id=LEAD_SESSION,
-        profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
-    )
-
-    assert seat is not None
-    [created] = port.created
-    assert created["command"] == (
-        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
-        f"--channels {FAKECHAT_CHANNEL_ENTRY}"
-    )
-    assert created["env"] == {
-        "CLAUDE_CONFIG_DIR": "/profiles/max-a",
-        "FAKECHAT_PORT": "40123",
-    }
-    # The port was issued exactly once, with this exact cell/session
-    # identity and no other.
-    assert len(signal_ports.issued) == 1
-    [issued] = signal_ports.issued
-    assert issued["cell_id"] == LEAD_CELL
-    assert issued["session_id"] == LEAD_SESSION
-
-
-@pytest.mark.asyncio
-async def test_signal_port_issue_failure_falls_back_and_records_one_receipt(
-    seater_database: Database, seater_bindings: CmuxSurfaceBindings
-) -> None:
-    port = FakeSeaterPort(next_refs=[LEAD_WORKSPACE])
-    signal_ports = FakeSignalPorts(error=RuntimeError("no free loopback port"))
-    control = ControlOperations(seater_database, events=EventStore(seater_database))
-    ensure = make_seater(
-        seater_bindings, port, signal_ports=signal_ports, control=control
-    )
-
-    seat = await ensure.ensure(
-        project_key=LEAD_PROJECT,
-        cell_id=LEAD_CELL,
-        session_id=LEAD_SESSION,
-        profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
-    )
-
-    # The failure never raises past ensure(): the seat still comes up,
-    # channel-less, on the plain classic command — which still carries
-    # the fixed flag, since the fallback never touches it.
-    assert seat is not None
-    [created] = port.created
-    assert created["command"] == (
-        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}"
-    )
-    assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
-    [receipt] = control.pending_for_session(LEAD_SESSION)
-    assert receipt.kind == "channel.blocked"
-    assert receipt.result["launcher_error"] == "no free loopback port"
-
-
-@pytest.mark.asyncio
-async def test_signal_ports_none_preserves_the_dev_channel_launch(
-    seater_bindings: CmuxSurfaceBindings,
-) -> None:
-    # Production wiring today (signal_ports=None) must stay
-    # byte-identical to the pre-H6 dev-channel behavior.
+    # v5: the hermes-control channel launch is the primary path for a
+    # composed classic seat; nothing fakechat-shaped rides along.
     port = FakeSeaterPort(next_refs=[LEAD_WORKSPACE])
     channel_launch = FakeChannelLaunch(
         config=Path(f"/state/channels/{LEAD_SESSION}.mcp.json")
@@ -1041,32 +944,5 @@ async def test_signal_ports_none_preserves_the_dev_channel_launch(
         f"--mcp-config /state/channels/{LEAD_SESSION}.mcp.json "
         f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
     )
+    assert "fakechat" not in str(created["command"])
     assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
-
-
-@pytest.mark.asyncio
-async def test_rotation_retires_the_fakechat_port_row(
-    seater_bindings: CmuxSurfaceBindings,
-) -> None:
-    port = FakeSeaterPort(next_refs=[LEAD_WORKSPACE, ROTATED_WORKSPACE])
-    signal_ports = FakeSignalPorts(port=40123)
-    ensure = make_seater(seater_bindings, port, signal_ports=signal_ports)
-    await ensure.ensure(
-        project_key=LEAD_PROJECT,
-        cell_id=LEAD_CELL,
-        session_id=LEAD_SESSION,
-        profile_alias=LEAD_PROFILE,
-        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
-    )
-
-    await ensure.ensure(
-        project_key=LEAD_PROJECT,
-        cell_id=LEAD_CELL,
-        session_id=ROTATED_SESSION,
-        profile_alias=LEAD_PROFILE,
-        classic_command=(
-            f"claude --session-id {ROTATED_SESSION} {SKIP_PERMISSIONS_FLAG}"
-        ),
-    )
-
-    assert signal_ports.retired == [LEAD_SESSION]

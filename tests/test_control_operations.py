@@ -194,6 +194,64 @@ def test_committed_operations_notify_listeners_best_effort(
     assert seen == [operation]
 
 
+def test_confirm_claim_and_ambiguous_kinds_record_and_cas_dedup(
+    operations: ControlOperations, database: Database
+) -> None:
+    """Sol correction b4b545f3 packet 4: the confirmation claim and its
+    explicit ambiguous outcome are closed-vocabulary kinds, and the
+    live-dedup unique key is the at-most-once claim CAS."""
+
+    claim_key = "channel.confirm:anc-1:ws-1:sf-1:sess-1"
+    claim = record(
+        operations,
+        kind="channel.confirm_claimed",
+        result={"anchor_id": "anc-1"},
+        dedup_key=claim_key,
+    )
+    assert claim is not None
+    assert claim.kind == "channel.confirm_claimed"
+    assert claim.dedup_key == claim_key
+
+    duplicate = record(
+        operations,
+        kind="channel.confirm_claimed",
+        result={"anchor_id": "anc-1"},
+        dedup_key=claim_key,
+    )
+    assert duplicate is None
+    assert (
+        database.scalar(
+            "SELECT COUNT(*) FROM control_operations WHERE dedup_key = ?",
+            (claim_key,),
+        )
+        == 1
+    )
+
+    ambiguous = record(
+        operations,
+        kind="channel.confirm_ambiguous",
+        result={"claim_operation_id": claim.operation_id, "stage": "keypress"},
+        reason="CHANNEL CONFIRM AMBIGUOUS: keypress failed after the claim",
+        dedup_key=f"channel.confirm_ambiguous:{claim.operation_id}",
+    )
+    assert ambiguous is not None
+    assert ambiguous.kind == "channel.confirm_ambiguous"
+
+    with pytest.raises(ControlOperationRefused, match="unknown"):
+        record(operations, kind="channel.confirm_pressed")
+
+    # Acknowledging the claim frees the key — recovery is an explicit
+    # operator action, never a blind retry.
+    assert operations.acknowledge(claim.operation_id, session_id=SESSION)
+    again = record(
+        operations,
+        kind="channel.confirm_claimed",
+        result={"anchor_id": "anc-1"},
+        dedup_key=claim_key,
+    )
+    assert again is not None
+
+
 def test_lead_launch_failed_is_accepted_and_free_text_still_refuses(
     operations: ControlOperations,
 ) -> None:

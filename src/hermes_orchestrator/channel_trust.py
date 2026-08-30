@@ -16,11 +16,19 @@ the exact confirmation prompt shape.
 
 :class:`ChannelTrustGate` is the fail-closed re-derivation: every bound
 field is re-measured live and compared against the active anchor for
-the cell, in a fixed order, stopping at the first mismatch. A full
-match calls the injected ``confirm`` collaborator exactly once and
-records a durable ``channel.auto_confirmed`` receipt carrying the match
-evidence; any mismatch, drift, ambiguity, missing anchor, or
-measurement exception fails closed with a durable
+the cell, in a fixed order, stopping at the first mismatch. The prompt
+evidence is never arbitrary regex: only the fixed normalized matcher
+shape (escaped literal dialog markers with bounded gaps, naming
+:data:`CHANNEL_ENTRY`) is honored, at capture and at evaluation alike.
+A full match first records a durable at-most-once
+``channel.confirm_claimed`` claim (the live-dedup unique index is the
+CAS binding anchor + workspace + surface + launch session), then calls
+the injected ``confirm`` collaborator exactly once, then records the
+``channel.auto_confirmed`` completion receipt carrying the match
+evidence — or, when the keypress or its receipt fails after the claim,
+an explicit durable ``channel.confirm_ambiguous`` state that is never
+blindly retried. Any mismatch, drift, ambiguity, missing anchor,
+refused claim, or measurement exception fails closed with a durable
 ``channel.approval_required`` receipt whose reason starts with
 ``CHANNEL APPROVAL REQUIRED`` and never calls ``confirm``. There is no
 generic keystroke or prompt-approval capability here: ``confirm`` and
@@ -54,6 +62,16 @@ CHANNEL_ENTRY = "server:hermes-control"
 _DEV_CHANNEL_FLAG = "--dangerously-load-development-channels"
 _LEGACY_CHANNELS_FLAG = "--channels"
 _MCP_CONFIG_PATH = re.compile(r"^/[A-Za-z0-9._/-]+\.mcp\.json$")
+
+# The one prompt-matcher shape the gate ever honors (Sol correction
+# b4b545f3 packet 4): two or more ``re.escape``'d literal dialog-marker
+# segments — one of them exactly :data:`CHANNEL_ENTRY` — joined by this
+# exact bounded gap. The CLI's bounded prompt capture derives exactly
+# this shape from the live dialog's operator-recorded markers; anything
+# else (broad, partial, look-alike, or legacy arbitrary regex evidence)
+# refuses at capture and fails closed at evaluation.
+PROMPT_MATCHER_GAP = r"[\s\S]{0,4000}?"
+_MIN_PROMPT_SEGMENT_CHARS = 8
 
 
 class TrustRefused(ValueError):
@@ -151,15 +169,67 @@ def _read_manifest(package_root: Path) -> tuple[str, str]:
     return str(manifest["name"]), str(manifest["version"])
 
 
+def _unescape_literal(segment: str) -> str | None:
+    """The literal text of one ``re.escape``'d segment, or ``None`` on
+    a malformed trailing escape. The caller must still round-trip the
+    result through ``re.escape`` — that comparison, not this walk, is
+    what refuses unescaped metacharacters and non-normalized escapes."""
+
+    characters: list[str] = []
+    index = 0
+    while index < len(segment):
+        if segment[index] == "\\":
+            if index + 1 >= len(segment):
+                return None
+            characters.append(segment[index + 1])
+            index += 2
+        else:
+            characters.append(segment[index])
+            index += 1
+    return "".join(characters)
+
+
+def _fixed_prompt_segments(prompt_pattern: str) -> tuple[str, ...] | None:
+    """The literal marker texts of a fixed normalized prompt matcher,
+    or ``None`` when ``prompt_pattern`` is anything else.
+
+    Acceptance requires every segment between the exact
+    :data:`PROMPT_MATCHER_GAP` separators to round-trip through
+    ``re.escape`` as a literal of at least
+    :data:`_MIN_PROMPT_SEGMENT_CHARS` characters, at least two
+    segments, and one segment exactly :data:`CHANNEL_ENTRY` — so the
+    accepted language is precisely escaped dialog literals with bounded
+    gaps, never a broad, partial, or look-alike expression.
+    """
+
+    segments = prompt_pattern.split(PROMPT_MATCHER_GAP)
+    if len(segments) < 2:
+        return None
+    literals: list[str] = []
+    for segment in segments:
+        literal = _unescape_literal(segment)
+        if (
+            literal is None
+            or re.escape(literal) != segment
+            or len(literal) < _MIN_PROMPT_SEGMENT_CHARS
+        ):
+            return None
+        literals.append(literal)
+    if CHANNEL_ENTRY not in literals:
+        return None
+    return tuple(literals)
+
+
 def _validate_prompt_pattern(prompt_pattern: str) -> None:
     if not prompt_pattern:
         raise TrustRefused("prompt_pattern must be non-empty")
-    try:
-        re.compile(prompt_pattern)
-    except re.error as error:
+    if _fixed_prompt_segments(prompt_pattern) is None:
         raise TrustRefused(
-            f"prompt_pattern is not a valid regular expression: {error}"
-        ) from error
+            "prompt_pattern is not a fixed normalized prompt matcher: "
+            "expected re.escape'd literal dialog markers (one exactly "
+            f"{CHANNEL_ENTRY!r}) joined by {PROMPT_MATCHER_GAP!r}; "
+            "arbitrary regular-expression evidence is refused"
+        )
 
 
 def _is_uuid(token: str) -> bool:
@@ -519,10 +589,17 @@ class ChannelTrustGate:
 
         Checks run in a fixed order and stop at the first failure; that
         failure's name is the only thing carried in the refusal
-        receipt. Only the anchor lookup, ``confirm``, and the durable
-        receipt calls may propagate an exception past this method —
-        every measurement failure in between is caught and turned into
-        a refusal.
+        receipt. Every measurement failure is caught and turned into a
+        refusal; only the anchor lookup may propagate an exception.
+
+        The keypress itself is guarded by a durable at-most-once claim
+        (``channel.confirm_claimed``): the claim must record BEFORE
+        ``confirm`` is called — a live duplicate or a claim-record
+        failure means zero keypresses — and after the external action
+        either the ``channel.auto_confirmed`` completion or an explicit
+        ``channel.confirm_ambiguous`` state is recorded. A failed or
+        uncertain keypress is never blindly retried: the live claim
+        keeps refusing until an operator acknowledges it.
         """
 
         project_key = self._project_key_for(cell_id)
@@ -602,6 +679,10 @@ class ChannelTrustGate:
             if anchor.prompt_pattern is None:
                 raise _CheckFailed(current_check)
 
+            current_check = "prompt_matcher_fixed"
+            if _fixed_prompt_segments(anchor.prompt_pattern) is None:
+                raise _CheckFailed(current_check)
+
             current_check = "prompt_match"
             text = self._read_screen() if screen_text is None else screen_text
             matches = list(re.finditer(anchor.prompt_pattern, text))
@@ -627,8 +708,7 @@ class ChannelTrustGate:
                 anchor_id=(anchor.anchor_id if anchor is not None else None),
             )
 
-        self._confirm()
-        result = {
+        evidence = {
             "anchor_id": anchor.anchor_id,
             "canonical_entry_path": anchor.canonical_entry_path,
             "entry_owner_uid": anchor.entry_owner_uid,
@@ -644,13 +724,77 @@ class ChannelTrustGate:
             "build_mtime": build_mtime,
             "prompt_match_sha256": prompt_match_sha256,
         }
-        operation = self._control.record(
-            kind="channel.auto_confirmed",
-            project_key=project_key,
-            cell_id=cell_id,
-            session_id=session_id,
-            result=result,
+
+        # The durable at-most-once claim: the unique live-dedup index on
+        # control_operations is the CAS. The claim binds the exact
+        # anchor, workspace, surface, and launch session (this launch's
+        # one claude process) plus the exact matched prompt BEFORE any
+        # keypress; a live duplicate or a claim-record failure means
+        # zero keypresses.
+        claim_key = (
+            f"channel.confirm:{anchor.anchor_id}:{workspace_uuid}:"
+            f"{surface_uuid}:{canonical_session}"
         )
+        try:
+            claim = self._control.record(
+                kind="channel.confirm_claimed",
+                project_key=project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                result={**evidence, "launch_argv": list(launch_argv)},
+                dedup_key=claim_key,
+            )
+        except Exception:
+            return self._refuse(
+                cell_id=cell_id,
+                session_id=session_id,
+                project_key=project_key,
+                first_failure="confirm_claim_failed",
+                anchor_id=anchor.anchor_id,
+            )
+        if claim is None:
+            return self._refuse(
+                cell_id=cell_id,
+                session_id=session_id,
+                project_key=project_key,
+                first_failure="confirm_already_claimed",
+                anchor_id=anchor.anchor_id,
+            )
+
+        try:
+            self._confirm()
+        except Exception:
+            return self._ambiguous(
+                cell_id=cell_id,
+                session_id=session_id,
+                project_key=project_key,
+                anchor_id=anchor.anchor_id,
+                claim_operation_id=claim.operation_id,
+                stage="keypress",
+                confirmed=False,
+            )
+
+        operation = None
+        with suppress(Exception):
+            operation = self._control.record(
+                kind="channel.auto_confirmed",
+                project_key=project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                result=evidence,
+            )
+        if operation is None:
+            # The keypress happened but its completion receipt did not
+            # record — leave an explicit durable state, never silence.
+            return self._ambiguous(
+                cell_id=cell_id,
+                session_id=session_id,
+                project_key=project_key,
+                anchor_id=anchor.anchor_id,
+                claim_operation_id=claim.operation_id,
+                stage="completion_receipt",
+                confirmed=True,
+            )
         self._journal(
             confirmed=True,
             cell_id=cell_id,
@@ -661,9 +805,7 @@ class ChannelTrustGate:
         return TrustVerdict(
             confirmed=True,
             anchor_id=anchor.anchor_id,
-            receipt_operation_id=(
-                operation.operation_id if operation is not None else None
-            ),
+            receipt_operation_id=operation.operation_id,
         )
 
     def _refuse(
@@ -697,6 +839,65 @@ class ChannelTrustGate:
         )
         return TrustVerdict(
             confirmed=False,
+            anchor_id=anchor_id,
+            first_failure=first_failure,
+            receipt_operation_id=(
+                operation.operation_id if operation is not None else None
+            ),
+        )
+
+    def _ambiguous(
+        self,
+        *,
+        cell_id: str,
+        session_id: str,
+        project_key: str,
+        anchor_id: str,
+        claim_operation_id: str,
+        stage: str,
+        confirmed: bool,
+    ) -> TrustVerdict:
+        """Record the explicit durable ambiguous state after the
+        external action: the keypress failed (``stage="keypress"``) or
+        its completion receipt did not record
+        (``stage="completion_receipt"``). The claim stays live, so
+        nothing blindly retries — recovery is an operator verifying the
+        surface and acknowledging the claim and this state."""
+
+        detail = (
+            "the keypress failed"
+            if stage == "keypress"
+            else "the completion receipt did not record"
+        )
+        operation = None
+        with suppress(Exception):
+            operation = self._control.record(
+                kind="channel.confirm_ambiguous",
+                project_key=project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                result={
+                    "anchor_id": anchor_id,
+                    "claim_operation_id": claim_operation_id,
+                    "stage": stage,
+                },
+                reason=(
+                    f"CHANNEL CONFIRM AMBIGUOUS: {detail} after the "
+                    "durable claim; verify the surface manually and "
+                    "acknowledge the claim to recover"
+                ),
+                dedup_key=f"channel.confirm_ambiguous:{claim_operation_id}",
+            )
+        first_failure = None if confirmed else "confirm_outcome_ambiguous"
+        self._journal(
+            confirmed=confirmed,
+            cell_id=cell_id,
+            session_id=session_id,
+            anchor_id=anchor_id,
+            first_failure=first_failure,
+        )
+        return TrustVerdict(
+            confirmed=confirmed,
             anchor_id=anchor_id,
             first_failure=first_failure,
             receipt_operation_id=(

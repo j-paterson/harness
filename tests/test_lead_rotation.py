@@ -93,9 +93,13 @@ class RecordingSeater:
         self._bindings = bindings
         self._refs = iter(range(1, 1000))
         self.calls: list[dict[str, object]] = []
+        self.fail_next = False
 
     async def ensure(self, **identity: object) -> object:
         self.calls.append(dict(identity))
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("cmux seat activation crashed")
         cell_id = str(identity["cell_id"])
         session_id = str(identity["session_id"])
         existing = self._bindings.active_lead(cell_id)
@@ -174,10 +178,23 @@ def runner() -> RecordingRunner:
     return RecordingRunner()
 
 
+class CountingHandoffs(HandoffService):
+    """The real service, plus an acknowledgement-call counter so tests can
+    assert recovery performs ZERO additional acknowledgement calls."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.acknowledge_calls = 0
+
+    def acknowledge(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+        self.acknowledge_calls += 1
+        return super().acknowledge(*args, **kwargs)  # type: ignore[arg-type]
+
+
 @pytest.fixture
-def handoffs(database: Database) -> HandoffService:
+def handoffs(database: Database) -> CountingHandoffs:
     counter = iter(range(1, 1000))
-    return HandoffService(
+    return CountingHandoffs(
         database,
         handoff_ids=lambda: f"handoff-{next(counter)}",
         now=lambda: NOW,
@@ -389,7 +406,12 @@ async def test_happy_path_runs_ack_transfer_and_seat_in_order(
     # dispatch's own start + rotate's replacement ack turn.
     assert runner.start_count == 2
     assert runner.retired_sessions == [SESSION_ID]
-    assert handoffs.get(handoff_id).state == "acknowledged"
+    acknowledged = handoffs.get(handoff_id)
+    assert acknowledged.state == "acknowledged"
+    # Sol b4b545f3 P2: the selected identities became durable with the
+    # acknowledgement, so a crash from here on is recoverable.
+    assert acknowledged.replacement_session_id == REPLACEMENT_SESSION
+    assert acknowledged.replacement_profile_alias == "max-b"
     assert database.scalar(
         "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
     ) == str(REPLACEMENT_SESSION)
@@ -445,17 +467,23 @@ async def test_resume_after_crash_handoff_acknowledged_cell_not_yet_rotated(
     seater: RecordingSeater,
     runner: RecordingRunner,
 ) -> None:
-    """A prior run acknowledged the handoff but crashed before cells.rotate
-    ever ran its own transactional transfer: cell.session_id is still the
-    incumbent. LeadRotation must call cells.rotate() again and it must
-    accept the already-acknowledged row (cells.py tolerates this)."""
+    """A prior run durably acknowledged the handoff (persisting the selected
+    replacement session AND profile) but crashed before cells.rotate ever
+    committed its transactional transfer: cell.session_id is still the
+    incumbent. Recovery reconstructs the persisted identities and completes
+    the transfer with ZERO additional runner or acknowledgement calls
+    (Sol correction b4b545f3 packet 2, required test 1)."""
 
     await start_cell(cells, queue)
     handoff_id = submit_handoff(handoffs)
     handoffs.acknowledge(
-        handoff_id, REPLACEMENT_SESSION, "Run the failing test and finish INFRA-197."
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
     )
     assert runner.start_count == 1  # only the initial dispatch so far
+    ack_calls_after_durable = handoffs.acknowledge_calls
     rotation = make_rotation(database, handoffs, cells, bindings, seater)
 
     report = await rotation.rotate("cell-demo")
@@ -463,9 +491,126 @@ async def test_resume_after_crash_handoff_acknowledged_cell_not_yet_rotated(
     assert report.ok is True
     assert report.phase == "complete"
     assert report.replacement_session == str(REPLACEMENT_SESSION)
-    assert runner.start_count == 2
+    assert report.profile == "max-b"
+    # ZERO additional runner or acknowledgement calls during recovery.
+    assert runner.start_count == 1
+    assert runner.resume_count == 0
+    assert handoffs.acknowledge_calls == ack_calls_after_durable
     assert runner.retired_sessions == [SESSION_ID]
     assert len(seater.calls) == 1
+    binding = bindings.active_lead("cell-demo")
+    assert binding is not None
+    assert binding.session_id == str(REPLACEMENT_SESSION)
+    assert database.scalar(
+        "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "max-b"
+
+
+@pytest.mark.asyncio
+async def test_recovery_preserves_the_originally_selected_profile(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: CountingHandoffs,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+    profiles: ProfilePool,
+) -> None:
+    """Sol b4b545f3 P2, required test 2: recovery must complete with the
+    profile persisted at acknowledgement even when current availability and
+    selection ordering have changed since — a fresh selection today would
+    pick max-b and would refuse the now-ineligible max-c."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-c",
+    )
+    # Availability changed after the durable selection.
+    profiles.record_health(
+        ProfileHealth(
+            profile_alias="max-c",
+            eligible=False,
+            reason="auth probe failed after selection",
+            last_checked_at=NOW,
+        )
+    )
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.profile == "max-c"
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+    assert runner.start_count == 1  # no reselection turn, no new runner call
+    assert database.scalar(
+        "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "max-c"
+    assert database.scalar(
+        "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+    ) == "max-c"
+
+
+@pytest.mark.asyncio
+async def test_repeated_recovery_produces_one_replacement_and_one_execution(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: CountingHandoffs,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Sol b4b545f3 P2, required test 3: repeated recovery across the
+    acknowledgement, transfer, and seating boundaries yields exactly one
+    replacement lead and one effective handoff execution."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    # Boundary 1: acknowledgement is durable, transfer never ran.
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    ack_calls_after_durable = handoffs.acknowledge_calls
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    # Boundary 2: the transfer commits but the process dies at seating.
+    seater.fail_next = True
+    first = await rotation.rotate("cell-demo")
+    assert first.ok is False
+    assert first.phase == "seat"
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)
+
+    # Boundary 3: recovery completes seating; a further call is a no-op.
+    second = await rotation.rotate("cell-demo")
+    assert second.ok is True
+    assert second.phase == "complete"
+    third = await rotation.rotate("cell-demo")
+    assert third == second
+
+    # One replacement lead, one effective handoff execution.
+    assert runner.start_count == 1  # the initial dispatch only
+    assert handoffs.acknowledge_calls == ack_calls_after_durable
+    assert runner.retired_sessions == [SESSION_ID]
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'project_cell.rotated'"
+    ) == 1
+    lease_rows = database.execute(
+        "SELECT profile_alias, project_key FROM profile_leases"
+    ).fetchall()
+    assert [
+        (str(row["profile_alias"]), str(row["project_key"])) for row in lease_rows
+    ] == [("max-b", "demo")]
     binding = bindings.active_lead("cell-demo")
     assert binding is not None
     assert binding.session_id == str(REPLACEMENT_SESSION)

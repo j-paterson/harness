@@ -241,6 +241,90 @@ async def test_old_lead_retires_only_after_acknowledgement(tmp_path: Path) -> No
         database.close()
 
 
+@pytest.mark.asyncio
+async def test_recovery_restores_pool_affinity_to_the_persisted_profile(
+    tmp_path: Path,
+) -> None:
+    """Sol b4b545f3 P2: an acknowledged-but-untransferred rotation recovers
+    on the persisted profile — never a fresh selection (which would order
+    max-b first) — and leaves the pool's project affinity on that exact
+    profile. A repeat call after the transfer is durable stays a no-op."""
+
+    config = tmp_path / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        "  - {alias: max-a, config_dir: /tmp/max-a}\n"
+        "  - {alias: max-b, config_dir: /tmp/max-b}\n"
+        "  - {alias: max-c, config_dir: /tmp/max-c}\n"
+        "  - {alias: max-d, config_dir: /tmp/max-d}\n",
+        encoding="utf-8",
+    )
+    registry = ProfileRegistry.load(config)
+    profiles = ProfilePool(registry)
+    for profile in registry.profiles:
+        profiles.record_health(
+            ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=True,
+                reason="eligible",
+                last_checked_at=datetime(2026, 8, 26, tzinfo=UTC),
+            )
+        )
+    database = Database.open(tmp_path / "state.db")
+    try:
+        events = EventStore(database)
+        queue = QueueService(database, events, {"demo"})
+        runner = RecordingRunner()
+        handoffs = HandoffService(database, handoff_ids=lambda: "handoff-1")
+        replacement_session = UUID("22222222-2222-4222-8222-222222222222")
+        cells = ProjectCellService(
+            database=database,
+            events=events,
+            queue=queue,
+            profiles=profiles,
+            runner=runner,
+            linear=RecordingLinear(),
+            project_paths={"demo": tmp_path},
+            session_ids=lambda: SESSION_ID,
+            cell_ids=lambda: "cell-demo",
+            handoffs=handoffs,
+            replacement_session_ids=lambda: replacement_session,
+        )
+        admit(queue, "ENG-9")
+        await cells.dispatch("ENG-9")
+        record = handoffs.submit(valid_handoff())
+        handoffs.acknowledge(
+            record.handoff_id,
+            replacement_session,
+            "Run the failing unit test and correct ENG-9.",
+            profile_alias="max-c",
+        )
+        starts_after_dispatch = runner.start_count
+
+        rotated = await cells.rotate("cell-demo", record.handoff_id)
+
+        assert rotated.profile_alias == "max-c"
+        assert rotated.session_id == replacement_session
+        assert runner.start_count == starts_after_dispatch  # no ack turn re-run
+        assert runner.retired_sessions == [SESSION_ID]
+        assert profiles.acquire("demo").profile_alias == "max-c"
+        assert database.scalar(
+            "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+        ) == "max-c"
+
+        again = await cells.rotate("cell-demo", record.handoff_id)
+
+        assert again.session_id == replacement_session
+        assert again.profile_alias == "max-c"
+        assert database.scalar(
+            "SELECT count(*) FROM events "
+            "WHERE event_type = 'project_cell.rotated'"
+        ) == 1
+        assert profiles.acquire("demo").profile_alias == "max-c"
+    finally:
+        database.close()
+
+
 # --- INFRA-197 correction C2: Fable-capacity evidence gates replacement ---
 #
 # Motivating incident: max-a was auth-healthy (first-party Max) while its
