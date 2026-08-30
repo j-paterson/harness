@@ -1850,6 +1850,28 @@ class FakeTrustTrigger:
         return None
 
 
+@dataclass
+class SequencedScreenPort(FakePort):
+    """A FakePort whose ``read_screen`` serves a scripted sequence:
+    entries are consumed in order (the last one repeats), and an
+    exception entry raises instead of returning — so the pane can
+    change, or the surface vanish, between the watcher's detection
+    read and the gate's last-moment re-read."""
+
+    screen_sequence: list[object] = field(default_factory=list)
+
+    async def read_screen(self, ref: CmuxSurfaceRef, *, lines: int = 60) -> str:
+        self.screen_reads += 1
+        step = (
+            self.screen_sequence.pop(0)
+            if len(self.screen_sequence) > 1
+            else self.screen_sequence[0]
+        )
+        if isinstance(step, Exception):
+            raise step
+        return str(step)
+
+
 class TestChannelTrustLifecycle:
     """The bounded watcher and trust gate run automatically for the
     exact newly created channel-launched binding — the manually invoked
@@ -1893,6 +1915,10 @@ class TestChannelTrustLifecycle:
             "channel.confirm_claimed",
             "channel.auto_confirmed",
         ]
+        # The watch detection read plus the gate's last-moment live
+        # re-read of the exact surface immediately before the Enter
+        # (Sol correction a9cc6d5f packet 3).
+        assert port.screen_reads >= 2
 
     @pytest.mark.asyncio
     async def test_repeated_and_concurrent_triggers_send_at_most_one_enter(
@@ -2051,6 +2077,79 @@ class TestChannelTrustLifecycle:
         assert verdict is not None
         assert verdict.confirmed is False
         assert verdict.first_failure == "confirm_claim_failed"
+
+    @pytest.mark.asyncio
+    async def test_pane_change_between_detection_and_confirmation_sends_zero_keys(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """Sol correction a9cc6d5f packet 3, required test (1): the
+        watcher detects the exact approved dialog, but the pane changes
+        before confirmation — the gate's last-moment live re-read of
+        the exact surface sees the change and ZERO Enter goes out; the
+        durable non-success refusal records with the retained claim."""
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = SequencedScreenPort(
+            screen_sequence=[
+                f"...\n{DIALOG_TEXT}\n",  # the watcher's detection read
+                "$ user typed something; the dialog is gone",  # boundary
+            ]
+        )
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert verdict.first_failure == "final_prompt_missing"
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.approval_required",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_surface_loss_at_the_final_boundary_sends_zero_keys(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """Sol correction a9cc6d5f packet 3, required test (3): the
+        exact bound surface is replaced or vanishes between detection
+        and the keypress boundary, so the last-moment bounded re-read
+        fails — zero keys and a durable non-success result."""
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = SequencedScreenPort(
+            screen_sequence=[
+                f"...\n{DIALOG_TEXT}\n",  # the watcher's detection read
+                CmuxUnavailable("the exact surface no longer exists"),
+            ]
+        )
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert verdict.first_failure == "final_read_failed"
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.approval_required",
+        ]
 
     @pytest.mark.asyncio
     async def test_a_seat_composed_without_the_collaborator_behaves_as_today(

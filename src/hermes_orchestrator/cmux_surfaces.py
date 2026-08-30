@@ -1335,6 +1335,13 @@ class ChannelTrustConfirmer:
     triggers for one launch (this trigger and the CLI included) still
     send at most one Enter. A watcher timeout is an absent dialog, not
     a trust refusal: zero keys and no durable trust receipt.
+
+    Sol correction a9cc6d5f (packet 3): the watch snapshot is only the
+    trigger and initial evidence — the gate's ``read_screen``
+    collaborator is wired to a live bounded re-read of the exact bound
+    surface, so the gate's last-moment verify re-reads that surface
+    immediately before the Enter and sends no key when the dialog is
+    no longer freshly, uniquely, and identically present.
     """
 
     def __init__(
@@ -1393,33 +1400,51 @@ class ChannelTrustConfirmer:
         entry_path = self._entry_resolver()
         launch_argv = self._live_argv(session_id)
 
-        def _press() -> None:
-            # The gate calls ``confirm`` synchronously between its
-            # durable claim and its completion receipt, while this
+        def _run_bounded(operation: Callable[[], Awaitable[Any]]) -> Any:
+            # The gate calls its collaborators synchronously between
+            # its durable claim and its completion receipt, while this
             # coroutine's own event loop is blocked inside
-            # ``gate.evaluate`` — so the one Enter runs its own loop on
-            # a short-lived helper thread; any failure re-raises into
-            # the gate's explicit ambiguous-outcome handling.
+            # ``gate.evaluate`` — so each bounded cmux operation runs
+            # its own loop on a short-lived helper thread; any failure
+            # re-raises into the gate's fail-closed handling.
+            outcome: list[Any] = []
             failure: list[BaseException] = []
 
             def _runner() -> None:
                 try:
-                    asyncio.run(self._port.confirm_channel_dialog(ref))
+                    outcome.append(asyncio.run(operation()))
                 except BaseException as error:
                     failure.append(error)
 
-            keypress = threading.Thread(target=_runner, daemon=True)
-            keypress.start()
-            keypress.join()
+            worker = threading.Thread(target=_runner, daemon=True)
+            worker.start()
+            worker.join()
             if failure:
                 raise failure[0]
+            return outcome[0]
+
+        def _read_live() -> str:
+            # Sol correction a9cc6d5f (packet 3): the gate's
+            # last-moment verify re-reads the EXACT bound surface live
+            # immediately before the Enter — never the watch snapshot
+            # above, which is only the trigger evidence
+            # (``screen_text``). A replaced or vanished surface fails
+            # this bounded read and the gate then sends no key.
+            return str(
+                _run_bounded(lambda: self._port.read_screen(ref, lines=200))
+            )
+
+        def _press() -> None:
+            # The one non-parameterizable Enter; a failure re-raises
+            # into the gate's explicit ambiguous-outcome handling.
+            _run_bounded(lambda: self._port.confirm_channel_dialog(ref))
 
         gate = ChannelTrustGate(
             self._database,
             self._events,
             ChannelTrustAnchors(self._database, events=self._events),
             self._control,
-            lambda: screen,
+            _read_live,
             _press,
         )
         return gate.evaluate(

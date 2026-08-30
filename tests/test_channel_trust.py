@@ -359,7 +359,9 @@ def test_complete_prompt_binds_then_gate_full_matches(
     assert completed.prompt_pattern == PROMPT_PATTERN
 
     screen_text = f"...\n{DIALOG_TEXT}\n"
-    gate, confirm, _ = _make_gate(database, events, anchors, control)
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
     result = _evaluate(
         gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
     )
@@ -409,7 +411,9 @@ def test_gate_full_match_confirms_once_and_records_receipt(
     package_root, entry_path = package
     anchor = _capture(anchors, package_root=package_root, entry_path=entry_path)
     screen_text = f"...\n{DIALOG_TEXT}\n"
-    gate, confirm, _ = _make_gate(database, events, anchors, control)
+    gate, confirm, read_screen = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
 
     result = _evaluate(
         gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
@@ -418,6 +422,10 @@ def test_gate_full_match_confirms_once_and_records_receipt(
     assert result.confirmed is True
     assert result.anchor_id == anchor.anchor_id
     assert confirm.calls == 1
+    # The one live read is the last-moment verify at the keypress
+    # boundary (Sol correction a9cc6d5f packet 3); the supplied
+    # screen_text served only the initial evaluation.
+    assert read_screen.calls == 1
     assert result.receipt_operation_id is not None
     operation = control.get(result.receipt_operation_id)
     assert operation.kind == "channel.auto_confirmed"
@@ -455,7 +463,10 @@ def test_gate_reads_the_screen_when_no_text_is_supplied(
     result = _evaluate(gate, entry_path=entry_path, package_root=package_root)
 
     assert result.confirmed is True
-    assert read_screen.calls == 1
+    # One read for the initial evaluation, one for the last-moment
+    # verify immediately before the Enter (Sol correction a9cc6d5f
+    # packet 3).
+    assert read_screen.calls == 2
     assert confirm.calls == 1
 
 
@@ -883,7 +894,12 @@ def test_gate_interleaved_and_repeated_evaluations_press_enter_at_most_once(
         )
 
     outer_gate = ChannelTrustGate(
-        database, events, anchors, control, _ReadScreen(), press_and_interleave
+        database,
+        events,
+        anchors,
+        control,
+        _ReadScreen(screen_text),
+        press_and_interleave,
     )
     result = _evaluate(
         outer_gate,
@@ -1011,7 +1027,7 @@ def test_gate_keypress_failure_after_claim_is_explicit_and_not_blindly_retried(
     screen_text = f"...\n{DIALOG_TEXT}\n"
     confirm = _ExplodingConfirm()
     gate = ChannelTrustGate(
-        database, events, anchors, control, _ReadScreen(), confirm
+        database, events, anchors, control, _ReadScreen(screen_text), confirm
     )
 
     result = _evaluate(
@@ -1050,7 +1066,9 @@ def test_gate_keypress_failure_after_claim_is_explicit_and_not_blindly_retried(
     # the claim for one fresh evaluation.
     assert control.acknowledge(claim_id, session_id=SESSION)
     assert control.acknowledge(ambiguous.operation_id, session_id=SESSION)
-    fresh_gate, fresh_confirm, _ = _make_gate(database, events, anchors, control)
+    fresh_gate, fresh_confirm, _ = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
     recovered = _evaluate(
         fresh_gate,
         entry_path=entry_path,
@@ -1086,13 +1104,16 @@ def test_gate_completion_record_failure_is_a_non_success_ambiguous_verdict(
     package_root, entry_path = package
     failing = _CompletionRecordingFails(database, events=events)
     _capture(anchors, package_root=package_root, entry_path=entry_path)
-    gate, confirm, _ = _make_gate(database, events, anchors, failing)
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, failing, screen_text=screen_text
+    )
 
     result = _evaluate(
         gate,
         entry_path=entry_path,
         package_root=package_root,
-        screen_text=f"...\n{DIALOG_TEXT}\n",
+        screen_text=screen_text,
     )
 
     assert result.confirmed is False
@@ -1119,7 +1140,9 @@ def test_gate_completion_receipt_ambiguity_still_prevents_another_enter(
     failing = _CompletionRecordingFails(database, events=events)
     _capture(anchors, package_root=package_root, entry_path=entry_path)
     screen_text = f"...\n{DIALOG_TEXT}\n"
-    gate, confirm, _ = _make_gate(database, events, anchors, failing)
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, failing, screen_text=screen_text
+    )
 
     first = _evaluate(
         gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
@@ -1216,8 +1239,10 @@ def test_gate_only_the_exact_approved_marker_sequence_authorizes_enter(
 
     package_root, entry_path = package
     anchor = _capture(anchors, package_root=package_root, entry_path=entry_path)
-    gate, confirm, _ = _make_gate(database, events, anchors, control)
     screen_text = f"...\n{DIALOG_TEXT}\n"
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
 
     for markers in LOOKALIKE_MARKER_SEQUENCES:
         with database.transaction() as connection:
@@ -1247,3 +1272,215 @@ def test_gate_only_the_exact_approved_marker_sequence_authorizes_enter(
     )
     assert approved.confirmed is True
     assert confirm.calls == 1
+
+
+# --------------------------------------------------------------------
+# Sol correction a9cc6d5f packet 3 — last-moment verify-and-confirm:
+# Enter may be sent only when the exact approved dialog is freshly
+# present on the exact bound surface at the keypress boundary. The
+# gate re-reads through the caller-bound ``read_screen`` immediately
+# before the Enter, inside the post-claim path; any final-boundary
+# anomaly sends zero keys, records the durable non-success refusal,
+# and retains the live claim so nothing blindly retries.
+# --------------------------------------------------------------------
+
+
+class _ExplodingReadScreen:
+    """The final-boundary re-read fails (surface vanished/replaced)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> str:
+        self.calls += 1
+        raise RuntimeError("cmux read-screen lost the surface")
+
+
+def _final_boundary_gate(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    read_screen,
+) -> tuple[ChannelTrustGate, _Confirm]:
+    confirm = _Confirm()
+    gate = ChannelTrustGate(database, events, anchors, control, read_screen, confirm)
+    return gate, confirm
+
+
+def _assert_final_boundary_refused(
+    result,
+    control: ControlOperations,
+    confirm: _Confirm,
+    database: Database,
+    *,
+    first_failure: str,
+) -> None:
+    """Zero keys, a durable non-success approval-required receipt, and
+    the retained claim recorded before it."""
+
+    _assert_refused(result, control, confirm, first_failure=first_failure)
+    rows = database.execute(
+        "SELECT kind FROM control_operations ORDER BY rowid ASC"
+    ).fetchall()
+    assert [str(row["kind"]) for row in rows] == [
+        "channel.confirm_claimed",
+        "channel.approval_required",
+    ]
+
+
+def test_gate_pane_change_after_initial_detection_sends_zero_keys(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Required test (1): the pane changes after initial detection but
+    before confirmation — the last-moment re-read no longer shows the
+    approved dialog, so zero Enter goes out; the retained claim then
+    refuses any blind retry."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    changed_pane = _ReadScreen("$ vim notes.txt\nsomething else entirely\n")
+    gate, confirm = _final_boundary_gate(
+        database, events, anchors, control, changed_pane
+    )
+
+    result = _evaluate(
+        gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
+    )
+
+    _assert_final_boundary_refused(
+        result, control, confirm, database, first_failure="final_prompt_missing"
+    )
+    assert changed_pane.calls == 1
+
+    retry = _evaluate(
+        gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
+    )
+    assert retry.confirmed is False
+    assert retry.first_failure == "confirm_already_claimed"
+    assert confirm.calls == 0
+
+
+def test_gate_fresh_dialog_at_the_boundary_sends_one_enter(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Required test (2): the exact approved dialog is still freshly
+    present at the last moment — exactly one Enter goes out and the
+    durable channel.auto_confirmed receipt records."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    fresh = _ReadScreen(screen_text)
+    gate, confirm = _final_boundary_gate(database, events, anchors, control, fresh)
+
+    result = _evaluate(
+        gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
+    )
+
+    assert result.confirmed is True
+    assert confirm.calls == 1
+    assert fresh.calls == 1
+    assert result.receipt_operation_id is not None
+    assert control.get(result.receipt_operation_id).kind == "channel.auto_confirmed"
+
+
+def test_gate_final_read_failure_sends_zero_keys(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Required test (3), read failure / replaced surface: the bounded
+    re-read of the exact surface fails at the final boundary — zero
+    keys, a durable non-success refusal."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    exploding = _ExplodingReadScreen()
+    gate, confirm = _final_boundary_gate(database, events, anchors, control, exploding)
+
+    result = _evaluate(
+        gate,
+        entry_path=entry_path,
+        package_root=package_root,
+        screen_text=f"...\n{DIALOG_TEXT}\n",
+    )
+
+    _assert_final_boundary_refused(
+        result, control, confirm, database, first_failure="final_read_failed"
+    )
+    assert exploding.calls == 1
+
+
+def test_gate_multiple_prompt_matches_at_the_boundary_send_zero_keys(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Required test (3), multiple matches: the fresh read shows the
+    dialog twice, so the match is no longer unique — zero keys."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    doubled = _ReadScreen(f"{DIALOG_TEXT}\n...\n{DIALOG_TEXT}")
+    gate, confirm = _final_boundary_gate(database, events, anchors, control, doubled)
+
+    result = _evaluate(
+        gate,
+        entry_path=entry_path,
+        package_root=package_root,
+        screen_text=f"...\n{DIALOG_TEXT}\n",
+    )
+
+    _assert_final_boundary_refused(
+        result, control, confirm, database, first_failure="final_prompt_multiple"
+    )
+
+
+def test_gate_dialog_content_drift_at_the_boundary_sends_zero_keys(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Required test (3), content drift: the fresh read still matches
+    the fixed matcher exactly once, but the matched dialog is not
+    byte-identical to the one the claim was recorded against (here the
+    development checkbox flipped) — zero keys."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    drifted = _ReadScreen(
+        f"...\n{DIALOG_TEXT.replace('[x] I am using', '[ ] I am using')}\n"
+    )
+    gate, confirm = _final_boundary_gate(database, events, anchors, control, drifted)
+
+    result = _evaluate(
+        gate,
+        entry_path=entry_path,
+        package_root=package_root,
+        screen_text=f"...\n{DIALOG_TEXT}\n",
+    )
+
+    _assert_final_boundary_refused(
+        result, control, confirm, database, first_failure="final_prompt_drift"
+    )

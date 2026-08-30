@@ -4,9 +4,12 @@ Starts from the exact legacy durable schema (migrations 1, legacy 3, 4-7),
 upgrades it through the real migration runner, establishes the reviewer
 channel through the schema-faithful App Server fake, emits a candidate
 through the real manifest writer and the real ``codex queue`` adapter (with
-a fake process), and then settles the Merger's report through the real
-turn service, review service, merge state machine, CI window, and QA
-router. No network, no CircleCI polling, no sleeping.
+a fake process), and then settles Sol's explicitly submitted verdict
+through the real turn service, review service, merge state machine, CI
+window, and QA router. Observation (turn handling, notifications, startup
+recovery) is non-settling: the thread's report is never pulled as a
+verdict; ``submit_review`` is the only verdict source. No network, no
+CircleCI polling, no sleeping.
 """
 
 from __future__ import annotations
@@ -33,7 +36,12 @@ from hermes_orchestrator.github import MergeResult
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.merge import GitHubIntakeGate, IntegrationMerge
-from hermes_orchestrator.merger_turns import CodexThreadReports, MergerTurnService
+from hermes_orchestrator.merger_turns import (
+    CodexThreadReports,
+    MergerTurnService,
+    SubmissionRejected,
+    TurnOutcome,
+)
 from hermes_orchestrator.qa import QaOrigin, QaRouter
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.review_intake import CandidateAdmission, CompositeIntakeGate
@@ -299,6 +307,30 @@ class ProductionShapedFlow:
             ]
         return json.dumps(document)
 
+    async def submit(
+        self,
+        issue_id: str,
+        event_id: str,
+        sha: str,
+        verdict_json: str,
+        *,
+        turns: MergerTurnService | None = None,
+        merger: CodexMerger | None = None,
+    ) -> TurnOutcome:
+        """Sol's explicit verdict submission, bound to the ready channel."""
+
+        channel = (merger or self.merger).read_channel("demo")
+        assert channel is not None
+        return await (turns or self.turns).submit_review(
+            "demo",
+            issue_id=issue_id,
+            event_id=event_id,
+            candidate_sha=sha,
+            reviewed_thread_id=channel.thread_id,
+            reviewed_generation=channel.generation,
+            verdict_json=verdict_json,
+        )
+
 
 @pytest.fixture
 def flow(tmp_path: Path) -> Any:
@@ -346,9 +378,18 @@ async def test_legacy_database_reaches_ready_channel_then_merges_end_to_end(
     )
     assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
 
-    # 3. The Merger's completed turn: admission, verdict, merge, projection.
-    flow.report(flow.verdict(SHA_A, branch, 14))
-    outcome = await flow.turns.handle_turn("demo")
+    # 3. The completed turn alone is non-settling observation: the wake
+    #    stays outstanding and the thread's report is never pulled.
+    observed = await flow.turns.handle_turn("demo")
+    assert observed.kind == "awaiting_submission"
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert flow.github.merge_calls == []
+    assert "thread/read" not in flow.rpc.methods
+
+    # 4. Sol's explicit submission: admission, verdict, merge, projection.
+    outcome = await flow.submit(
+        "ENG-9", emitted.event.event_id, SHA_A, flow.verdict(SHA_A, branch, 14)
+    )
     assert outcome.kind == "merged"
     assert outcome.merge_sha == merge_sha_for(SHA_A)
     assert flow.github.merge_calls[-1]["expected_head_sha"] == SHA_A
@@ -375,9 +416,13 @@ async def test_defect_returns_packet_via_outbox_then_correction_routes_to_ryan(
     branch = flow.stage("ENG-10", SHA_A, pr_number=15, qa_origin="ryan_assigned")
     emitted = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
     assert emitted.delivery.delivered
-    flow.report(flow.verdict(SHA_A, branch, 15, defect=True))
 
-    first = await flow.turns.handle_turn("demo")
+    first = await flow.submit(
+        "ENG-10",
+        emitted.event.event_id,
+        SHA_A,
+        flow.verdict(SHA_A, branch, 15, defect=True),
+    )
     assert first.kind == "corrections_required"
     pending = flow.outbox.pending("demo")
     assert len(pending) == 1
@@ -391,8 +436,9 @@ async def test_defect_returns_packet_via_outbox_then_correction_routes_to_ryan(
     flow.stage("ENG-10", SHA_B, pr_number=15)
     corrected = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
     assert corrected.delivery.delivered
-    flow.report(flow.verdict(SHA_B, branch, 15))
-    second = await flow.turns.handle_turn("demo")
+    second = await flow.submit(
+        "ENG-10", corrected.event.event_id, SHA_B, flow.verdict(SHA_B, branch, 15)
+    )
     assert second.kind == "merged"
     assert flow.linear.targets[-1] == ("ENG-10", "QA", "ryan")
     assert flow.queue.get("ENG-10").state is IssueState.QA
@@ -404,17 +450,20 @@ async def test_next_wake_reconciles_prior_ci_once_and_failure_blocks_intake(
 ) -> None:
     await flow.merger.ensure_thread("demo")
     branch_a = flow.stage("ENG-9", SHA_A, pr_number=14)
-    await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-    flow.report(flow.verdict(SHA_A, branch_a, 14))
-    assert (await flow.turns.handle_turn("demo")).kind == "merged"
+    first = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    merged = await flow.submit(
+        "ENG-9", first.event.event_id, SHA_A, flow.verdict(SHA_A, branch_a, 14)
+    )
+    assert merged.kind == "merged"
 
     flow.ci.results[merge_sha_for(SHA_A)] = CiCheck(
         outcome="failure", reason="build failed", evidence=("build: failed",)
     )
     branch_b = flow.stage("ENG-11", SHA_B, pr_number=16)
-    await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
-    flow.report(flow.verdict(SHA_B, branch_b, 16))
-    blocked = await flow.turns.handle_turn("demo")
+    second = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+    blocked = await flow.submit(
+        "ENG-11", second.event.event_id, SHA_B, flow.verdict(SHA_B, branch_b, 16)
+    )
     assert blocked.kind == "blocked_prior_failure"
     assert blocked.issue_id == "ENG-9"
     assert flow.ci.calls == [merge_sha_for(SHA_A)]
@@ -432,9 +481,10 @@ async def test_next_wake_reconciles_prior_ci_once_and_failure_blocks_intake(
     # 1. An ordinary FABLE_READY with a new SHA on the failed branch is not
     #    a correction: it stays blocked and the ledger stays failed.
     flow.stage("ENG-9", SHA_C, pr_number=14)
-    await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-    flow.report(flow.verdict(SHA_C, branch_a, 14))
-    ordinary = await flow.turns.handle_turn("demo")
+    retry = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    ordinary = await flow.submit(
+        "ENG-9", retry.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
+    )
     assert ordinary.kind == "blocked_prior_failure"
     assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
     assert len(flow.outbox.pending("demo")) == 1
@@ -444,10 +494,12 @@ async def test_next_wake_reconciles_prior_ci_once_and_failure_blocks_intake(
     #    failure's packet: blocked, ledger untouched.
     flow.clock = flow.clock.replace(minute=10)
     flow.stage("ENG-11", SHA_B, pr_number=16)
-    await flow.emitter.emit(
+    reworked = await flow.emitter.emit(
         "demo", "ENG-11", verification=(("t", "ok"),), status="FABLE_REWORK_READY"
     )
-    foreign = await flow.turns.handle_turn("demo")
+    foreign = await flow.submit(
+        "ENG-11", reworked.event.event_id, SHA_B, flow.verdict(SHA_B, branch_b, 16)
+    )
     assert foreign.kind == "blocked_prior_failure"
     assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
 
@@ -460,8 +512,9 @@ async def test_next_wake_reconciles_prior_ci_once_and_failure_blocks_intake(
         "demo", "ENG-9", verification=(("t", "ok"),), status="FABLE_REWORK_READY"
     )
     assert rework.delivery.delivered is True
-    flow.report(flow.verdict(SHA_C, branch_a, 14))
-    corrected = await flow.turns.handle_turn("demo")
+    corrected = await flow.submit(
+        "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
+    )
     assert corrected.kind == "merged"
     assert flow.ledger_state(merge_sha_for(SHA_A)) == "corrected"
     assert flow.ci.calls == [merge_sha_for(SHA_A)]
@@ -487,16 +540,21 @@ async def test_idle_report_and_missing_report_never_merge(
     await flow.merger.ensure_thread("demo")
     flow.stage("ENG-9", SHA_A, pr_number=14)
     emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-    flow.rpc.respond("thread/read", {"thread": {"id": "thr_legacy", "turns": []}})
+    # With no submitted verdict, observation is non-settling: it never pulls
+    # the thread's report (present or missing) and leaves the wake outstanding.
     waiting = await flow.turns.handle_turn("demo")
-    assert waiting.kind == "report_unavailable"
-    assert flow.turns.outstanding_wake("demo") == (emitted.event, "admitted")
+    assert waiting.kind == "awaiting_submission"
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert "thread/read" not in flow.rpc.methods
 
-    flow.report(IDLE_TERMINAL_REPORT)
-    idle = await flow.turns.handle_turn("demo")
-    assert idle.kind == "idle"
+    # The idle terminal line is not a verdict document: submitting it fails
+    # closed with no side effects, so nothing can ever merge from idle.
+    with pytest.raises(SubmissionRejected):
+        await flow.submit(
+            "ENG-9", emitted.event.event_id, SHA_A, IDLE_TERMINAL_REPORT
+        )
     assert flow.github.merge_calls == []
-    assert flow.turns.outstanding_wake("demo") is None
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
     assert flow.linear.targets == []
 
 
@@ -508,22 +566,27 @@ async def test_stale_rework_rejected_at_intake_leaves_the_ledger_failed(
     try:
         await flow.merger.ensure_thread("demo")
         branch_a = flow.stage("ENG-9", SHA_A, pr_number=14)
-        await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-        flow.report(flow.verdict(SHA_A, branch_a, 14))
-        assert (await flow.turns.handle_turn("demo")).kind == "merged"
+        first = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+        merged = await flow.submit(
+            "ENG-9", first.event.event_id, SHA_A, flow.verdict(SHA_A, branch_a, 14)
+        )
+        assert merged.kind == "merged"
         flow.ci.results[merge_sha_for(SHA_A)] = CiCheck(
             outcome="failure", reason="build failed", evidence=("build: failed",)
         )
-        flow.stage("ENG-11", SHA_B, pr_number=16)
-        await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
-        assert (await flow.turns.handle_turn("demo")).kind == "blocked_prior_failure"
+        branch_b = flow.stage("ENG-11", SHA_B, pr_number=16)
+        second = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+        blocked = await flow.submit(
+            "ENG-11", second.event.event_id, SHA_B, flow.verdict(SHA_B, branch_b, 16)
+        )
+        assert blocked.kind == "blocked_prior_failure"
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
 
         # A bound rework whose pushed head moved on before intake is stale:
         # rejected by the GitHub gate after the CI gate, ledger untouched.
         flow.clock = flow.clock.replace(minute=20)
         flow.stage("ENG-9", SHA_C, pr_number=14)
-        await flow.emitter.emit(
+        rework = await flow.emitter.emit(
             "demo", "ENG-9", verification=(("t", "ok"),), status="FABLE_REWORK_READY"
         )
         flow.github.open_pulls = (
@@ -532,7 +595,9 @@ async def test_stale_rework_rejected_at_intake_leaves_the_ledger_failed(
         flow.github.full_pulls = {
             14: open_pull(number=14, head_sha=SHA_B, head_ref=branch_a)
         }
-        stale = await flow.turns.handle_turn("demo")
+        stale = await flow.submit(
+            "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
+        )
         assert stale.kind == "rejected"
         assert "not the candidate SHA" in stale.reason
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
@@ -575,13 +640,22 @@ async def test_create_close_new_client_read_and_settle(tmp_path: Path) -> None:
         assert "thread/start" not in fresh.methods
         assert await merger_b.thread_status("thr_demo") is None or True
 
-        # The queued wake is consumed once the task is opened; its completed
-        # turn is then settled by the fresh client from thread/read alone.
-        report = flow.thread_read(flow.verdict(SHA_A, branch, 14))
-        report["thread"]["id"] = "thr_demo"
-        fresh.respond("thread/read", report)
+        # The queued wake is consumed once the task is opened. Observation by
+        # the fresh client is non-settling — it never reads the thread for a
+        # verdict — and Sol's explicit submission, bound to the persisted
+        # thread, settles the turn through the fresh client.
         turns_b = flow.new_turns(merger_b, fresh)
-        outcome = await turns_b.handle_turn("demo")
+        observed = await turns_b.handle_turn("demo")
+        assert observed.kind == "awaiting_submission"
+        assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+        outcome = await flow.submit(
+            "ENG-9",
+            emitted.event.event_id,
+            SHA_A,
+            flow.verdict(SHA_A, branch, 14),
+            turns=turns_b,
+            merger=merger_b,
+        )
         assert outcome.kind == "merged"
         assert flow.linear.targets[-1] == ("ENG-9", "Done", "operator")
         assert (
@@ -602,23 +676,27 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
     try:
         await flow.merger.ensure_thread("demo")
         branch_a = flow.stage("ENG-9", SHA_A, pr_number=14)
-        await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-        flow.report(flow.verdict(SHA_A, branch_a, 14))
-        assert (await flow.turns.handle_turn("demo")).kind == "merged"
+        first = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+        merged = await flow.submit(
+            "ENG-9", first.event.event_id, SHA_A, flow.verdict(SHA_A, branch_a, 14)
+        )
+        assert merged.kind == "merged"
         flow.ci.results[merge_sha_for(SHA_A)] = CiCheck(
             outcome="failure", reason="build failed", evidence=("build: failed",)
         )
-        flow.stage("ENG-11", SHA_B, pr_number=16)
-        await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
-        assert (await flow.turns.handle_turn("demo")).kind == "blocked_prior_failure"
+        branch_b = flow.stage("ENG-11", SHA_B, pr_number=16)
+        second = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+        blocked = await flow.submit(
+            "ENG-11", second.event.event_id, SHA_B, flow.verdict(SHA_B, branch_b, 16)
+        )
+        assert blocked.kind == "blocked_prior_failure"
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
 
         flow.clock = flow.clock.replace(minute=20)
         flow.stage("ENG-9", SHA_C, pr_number=14)
-        await flow.emitter.emit(
+        rework = await flow.emitter.emit(
             "demo", "ENG-9", verification=(("t", "ok"),), status="FABLE_REWORK_READY"
         )
-        flow.report(flow.verdict(SHA_C, branch_a, 14))
         list_calls_before = len(flow.github.list_calls)
 
         def move_head_after_admission(count: int) -> None:
@@ -630,7 +708,9 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
                 )
 
         flow.github.on_list = move_head_after_admission
-        outcome = await flow.turns.handle_turn("demo")
+        outcome = await flow.submit(
+            "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
+        )
         assert outcome.kind == "rejected"
         assert "exactly one open pull request" in outcome.reason
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
@@ -642,11 +722,13 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
         # own failure; replaying the settled turn changes nothing.
         flow.clock = flow.clock.replace(minute=30)
         flow.stage("ENG-9", SHA_B, pr_number=14)
-        await flow.emitter.emit(
+        later = await flow.emitter.emit(
             "demo", "ENG-9", verification=(("t", "ok"),), status="FABLE_REWORK_READY"
         )
-        flow.report(flow.verdict(SHA_B, branch_a, 14))
-        assert (await flow.turns.handle_turn("demo")).kind == "merged"
+        settled = await flow.submit(
+            "ENG-9", later.event.event_id, SHA_B, flow.verdict(SHA_B, branch_a, 14)
+        )
+        assert settled.kind == "merged"
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "corrected"
         assert (await flow.turns.handle_turn("demo")).kind == "no_outstanding_wake"
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "corrected"
@@ -661,20 +743,39 @@ async def test_lost_turn_completion_settles_at_the_next_boundary(
 ) -> None:
     """INFRA-194: the completed-turn notification is delivery, not truth.
 
-    The wake is delivered and the Merger's approved report sits in its
-    thread, but the turn/completed notification never arrives (rpc
+    The wake is delivered and Sol's approved verdict was durably
+    submitted, but the process crashed before settlement completed (rpc
     drop, daemon crash). The startup/intake boundary pass re-derives
     both durable facts and settles exactly once; a second pass replays
-    clean with no second mutation.
+    clean with no second mutation. Without a submitted verdict the same
+    boundary pass is non-settling and leaves the wake outstanding.
     """
 
     await flow.merger.ensure_thread("demo")
     branch = flow.stage("ENG-9", SHA_A, pr_number=14)
-    await flow.emitter.emit(
+    emitted = await flow.emitter.emit(
         "demo", "ENG-9", verification=(("uv run pytest -q", "passed"),)
     )
-    flow.report(flow.verdict(SHA_A, branch, 14))
-    # No notification is ever handled; only the boundary pass runs.
+    # No notification is ever handled; only the boundary pass runs. With
+    # no submitted verdict it observes without settling.
+    [waiting] = await flow.turns.recover_outstanding(("demo",))
+    assert waiting.kind == "awaiting_submission"
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert flow.github.merge_calls == []
+
+    # Sol's submission was durably persisted, then the process died before
+    # settlement: only the exactly-once row survives.
+    document = flow.verdict(SHA_A, branch, 14)
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO submitted_verdicts("
+            "event_id, project_key, issue_id, candidate_sha, "
+            "reviewed_thread_id, reviewed_generation, verdict_json, state, "
+            "created_at, updated_at) "
+            "VALUES (?, 'demo', 'ENG-9', ?, 'thr_legacy', 1, ?, 'submitted', "
+            "'2026-08-28T12:00:00+00:00', '2026-08-28T12:00:00+00:00')",
+            (emitted.event.event_id, SHA_A, document),
+        )
 
     [outcome] = await flow.turns.recover_outstanding(("demo",))
 
@@ -704,11 +805,13 @@ async def test_a_direct_sol_merge_reconciles_at_the_next_intake_boundary(
 
     await flow.merger.ensure_thread("demo")
     branch_a = flow.stage("ENG-1", SHA_A, pr_number=14)
-    await flow.emitter.emit(
+    first = await flow.emitter.emit(
         "demo", "ENG-1", verification=(("uv run pytest -q", "passed"),)
     )
-    flow.report(flow.verdict(SHA_A, branch_a, 14))
-    assert (await flow.turns.handle_turn("demo")).kind == "merged"
+    merged = await flow.submit(
+        "ENG-1", first.event.event_id, SHA_A, flow.verdict(SHA_A, branch_a, 14)
+    )
+    assert merged.kind == "merged"
 
     # Candidate C: verdict approved and durably recorded, wake
     # completed, merge not yet performed.

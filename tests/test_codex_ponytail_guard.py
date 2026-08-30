@@ -1,8 +1,12 @@
-"""Verify the session-scoped Ponytail review gate (correction c3f4aad5).
+"""Verify the session-scoped Ponytail review gate (correction c3f4aad5,
+hardened by Sol correction a9cc6d5f).
 
 The guard blocks exactly ``git commit`` and ``git push`` in a managed Sol
-session until the current diff (SHA-256 of ``git diff HEAD``) has a
-recorded @ponytail-review; a changed diff invalidates the prior review by
+session until the current candidate snapshot — a canonical hash covering
+tracked modifications, index state, deletions, renames, and untracked
+files — has a recorded @ponytail-review for the command's *effective*
+repository (``-C``/``cd``/``--git-dir``/``--work-tree`` resolved; unprovable
+contexts fail closed). A changed candidate invalidates the prior review by
 hash comparison; the state is one marker file overwritten in place — no
 receipt or manifest subsystem; and sessions without the hook binding are
 untouched (no global git hook is ever installed).
@@ -27,6 +31,7 @@ from hermes_orchestrator.codex_ponytail_guard import (
     record_command,
     record_review,
     reviewed_hash,
+    snapshot_hash,
 )
 
 
@@ -36,9 +41,7 @@ def _git(repo: Path, *args: str) -> None:
     )
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    path = tmp_path / "workspace"
+def _make_repo(path: Path) -> Path:
     path.mkdir()
     _git(path, "init", "-b", "main")
     _git(path, "config", "user.email", "sol@example.test")
@@ -48,6 +51,11 @@ def repo(tmp_path: Path) -> Path:
     _git(path, "add", ".")
     _git(path, "commit", "-m", "initial")
     return path
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    return _make_repo(tmp_path / "workspace")
 
 
 def dirty(repo: Path) -> None:
@@ -224,6 +232,112 @@ def test_record_cli_writes_the_marker_for_the_workspace(
     assert evaluate_command("git commit -am 'x'", repo).allowed is True
 
 
+# Sol correction a9cc6d5f test 1: an untracked file added after review
+# invalidates the marker and blocks `git add -A && git commit`.
+def test_untracked_file_added_after_review_invalidates_the_marker(
+    repo: Path,
+) -> None:
+    dirty(repo)
+    reviewed = record_review(repo)
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    (repo / "smuggled.py").write_text("print('sneaky')\n", encoding="utf-8")
+
+    code, reason = sol_hook_exit(repo, "git add -A && git commit -m 'x'")
+    assert code == BLOCK_EXIT_CODE
+    assert "@ponytail-review" in reason
+    # Reviewing the complete candidate — untracked file included — differs
+    # from the tracked-only review and re-opens the gate.
+    assert record_review(repo) != reviewed
+    assert evaluate_command("git add -A && git commit -m 'x'", repo).allowed
+
+
+# Sol correction a9cc6d5f test 2: a reviewed parent repository cannot
+# authorize `git -C nested commit` in an unreviewed nested repository.
+def test_reviewed_parent_cannot_authorize_nested_repository_commit(
+    repo: Path,
+) -> None:
+    nested = _make_repo(repo / "nested")
+    dirty(repo)
+    record_review(repo)
+    assert evaluate_command("git commit -am 'parent'", repo).allowed is True
+
+    (nested / "module.py").write_text("print('nested')\n", encoding="utf-8")
+
+    for command in (
+        "git -C nested commit -am 'x'",
+        ["bash", "-lc", "cd nested && git commit -am 'x'"],
+    ):
+        assert evaluate_command(command, repo).allowed is False, command
+    # The parent's review still stands for the parent itself.
+    assert evaluate_command("git commit -am 'parent'", repo).allowed is True
+    # Reviewing the nested repository itself opens its own gate.
+    record_review(nested)
+    assert evaluate_command("git -C nested commit -am 'x'", repo).allowed
+
+
+# Sol correction a9cc6d5f test 3: --git-dir/--work-tree forms validate the
+# effective target they select, or fail closed when it cannot be proven.
+def test_git_dir_and_work_tree_forms_validate_the_effective_target(
+    repo: Path,
+) -> None:
+    nested = _make_repo(repo / "nested")
+    (nested / "module.py").write_text("print('nested')\n", encoding="utf-8")
+    git_dir = nested / ".git"
+
+    equivalent = (
+        f"git --git-dir={git_dir} --work-tree={nested} commit -am 'x'",
+        f"git --git-dir {git_dir} --work-tree {nested} commit -am 'x'",
+        "git -C nested commit -am 'x'",
+    )
+    for command in equivalent:
+        assert evaluate_command(command, repo).allowed is False, command
+    record_review(nested)
+    for command in equivalent:
+        assert evaluate_command(command, repo).allowed is True, command
+
+    # Context the guard cannot prove fails closed, naming the reason.
+    for command in (
+        "GIT_DIR=nested/.git git commit -am 'x'",
+        "git -c core.worktree=nested commit -am 'x'",
+        "git --namespace=other push origin main",
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert "fails closed" in decision.reason, command
+
+    # A nested git dir crossed with the parent's work tree matches
+    # neither repository's review, so it stays blocked.
+    dirty(repo)
+    record_review(repo)
+    crossed = f"git --git-dir={git_dir} commit -am 'x'"
+    assert evaluate_command(crossed, repo).allowed is False
+
+
+# Sol correction a9cc6d5f test 4: staged, unstaged, deleted, renamed, and
+# newly added files all affect the reviewed snapshot.
+def test_every_change_class_affects_the_reviewed_snapshot(repo: Path) -> None:
+    seen = [snapshot_hash(repo)]
+
+    def changed() -> None:
+        current = snapshot_hash(repo)
+        assert current not in seen
+        seen.append(current)
+
+    (repo / "module.py").write_text("print('edit')\n", encoding="utf-8")
+    changed()  # unstaged modification
+    _git(repo, "add", "module.py")
+    changed()  # staged modification (index state alone)
+    (repo / "brand-new.py").write_text("print('new')\n", encoding="utf-8")
+    changed()  # newly added untracked file
+    _git(repo, "add", "brand-new.py")
+    changed()  # staged addition
+    _git(repo, "mv", "brand-new.py", "renamed.py")
+    changed()  # rename
+    (repo / "module.py").unlink()
+    changed()  # deletion
+
+
 def test_outside_a_repository_the_gate_fails_closed(tmp_path: Path) -> None:
     bare = tmp_path / "not-a-repo"
     bare.mkdir()
@@ -231,4 +345,4 @@ def test_outside_a_repository_the_gate_fails_closed(tmp_path: Path) -> None:
     decision = evaluate_command("git push origin main", bare)
 
     assert decision.allowed is False
-    assert "cannot verify the diff" in decision.reason
+    assert "cannot verify the candidate snapshot" in decision.reason

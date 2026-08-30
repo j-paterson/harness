@@ -23,9 +23,13 @@ set: the ONLY honored matcher is the one derived from the code-owned
 derived markers, at capture, complete_prompt, and evaluation alike).
 A full match first records a durable at-most-once
 ``channel.confirm_claimed`` claim (the live-dedup unique index is the
-CAS binding anchor + workspace + surface + launch session), then calls
-the injected ``confirm`` collaborator exactly once, then records the
-``channel.auto_confirmed`` completion receipt carrying the match
+CAS binding anchor + workspace + surface + launch session), then — Sol
+correction a9cc6d5f packet 3 — re-reads the exact bound surface and
+fully re-validates the approved dialog IMMEDIATELY before the keypress
+(any final-boundary anomaly sends no key and records a durable
+non-success refusal while the retained claim blocks blind retry), then
+calls the injected ``confirm`` collaborator exactly once, then records
+the ``channel.auto_confirmed`` completion receipt carrying the match
 evidence — or, when the keypress or its receipt fails after the claim,
 an explicit durable ``channel.confirm_ambiguous`` state that reports
 ``confirmed=False`` (every ambiguous outcome is a non-success verdict)
@@ -611,7 +615,13 @@ class ChannelTrustGate:
         The keypress itself is guarded by a durable at-most-once claim
         (``channel.confirm_claimed``): the claim must record BEFORE
         ``confirm`` is called — a live duplicate or a claim-record
-        failure means zero keypresses — and after the external action
+        failure means zero keypresses. After the claim, and immediately
+        before the Enter, the approved dialog is re-read and fully
+        re-validated on the exact bound surface
+        (:meth:`_final_boundary_failure`): a final-boundary anomaly
+        sends no key and records a durable approval-required refusal
+        while the retained claim keeps blocking blind retry. After the
+        external action
         either the ``channel.auto_confirmed`` completion or an explicit
         ``channel.confirm_ambiguous`` state is recorded. A failed or
         uncertain keypress is never blindly retried: the live claim
@@ -777,6 +787,26 @@ class ChannelTrustGate:
                 anchor_id=anchor.anchor_id,
             )
 
+        # LAST-MOMENT VERIFY-AND-CONFIRM (Sol correction a9cc6d5f,
+        # packet 3): Enter is authorized only when the exact approved
+        # dialog is freshly present on the exact bound surface at the
+        # keypress boundary — proven by one bounded re-read immediately
+        # before the press, never by the evidence the claim was
+        # evaluated against. No key was sent on any anomaly here, so
+        # the definite non-success refusal is recorded while the live
+        # claim keeps refusing any blind retry.
+        final_failure = self._final_boundary_failure(
+            anchor.prompt_pattern, prompt_match_sha256
+        )
+        if final_failure is not None:
+            return self._refuse(
+                cell_id=cell_id,
+                session_id=session_id,
+                project_key=project_key,
+                first_failure=final_failure,
+                anchor_id=anchor.anchor_id,
+            )
+
         try:
             self._confirm()
         except Exception:
@@ -823,6 +853,54 @@ class ChannelTrustGate:
             anchor_id=anchor.anchor_id,
             receipt_operation_id=operation.operation_id,
         )
+
+    def _final_boundary_failure(
+        self, prompt_pattern: str, claimed_match_sha256: str
+    ) -> str | None:
+        """Re-read and fully re-validate the approved dialog at the
+        keypress boundary; ``None`` authorizes the one Enter, any
+        string names the invariant that broke (and no key is sent).
+
+        The cmux CLI offers no atomic read-and-press, so this is the
+        narrowest achievable window: one bounded live re-read through
+        the caller-bound ``read_screen`` — bound at wiring time to the
+        exact validated workspace/surface, so a replaced or vanished
+        surface fails the read itself — re-validated in full: the
+        anchor's fixed approved matcher must match the fresh text
+        exactly once, and the matched dialog must be byte-identical
+        (by sha256) to the one the durable claim was recorded against.
+
+        RESIDUAL TOCTOU WINDOW, stated honestly: between this final
+        read returning and the Enter landing on the surface there
+        remains one unavoidable gap — the duration of the ``confirm``
+        call itself — in which the pane could still mutate. No
+        mechanism available to this process can close that gap; this
+        check only shrinks it from
+        watch-detection-to-keypress down to read-to-keypress.
+
+        Failure names: ``final_read_failed`` (the re-read raised),
+        ``final_prompt_missing`` (the prompt disappeared or a replaced
+        surface shows other content), ``final_prompt_multiple`` (the
+        match is no longer unique), ``final_prompt_drift`` (one match,
+        but its content differs from the claimed evaluation's dialog).
+        Each records the existing durable approval-required refusal:
+        zero keys went out, so the outcome is definite — never
+        ambiguous — and the retained claim still prevents blind retry.
+        """
+
+        try:
+            text = self._read_screen()
+        except Exception:
+            return "final_read_failed"
+        matches = list(re.finditer(prompt_pattern, text))
+        if not matches:
+            return "final_prompt_missing"
+        if len(matches) > 1:
+            return "final_prompt_multiple"
+        fresh_sha256 = hashlib.sha256(matches[0].group(0).encode()).hexdigest()
+        if fresh_sha256 != claimed_match_sha256:
+            return "final_prompt_drift"
+        return None
 
     def _refuse(
         self,

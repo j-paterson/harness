@@ -3,12 +3,14 @@
 INFRA-166: after a delivered ``FABLE_*`` wake, the Codex Merger thread
 reviews the candidate on its own turn and reports either the exact idle
 ``BLOCKED_ON_EXTERNAL_INTAKE`` line or a structured verdict. This service
-is the orchestrator side of that boundary: on a turn-completed signal it
-admits the delivered wake through every intake gate (CI reconciliation,
-then the one-pull-request GitHub gate), reads the thread's latest report,
-parses it against the admitted candidate binding, and drives
-:class:`ReviewService`. Nothing here polls: every call is caused by a
-delivered wake or a completed-turn notification.
+is the orchestrator side of that boundary. Sol correction a9cc6d5f: the
+only verdict source is an explicit ``submit_review`` submission, durably
+claimed under the wake's event_id before settlement. Observation —
+turn-completed notifications and startup recovery — is non-settling: it
+resumes the settlement of an already-submitted document and otherwise
+leaves the wake outstanding, never pulling the thread's report as a
+verdict. Nothing here polls: every call is caused by a delivered wake, a
+completed-turn notification, or an explicit submission.
 """
 
 from __future__ import annotations
@@ -180,7 +182,7 @@ def _outcome_from_json(text: str) -> TurnOutcome:
 
 
 class MergerTurnService:
-    """Admit the delivered wake and settle the Merger's report, exactly once."""
+    """Admit the delivered wake and settle the submitted verdict, once."""
 
     def __init__(
         self,
@@ -243,17 +245,17 @@ class MergerTurnService:
     async def recover_outstanding(
         self, project_keys: tuple[str, ...] | None = None
     ) -> tuple[TurnOutcome, ...]:
-        """Settle any wake whose completed-turn notification was lost.
+        """Resume any submitted-but-unsettled verdict after a lost signal.
 
         INFRA-194: the completed-turn notification is delivery, not
         truth — a daemon restart, an rpc drop, or a crashed handler
-        loses it while the delivered wake and the thread's completed
-        report both survive durably. This boundary pass re-derives
-        them: each project with an outstanding wake gets exactly one
-        ``handle_turn``, which no-ops when the report is not yet a
-        verdict and settles exactly once when it is (the settlement
-        claim and idempotent review make a racing notification
-        harmless). Never called on a timer — only at startup and
+        loses it while the delivered wake and any durably submitted
+        verdict both survive. This boundary pass is non-settling
+        observation: each project with an outstanding wake gets exactly
+        one ``handle_turn``, which resumes settlement only when a
+        ``submitted`` verdict row already exists and otherwise leaves
+        the wake outstanding — it never pulls the thread's report as a
+        verdict source. Never called on a timer — only at startup and
         explicit intake boundaries, so nothing polls.
         """
 
@@ -276,7 +278,7 @@ class MergerTurnService:
         return tuple(outcomes)
 
     async def handle_turn(self, project_key: str) -> TurnOutcome:
-        """Admit, read, parse, and settle the project's outstanding wake."""
+        """Reconcile the outstanding wake; settle only a submitted verdict."""
 
         project = self._projects.get(project_key)
         if project is None:
@@ -299,16 +301,24 @@ class MergerTurnService:
                 "no delivered candidate wake; terminal idle",
             )
         event, state = outstanding
-        # Crash-recovery fallback only: a verdict already durably written
-        # by an explicit submission whose settlement did not complete is
-        # resumed here. Observation never writes a submitted_verdicts row
-        # and never infers a fresh verdict from idle.
+        # Sol correction a9cc6d5f: observation is non-settling. Only an
+        # explicit submission durably claimed under the event_id primary
+        # key is ever a verdict source; when no such row exists this path
+        # neither pulls the thread's report nor consumes the wake, so a
+        # racing submit_review can never be preempted by an inferred
+        # verdict.
         submitted = self._pending_submission(project_key, event.event_id)
+        if submitted is None:
+            return TurnOutcome(
+                project_key, "awaiting_submission", event.event_id,
+                event.issue_id,
+                "no submitted verdict for the outstanding wake; "
+                "observation never infers one from the thread",
+            )
         outcome = await self._settle_wake(
             project, project_key, channel, event, state, submitted=submitted
         )
-        if submitted is not None:
-            self._record_settled(event.event_id, outcome)
+        self._record_settled(event.event_id, outcome)
         return outcome
 
     async def _settle_wake(
@@ -319,17 +329,16 @@ class MergerTurnService:
         event: WakeEvent,
         state: str,
         *,
-        submitted: _Submission | None,
+        submitted: _Submission,
     ) -> TurnOutcome:
-        """Admit the wake and settle one verdict source, exactly once.
+        """Admit the wake and settle the submitted document, exactly once.
 
-        The shared downstream settlement for both verdict sources: the
-        explicit Sol submission (``submitted`` set — its durable verdict
-        document is settled) and the completed-turn observation fallback
-        (``submitted`` is ``None`` — the thread's latest report is
-        pulled). Everything after the verdict source — admission gates,
-        the live pull-request check, parsing against the admitted
-        binding, and the idempotent review drive — is identical.
+        The single verdict source is the immutable ``submitted_verdicts``
+        row that ``submit_review`` durably claimed; the thread is never
+        pulled here. Both the direct submission path and every recovery
+        path (notification, startup, duplicate resume) converge on this
+        settlement: admission gates, the live pull-request check, parsing
+        against the admitted binding, and the idempotent review drive.
         """
 
         if state == "delivered":
@@ -400,15 +409,7 @@ class MergerTurnService:
         # (report missing or malformed) are not rejections and replay this
         # event-bound close idempotently.
         self._close_bound_failure(project_key, admitted.manifest)
-        if submitted is not None:
-            text: str | None = submitted.verdict_json
-        else:
-            text = await self._reports.latest_report(channel.thread_id)
-        if text is None:
-            return TurnOutcome(
-                project_key, "report_unavailable", event.event_id,
-                event.issue_id, "the Merger thread has no completed report yet",
-            )
+        text = submitted.verdict_json
         binding = VerdictBinding(
             repository=project.github_repo,
             branch=admitted.manifest.branch,

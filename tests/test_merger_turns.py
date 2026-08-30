@@ -144,15 +144,27 @@ async def test_full_window_defers_and_returns_the_wake_to_pending(
     await flow.merger.ensure_thread("demo")
     for issue, sha, number in (("ENG-9", SHA_A, 14), ("ENG-11", SHA_B, 16)):
         branch = flow.stage(issue, sha, pr_number=number)
-        await flow.emitter.emit("demo", issue, verification=(("t", "ok"),))
-        flow.report(flow.verdict(sha, branch, number))
-        assert (await flow.turns.handle_turn("demo")).kind == "merged"
+        emitted = await flow.emitter.emit(
+            "demo", issue, verification=(("t", "ok"),)
+        )
+        settled = await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                emitted.event.event_id, issue, sha,
+                flow.verdict(sha, branch, number),
+            ),
+        )
+        assert settled.kind == "merged"
     assert len(flow.window.unresolved_items("demo")) == 2
 
     branch = flow.stage("ENG-12", SHA_C, pr_number=17)
     emitted = await flow.emitter.emit("demo", "ENG-12", verification=(("t", "ok"),))
-    flow.report(flow.verdict(SHA_C, branch, 17))
-    deferred = await flow.turns.handle_turn("demo")
+    deferred = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-12", SHA_C, flow.verdict(SHA_C, branch, 17)
+        ),
+    )
     assert deferred.kind == "deferred"
     assert len(flow.github.merge_calls) == 2
     row = flow.database.execute(
@@ -185,30 +197,86 @@ async def test_full_window_defers_and_returns_the_wake_to_pending(
     assert [(r["event_id"], r["state"]) for r in rows] == [
         (reemitted.event.event_id, "delivered")
     ]
-    assert (await flow.turns.handle_turn("demo")).kind == "merged"
+    resubmitted = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            reemitted.event.event_id, "ENG-12", SHA_C,
+            flow.verdict(SHA_C, branch, 17),
+        ),
+    )
+    assert resubmitted.kind == "merged"
     assert flow.ci.calls[-2:] == [merge_sha_for(SHA_A), merge_sha_for(SHA_B)]
     assert [item.merge_sha for item in flow.window.unresolved_items("demo")] == [
         merge_sha_for(SHA_B),
         merge_sha_for(SHA_C),
     ]
+    # Every settlement above came from a persisted submission; the thread
+    # was never pulled as a verdict source.
+    assert "thread/read" not in flow.rpc.methods
 
 
 @pytest.mark.asyncio
-async def test_stale_or_malformed_reports_never_merge(
+async def test_completed_report_without_submission_is_non_settling(
     flow: ProductionShapedFlow,
 ) -> None:
+    # Sol a9cc6d5f required test 1: a completed thread report with no
+    # submitted_verdicts row does not settle and does not consume the
+    # wake — even a fully mergeable report is never pulled as a verdict.
     await flow.merger.ensure_thread("demo")
     branch = flow.stage("ENG-9", SHA_A, pr_number=14)
-    await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-    flow.report(flow.verdict(SHA_B, branch, 14))
-    stale = await flow.turns.handle_turn("demo")
-    assert stale.kind == "verdict_invalid"
-    flow.report("PAUSED_NO_ELIGIBLE_WORK")
-    forbidden = await flow.turns.handle_turn("demo")
-    assert forbidden.kind == "verdict_invalid"
-    assert "forbidden pause" in forbidden.reason
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+
+    outcome = await flow.turns.handle_turn("demo")
+
+    assert outcome.kind == "awaiting_submission"
+    assert outcome.event_id == emitted.event.event_id
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert _submitted_rows(flow) == []
     assert flow.github.merge_calls == []
-    assert flow.turns.outstanding_wake("demo") is not None
+    assert "thread/read" not in flow.rpc.methods
+
+    # The turn-completed notification path is the same observation and
+    # stays non-settling and stable across repeats.
+    routed = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert routed is not None and routed.kind == "awaiting_submission"
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert _submitted_rows(flow) == []
+    assert flow.github.merge_calls == []
+    assert "thread/read" not in flow.rpc.methods
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_without_submission_leaves_wake_outstanding(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol a9cc6d5f required test 2: startup recovery with no submitted
+    # verdict leaves the wake outstanding; only a later explicit
+    # submission settles it.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-10", SHA_A, pr_number=15)
+    emitted = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 15))
+
+    outcomes = await flow.turns.recover_outstanding()
+
+    assert [outcome.kind for outcome in outcomes] == ["awaiting_submission"]
+    assert outcomes[0].event_id == emitted.event.event_id
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert _submitted_rows(flow) == []
+    assert flow.github.merge_calls == []
+    assert "thread/read" not in flow.rpc.methods
+
+    settled = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-10", SHA_A, flow.verdict(SHA_A, branch, 15)
+        ),
+    )
+    assert settled.kind == "merged"
+    assert "thread/read" not in flow.rpc.methods
 
 
 def _submission(
@@ -322,6 +390,7 @@ async def test_unbound_stale_or_conflicting_submissions_fail_closed(
         {**good, "reviewed_thread_id": "thr_other"},
         {**good, "reviewed_generation": 2},
         {**good, "verdict_json": "not json"},
+        {**good, "verdict_json": "PAUSED_NO_ELIGIBLE_WORK"},
         {**good, "verdict_json": IDLE_TERMINAL_REPORT},
         {**good, "verdict_json": flow.verdict(SHA_B, branch, 14)},
     ]
@@ -381,24 +450,72 @@ async def test_approved_submission_enters_the_guarded_merge_transition(
 
 
 @pytest.mark.asyncio
-async def test_observation_never_infers_a_verdict_and_resumes_durable_ones(
+async def test_interleaved_opposing_submission_settles_exactly_once(
     flow: ProductionShapedFlow,
 ) -> None:
-    # Required test 5: idle/turn observation does not create or infer a
-    # new verdict; it only resumes settlement when a matching verdict was
-    # already durably written before submission completion.
+    # Sol a9cc6d5f required test 3: interleave turn-completed handling
+    # with an opposing valid submit-review and prove exactly one
+    # settlement, from the persisted document. The old race window —
+    # observation reading no pending submission, then awaiting the
+    # thread report — is armed as a trap: any thread/read fires the
+    # conflicting submission mid-await, so if observation ever reopens
+    # that window the stale approved report would settle after the
+    # opposing verdict and the assertions below would catch the double
+    # settlement.
     await flow.merger.ensure_thread("demo")
-    flow.stage("ENG-9", SHA_A, pr_number=14)
-    await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
-    flow.report(IDLE_TERMINAL_REPORT)
-    idle = await flow.turns.handle_turn("demo")
-    assert idle.kind == "idle"
-    assert _submitted_rows(flow) == []
-    assert flow.github.merge_calls == []
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    opposing = flow.verdict(SHA_A, branch, 14, defect=True)
+    flow.report(flow.verdict(SHA_A, branch, 14))
+    fired: list[Any] = []
 
-    # A durably written but unsettled submission (crash between the
-    # exactly-once persist and settlement completion) is resumed by the
-    # observation fallback, from the stored verdict, never the thread.
+    async def fire(method: str) -> None:
+        if method == "thread/read" and not fired:
+            fired.append(
+                await flow.turns.submit_review(
+                    "demo",
+                    **_submission(
+                        emitted.event.event_id, "ENG-9", SHA_A, opposing
+                    ),
+                )
+            )
+
+    flow.rpc.on_request = fire
+
+    observed = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+
+    # Observation never opened the window: no report await, no trap.
+    assert observed is not None and observed.kind == "awaiting_submission"
+    assert fired == [] and "thread/read" not in flow.rpc.methods
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+    outcome = await flow.turns.submit_review(
+        "demo",
+        **_submission(emitted.event.event_id, "ENG-9", SHA_A, opposing),
+    )
+
+    assert outcome.kind == "corrections_required"
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "settled", opposing)
+    ]
+    pending = flow.outbox.pending("demo")
+    assert len(pending) == 1 and pending[0].reviewed_sha == SHA_A
+    # Exactly one settlement: the opposing persisted document routed
+    # corrections; the thread's approved report never caused a merge.
+    assert flow.github.merge_calls == []
+    assert "thread/read" not in flow.rpc.methods
+
+
+@pytest.mark.asyncio
+async def test_crash_after_submission_resumes_the_exact_document(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol a9cc6d5f required test 4: a crash between the exactly-once
+    # persist and settlement completion resumes that exact document on
+    # the next observation, without pulling the thread.
+    await flow.merger.ensure_thread("demo")
     branch = flow.stage("ENG-11", SHA_B, pr_number=16)
     emitted = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
     document = flow.verdict(SHA_B, branch, 16)
@@ -412,7 +529,7 @@ async def test_observation_never_infers_a_verdict_and_resumes_durable_ones(
             "'2026-08-28T12:00:00+00:00', '2026-08-28T12:00:00+00:00')",
             (emitted.event.event_id, SHA_B, document),
         )
-    flow.report(IDLE_TERMINAL_REPORT)
+    # No thread/read response is armed: the stored document alone settles.
 
     resumed = await flow.turns.handle_turn("demo")
 
@@ -422,3 +539,4 @@ async def test_observation_never_infers_a_verdict_and_resumes_durable_ones(
         (emitted.event.event_id, "settled", document)
     ]
     assert len(flow.github.merge_calls) == 1
+    assert "thread/read" not in flow.rpc.methods
