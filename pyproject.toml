@@ -30,6 +30,17 @@ dev = [
   "ruff==0.15.10",
 ]
 
+# The package version rarely changes, so without explicit cache keys
+# uv can reuse a stale cached wheel for freshly exported runtime
+# artifacts (observed live during INFRA-195 activation). Key the build
+# cache on the actual sources instead.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/hermes_orchestrator/**/*.py" },
+    { file = "src/hermes_orchestrator/**/*.sql" },
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
