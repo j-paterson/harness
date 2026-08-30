@@ -17,6 +17,9 @@ from hermes_orchestrator.db import Database
 
 MIGRATIONS = Path("src/hermes_orchestrator/migrations")
 
+# Deliberate explicit pin of the current schema version (keep as a literal).
+CURRENT_SCHEMA = 50
+
 LEGACY_0003 = """
 BEGIN IMMEDIATE;
 CREATE TABLE merger_threads (
@@ -89,7 +92,7 @@ def test_legacy_database_upgrades_to_current_schema(tmp_path: Path) -> None:
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 50
+        assert database.schema_version() == CURRENT_SCHEMA
         names = tables(database)
         assert "reviewer_channels" in names
         assert "merger_threads" not in names
@@ -148,7 +151,7 @@ def test_upgrade_never_replaces_an_existing_current_channel(tmp_path: Path) -> N
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 50
+        assert database.schema_version() == CURRENT_SCHEMA
         row = database.execute(
             "SELECT thread_id, generation, state FROM reviewer_channels"
         ).fetchone()
@@ -168,7 +171,7 @@ def test_upgrade_is_idempotent_across_reopen(tmp_path: Path) -> None:
     Database.open(path).close()
     reopened = Database.open(path)
     try:
-        assert reopened.schema_version() == 50
+        assert reopened.schema_version() == CURRENT_SCHEMA
         assert reopened.scalar("SELECT count(*) FROM reviewer_channels") == 1
     finally:
         reopened.close()
@@ -250,7 +253,7 @@ def test_pending_commands_survive_the_claim_state_recreate(tmp_path: Path) -> No
 
     database = Database.open(path)
     try:
-        assert database.schema_version() == 50
+        assert database.schema_version() == CURRENT_SCHEMA
         row = database.execute(
             "SELECT * FROM remote_pending_commands WHERE confirmation_id = 'c-1'"
         ).fetchone()
