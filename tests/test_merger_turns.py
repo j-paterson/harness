@@ -540,3 +540,224 @@ async def test_crash_after_submission_resumes_the_exact_document(
     ]
     assert len(flow.github.merge_calls) == 1
     assert "thread/read" not in flow.rpc.methods
+
+
+def _persist_submitted_row(
+    flow: ProductionShapedFlow,
+    event_id: str,
+    issue_id: str,
+    sha: str,
+    document: str,
+) -> None:
+    """A submission durably persisted, then the process died pre-settlement."""
+
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO submitted_verdicts("
+            "event_id, project_key, issue_id, candidate_sha, "
+            "reviewed_thread_id, reviewed_generation, verdict_json, state, "
+            "created_at, updated_at) "
+            "VALUES (?, 'demo', ?, ?, 'thr_legacy', 1, ?, 'submitted', "
+            "'2026-08-28T12:00:00+00:00', '2026-08-28T12:00:00+00:00')",
+            (event_id, issue_id, sha, document),
+        )
+
+
+def _replace_channel(flow: ProductionShapedFlow) -> None:
+    """Replace the reviewer channel: new thread, incremented generation."""
+
+    flow.merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_legacy",
+        expected_generation=1,
+        reason="reviewer channel rotated",
+    )
+    flow.merger.complete_replacement(
+        "demo",
+        expected_thread_id="thr_legacy",
+        expected_generation=1,
+        new_thread_id="thr_new",
+    )
+
+
+@pytest.mark.asyncio
+async def test_channel_replacement_leaves_persisted_submission_non_settling(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 743338e2 required test 1: persist a valid submission, replace
+    # the reviewer channel with a new generation, run recovery, and
+    # assert zero review, merge, correction, or wake-completion effects.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 14)
+    _persist_submitted_row(flow, emitted.event.event_id, "ENG-9", SHA_A, document)
+    _replace_channel(flow)
+
+    outcomes = await flow.turns.recover_outstanding()
+
+    assert [outcome.kind for outcome in outcomes] == ["stale_submission"]
+    assert outcomes[0].event_id == emitted.event.event_id
+    # The row stays 'submitted': non-settling, awaiting the new binding.
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "submitted", document)
+    ]
+    assert _review_count(flow) == 0
+    assert flow.github.merge_calls == []
+    assert flow.outbox.pending("demo") == ()
+    assert flow.linear.targets == []
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    # The refusal is stable across repeated recovery: still no effects.
+    again = await flow.turns.recover_outstanding()
+    assert [outcome.kind for outcome in again] == ["stale_submission"]
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "submitted", document)
+    ]
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+
+@pytest.mark.asyncio
+async def test_replacement_binding_submission_supersedes_and_settles_once(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 743338e2 required test 2: after the stale refusal, a submission
+    # from the replacement thread/generation supersedes the stale row via
+    # the UPDATE-if-stale CAS and settles exactly once — settling its own
+    # document, never the stale approved evidence.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    stale_document = flow.verdict(SHA_A, branch, 14)
+    _persist_submitted_row(
+        flow, emitted.event.event_id, "ENG-9", SHA_A, stale_document
+    )
+    _replace_channel(flow)
+    stale = await flow.turns.recover_outstanding()
+    assert [outcome.kind for outcome in stale] == ["stale_submission"]
+    # The wake is re-delivered to the replacement channel: register_wake
+    # reopens the stale delivery atomically and delivery re-binds it.
+    redelivered = await flow.delivery.deliver("demo", emitted.event)
+    assert redelivered.delivered is True
+    assert (redelivered.thread_id, redelivered.generation) == ("thr_new", 2)
+
+    fresh_document = flow.verdict(SHA_A, branch, 14, defect=True)
+    fresh = {
+        **_submission(emitted.event.event_id, "ENG-9", SHA_A, fresh_document),
+        "reviewed_thread_id": "thr_new",
+        "reviewed_generation": 2,
+    }
+    outcome = await flow.turns.submit_review("demo", **fresh)
+
+    assert outcome.kind == "corrections_required"
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "settled", fresh_document)
+    ]
+    pending = flow.outbox.pending("demo")
+    assert len(pending) == 1
+    assert pending[0].reviewed_sha == SHA_A
+    # Exactly once: the stale approved document never merged, and the
+    # identical duplicate from the current binding replays the result.
+    assert flow.github.merge_calls == []
+    duplicate = await flow.turns.submit_review("demo", **fresh)
+    assert duplicate == outcome
+    assert len(flow.outbox.pending("demo")) == 1
+    assert flow.github.merge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_replacement_racing_persistence_persists_no_stale_identity(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 743338e2 required test 3 (first interleaving): the channel is
+    # replaced between submission validation and persistence, via an
+    # injected hook on the persistence seam. The binding-conditioned
+    # persist stores nothing, so no stale identity exists to settle.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 14)
+    original = flow.turns._persist_submission
+
+    def replace_then_persist(**kwargs: Any) -> Any:
+        _replace_channel(flow)
+        return original(**kwargs)
+
+    flow.turns._persist_submission = replace_then_persist  # type: ignore[method-assign]
+    with pytest.raises(SubmissionRejected, match="replaced while persisting"):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(emitted.event.event_id, "ENG-9", SHA_A, document),
+        )
+
+    assert _submitted_rows(flow) == []
+    assert _review_count(flow) == 0
+    assert flow.github.merge_calls == []
+    assert flow.outbox.pending("demo") == ()
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    # Recovery finds nothing submitted: the stale identity cannot settle.
+    flow.turns._persist_submission = original  # type: ignore[method-assign]
+    outcomes = await flow.turns.recover_outstanding()
+    assert [outcome.kind for outcome in outcomes] == ["awaiting_submission"]
+
+
+@pytest.mark.asyncio
+async def test_replacement_after_persistence_refuses_direct_settlement(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 743338e2 required test 3 (second interleaving): the channel is
+    # replaced after the exactly-once persist but before the direct
+    # settlement. The settlement-entry revalidation refuses; the row
+    # stays 'submitted' and nothing settles from the stale identity.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 14)
+    original = flow.turns._persist_submission
+
+    def persist_then_replace(**kwargs: Any) -> Any:
+        persisted = original(**kwargs)
+        _replace_channel(flow)
+        return persisted
+
+    flow.turns._persist_submission = persist_then_replace  # type: ignore[method-assign]
+    outcome = await flow.turns.submit_review(
+        "demo",
+        **_submission(emitted.event.event_id, "ENG-9", SHA_A, document),
+    )
+
+    assert outcome.kind == "stale_submission"
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "submitted", document)
+    ]
+    assert _review_count(flow) == 0
+    assert flow.github.merge_calls == []
+    assert flow.outbox.pending("demo") == ()
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+
+@pytest.mark.asyncio
+async def test_duplicates_idempotent_only_for_the_current_binding(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol 743338e2 required test 4: identical duplicate submissions are
+    # idempotent only while their thread/generation is still the current
+    # binding; after replacement the exact same bytes fail closed.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 14)
+    submission = _submission(emitted.event.event_id, "ENG-9", SHA_A, document)
+
+    first = await flow.turns.submit_review("demo", **submission)
+    assert first.kind == "merged"
+    second = await flow.turns.submit_review("demo", **submission)
+    assert second == first
+    assert len(flow.github.merge_calls) == 1
+
+    _replace_channel(flow)
+    with pytest.raises(SubmissionRejected, match="reviewer-channel binding"):
+        await flow.turns.submit_review("demo", **submission)
+    assert len(flow.github.merge_calls) == 1
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "settled", document)
+    ]

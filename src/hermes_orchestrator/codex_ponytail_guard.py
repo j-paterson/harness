@@ -1,9 +1,10 @@
 """Ponytail review gate for the Hermes-managed Sol merger session.
 
-Operator correction c3f4aad5, hardened by Sol correction a9cc6d5f: block
-only ``git commit`` and ``git push`` in the Hermes-managed Sol session
-until the current candidate snapshot has received @ponytail-review, with
-any change to the candidate invalidating the prior review.
+Operator correction c3f4aad5, hardened by Sol corrections a9cc6d5f and
+743338e2: block only ``git commit`` and ``git push`` in the
+Hermes-managed Sol session until the current candidate snapshot has
+received @ponytail-review, with any change to the candidate invalidating
+the prior review.
 
 Mechanism (installed codex-cli 0.149.0-alpha.4.1; the ``hooks`` feature
 is stable and enabled): the App Server accepts free-form ``config``
@@ -39,15 +40,45 @@ each produced by ``git write-tree`` against a TEMPORARY index file
 * the index tree — ``git write-tree`` over a copy of the real index —
   so staged state is captured independently of the worktree.
 
-Effective target (same correction): the guard resolves the repository a
-guarded command actually operates on — applying ``-C`` values in order,
-``cd`` steps earlier in the shell line, and ``--git-dir``/``--work-tree``
-in both ``=`` and split forms — then validates the marker inside THAT
-repository's git directory against THAT repository's snapshot. Any
-context the guard cannot prove fails closed naming the reason:
-``GIT_DIR``-style environment overrides, ``-c core.worktree`` or
-``-c core.bare``, ``--namespace``, ``--bare``, untrackable ``cd``
-forms, and shell text that cannot be tokenized.
+Command analysis (correction 743338e2 — the earlier parser classified
+anything it could not match as unguarded and ALLOWED it; the default is
+now inverted):
+
+1. a cheap conservative TRIGGER fires whenever the input so much as
+   mentions ``commit`` or ``push`` (case-insensitive substring);
+2. a triggered input must be POSITIVELY PROVEN safe by a strict
+   recognizer: simple commands joined by ``&&``/``||``/``;`` (plain
+   pipes are accepted only between segments proven free of guarded git
+   invocations), the fully modeled wrappers ``command``/``env``/
+   ``nohup``, ``export``/``unset`` of context-inert names, trackable
+   ``cd``/``pushd``, ``sh``/``bash``-style ``-c`` scripts (recursed),
+   and git invocations whose global options all come from an explicit
+   modeled allowlist and whose subcommand is either guarded or on the
+   safe-builtin allowlist. Everything else — subshells, command
+   substitution, backquotes, heredocs, background ``&``, multi-line
+   input, unmodeled wrapper or git options, ``--exec-path``,
+   ``--config-env``, context-changing ``-c`` keys, argument-executing
+   wrappers such as ``sudo``/``xargs``/``timeout``, unknown git
+   subcommands (possible aliases), and untokenizable text — BLOCKS
+   with the reason named;
+3. proven guarded invocations then go through effective-target
+   resolution and snapshot comparison exactly as before.
+
+Environment context (same correction — the guard used to scrub the
+``GIT_*`` family for its own subprocesses while the executed command
+still inherited it): every guard subprocess now REPLAYS the inherited
+environment identically, so resolution and snapshotting describe the
+same effective repository the guarded command will operate on, and the
+marker is required from THAT repository. Inherited context-changing
+``GIT_CONFIG_*`` entries that command-line configuration could not
+model (``core.worktree``, ``core.bare``, includes, or an opaque
+``GIT_CONFIG_PARAMETERS``) fail closed naming the variable. Inline
+``export``/assignments of the ``GIT_*`` context family and
+``GIT_CONFIG*`` names in the command itself are rejected rather than
+modeled, as are ``--config-env`` and context-changing ``-c`` keys.
+File-based configuration includes need no enumeration: replaying the
+environment identically makes ``rev-parse`` resolve the same effective
+target the command will see.
 """
 
 from __future__ import annotations
@@ -69,12 +100,43 @@ BLOCK_EXIT_CODE = 2
 MARKER_NAME = "hermes-ponytail-review"
 
 _GUARDED = frozenset({"commit", "push"})
-_SEPARATORS = frozenset({"&&", "||", ";", "|", "&"})
-_WRAPPERS = frozenset({"env", "command", "nohup"})
-_CHDIR_BUILTINS = frozenset({"cd", "pushd", "popd"})
+_TRIGGER = re.compile(r"commit|push", re.IGNORECASE)
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Shell operator tokens the recognizer accepts; every other punctuation
+# run (subshells, background &, heredocs, >&, |&, ...) blocks.
+_SAFE_SEPARATORS = frozenset({"&&", "||", ";"})
+_REDIRECTS = frozenset({">", ">>", "<"})
+_PUNCTUATION = frozenset("();<>|&")
+
+_CHDIR_BUILTINS = frozenset({"cd", "pushd", "popd"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_FLAG_LETTERS = frozenset("cileux")
+# Programs that execute their arguments as a command; a guarded verb
+# behind them cannot be attributed, so they block when triggered.
+_EXEC_WRAPPERS = frozenset(
+    {
+        "sudo",
+        "doas",
+        "xargs",
+        "time",
+        "timeout",
+        "nice",
+        "ionice",
+        "setsid",
+        "stdbuf",
+        "watch",
+        "script",
+        "ssh",
+        "strace",
+        "caffeinate",
+    }
+)
+
 # Environment overrides that relocate the repository a git command acts
-# on; the guard cannot prove the reviewed target under them.
+# on. Inherited values are replayed identically; values introduced by
+# the command line itself are rejected.
 _CONTEXT_ENV = frozenset(
     {
         "GIT_DIR",
@@ -86,10 +148,72 @@ _CONTEXT_ENV = frozenset(
         "GIT_CEILING_DIRECTORIES",
     }
 )
-# -c config keys that redirect the effective repository.
-_CONTEXT_CONFIG_KEYS = frozenset({"core.worktree", "core.bare"})
-_LOOSE_GIT = re.compile(r"\bgit\b")
-_LOOSE_GUARDED = re.compile(r"\b(commit|push)\b")
+# -c / GIT_CONFIG_* keys that redirect the effective repository or pull
+# in unmodeled configuration.
+_CONTEXT_CONFIG_KEYS = frozenset({"core.worktree", "core.bare", "include.path"})
+
+# git global options proven inert for target resolution.
+_INERT_GIT_OPTIONS = frozenset(
+    {
+        "-p",
+        "--paginate",
+        "-P",
+        "--no-pager",
+        "--no-optional-locks",
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+    }
+)
+_VALUE_SELECTORS = frozenset({"-C", "--git-dir", "--work-tree"})
+
+# git subcommands positively known not to be commit or push (builtins
+# cannot be shadowed by aliases). Anything not listed blocks when the
+# input is triggered, because an alias could expand to a guarded verb.
+_SAFE_GIT_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "apply",
+        "blame",
+        "branch",
+        "cat-file",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "clone",
+        "describe",
+        "diff",
+        "fetch",
+        "grep",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge",
+        "mv",
+        "pull",
+        "rebase",
+        "reflog",
+        "remote",
+        "reset",
+        "restore",
+        "rev-list",
+        "rev-parse",
+        "revert",
+        "rm",
+        "shortlog",
+        "show",
+        "stash",
+        "status",
+        "switch",
+        "tag",
+    }
+)
+
+_SAFE = ("safe", None)
 
 
 class GuardError(RuntimeError):
@@ -121,12 +245,12 @@ class GitInvocation:
 
 
 def guarded_subcommand(command: object) -> str | None:
-    """Return ``commit`` or ``push`` when the command invokes it, else None.
+    """Return ``commit`` or ``push`` when the command may invoke it.
 
     Accepts the shell string or argv list found in a PreToolUse
-    ``tool_input.command``. Tokens that are themselves shell scripts
-    (``bash -lc "…"``) are parsed recursively; shell text that cannot be
-    tokenized fails closed when it plainly names a guarded git operation.
+    ``tool_input.command``. Input the recognizer cannot positively
+    prove safe is reported as a guarded invocation whose
+    ``unresolvable`` reason fails the gate closed.
     """
 
     invocations = guarded_invocations(command)
@@ -134,165 +258,468 @@ def guarded_subcommand(command: object) -> str | None:
 
 
 def guarded_invocations(command: object) -> tuple[GitInvocation, ...]:
-    """Every guarded git invocation in the command, with its context."""
+    """Every guarded git invocation in the command, with its context.
 
-    tokens = _tokens(command)
-    if tokens is None:
-        text = str(command)
-        loose = _LOOSE_GUARDED.search(text)
-        if _LOOSE_GIT.search(text) and loose:
-            return (
-                GitInvocation(
-                    loose.group(1),
-                    unresolvable="the shell text could not be tokenized",
-                ),
-            )
-        return ()
-    found = _scan(tokens)
-    for token in tokens:
-        if token != command and " " in token and _LOOSE_GIT.search(token):
-            found.extend(guarded_invocations(token))
-    return tuple(found)
+    The default is inverted from the original parser (correction
+    743338e2): once the conservative trigger fires, anything that is
+    not positively proven safe is returned as a guarded invocation
+    carrying an ``unresolvable`` reason, so the gate blocks it.
+    """
 
-
-def _tokens(command: object) -> list[str] | None:
     if isinstance(command, list | tuple):
-        return [str(token) for token in command]
+        return _analyze_argv([str(token) for token in command])
+    return _analyze_shell(str(command))
+
+
+def _loose_verb(text: str) -> str:
+    match = _TRIGGER.search(text)
+    return match.group(0).lower() if match else "commit"
+
+
+def _context_env_name(name: str) -> bool:
+    return name in _CONTEXT_ENV or name.startswith("GIT_CONFIG")
+
+
+def _context_config_key(key: str) -> bool:
+    return key in _CONTEXT_CONFIG_KEYS or key.startswith("includeif.")
+
+
+def _shell_tokens(text: str) -> list[str] | None:
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    # '#' must not hide trailing shell text from the recognizer.
+    lexer.commenters = ""
     try:
-        return shlex.split(str(command), posix=True)
+        return list(lexer)
     except ValueError:
         return None
 
 
-def _scan(tokens: list[str]) -> list[GitInvocation]:
-    """Find guarded git subcommands at shell command positions."""
+def _analyze_shell(
+    text: str,
+    context: tuple[tuple[str, str], ...] = (),
+    problem: str | None = None,
+) -> tuple[GitInvocation, ...]:
+    if not _TRIGGER.search(text):
+        return ()
+    verb = _loose_verb(text)
 
-    invocations: list[GitInvocation] = []
-    chdirs: list[tuple[str, str]] = []  # simulated -C steps from `cd`
-    chdir_problem: str | None = None
-    env_problem: str | None = None
-    command_position = True
+    def block(reason: str) -> tuple[GitInvocation, ...]:
+        return (GitInvocation(verb, unresolvable=reason),)
+
+    if "\n" in text or "\r" in text:
+        return block(
+            "multi-line shell input cannot be proven safe; "
+            "run each command on its own line"
+        )
+    if "`" in text:
+        return block("backquote command substitution cannot be proven safe")
+    if "$(" in text:
+        return block("command substitution cannot be proven safe")
+    tokens = _shell_tokens(text)
+    if tokens is None:
+        return block("the shell text could not be tokenized")
+
+    segments: list[list[str]] = [[]]
+    has_pipe = False
+    for token in tokens:
+        if token and all(char in _PUNCTUATION for char in token):
+            if token in _SAFE_SEPARATORS:
+                segments.append([])
+            elif token == "|":
+                has_pipe = True
+                segments.append([])
+            elif token in _REDIRECTS:
+                segments[-1].append(token)
+            else:
+                return block(
+                    f"the shell operator `{token}` cannot be proven safe"
+                )
+        else:
+            segments[-1].append(token)
+
+    chdirs = list(context)
+    state = {"problem": problem}
+    found: list[GitInvocation] = []
+    for segment in segments:
+        kind, value = _classify_segment(segment, chdirs, state)
+        if kind == "blocked":
+            return block(str(value))
+        if kind == "guarded":
+            found.extend(value)  # type: ignore[arg-type]
+    if has_pipe and found:
+        return block(
+            "a pipeline cannot carry git commit or push; "
+            "run the guarded git command on its own"
+        )
+    return tuple(found)
+
+
+def _analyze_argv(argv: list[str]) -> tuple[GitInvocation, ...]:
+    text = " ".join(argv)
+    if not argv or not _TRIGGER.search(text):
+        return ()
+    verb = _loose_verb(text)
+    if argv[0].rsplit("/", 1)[-1] in _SHELLS:
+        kind, value = _shell_runner(argv[1:], (), None)
+    else:
+        kind, value = _classify_segment(list(argv), [], {"problem": None})
+    if kind == "blocked":
+        return (GitInvocation(verb, unresolvable=str(value)),)
+    if kind == "guarded":
+        return tuple(value)  # type: ignore[arg-type]
+    return ()
+
+
+def _classify_segment(
+    tokens: list[str],
+    chdirs: list[tuple[str, str]],
+    state: dict[str, str | None],
+) -> tuple[str, object]:
+    """Prove one simple command safe, guarded, or blocked.
+
+    ``chdirs`` and ``state`` persist across segments: ``cd`` steps in
+    earlier segments select the directory later git invocations run in.
+    """
+
+    core: list[str] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in _SEPARATORS:
-            command_position = True
-            env_problem = None
-            index += 1
+        if token in _REDIRECTS:
+            if index + 1 >= len(tokens):
+                return "blocked", "a redirection is missing its target"
+            index += 2  # redirection target is data, not a command
             continue
-        if not command_position:
-            index += 1
+        core.append(token)
+        index += 1
+
+    index = 0
+    while index < len(core) and _ASSIGNMENT.match(core[index]):
+        name = core[index].split("=", 1)[0]
+        if _context_env_name(name):
+            return (
+                "blocked",
+                f"the {name} environment override changes the git context",
+            )
+        index += 1
+
+    while index < len(core):
+        program = core[index]
+        if "$" in program:
+            return (
+                "blocked",
+                "the command name contains an unexpanded substitution "
+                "or variable",
+            )
+        base = program.rsplit("/", 1)[-1]
+        if base == "command":
+            outcome = _consume_command_wrapper(core, index)
+            if isinstance(outcome, tuple):
+                return outcome
+            if outcome < 0:
+                return _SAFE  # `command -v/-V`: prints, executes nothing
+            index = outcome
             continue
-        if _ASSIGNMENT.match(token):
-            name = token.split("=", 1)[0]
-            if name in _CONTEXT_ENV:
-                env_problem = (
-                    f"the {name} environment override changes the git context"
+        if base == "env":
+            outcome = _consume_env_wrapper(core, index)
+            if isinstance(outcome, tuple):
+                return outcome
+            index = outcome
+            continue
+        if base == "nohup":
+            index += 1
+            if index < len(core) and core[index].startswith("-"):
+                return (
+                    "blocked",
+                    f"the nohup option {core[index]} is not modeled",
                 )
-            index += 1
             continue
-        if token in _WRAPPERS:
-            index += 1
-            continue
-        if token in _CHDIR_BUILTINS:
-            arguments: list[str] = []
-            index += 1
-            while index < len(tokens) and tokens[index] not in _SEPARATORS:
-                arguments.append(tokens[index])
-                index += 1
+        if program == "export":
+            return _classify_export(core[index + 1 :])
+        if program == "unset":
+            for token in core[index + 1 :]:
+                if _context_env_name(token):
+                    return (
+                        "blocked",
+                        f"unsetting {token} desynchronizes the git context "
+                        "the gate verifies",
+                    )
+            return _SAFE
+        if program in _CHDIR_BUILTINS:
+            arguments = core[index + 1 :]
             if (
-                token != "popd"
+                program != "popd"
                 and len(arguments) == 1
                 and not arguments[0].startswith("-")
+                and "$" not in arguments[0]
             ):
                 chdirs.append(("-C", arguments[0]))
             else:
-                chdir_problem = (
-                    f"the working directory cannot be tracked across `{token}`"
+                state["problem"] = (
+                    f"the working directory cannot be tracked across "
+                    f"`{program}`"
                 )
-            command_position = False
-            continue
-        if token == "git" or token.endswith("/git"):
-            invocation = _parse_git(
-                tokens[index + 1 :], tuple(chdirs), env_problem or chdir_problem
+            return _SAFE
+        if program == "git" or program.endswith("/git"):
+            return _prove_git(
+                core[index + 1 :], tuple(chdirs), state["problem"]
             )
-            if invocation is not None:
-                invocations.append(invocation)
-        command_position = False
-        index += 1
-    return invocations
+        if base in _SHELLS:
+            return _shell_runner(
+                core[index + 1 :], tuple(chdirs), state["problem"]
+            )
+        if base in _EXEC_WRAPPERS:
+            return (
+                "blocked",
+                f"`{base}` executes its arguments and is not modeled by the "
+                "gate; run the git command directly",
+            )
+        # An ordinary program: its remaining tokens are arguments (data),
+        # not an executable path to git.
+        return _SAFE
+    return _SAFE
 
 
-def _parse_git(
+def _consume_command_wrapper(
+    core: list[str], index: int
+) -> int | tuple[str, str]:
+    """Consume ``command`` and its options; -1 means a safe query form."""
+
+    index += 1
+    query = False
+    while index < len(core):
+        token = core[index]
+        if token == "--":
+            index += 1
+            break
+        if (
+            token.startswith("-")
+            and len(token) > 1
+            and all(char in "pvV" for char in token[1:])
+        ):
+            if "v" in token or "V" in token:
+                query = True
+            index += 1
+            continue
+        if token.startswith("-"):
+            return "blocked", f"the `command` option {token} is not modeled"
+        break
+    return -1 if query else index
+
+
+def _consume_env_wrapper(core: list[str], index: int) -> int | tuple[str, str]:
+    """Consume ``env``, its modeled options, and its assignments."""
+
+    index += 1
+    while index < len(core):
+        token = core[index]
+        if token == "--":
+            index += 1
+            break
+        if token in {"-i", "-", "--ignore-environment"}:
+            index += 1
+            continue
+        if token == "-u":
+            if index + 1 >= len(core):
+                return "blocked", "env -u is missing its argument"
+            index += 2
+            continue
+        if token.startswith("--unset="):
+            index += 1
+            continue
+        if token.startswith("-"):
+            return "blocked", f"the env option {token} is not modeled"
+        if _ASSIGNMENT.match(token):
+            name = token.split("=", 1)[0]
+            if _context_env_name(name):
+                return (
+                    "blocked",
+                    f"the {name} environment override changes the git "
+                    "context",
+                )
+            index += 1
+            continue
+        break
+    return index
+
+
+def _classify_export(arguments: list[str]) -> tuple[str, object]:
+    for token in arguments:
+        name = token.split("=", 1)[0]
+        if not _NAME.match(name):
+            return "blocked", "the export statement cannot be proven safe"
+        if _context_env_name(name):
+            return (
+                "blocked",
+                f"exporting {name} changes the git context for later "
+                "commands",
+            )
+    return _SAFE
+
+
+def _shell_runner(
+    arguments: list[str],
+    context: tuple[tuple[str, str], ...],
+    problem: str | None,
+) -> tuple[str, object]:
+    """Prove a ``bash -c``-style invocation by recursing into the script."""
+
+    script: str | None = None
+    saw_script_flag = False
+    for token in arguments:
+        if token.startswith("-") and len(token) > 1:
+            if not all(char in _SHELL_FLAG_LETTERS for char in token[1:]):
+                return "blocked", f"the shell option {token} is not modeled"
+            if "c" in token:
+                saw_script_flag = True
+            continue
+        script = token
+        break
+    if not saw_script_flag or script is None:
+        return (
+            "blocked",
+            "a shell invocation without a provable -c script cannot be "
+            "proven safe",
+        )
+    inner = _analyze_shell(script, context, problem)
+    if not inner:
+        return _SAFE
+    return "guarded", inner
+
+
+def _prove_git(
     rest: list[str],
     context: tuple[tuple[str, str], ...],
     problem: str | None,
-) -> GitInvocation | None:
+) -> tuple[str, object]:
+    """Prove one git invocation: every global option must be modeled."""
+
     selectors = list(context)
     subcommand: str | None = None
     index = 0
     while index < len(rest):
         token = rest[index]
-        if token in _SEPARATORS:
-            return None
-        if token in {"-C", "--git-dir", "--work-tree", "-c", "--namespace"}:
-            if index + 1 >= len(rest) or rest[index + 1] in _SEPARATORS:
-                return None  # git dies on the missing value; nothing runs
+        if token in _VALUE_SELECTORS:
+            if index + 1 >= len(rest):
+                return _SAFE  # git dies on the missing value; nothing runs
             value = rest[index + 1]
-            if token == "-c":
-                problem = problem or _config_problem(value)
-            elif token == "--namespace":
-                problem = problem or "--namespace changes the git context"
-            else:
-                selectors.append((token, value))
+            if "$" in value:
+                return (
+                    "blocked",
+                    f"the {token} value contains an unexpanded substitution "
+                    "or variable",
+                )
+            selectors.append((token, value))
             index += 2
             continue
-        if token.startswith("--git-dir="):
-            selectors.append(("--git-dir", token.removeprefix("--git-dir=")))
+        if token.startswith(("--git-dir=", "--work-tree=")):
+            option, value = token.split("=", 1)
+            if "$" in value:
+                return (
+                    "blocked",
+                    f"the {option} value contains an unexpanded substitution "
+                    "or variable",
+                )
+            selectors.append((option, value))
             index += 1
             continue
-        if token.startswith("--work-tree="):
-            selectors.append(("--work-tree", token.removeprefix("--work-tree=")))
-            index += 1
+        if token == "-c":
+            if index + 1 >= len(rest):
+                return _SAFE  # git dies on the missing value; nothing runs
+            key = rest[index + 1].split("=", 1)[0].strip().lower()
+            if "$" in key:
+                return (
+                    "blocked",
+                    "the -c configuration key contains an unexpanded "
+                    "substitution or variable",
+                )
+            if _context_config_key(key):
+                return "blocked", f"-c {key} changes the git context"
+            index += 2
             continue
-        if token.startswith("--namespace="):
-            problem = problem or "--namespace changes the git context"
-            index += 1
-            continue
+        if token == "--config-env" or token.startswith("--config-env="):
+            return (
+                "blocked",
+                "--config-env supplies configuration from the environment "
+                "that the gate does not model",
+            )
+        if token == "--namespace" or token.startswith("--namespace="):
+            return "blocked", "--namespace changes the git context"
         if token == "--bare":
-            problem = problem or "--bare changes the git context"
+            return "blocked", "--bare changes the git context"
+        if token == "--exec-path" or token.startswith("--exec-path="):
+            return "blocked", "--exec-path changes which git programs run"
+        if token in _INERT_GIT_OPTIONS:
             index += 1
             continue
         if token.startswith("-"):
-            index += 1
-            continue
+            return (
+                "blocked",
+                f"the git option {token} is not modeled; only proven-safe "
+                "forms pass",
+            )
         subcommand = token
         break
-    if subcommand not in _GUARDED:
-        return None
-    return GitInvocation(subcommand, tuple(selectors), problem)
+    if subcommand is None:
+        return _SAFE  # bare `git` (or options only) prints usage
+    if "$" in subcommand:
+        return (
+            "blocked",
+            "the git subcommand contains an unexpanded substitution or "
+            "variable",
+        )
+    if subcommand in _GUARDED:
+        return "guarded", (GitInvocation(subcommand, tuple(selectors), problem),)
+    if subcommand in _SAFE_GIT_SUBCOMMANDS:
+        return _SAFE
+    return (
+        "blocked",
+        f"`git {subcommand}` cannot be proven free of commit or push "
+        "(aliases and unknown subcommands are not modeled)",
+    )
 
 
-def _config_problem(value: str) -> str | None:
-    key = value.split("=", 1)[0].strip().lower()
-    if key in _CONTEXT_CONFIG_KEYS:
-        return f"-c {key} changes the git context"
+def _inherited_config_problem() -> str | None:
+    """Context-changing GIT_CONFIG_* inherited from the environment.
+
+    The rest of the ``GIT_*`` family is replayed identically into every
+    guard subprocess, so resolution and snapshotting already describe
+    the repository the command will operate on. Command-line-equivalent
+    configuration entries that would change the context are rejected by
+    name instead, matching the ``-c`` rules.
+    """
+
+    if os.environ.get("GIT_CONFIG_PARAMETERS"):
+        return (
+            "the inherited GIT_CONFIG_PARAMETERS configuration cannot be "
+            "modeled"
+        )
+    count = os.environ.get("GIT_CONFIG_COUNT")
+    if count:
+        try:
+            entries = int(count)
+        except ValueError:
+            return "the inherited GIT_CONFIG_COUNT value is not an integer"
+        for position in range(entries):
+            key = (
+                os.environ.get(f"GIT_CONFIG_KEY_{position}", "")
+                .strip()
+                .lower()
+            )
+            if _context_config_key(key):
+                return (
+                    f"the inherited GIT_CONFIG_KEY_{position}={key} "
+                    "configuration changes the git context"
+                )
     return None
 
 
-def _base_env() -> dict[str, str]:
-    env = dict(os.environ)
-    for name in _CONTEXT_ENV:
-        env.pop(name, None)
-    return env
-
-
 def _git(args: list[str], env: dict[str, str] | None = None) -> bytes:
+    # env=None inherits the process environment unchanged: the guard
+    # replays the exact context the guarded command will run under.
     result = subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        check=False,
-        env=_base_env() if env is None else env,
+        ["git", *args], capture_output=True, check=False, env=env
     )
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip()
@@ -324,7 +751,9 @@ def _snapshot(toplevel: Path, git_dir: Path) -> tuple[str, bool]:
 
     Both tree ids come from ``git write-tree`` against temporary index
     files, so the real index is never modified; ``git add -A`` into the
-    scratch index writes only loose objects, which git prunes.
+    scratch index writes only loose objects, which git prunes. The
+    inherited environment is replayed identically, with only
+    ``GIT_INDEX_FILE`` overridden to the scratch index.
     """
 
     ctx = ["-C", str(toplevel), "--git-dir", str(git_dir)]
@@ -335,7 +764,7 @@ def _snapshot(toplevel: Path, git_dir: Path) -> tuple[str, bool]:
     if not index_path.is_absolute():
         index_path = toplevel / index_path
     with tempfile.TemporaryDirectory() as scratch:
-        worktree_env = _base_env()
+        worktree_env = dict(os.environ)
         worktree_env["GIT_INDEX_FILE"] = str(Path(scratch) / "worktree-index")
         _git([*ctx, "read-tree", "HEAD"], env=worktree_env)
         _git([*ctx, "add", "-A"], env=worktree_env)
@@ -345,7 +774,7 @@ def _snapshot(toplevel: Path, git_dir: Path) -> tuple[str, bool]:
         index_copy = Path(scratch) / "index-copy"
         if index_path.exists():
             shutil.copy2(index_path, index_copy)
-        index_env = _base_env()
+        index_env = dict(os.environ)
         index_env["GIT_INDEX_FILE"] = str(index_copy)
         index_tree = _git([*ctx, "write-tree"], env=index_env).decode().strip()
     digest = hashlib.sha256(
@@ -410,6 +839,16 @@ def evaluate_command(command: object, repo: Path) -> GuardDecision:
     invocations = guarded_invocations(command)
     if not invocations:
         return GuardDecision(allowed=True, reason="not a guarded git command")
+    inherited = _inherited_config_problem()
+    if inherited is not None:
+        return GuardDecision(
+            allowed=False,
+            reason=(
+                f"ponytail-review gate: git {invocations[0].subcommand} is "
+                f"blocked: {inherited}; the reviewed target cannot be "
+                "proven, so the gate fails closed."
+            ),
+        )
     all_clean = True
     for invocation in invocations:
         if invocation.unresolvable is not None:

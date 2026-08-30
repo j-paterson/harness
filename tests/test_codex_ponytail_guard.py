@@ -338,6 +338,287 @@ def test_every_change_class_affects_the_reviewed_snapshot(repo: Path) -> None:
     changed()  # deletion
 
 
+# Sol correction 743338e2 packet 1: `command` wrapper forms are consumed
+# correctly — gated when unreviewed, allowed once reviewed, and unmodeled
+# options fail closed even with a review on record.
+def test_command_wrapper_forms_are_gated(repo: Path) -> None:
+    dirty(repo)
+
+    for command in (
+        "command -- git commit -am 'x'",
+        "command -- git push origin main",
+        "command -p git commit -am 'x'",
+        "command git push origin main",
+    ):
+        code, reason = sol_hook_exit(repo, command)
+        assert code == BLOCK_EXIT_CODE, command
+        assert "@ponytail-review" in reason, command
+    # `command -v git` prints a path and executes nothing.
+    assert evaluate_command("command -v git commit", repo).allowed is True
+
+    record_review(repo)
+    assert evaluate_command("command -- git commit -am 'x'", repo).allowed
+    # An unmodeled `command` option is never proven safe, review or not.
+    decision = evaluate_command("command -Q git commit -am 'x'", repo)
+    assert decision.allowed is False
+    assert "fails closed" in decision.reason
+
+
+# Sol correction 743338e2 packet 1: env wrapper options are fully
+# consumed; `env -i ... git commit` cannot slip past the gate.
+def test_env_wrapper_options_are_gated(repo: Path) -> None:
+    dirty(repo)
+
+    for command in (
+        "env -i PATH=/usr/bin:/bin git commit -am 'x'",
+        "env -u SOME_VAR git push origin main",
+        "env - git commit -am 'x'",
+        "env -- git push origin main",
+    ):
+        code, reason = sol_hook_exit(repo, command)
+        assert code == BLOCK_EXIT_CODE, command
+        assert "@ponytail-review" in reason, command
+
+    record_review(repo)
+    assert evaluate_command(
+        "env -i PATH=/usr/bin:/bin git commit -am 'x'", repo
+    ).allowed
+    # Context-changing env assignments and unmodeled env options fail
+    # closed even with a review on record.
+    for command, named in (
+        ("env GIT_DIR=elsewhere/.git git commit -am 'x'", "GIT_DIR"),
+        ("env -S 'git commit -am x' true", "-S"),
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert named in decision.reason, command
+
+
+# Sol correction 743338e2 packet 1: --exec-path retargets which git
+# programs run, so both forms are rejected outright.
+def test_exec_path_forms_are_rejected(repo: Path) -> None:
+    dirty(repo)
+    record_review(repo)
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    for command in (
+        "git --exec-path=/tmp/fake-git-libexec commit -am 'x'",
+        "git --exec-path /tmp/fake-git-libexec commit -am 'x'",
+        "git --exec-path=/tmp/fake-git-libexec push origin main",
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert "--exec-path" in decision.reason, command
+
+
+# Sol correction 743338e2 packet 1: shell syntax that could hide a
+# guarded verb is never classified unguarded. No-space separators are
+# now parsed correctly (gated, not invisible); subshells, substitution,
+# pipelines, and background execution fail closed even when reviewed.
+def test_shell_syntax_that_could_hide_guarded_verbs_fails_closed(
+    repo: Path,
+) -> None:
+    dirty(repo)
+
+    # No-space separators and logical operators reach the gate.
+    for command in (
+        "true;git commit -am 'x'",
+        "false||git push origin main",
+        "git add -A;git commit -m 'x'",
+        "true&&git push origin main",
+    ):
+        code, reason = sol_hook_exit(repo, command)
+        assert code == BLOCK_EXIT_CODE, command
+        assert "@ponytail-review" in reason, command
+
+    record_review(repo)
+    assert evaluate_command("true;git commit -am 'x'", repo).allowed is True
+
+    # Syntax the recognizer cannot prove blocks despite the review.
+    for command in (
+        "(git commit -am 'x')",
+        "echo $(git push origin main)",
+        "echo `git push origin main`",
+        "git commit -am 'x' | cat",
+        "echo ok && git commit -am $(date)",
+        "git commit -am 'x' &",
+        "git status\ngit push origin main",
+        "cat <<DOC\ngit commit\nDOC",
+        "sudo git commit -am 'x'",
+        "xargs git push < targets.txt",
+        "timeout 30 git push origin main",
+        "bash script-that-commits.sh",
+        # An unknown subcommand could be an alias expanding to commit.
+        "git commit-tree HEAD -m 'raw'",
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert "fails closed" in decision.reason, command
+
+
+# Sol correction 743338e2 packet 1 (positive pin): ordinary non-guarded
+# commands stay allowed on a dirty, unreviewed workspace.
+def test_ordinary_commands_remain_allowed_unreviewed(repo: Path) -> None:
+    dirty(repo)
+
+    for command in (
+        "git status",
+        "git diff HEAD",
+        "git log --oneline",
+        "git add -A",
+        "git stash push",
+        "git fetch origin",
+        "git checkout -b feature/guard-pilot",
+        "git rev-parse HEAD",
+        "git log --oneline | grep commit",
+        "echo git commit",
+        "grep -rn 'git push' .",
+        "uv run pytest tests/test_commit_flow.py -q",
+        "command -v git",
+        ["python", "-m", "pytest", "tests/test_push_flow.py"],
+        "ls -la && echo done",
+    ):
+        assert evaluate_command(command, repo).allowed is True, command
+
+
+# Sol correction 743338e2 packet 2: inherited GIT_DIR/GIT_WORK_TREE are
+# replayed identically, so another repository's marker cannot authorize
+# the effective repository the command will actually operate on.
+def test_inherited_git_context_cannot_borrow_another_repos_marker(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = _make_repo(tmp_path / "other")
+    dirty(repo)
+    record_review(repo)
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    (other / "module.py").write_text("print('other')\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+
+    # The effective repository is `other`, which has no review; the
+    # marker recorded for `repo` cannot authorize it.
+    assert evaluate_command("git commit -am 'x'", repo).allowed is False
+    assert evaluate_command("git push origin main", repo).allowed is False
+
+    # Reviewing the resulting effective repository opens its gate.
+    record_review(other)
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+
+# Sol correction 743338e2 packet 2: exported and command-level context
+# overrides in the command itself are rejected naming the variable.
+def test_exported_and_inline_git_context_fails_closed(repo: Path) -> None:
+    dirty(repo)
+    record_review(repo)
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    for command, named in (
+        ("export GIT_DIR=/elsewhere/.git; git commit -am 'x'", "GIT_DIR"),
+        (
+            "export GIT_WORK_TREE=/elsewhere && git push origin main",
+            "GIT_WORK_TREE",
+        ),
+        ("GIT_WORK_TREE=/elsewhere git commit -am 'x'", "GIT_WORK_TREE"),
+        ("GIT_INDEX_FILE=/tmp/alt-index git commit -am 'x'", "GIT_INDEX_FILE"),
+        ("unset GIT_DIR; git push origin main", "GIT_DIR"),
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert named in decision.reason, command
+    # Context-inert exports stay usable.
+    assert evaluate_command(
+        "export GIT_EDITOR=true; git commit -am 'x'", repo
+    ).allowed
+
+
+# Sol correction 743338e2 packet 2: GIT_CONFIG_* fails closed unless
+# modeled identically — context-changing keys are rejected by name
+# whether inherited or written into the command line.
+def test_git_config_environment_family_fails_closed(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dirty(repo)
+    record_review(repo)
+
+    command_level = (
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree "
+        "GIT_CONFIG_VALUE_0=/elsewhere git commit -am 'x'"
+    )
+    decision = evaluate_command(command_level, repo)
+    assert decision.allowed is False
+    assert "GIT_CONFIG" in decision.reason
+
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.worktree")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/elsewhere")
+    decision = evaluate_command("git commit -am 'x'", repo)
+    assert decision.allowed is False
+    assert "GIT_CONFIG_KEY_0" in decision.reason
+
+    # Context-inert inherited configuration is replayed, not rejected.
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Sol")
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    monkeypatch.delenv("GIT_CONFIG_COUNT")
+    monkeypatch.delenv("GIT_CONFIG_KEY_0")
+    monkeypatch.delenv("GIT_CONFIG_VALUE_0")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.worktree=/elsewhere'")
+    decision = evaluate_command("git push origin main", repo)
+    assert decision.allowed is False
+    assert "GIT_CONFIG_PARAMETERS" in decision.reason
+
+
+# Sol correction 743338e2 packet 2: --config-env injects configuration
+# from the environment and fails closed in both forms.
+def test_config_env_option_fails_closed(repo: Path) -> None:
+    dirty(repo)
+    record_review(repo)
+
+    for command in (
+        "git --config-env=user.email=EMAIL_VAR commit -am 'x'",
+        "git --config-env user.email=EMAIL_VAR push origin main",
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert "--config-env" in decision.reason, command
+
+
+# Sol correction 743338e2 packet 2: context-changing configuration
+# includes fail closed on the command line, and file-based includes are
+# resolved identically so they cannot smuggle a different worktree past
+# the recorded review.
+def test_context_changing_config_includes_fail_closed(
+    repo: Path, tmp_path: Path
+) -> None:
+    dirty(repo)
+    record_review(repo)
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+    for command in (
+        f"git -c include.path={tmp_path}/ctx.cfg commit -am 'x'",
+        "git -c includeIf.gitdir:/x.path=/tmp/ctx.cfg commit -am 'x'",
+    ):
+        decision = evaluate_command(command, repo)
+        assert decision.allowed is False, command
+        assert "changes the git context" in decision.reason, command
+
+    # Context-changing configuration in the effective config file is
+    # applied identically during resolution and snapshotting (the guard
+    # replays the same environment and reads the same config git will):
+    # the effective candidate differs from the reviewed one, so the gate
+    # closes until the resulting target itself is reviewed.
+    other = tmp_path / "other-worktree"
+    other.mkdir()
+    (other / "smuggled.py").write_text("print('sneaky')\n", encoding="utf-8")
+    _git(repo, "config", "core.worktree", str(other))
+
+    assert evaluate_command("git commit -am 'x'", repo).allowed is False
+    record_review(repo)  # now reviews the effective (redirected) candidate
+    assert evaluate_command("git commit -am 'x'", repo).allowed is True
+
+
 def test_outside_a_repository_the_gate_fails_closed(tmp_path: Path) -> None:
     bare = tmp_path / "not-a-repo"
     bare.mkdir()

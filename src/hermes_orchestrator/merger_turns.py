@@ -339,8 +339,32 @@ class MergerTurnService:
         path (notification, startup, duplicate resume) converge on this
         settlement: admission gates, the live pull-request check, parsing
         against the admitted binding, and the idempotent review drive.
+
+        Sol correction 743338e2: a persisted verdict may settle only while
+        its exact reviewed thread and generation remain bound to the ready
+        reviewer channel. The live channel is re-read here, at the single
+        settlement entry every direct and recovered path converges on; a
+        replaced channel refuses with the non-settling ``stale_submission``
+        outcome, the row stays ``submitted``, and only a fresh submission
+        from the new binding (which supersedes the stale identity) can
+        settle the event.
         """
 
+        live = self._merger.read_channel(project_key)
+        if (
+            live is None
+            or live.state != "ready"
+            or live.thread_id != submitted.reviewed_thread_id
+            or live.generation != submitted.reviewed_generation
+        ):
+            return TurnOutcome(
+                project_key, "stale_submission", event.event_id,
+                event.issue_id,
+                "the persisted submission's reviewed thread and generation "
+                "no longer match the ready reviewer channel; the row stays "
+                "'submitted' and non-settling until the new binding submits",
+            )
+        channel = live
         if state == "delivered":
             try:
                 admitted = self._admission.admit(
@@ -465,23 +489,22 @@ class MergerTurnService:
         runs immediately. An identical duplicate returns the recorded
         result; a conflicting or stale submission raises
         :class:`SubmissionRejected` with no side effects.
+
+        Sol correction 743338e2: the ready reviewer-channel binding is
+        validated before duplicate resolution, so a duplicate is
+        idempotent only while its thread and generation are still the
+        current binding. A ``submitted`` row left stale by a channel
+        replacement never resolves as a duplicate: this fresh submission
+        from the new binding supersedes it with an UPDATE-if-stale CAS
+        that re-binds the event's single row (the event_id primary key)
+        to the new identity inside one transaction, and persistence
+        itself is conditioned on the channel still holding that exact
+        binding.
         """
 
         project = self._projects.get(project_key)
         if project is None:
             raise SubmissionRejected(f"unknown project {project_key!r}")
-        existing = self._read_submission(event_id)
-        if existing is not None:
-            return await self._resolve_duplicate(
-                existing,
-                project_key=project_key,
-                issue_id=issue_id,
-                event_id=event_id,
-                candidate_sha=candidate_sha,
-                reviewed_thread_id=reviewed_thread_id,
-                reviewed_generation=reviewed_generation,
-                verdict_json=verdict_json,
-            )
         channel = self._merger.read_channel(project_key)
         if channel is None or channel.state != "ready":
             raise SubmissionRejected(
@@ -494,6 +517,25 @@ class MergerTurnService:
             raise SubmissionRejected(
                 "submission does not match the ready reviewer-channel "
                 "binding (thread or generation)"
+            )
+        existing = self._read_submission(event_id)
+        stale_existing = existing is not None and (
+            existing.state == "submitted"
+            and (
+                existing.reviewed_thread_id != channel.thread_id
+                or existing.reviewed_generation != channel.generation
+            )
+        )
+        if existing is not None and not stale_existing:
+            return await self._resolve_duplicate(
+                existing,
+                project_key=project_key,
+                issue_id=issue_id,
+                event_id=event_id,
+                candidate_sha=candidate_sha,
+                reviewed_thread_id=reviewed_thread_id,
+                reviewed_generation=reviewed_generation,
+                verdict_json=verdict_json,
             )
         await self._reviews.resume_settlements(project_key)
         outstanding = self.outstanding_wake(project_key)
@@ -542,20 +584,34 @@ class MergerTurnService:
             raise SubmissionRejected(
                 f"verdict document is invalid: {error}"
             ) from error
-        submission = self._persist_submission(
-            event_id=event_id,
-            project_key=project_key,
-            issue_id=issue_id,
-            candidate_sha=candidate_sha,
-            reviewed_thread_id=reviewed_thread_id,
-            reviewed_generation=reviewed_generation,
-            verdict_json=verdict_json,
-        )
+        if stale_existing:
+            assert existing is not None
+            submission = self._supersede_submission(
+                existing,
+                reviewed_thread_id=reviewed_thread_id,
+                reviewed_generation=reviewed_generation,
+                verdict_json=verdict_json,
+            )
+        else:
+            submission = self._persist_submission(
+                event_id=event_id,
+                project_key=project_key,
+                issue_id=issue_id,
+                candidate_sha=candidate_sha,
+                reviewed_thread_id=reviewed_thread_id,
+                reviewed_generation=reviewed_generation,
+                verdict_json=verdict_json,
+            )
         if submission is None:
-            # Lost the exactly-once CAS to a concurrent submission.
+            # Lost the exactly-once CAS to a concurrent submission, or the
+            # reviewer channel was replaced between validation and the
+            # binding-conditioned persist.
             raced = self._read_submission(event_id)
-            if raced is None:  # pragma: no cover - CAS row cannot vanish
-                raise SubmissionRejected("submission row disappeared")
+            if raced is None:
+                raise SubmissionRejected(
+                    "the reviewer channel was replaced while persisting the "
+                    "submission; submit again from the new binding"
+                )
             return await self._resolve_duplicate(
                 raced,
                 project_key=project_key,
@@ -675,12 +731,15 @@ class MergerTurnService:
         now = self._now().isoformat()
         try:
             with self._database.transaction() as connection:
-                connection.execute(
+                cursor = connection.execute(
                     "INSERT INTO submitted_verdicts(event_id, project_key, "
                     "issue_id, candidate_sha, reviewed_thread_id, "
                     "reviewed_generation, verdict_json, state, created_at, "
                     "updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ?)",
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ? "
+                    "WHERE EXISTS (SELECT 1 FROM reviewer_channels "
+                    "WHERE project_key = ? AND thread_id = ? "
+                    "AND generation = ? AND state = 'ready')",
                     (
                         event_id,
                         project_key,
@@ -691,9 +750,17 @@ class MergerTurnService:
                         verdict_json,
                         now,
                         now,
+                        project_key,
+                        reviewed_thread_id,
+                        reviewed_generation,
                     ),
                 )
         except sqlite3.IntegrityError:
+            return None
+        if cursor.rowcount != 1:
+            # Sol correction 743338e2: persistence is bound to the channel —
+            # a replacement that lands before this transaction leaves
+            # nothing persisted, so no stale identity can ever settle.
             return None
         return _Submission(
             event_id=event_id,
@@ -707,7 +774,67 @@ class MergerTurnService:
             result_json=None,
         )
 
+    def _supersede_submission(
+        self,
+        existing: _Submission,
+        *,
+        reviewed_thread_id: str,
+        reviewed_generation: int,
+        verdict_json: str,
+    ) -> _Submission | None:
+        """Re-bind the event's stale ``submitted`` row to the new identity.
+
+        Sol correction 743338e2: the event_id primary key allows exactly
+        one row per event, so a fresh submission from the replacement
+        binding supersedes the stale one with an UPDATE-if-stale CAS —
+        conditioned on the exact stale identity still being present, the
+        row still being ``submitted``, and the reviewer channel still
+        holding the new binding — all inside one transaction. Exactly-once
+        holds: the row never duplicates, and only the identity that
+        matches the ready channel at settlement can settle.
+        """
+
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE submitted_verdicts SET reviewed_thread_id = ?, "
+                "reviewed_generation = ?, verdict_json = ?, updated_at = ? "
+                "WHERE event_id = ? AND state = 'submitted' "
+                "AND reviewed_thread_id = ? AND reviewed_generation = ? "
+                "AND EXISTS (SELECT 1 FROM reviewer_channels "
+                "WHERE project_key = ? AND thread_id = ? "
+                "AND generation = ? AND state = 'ready')",
+                (
+                    reviewed_thread_id,
+                    reviewed_generation,
+                    verdict_json,
+                    self._now().isoformat(),
+                    existing.event_id,
+                    existing.reviewed_thread_id,
+                    existing.reviewed_generation,
+                    existing.project_key,
+                    reviewed_thread_id,
+                    reviewed_generation,
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return _Submission(
+            event_id=existing.event_id,
+            project_key=existing.project_key,
+            issue_id=existing.issue_id,
+            candidate_sha=existing.candidate_sha,
+            reviewed_thread_id=reviewed_thread_id,
+            reviewed_generation=reviewed_generation,
+            verdict_json=verdict_json,
+            state="submitted",
+            result_json=None,
+        )
+
     def _record_settled(self, event_id: str, outcome: TurnOutcome) -> None:
+        if outcome.kind == "stale_submission":
+            # The refusal is non-settling: the row stays 'submitted' so
+            # only a fresh submission from the new binding can settle it.
+            return
         with self._database.transaction() as connection:
             connection.execute(
                 "UPDATE submitted_verdicts SET state = 'settled', "
