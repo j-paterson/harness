@@ -332,3 +332,79 @@ All six checks are provable: bounded delegation proceeds.
   `~/.claude/channels/fakechat` state dir are unused by Hermes;
   the loopback-only bind bounds that surface to local users, and
   the wake-not-payload invariant contains any forged text.
+
+## v5 amendment: transport-v2 (operator decision `infra-197-transport-v2-20260830`)
+
+### Authority and supersession
+
+Durable operator decision `infra-197-transport-v2-20260830`
+(status `approved`, receipt sha256 `656def182883999ce1bcac0529…`,
+applied 2026-08-30T16:21:45Z, confirmed by the operator directly
+in the lead session): the dedicated unified `hermes-control`
+Claude Code channel is PRIMARY; Hermes remains the durable
+packet and receipt authority; the native cross-session socket
+inbox is FALLBACK; fakechat is RETIRED. Interactive proof comes
+first; machine-managed `allowedChannelPlugins` provisioning
+follows only after the proof. This supersedes the v4
+signal-plane substitution and every conflicting interim
+transport directive. The v4-era prohibition on per-launch human
+confirmation is lifted for the interactive proof only — the
+unattended path arrives via managed `allowedChannelPlugins`,
+not via a human approving every launch.
+
+Directive provenance (raised during the interim): only a
+hash-bound `operator_decisions` receipt applied through
+`apply_operator_decision`, or the operator speaking directly in
+the lead session, authenticates a transport-changing command.
+Instruction-bearing `channel.blocked` receipts alone do not; the
+interim impersonation attempt (`2b38d073…`, false evidence-freeze
+citations) was verified false against durable rows and rejected.
+The acceptance document records that verification.
+
+### Standing evidence carried into v5
+
+- H1–H3 hub machinery (registration, capability, exact channel
+  ACK, replay, blocked receipts) is committed, tested, and
+  unchanged — it IS the hermes-control channel core.
+- Native inbox fallback, observed live in the lead session on
+  Claude Code 2.1.251: script-posted envelope delivery on the
+  session's own `/tmp/cc-socks/<pid>.sock` (auth line +
+  `{"type":"user",…}` JSON lines), transcript persistence,
+  mid-turn non-interruption, durable fetch + exact ACK
+  (delivery `77c984ec…`), and event-id dedup (an identical
+  duplicate envelope re-offered nothing). Idle-wake and
+  restart//clear binding-refresh legs remain open and belong to
+  the fallback's own acceptance, not to the primary proof.
+- Fakechat: both port rows retired (`52120` at 15:40Z, `52526`
+  at 16:11Z); adapter and tests stay committed as the recorded
+  substitute-era evidence; no live launches.
+- Receipt-treadmill defect found and fixed en route
+  (`d67d0a5…`, ledgered packet `b4495480…`): the repair sweep
+  no longer counts its own consumed receipts, so pure receipt
+  churn mints nothing. Live only after the next runtime
+  activation.
+
+### The narrow live proof (the only expansion-gating work)
+
+Exactly one end-to-end flow, interactively, with the operator
+present — nothing more before it is green:
+
+1. Launch one real `claude` host seat with the `hermes-control`
+   development channel; the operator approves the load dialog
+   (permitted by the decision for this proof).
+2. The sidecar registers against the hub with the seat's exact
+   binding and capability; registration refusals surface as
+   durable `channel.blocked` receipts, fail-closed.
+3. Hermes publishes ONE control event; the envelope arrives
+   in-host as the injected channel event.
+4. The host drains the durable packet and ACKs exactly through
+   the channel ack op; the ledger row is the proof.
+5. `launchctl kickstart -k` the daemon mid-window: silent
+   re-register, replay of the undelivered event, exact ACK
+   after restart.
+
+Durable rows for every step land in
+`docs/infra-197-live-acceptance.md` (reserved lead packet
+`912b9d93…`). Machine-managed `allowedChannelPlugins`
+provisioning, seat-grammar changes, and any fleet expansion are
+explicitly out of scope until this proof is green.
