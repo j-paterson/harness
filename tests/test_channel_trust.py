@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from hermes_orchestrator.channel_trust import (
+    APPROVED_PROMPT_MARKERS,
+    APPROVED_PROMPT_PATTERN,
     CHANNEL_ENTRY,
     ChannelTrustAnchors,
     ChannelTrustGate,
@@ -37,9 +39,11 @@ SESSION = "33333333-3333-4333-8333-333333333333"
 OTHER_UUID = "44444444-4444-4444-8444-444444444444"
 CONFIG_PATH = f"/state/mcp/{SESSION}.mcp.json"
 
-# The fixed normalized prompt matcher: re.escape'd dialog markers joined
-# by the exact bounded gap — the one shape the CLI's bounded prompt
-# capture derives from the live dialog (Sol correction b4b545f3).
+# The approved fixed normalized prompt matcher: the code-owned
+# four-marker dialog sequence, re.escape'd and joined by the exact
+# bounded gap (Sol corrections b4b545f3 and f0a5a403). Transcribed
+# independently here and pinned equal to the module's code-owned
+# contract below.
 PROMPT_GAP = r"[\s\S]{0,4000}?"
 PROMPT_MARKERS = (
     "Loading development channels",
@@ -48,6 +52,16 @@ PROMPT_MARKERS = (
     "Enter to confirm",
 )
 PROMPT_PATTERN = PROMPT_GAP.join(re.escape(marker) for marker in PROMPT_MARKERS)
+
+
+def test_the_approved_marker_sequence_is_the_code_owned_contract() -> None:
+    """The module's code-owned approved sequence is exactly the real
+    operator-approved four-marker hermes-control dialog (the shape the
+    CLI's bounded prompt capture derives), CHANNEL_ENTRY included."""
+
+    assert APPROVED_PROMPT_MARKERS == PROMPT_MARKERS
+    assert CHANNEL_ENTRY in APPROVED_PROMPT_MARKERS
+    assert APPROVED_PROMPT_PATTERN == PROMPT_PATTERN
 DIALOG_TEXT = (
     "Loading development channels\n"
     f"  - {CHANNEL_ENTRY}\n"
@@ -1057,13 +1071,18 @@ class _CompletionRecordingFails(ControlOperations):
         return super().record(kind=kind, **kwargs)
 
 
-def test_gate_completion_record_failure_records_explicit_ambiguous_state(
+def test_gate_completion_record_failure_is_a_non_success_ambiguous_verdict(
     database: Database,
     events: EventStore,
     anchors: ChannelTrustAnchors,
     package: tuple[Path, Path],
     seeded_cell: None,
 ) -> None:
+    """Sol correction f0a5a403 packet 3: when Enter succeeded but the
+    ``channel.auto_confirmed`` receipt did not record, the outcome is
+    AMBIGUOUS — the verdict must NOT report success. The explicit
+    durable ``channel.confirm_ambiguous`` state is still recorded."""
+
     package_root, entry_path = package
     failing = _CompletionRecordingFails(database, events=events)
     _capture(anchors, package_root=package_root, entry_path=entry_path)
@@ -1076,12 +1095,155 @@ def test_gate_completion_record_failure_records_explicit_ambiguous_state(
         screen_text=f"...\n{DIALOG_TEXT}\n",
     )
 
-    # The keypress happened, so the verdict confirms — but the missing
-    # completion receipt is replaced by an explicit durable state, never
-    # left silent.
-    assert result.confirmed is True
+    assert result.confirmed is False
+    assert result.first_failure == "confirm_outcome_ambiguous"
     assert confirm.calls == 1
     assert result.receipt_operation_id is not None
     ambiguous = failing.get(result.receipt_operation_id)
     assert ambiguous.kind == "channel.confirm_ambiguous"
     assert ambiguous.result["stage"] == "completion_receipt"
+
+
+def test_gate_completion_receipt_ambiguity_still_prevents_another_enter(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """The non-success ambiguous verdict retains the durable claim, so
+    a repeat evaluation after a completion-receipt failure refuses
+    before the keypress — never a blind second Enter."""
+
+    package_root, entry_path = package
+    failing = _CompletionRecordingFails(database, events=events)
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    gate, confirm, _ = _make_gate(database, events, anchors, failing)
+
+    first = _evaluate(
+        gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
+    )
+    assert first.confirmed is False
+    assert confirm.calls == 1
+
+    retry = _evaluate(
+        gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
+    )
+    assert retry.confirmed is False
+    assert retry.first_failure == "confirm_already_claimed"
+    assert confirm.calls == 1
+
+
+# --------------------------------------------------------------------
+# Sol correction f0a5a403 packet 3 — the approved prompt marker
+# sequence is a code-owned contract: exact equality at capture,
+# complete_prompt, and evaluation. A caller-chosen set of escaped
+# literals — even a structurally normalized one naming CHANNEL_ENTRY —
+# never authorizes Enter.
+# --------------------------------------------------------------------
+
+# Each of these is structurally a "fixed normalized matcher" under the
+# prior packet's contract (escaped literals of sufficient length joined
+# by the exact gap, one exactly CHANNEL_ENTRY) — but none is the
+# operator-approved four-marker dialog.
+LOOKALIKE_MARKER_SEQUENCES = (
+    # arbitrary caller-chosen replacement markers around CHANNEL_ENTRY
+    (
+        "A completely different dialog",
+        CHANNEL_ENTRY,
+        "attacker-chosen literal line",
+        "press any key to continue",
+    ),
+    # fewer markers than the approved sequence
+    ("Loading development channels", CHANNEL_ENTRY),
+    # the approved sequence plus an extra trailing marker
+    (*PROMPT_MARKERS, "an extra trailing marker"),
+    # the approved markers, reordered
+    (PROMPT_MARKERS[1], PROMPT_MARKERS[0], *PROMPT_MARKERS[2:]),
+    # one literal differs
+    (*PROMPT_MARKERS[:3], "Enter to continue please"),
+)
+
+
+def _pattern_for(markers: tuple[str, ...]) -> str:
+    return PROMPT_GAP.join(re.escape(marker) for marker in markers)
+
+
+@pytest.mark.parametrize("markers", LOOKALIKE_MARKER_SEQUENCES)
+def test_capture_refuses_caller_chosen_normalized_marker_sequences(
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    markers: tuple[str, ...],
+) -> None:
+    package_root, entry_path = package
+
+    with pytest.raises(TrustRefused, match="approved"):
+        _capture(
+            anchors,
+            package_root=package_root,
+            entry_path=entry_path,
+            prompt_pattern=_pattern_for(markers),
+        )
+
+
+@pytest.mark.parametrize("markers", LOOKALIKE_MARKER_SEQUENCES)
+def test_complete_prompt_refuses_caller_chosen_normalized_marker_sequences(
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    markers: tuple[str, ...],
+) -> None:
+    package_root, entry_path = package
+    anchor = _capture(
+        anchors, package_root=package_root, entry_path=entry_path, prompt_pattern=None
+    )
+
+    with pytest.raises(TrustRefused, match="approved"):
+        anchors.complete_prompt(anchor.anchor_id, _pattern_for(markers))
+
+
+def test_gate_only_the_exact_approved_marker_sequence_authorizes_enter(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Every stored look-alike normalized marker sequence fails closed
+    at evaluation with zero keypresses; only the exact approved
+    four-marker sequence then confirms."""
+
+    package_root, entry_path = package
+    anchor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    gate, confirm, _ = _make_gate(database, events, anchors, control)
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+
+    for markers in LOOKALIKE_MARKER_SEQUENCES:
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE channel_trust_anchors SET prompt_pattern = ? "
+                "WHERE anchor_id = ?",
+                (_pattern_for(markers), anchor.anchor_id),
+            )
+        result = _evaluate(
+            gate,
+            entry_path=entry_path,
+            package_root=package_root,
+            screen_text=screen_text,
+        )
+        assert result.confirmed is False
+        assert result.first_failure == "prompt_matcher_fixed"
+    assert confirm.calls == 0
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE channel_trust_anchors SET prompt_pattern = ? "
+            "WHERE anchor_id = ?",
+            (PROMPT_PATTERN, anchor.anchor_id),
+        )
+    approved = _evaluate(
+        gate, entry_path=entry_path, package_root=package_root, screen_text=screen_text
+    )
+    assert approved.confirmed is True
+    assert confirm.calls == 1

@@ -16,6 +16,7 @@ from hermes_orchestrator.codex_merger import (
     MergerThreadUncertain,
     StaleChannelError,
 )
+from hermes_orchestrator.codex_ponytail_guard import session_guard_config
 from hermes_orchestrator.codex_rpc import (
     CodexRequestFailed,
     CodexTimeout,
@@ -259,6 +260,7 @@ async def test_new_merger_uses_the_writable_workspace_and_persists(
         "approvalPolicy": "never",
         "sandbox": "workspace-write",
         "serviceName": "hermes_orchestrator",
+        "config": session_guard_config(),
     }
     assert request["params"]["sandbox"] != "danger-full-access"
     assert thread.thread_id == "thr_demo"
@@ -323,12 +325,14 @@ async def test_not_loaded_thread_is_loaded_then_readable(
         "thread/read",
         "thread/goal/set",
     ]
-    # Recovery re-applies the bounded writable workspace mode, so a
-    # task started under a stale read-only configuration is corrected
-    # on its next load — without a duplicate thread or review intake.
+    # Recovery re-applies the bounded writable workspace mode and the
+    # session-scoped Ponytail guard binding, so a task started under a
+    # stale configuration is corrected on its next load — without a
+    # duplicate thread or review intake.
     assert rpc.request_for("thread/resume")["params"] == {
         "threadId": "thr_stored",
         "sandbox": "workspace-write",
+        "config": session_guard_config(),
     }
     assert "thread/start" not in rpc.methods
 
@@ -1287,44 +1291,12 @@ def test_replacement_without_outstanding_wakes_clears_heartbeat(
     assert channel.heartbeat_enabled is False
 
 
-def test_prompt_contract_exists_and_is_read_only() -> None:
-    text = " ".join(PROMPT_PATH.read_text(encoding="utf-8").lower().split())
-    for clause in (
-        "independent",
-        "one pull request at a time",
-        "merge-settle",
-        "accept_with_reviewer_fix",
-        "direct exact-head merge",
-        "reconciles it into the same durable receipts",
-        "read-only",
-        "reviewer repair budget",
-        "critical",
-        "important",
-        "circleci",
-        "ancestry",
-        "never poll",
-        "cmux",
-        "outbox",
-        "mutable worktree",
-        "child agents",
-        "one immutable candidate",
-        "metadata-only",
-        "generation",
-        "no automatic goal continuation",
-        "fable_ready",
-        "fable_rework_ready",
-        "fable_blocked",
-        "fable_complete",
-        "advisory",
-        "rule-restatement",
-    ):
-        assert clause in text
-
-
 def test_goal_and_contract_authorize_only_bounded_fix_and_exact_merge() -> None:
     """INFRA-194 operator scope: Sol's authority is exactly the bounded
     labeled reviewer fix plus completing the exact approved merge, and
-    neither document claims an OS-enforced read-only sandbox."""
+    neither document claims an OS-enforced read-only sandbox. The
+    one-paragraph prompt contract itself (operator correction 719cd2ad)
+    is pinned in tests/test_merger_prompt.py."""
 
     from hermes_orchestrator.codex_merger import MERGER_GOAL
 
@@ -1337,53 +1309,73 @@ def test_goal_and_contract_authorize_only_bounded_fix_and_exact_merge() -> None:
 
     contract = " ".join(PROMPT_PATH.read_text(encoding="utf-8").lower().split())
     assert "read-only sandbox" not in contract
-    # The behavioral guard survives: outside the bounded fix path the
-    # implementation tree is untouchable.
-    assert "read-only with respect to the implementation tree" in contract
-    assert "accept_with_reviewer_fix" in contract
-    assert "authorized to complete the exact approved pull-request merge" in (
-        contract
+
+
+def test_ponytail_guard_binding_shape_is_the_minimal_session_hook() -> None:
+    """Operator correction c3f4aad5: the guard binding is one
+    session-scoped ``hooks.PreToolUse`` config override — a single
+    synchronous command hook running the guard script — and nothing
+    else: no global git hook, no shared Codex config write, no receipt
+    or manifest machinery."""
+
+    config = session_guard_config(python="/opt/venv/bin/python")
+    assert set(config) == {"hooks.PreToolUse"}
+    (group,) = config["hooks.PreToolUse"]
+    assert set(group) == {"hooks"}  # no matcher: the guard filters itself
+    (handler,) = group["hooks"]
+    assert handler["type"] == "command"
+    assert handler["async"] is False
+    assert handler["command"] == (
+        "/opt/venv/bin/python -m hermes_orchestrator.codex_ponytail_guard hook"
     )
 
 
-def test_prompt_idle_terminal_token_is_exact_and_pause_token_is_gone() -> None:
-    text = PROMPT_PATH.read_text(encoding="utf-8")
-    assert "BLOCKED_ON_EXTERNAL_INTAKE" in text
-    assert "PAUSED_NO_ELIGIBLE_WORK" not in text
-    without_token = text.replace("BLOCKED_ON_EXTERNAL_INTAKE", "")
-    assert "blocked_on_external_intake" not in without_token.lower()
-    assert "revalidate" in text.lower()
+@pytest.mark.asyncio
+async def test_managed_sol_thread_carries_the_ponytail_guard_binding(
+    merger: CodexMerger, rpc: FakeRpc
+) -> None:
+    """Operator correction c3f4aad5: the managed Sol thread — created or
+    resumed — always carries the session-scoped Ponytail guard in its
+    thread configuration, alongside the bounded writable workspace."""
+
+    await merger.ensure_thread("demo")
+
+    params = rpc.request_for("thread/start")["params"]
+    assert params["config"] == session_guard_config()
+    assert params["sandbox"] == "workspace-write"
 
 
-def test_prompt_requires_prior_ci_reconciliation_before_new_candidates() -> None:
-    text = PROMPT_PATH.read_text(encoding="utf-8").lower()
-    assert "reconcile" in text
-    assert "previous pull request" in text
-    assert "never watch or poll ci" in text
-    assert "one pull request" in text and "in flight" in text
-    assert "pr2" in text
+@pytest.mark.asyncio
+async def test_resumed_sol_thread_reapplies_the_ponytail_guard_binding(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    stored_thread(database)
+    rpc.respond_sequence(
+        "thread/read",
+        [
+            {"thread": {"id": "thr_stored", "status": {"type": "notLoaded"}}},
+            {"thread": {"id": "thr_stored", "status": {"type": "idle"}}},
+        ],
+    )
+
+    await merger.ensure_thread("demo")
+
+    params = rpc.request_for("thread/resume")["params"]
+    assert params["config"] == session_guard_config()
 
 
-def test_prompt_pins_the_reviewer_repair_budget() -> None:
-    """INFRA-194 operator correction: the fix boundary is the durable
-    user-approved repair budget, with its exact eligibility limits and
-    exclusions, not zero edits."""
+def test_ponytail_guard_binds_nowhere_but_the_managed_sol_boundary() -> None:
+    """Operator correction c3f4aad5 required test 5 (binding side): only
+    the CodexMerger managed-Sol boundary references the guard, so no
+    other Codex session, launch surface, or agent lead is subject to
+    it."""
 
-    text = " ".join(PROMPT_PATH.read_text(encoding="utf-8").lower().split())
-    for clause in (
-        "mechanical",
-        "unambiguous",
-        "auditable",
-        "2 files",
-        "20-30 changed lines",
-        "15-20 minutes",
-        "focused verification",
-        "schemas",
-        "migrations",
-        "generated artifacts",
-        "pricing or economics",
-        "public apis",
-        "persisted ownership architecture",
-        "broad consumer-facing changes",
-    ):
-        assert clause in text, clause
+    import hermes_orchestrator
+
+    package_root = Path(hermes_orchestrator.__file__).parent
+    binders = {"codex_merger.py", "codex_ponytail_guard.py"}
+    for module in sorted(package_root.rglob("*.py")):
+        if module.name in binders:
+            continue
+        source = module.read_text(encoding="utf-8")
+        assert "codex_ponytail_guard" not in source, module.name

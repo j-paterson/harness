@@ -31,6 +31,7 @@ from hermes_orchestrator.claude import (
 )
 from hermes_orchestrator.cmux import CMUX_KEYCHAIN_SERVICE, CmuxCliAdapter
 from hermes_orchestrator.cmux_surfaces import (
+    ChannelTrustConfirmer,
     CmuxHibernationDriver,
     CmuxHibernationGate,
     CmuxLeadSeater,
@@ -230,16 +231,25 @@ def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
     JS output that Git never tracks, so a plain ``repo_root`` checkout
     may carry none — the historical location the daemon has always
     launched from when it runs directly out of a checkout. Runtime
-    activation (see ``activation.materialize_artifact``) now copies a
-    proven sidecar build into every immutable runtime artifact, so the
-    ACTIVE artifact's own build — read via the ``runtimes/ACTIVE``
-    pointer the same way the shell bootstrap does — is preferred when
-    it exists. A resolution where neither path exists is not itself an
-    error here: the caller's
-    ``shutil.which("node")`` guard and ultimately
-    :class:`~hermes_orchestrator.channel_hub.ChannelLauncher` still
-    fail closed exactly as before when the resolved path is not a
-    real file.
+    activation (see ``activation.materialize_artifact``) copies a
+    proven sidecar build into every immutable runtime artifact, read
+    via the ``runtimes/ACTIVE`` pointer the same way the shell
+    bootstrap does.
+
+    Sol correction f0a5a403 (packet 2): once an ACTIVE runtime is
+    recorded (the pointer is readable and non-empty), the artifact-
+    derived entry path is returned REGARDLESS of whether the file
+    exists — an ACTIVE artifact missing or carrying an incomplete
+    sidecar must make
+    :class:`~hermes_orchestrator.channel_hub.ChannelLauncher` refuse
+    the missing entry (the durable ``channel.blocked`` receipt), never
+    silently execute mutable gitignored checkout bytes unrelated to
+    the active artifact identity. The ``repo_root`` fallback exists
+    only for the documented pre-activation state, when no ACTIVE
+    runtime is recorded; a resolution where that path does not exist
+    is not itself an error here — the caller's ``shutil.which("node")``
+    guard and the launcher's file-exists check remain the fail-closed
+    boundary.
     """
 
     fallback = (
@@ -252,7 +262,7 @@ def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
         return fallback
     if not recorded:
         return fallback
-    candidate = (
+    return (
         Path(recorded)
         / "channels"
         / "hermes-control"
@@ -260,7 +270,6 @@ def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
         / "src"
         / "main.js"
     )
-    return candidate if candidate.is_file() else fallback
 
 
 def build_linear_router(
@@ -538,6 +547,28 @@ def open_runtime(
                         node_binary=Path(node_binary),
                     )
                 )
+                # Sol correction f0a5a403 (packet 4): the trust gate is
+                # part of the production managed-seat lifecycle — the
+                # seater triggers one bounded gate evaluation for each
+                # newly created channel-launched binding, so a trusted
+                # launch auto-confirms without the manual
+                # channel-trust-confirm command. The entry path is
+                # re-resolved per trigger so the gate always measures
+                # the ACTIVE artifact identity of that moment.
+                channel_confirmer = (
+                    None
+                    if channel_launcher is None
+                    else ChannelTrustConfirmer(
+                        database=database,
+                        events=events,
+                        control=control_operations,
+                        port=cmux_port,
+                        entry_resolver=lambda: resolve_sidecar_entry(
+                            repo_root=settings.repo_root,
+                            state_dir=settings.state_dir,
+                        ),
+                    )
+                )
                 cmux_seater = CmuxLeadSeater(
                     bindings=cmux_bindings,
                     port=cmux_port,
@@ -550,6 +581,7 @@ def open_runtime(
                     auth_probe=lambda alias: probe.check(alias).eligible,
                     channel_launch=channel_launcher,
                     control=control_operations,
+                    channel_trust=channel_confirmer,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,

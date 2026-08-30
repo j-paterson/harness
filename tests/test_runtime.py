@@ -847,9 +847,15 @@ class TestResolveSidecarEntry:
 
         assert resolved == artifact_entry
 
-    def test_falls_back_to_repo_root_when_the_active_artifact_lacks_one(
+    def test_an_active_artifact_missing_its_sidecar_never_falls_back(
         self, tmp_path: Path
     ) -> None:
+        """Sol correction f0a5a403 (packet 2): with an ACTIVE runtime
+        recorded, the artifact-derived entry is returned even when the
+        artifact's sidecar build is missing — the mutable, gitignored
+        repo_root build must NEVER stand in for the active artifact
+        identity; ChannelLauncher then refuses the missing entry."""
+
         repo_root = tmp_path / "repo"
         repo_entry = (
             repo_root / "channels/hermes-control/dist/src/main.js"
@@ -868,7 +874,36 @@ class TestResolveSidecarEntry:
             repo_root=repo_root, state_dir=state_dir
         )
 
-        assert resolved == repo_entry
+        # The repo build exists and is still not chosen: the resolved
+        # path is the (absent) artifact entry, so the launcher's
+        # file-exists guard fails the channel closed.
+        assert resolved == (
+            artifact / "channels/hermes-control/dist/src/main.js"
+        )
+        assert not resolved.exists()
+        assert repo_entry.is_file()
+
+    def test_an_empty_active_pointer_keeps_the_pre_activation_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        """A pointer file with no recorded runtime is the documented
+        pre-activation state: the historical repo_root path remains
+        available."""
+
+        repo_root = tmp_path / "repo"
+        state_dir = tmp_path / "state"
+        (state_dir / "runtimes").mkdir(parents=True)
+        (state_dir / "runtimes" / "ACTIVE").write_text(
+            "\n", encoding="utf-8"
+        )
+
+        resolved = resolve_sidecar_entry(
+            repo_root=repo_root, state_dir=state_dir
+        )
+
+        assert resolved == (
+            repo_root / "channels/hermes-control/dist/src/main.js"
+        )
 
     def test_yields_the_repo_root_path_when_neither_build_exists(
         self, tmp_path: Path

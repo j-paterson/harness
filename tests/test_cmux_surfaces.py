@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -8,6 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from hermes_orchestrator.channel_trust import (
+    APPROVED_PROMPT_PATTERN,
+    ChannelTrustAnchors,
+)
 from hermes_orchestrator.cmux import (
     CmuxAccessDenied,
     CmuxError,
@@ -17,12 +23,14 @@ from hermes_orchestrator.cmux import (
 )
 from hermes_orchestrator.cmux_surfaces import (
     SKIP_PERMISSIONS_FLAG,
+    ChannelTrustConfirmer,
     CmuxBindingConflict,
     CmuxHibernationGate,
     CmuxSurfaceBindings,
     CmuxSurfaceReconciler,
     HibernationDecision,
 )
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 
@@ -113,6 +121,9 @@ class FakePort:
     fail: dict[str, CmuxError] = field(default_factory=dict)
     crash: str | None = None
     on_create: Callable[[str], None] | None = None
+    screen: str = ""
+    screen_reads: int = 0
+    confirmed: list[CmuxSurfaceRef] = field(default_factory=list)
 
     def _maybe_fail(self, operation: str) -> None:
         error = self.fail.get(operation)
@@ -181,6 +192,15 @@ class FakePort:
         self._maybe_fail("rename_workspace")
         self.renames.append((workspace_uuid, title))
         self.titles[workspace_uuid] = title
+
+    async def read_screen(self, ref: CmuxSurfaceRef, *, lines: int = 60) -> str:
+        self._maybe_fail("read_screen")
+        self.screen_reads += 1
+        return self.screen
+
+    async def confirm_channel_dialog(self, ref: CmuxSurfaceRef) -> None:
+        self._maybe_fail("confirm_channel_dialog")
+        self.confirmed.append(ref)
 
     async def find_workspace_uuids(self, *, title_marker: str) -> frozenset[str]:
         self._maybe_fail("find_workspace_uuids")
@@ -535,6 +555,7 @@ def seater(
     profiles: dict[str, Path] | None = None,
     channel_launch: object | None = None,
     control: object | None = None,
+    channel_trust: object | None = None,
 ) -> object:
     from hermes_orchestrator.cmux_surfaces import CmuxLeadSeater
 
@@ -547,6 +568,7 @@ def seater(
         ),
         channel_launch=channel_launch,
         control=control,
+        channel_trust=channel_trust,
     )
 
 
@@ -1718,3 +1740,476 @@ class TestChannelLaunch:
         # The rotated-away session's config and capability were
         # removed only after its workspace was confirmed closed.
         assert launch.cleaned == [SESSION]
+
+
+# --------------------------------------------------------------------
+# Channel-trust confirmation rides the managed-seat lifecycle
+# (Sol correction f0a5a403, packet 4)
+# --------------------------------------------------------------------
+
+DIALOG_TEXT = (
+    "Loading development channels\n"
+    "  - server:hermes-control\n"
+    "  [x] I am using this for local development\n"
+    "  Press Enter to confirm, Esc to cancel"
+)
+
+CHANNEL_ARGV = [
+    "claude",
+    "--session-id",
+    SESSION,
+    SKIP_PERMISSIONS_FLAG,
+    "--mcp-config",
+    f"/state/channels/{SESSION}.mcp.json",
+    "--dangerously-load-development-channels",
+    "server:hermes-control",
+]
+
+
+def trust_package(tmp_path: Path) -> Path:
+    """A sidecar package laid out exactly as production resolves it:
+    ``<root>/dist/src/main.js`` with the manifest at ``<root>`` — so
+    ``entry.parents[2]`` is the package root, as in the real
+    ``channels/hermes-control`` layout."""
+
+    root = tmp_path / "artifact" / "channels" / "hermes-control"
+    (root / "dist" / "src").mkdir(parents=True)
+    (root / "package.json").write_text(
+        json.dumps({"name": "hermes-control-channel", "version": "9.9.9"}),
+        encoding="utf-8",
+    )
+    entry = root / "dist" / "src" / "main.js"
+    entry.write_text("console.log('hermes-control');\n", encoding="utf-8")
+    return entry
+
+
+def capture_trust_anchor(
+    database: Database,
+    entry: Path,
+    *,
+    surface_uuid: str = LEAD.surface_uuid,
+    prompt_pattern: str = APPROVED_PROMPT_PATTERN,
+) -> object:
+    events = EventStore(database)
+    return ChannelTrustAnchors(database, events=events).capture(
+        cell_id="cell-demo",
+        profile_alias="max-a",
+        entry_path=entry,
+        package_root=entry.parents[2],
+        channel_entry="server:hermes-control",
+        launch_argv_template=CHANNEL_ARGV,
+        workspace_uuid=LEAD.workspace_uuid,
+        surface_uuid=surface_uuid,
+        session_id=SESSION,
+        prompt_pattern=prompt_pattern,
+    )
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+def trust_confirmer(
+    database: Database,
+    port: FakePort,
+    entry: Path,
+    *,
+    control: ControlOperations,
+    wait_seconds: int = 90,
+) -> ChannelTrustConfirmer:
+    ticks = iter(float(tick) for tick in range(10_000))
+    return ChannelTrustConfirmer(
+        database=database,
+        events=EventStore(database),
+        control=control,
+        port=port,
+        entry_resolver=lambda: entry,
+        live_argv=lambda _session: list(CHANNEL_ARGV),
+        wait_seconds=wait_seconds,
+        clock=lambda: next(ticks),
+        sleep=_no_sleep,
+    )
+
+
+def control_operation_kinds(database: Database) -> list[str]:
+    rows = database.execute(
+        "SELECT kind FROM control_operations ORDER BY rowid ASC"
+    ).fetchall()
+    return [str(row["kind"]) for row in rows]
+
+
+class FakeTrustTrigger:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[object] = []
+        self.error = error
+
+    async def confirm_seat(self, binding: object) -> object | None:
+        self.calls.append(binding)
+        if self.error is not None:
+            raise self.error
+        return None
+
+
+class TestChannelTrustLifecycle:
+    """The bounded watcher and trust gate run automatically for the
+    exact newly created channel-launched binding — the manually invoked
+    channel-trust-confirm CLI command is no longer the only path."""
+
+    @pytest.mark.asyncio
+    async def test_a_trusted_seat_auto_confirms_one_enter_without_the_cli(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[LEAD], screen=f"...\n{DIALOG_TEXT}\n")
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        seat = await seater(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=confirmer,
+        ).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+
+        assert seat is not None
+        # Exactly one Enter, sent to the exact bound surface, with no
+        # manual channel-trust-confirm invocation anywhere.
+        assert port.confirmed == [LEAD]
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_repeated_and_concurrent_triggers_send_at_most_one_enter(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[LEAD], screen=f"...\n{DIALOG_TEXT}\n")
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        confirmer = trust_confirmer(database, port, entry, control=control)
+        await seater(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=confirmer,
+        ).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+        binding = bindings.active_lead("cell-demo")
+        assert binding is not None
+
+        first, second = await asyncio.gather(
+            confirmer.confirm_seat(binding),
+            confirmer.confirm_seat(binding),
+        )
+
+        # The lifecycle trigger already pressed the one Enter; the
+        # durable claim CAS refuses every later or concurrent trigger
+        # for the same launch.
+        assert port.confirmed == [LEAD]
+        for verdict in (first, second):
+            assert verdict is not None
+            assert verdict.confirmed is False
+            assert verdict.first_failure == "confirm_already_claimed"
+
+    @pytest.mark.asyncio
+    async def test_prompt_mismatch_sends_zero_keys(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        # The watcher sees a dialog-shaped screen, but the full approved
+        # four-marker sequence is not on it.
+        port = FakePort(
+            screen=(
+                "Loading development channels\n"
+                "  - server:hermes-control\n"
+                "  Press Y to do something unexpected"
+            )
+        )
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert verdict.first_failure == "prompt_match"
+        assert control_operation_kinds(database) == [
+            "channel.approval_required"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_identity_drift_sends_zero_keys(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        # The anchor was trusted for a different surface than the one
+        # this seat is bound to.
+        capture_trust_anchor(
+            database, entry, surface_uuid=THIRD.surface_uuid
+        )
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert verdict.first_failure == "surface_uuid"
+
+    @pytest.mark.asyncio
+    async def test_watcher_timeout_sends_zero_keys_and_no_receipt(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen="just a shell prompt, no dialog")
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(
+            database, port, entry, control=control, wait_seconds=3
+        )
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        # An absent dialog is not a trust refusal: zero keys and no
+        # durable trust receipt of any kind.
+        assert verdict is None
+        assert port.confirmed == []
+        assert port.screen_reads >= 1
+        assert control_operation_kinds(database) == []
+
+    @pytest.mark.asyncio
+    async def test_claim_failure_sends_zero_keys(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        class _ClaimFails(ControlOperations):
+            def record(self, **kwargs: object) -> object:
+                if kwargs.get("kind") == "channel.confirm_claimed":
+                    raise RuntimeError("claim store down")
+                return super().record(**kwargs)
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        control = _ClaimFails(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert verdict.first_failure == "confirm_claim_failed"
+
+    @pytest.mark.asyncio
+    async def test_a_seat_composed_without_the_collaborator_behaves_as_today(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD], screen=f"...\n{DIALOG_TEXT}\n")
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+
+        seat = await seater(bindings, port, channel_launch=launch).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+
+        assert seat is not None
+        assert port.screen_reads == 0
+        assert port.confirmed == []
+
+    @pytest.mark.asyncio
+    async def test_the_trigger_fires_once_per_new_channel_binding(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        trigger = FakeTrustTrigger()
+        ensure = seater(
+            bindings, port, channel_launch=launch, channel_trust=trigger
+        )
+
+        first = await ensure.ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+        second = await ensure.ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+
+        # One trigger, carrying the exact newly created binding; the
+        # reuse path never re-triggers.
+        assert second.binding_id == first.binding_id
+        assert [b.binding_id for b in trigger.calls] == [first.binding_id]
+
+    @pytest.mark.asyncio
+    async def test_a_trigger_failure_never_breaks_the_seat(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        trigger = FakeTrustTrigger(error=RuntimeError("watcher exploded"))
+
+        seat = await seater(
+            bindings, port, channel_launch=launch, channel_trust=trigger
+        ).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+
+        assert seat is not None
+        assert len(trigger.calls) == 1
+        assert bindings.active_lead("cell-demo") is not None
+
+    @pytest.mark.asyncio
+    async def test_a_channel_less_seat_never_triggers_the_gate(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        trigger = FakeTrustTrigger()
+        # A launcher failure drains to the bare classic command; the
+        # bare seat carries no dev-channel dialog to confirm.
+        port = FakePort(next_refs=[LEAD, FRESH])
+        failing = FakeChannelLaunch(error=FileNotFoundError("no build"))
+        await seater(
+            bindings, port, channel_launch=failing, channel_trust=trigger
+        ).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+        # And a plain classic seat with no launcher composed at all.
+        rotated = "88888888-8888-4888-8888-888888888888"
+        await seater(bindings, port, channel_trust=trigger).ensure(
+            **demo_seat(cell_id="cell-other", session_id=rotated),
+            classic_command=(
+                f"claude --session-id {rotated} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+
+        assert trigger.calls == []
+        assert port.confirmed == []
+
+    @pytest.mark.asyncio
+    async def test_an_active_artifact_missing_its_entry_blocks_the_channel(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """Sol correction f0a5a403 (packet 2), launch side: with an
+        ACTIVE runtime recorded but its sidecar entry missing, the seat
+        launches channel-less with the existing actionable
+        channel.blocked receipt — the mutable repo_root checkout build
+        is present and still never executed."""
+
+        from hermes_orchestrator.channel_hub import ChannelLauncher
+        from hermes_orchestrator.runtime import resolve_sidecar_entry
+
+        repo_root = tmp_path / "repo"
+        mutable = repo_root / "channels/hermes-control/dist/src/main.js"
+        mutable.parent.mkdir(parents=True)
+        mutable.write_text("// mutable checkout bytes\n", encoding="utf-8")
+        state_dir = tmp_path / "state"
+        artifact = state_dir / "runtimes" / "cafe"
+        artifact.mkdir(parents=True)  # no sidecar inside this artifact
+        (state_dir / "runtimes" / "ACTIVE").write_text(
+            str(artifact), encoding="utf-8"
+        )
+
+        launcher = ChannelLauncher(
+            state_dir=state_dir,
+            capabilities=None,  # unreachable: the entry check fails first
+            sidecar_entry=resolve_sidecar_entry(
+                repo_root=repo_root, state_dir=state_dir
+            ),
+            node_binary=Path("/usr/bin/true"),
+        )
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[LEAD])
+
+        seat = await seater(
+            bindings, port, channel_launch=launcher, control=control
+        ).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+
+        assert seat is not None
+        [created] = port.created
+        assert created["command"] == (
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+        )
+        assert str(mutable) not in str(created["command"])
+        [receipt] = control.pending_for_session(SESSION)
+        assert receipt.kind == "channel.blocked"
+        assert "sidecar build is missing" in str(
+            receipt.result["launcher_error"]
+        )

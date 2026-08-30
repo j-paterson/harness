@@ -17,17 +17,20 @@ the exact confirmation prompt shape.
 :class:`ChannelTrustGate` is the fail-closed re-derivation: every bound
 field is re-measured live and compared against the active anchor for
 the cell, in a fixed order, stopping at the first mismatch. The prompt
-evidence is never arbitrary regex: only the fixed normalized matcher
-shape (escaped literal dialog markers with bounded gaps, naming
-:data:`CHANNEL_ENTRY`) is honored, at capture and at evaluation alike.
+evidence is never arbitrary regex and never a caller-chosen marker
+set: the ONLY honored matcher is the one derived from the code-owned
+:data:`APPROVED_PROMPT_MARKERS` sequence (exact equality of the
+derived markers, at capture, complete_prompt, and evaluation alike).
 A full match first records a durable at-most-once
 ``channel.confirm_claimed`` claim (the live-dedup unique index is the
 CAS binding anchor + workspace + surface + launch session), then calls
 the injected ``confirm`` collaborator exactly once, then records the
 ``channel.auto_confirmed`` completion receipt carrying the match
 evidence — or, when the keypress or its receipt fails after the claim,
-an explicit durable ``channel.confirm_ambiguous`` state that is never
-blindly retried. Any mismatch, drift, ambiguity, missing anchor,
+an explicit durable ``channel.confirm_ambiguous`` state that reports
+``confirmed=False`` (every ambiguous outcome is a non-success verdict)
+while the retained claim prevents any blind retry. Any mismatch,
+drift, ambiguity, missing anchor,
 refused claim, or measurement exception fails closed with a durable
 ``channel.approval_required`` receipt whose reason starts with
 ``CHANNEL APPROVAL REQUIRED`` and never calls ``confirm``. There is no
@@ -63,15 +66,30 @@ _DEV_CHANNEL_FLAG = "--dangerously-load-development-channels"
 _LEGACY_CHANNELS_FLAG = "--channels"
 _MCP_CONFIG_PATH = re.compile(r"^/[A-Za-z0-9._/-]+\.mcp\.json$")
 
-# The one prompt-matcher shape the gate ever honors (Sol correction
-# b4b545f3 packet 4): two or more ``re.escape``'d literal dialog-marker
-# segments — one of them exactly :data:`CHANNEL_ENTRY` — joined by this
-# exact bounded gap. The CLI's bounded prompt capture derives exactly
-# this shape from the live dialog's operator-recorded markers; anything
-# else (broad, partial, look-alike, or legacy arbitrary regex evidence)
-# refuses at capture and fails closed at evaluation.
+# The one prompt-matcher shape the gate ever honors (Sol corrections
+# b4b545f3 packet 4 and f0a5a403 packet 3): the ``re.escape``'d markers
+# of :data:`APPROVED_PROMPT_MARKERS` — exactly those literals, in
+# exactly that order — joined by this exact bounded gap. Anything else
+# (arbitrary caller-chosen marker sets included, even normalized ones
+# naming :data:`CHANNEL_ENTRY`) refuses at capture and fails closed at
+# evaluation.
 PROMPT_MATCHER_GAP = r"[\s\S]{0,4000}?"
-_MIN_PROMPT_SEGMENT_CHARS = 8
+
+# The operator-approved confirmation dialog, as a CODE-OWNED contract:
+# the exact four marker literals genuine hermes-control development-
+# channel confirmation dialogs produce, in order. This sequence — not
+# any caller-supplied evidence — defines the only prompt shape that can
+# ever authorize Enter; capture, complete_prompt, and evaluation all
+# require exact equality of the derived marker sequence with it.
+APPROVED_PROMPT_MARKERS = (
+    "Loading development channels",
+    CHANNEL_ENTRY,
+    "I am using this for local development",
+    "Enter to confirm",
+)
+APPROVED_PROMPT_PATTERN = PROMPT_MATCHER_GAP.join(
+    re.escape(marker) for marker in APPROVED_PROMPT_MARKERS
+)
 
 
 class TrustRefused(ValueError):
@@ -190,32 +208,28 @@ def _unescape_literal(segment: str) -> str | None:
 
 
 def _fixed_prompt_segments(prompt_pattern: str) -> tuple[str, ...] | None:
-    """The literal marker texts of a fixed normalized prompt matcher,
-    or ``None`` when ``prompt_pattern`` is anything else.
+    """:data:`APPROVED_PROMPT_MARKERS` when ``prompt_pattern`` is the
+    approved fixed normalized prompt matcher, ``None`` for anything
+    else.
 
-    Acceptance requires every segment between the exact
-    :data:`PROMPT_MATCHER_GAP` separators to round-trip through
-    ``re.escape`` as a literal of at least
-    :data:`_MIN_PROMPT_SEGMENT_CHARS` characters, at least two
-    segments, and one segment exactly :data:`CHANNEL_ENTRY` — so the
-    accepted language is precisely escaped dialog literals with bounded
-    gaps, never a broad, partial, or look-alike expression.
+    Every segment between the exact :data:`PROMPT_MATCHER_GAP`
+    separators must round-trip through ``re.escape`` as a literal, and
+    the derived marker sequence must equal
+    :data:`APPROVED_PROMPT_MARKERS` EXACTLY — extra markers, fewer
+    markers, different literals, or a different order all return
+    ``None``. Caller-chosen marker sets are never honored, and legacy
+    stored patterns (arbitrary or even invalid regex) fail this walk
+    without ever being compiled — fail closed, never crash.
     """
 
     segments = prompt_pattern.split(PROMPT_MATCHER_GAP)
-    if len(segments) < 2:
-        return None
     literals: list[str] = []
     for segment in segments:
         literal = _unescape_literal(segment)
-        if (
-            literal is None
-            or re.escape(literal) != segment
-            or len(literal) < _MIN_PROMPT_SEGMENT_CHARS
-        ):
+        if literal is None or re.escape(literal) != segment:
             return None
         literals.append(literal)
-    if CHANNEL_ENTRY not in literals:
+    if tuple(literals) != APPROVED_PROMPT_MARKERS:
         return None
     return tuple(literals)
 
@@ -225,10 +239,12 @@ def _validate_prompt_pattern(prompt_pattern: str) -> None:
         raise TrustRefused("prompt_pattern must be non-empty")
     if _fixed_prompt_segments(prompt_pattern) is None:
         raise TrustRefused(
-            "prompt_pattern is not a fixed normalized prompt matcher: "
-            "expected re.escape'd literal dialog markers (one exactly "
-            f"{CHANNEL_ENTRY!r}) joined by {PROMPT_MATCHER_GAP!r}; "
-            "arbitrary regular-expression evidence is refused"
+            "prompt_pattern is not the approved fixed normalized prompt "
+            "matcher: the code-owned approved marker sequence "
+            f"{APPROVED_PROMPT_MARKERS!r} joined by "
+            f"{PROMPT_MATCHER_GAP!r} is required exactly; caller-chosen "
+            "marker sets and arbitrary regular-expression evidence are "
+            "refused"
         )
 
 
@@ -771,7 +787,6 @@ class ChannelTrustGate:
                 anchor_id=anchor.anchor_id,
                 claim_operation_id=claim.operation_id,
                 stage="keypress",
-                confirmed=False,
             )
 
         operation = None
@@ -785,7 +800,9 @@ class ChannelTrustGate:
             )
         if operation is None:
             # The keypress happened but its completion receipt did not
-            # record — leave an explicit durable state, never silence.
+            # record — the outcome is AMBIGUOUS, never reported as
+            # success: an explicit durable state is left and the live
+            # claim keeps refusing any further Enter.
             return self._ambiguous(
                 cell_id=cell_id,
                 session_id=session_id,
@@ -793,7 +810,6 @@ class ChannelTrustGate:
                 anchor_id=anchor.anchor_id,
                 claim_operation_id=claim.operation_id,
                 stage="completion_receipt",
-                confirmed=True,
             )
         self._journal(
             confirmed=True,
@@ -855,14 +871,16 @@ class ChannelTrustGate:
         anchor_id: str,
         claim_operation_id: str,
         stage: str,
-        confirmed: bool,
     ) -> TrustVerdict:
         """Record the explicit durable ambiguous state after the
         external action: the keypress failed (``stage="keypress"``) or
         its completion receipt did not record
-        (``stage="completion_receipt"``). The claim stays live, so
-        nothing blindly retries — recovery is an operator verifying the
-        surface and acknowledging the claim and this state."""
+        (``stage="completion_receipt"``). EVERY ambiguous outcome is a
+        non-success verdict (``confirmed=False``,
+        ``first_failure="confirm_outcome_ambiguous"``). The claim stays
+        live, so nothing blindly retries — recovery is an operator
+        verifying the surface and acknowledging the claim and this
+        state."""
 
         detail = (
             "the keypress failed"
@@ -888,16 +906,16 @@ class ChannelTrustGate:
                 ),
                 dedup_key=f"channel.confirm_ambiguous:{claim_operation_id}",
             )
-        first_failure = None if confirmed else "confirm_outcome_ambiguous"
+        first_failure = "confirm_outcome_ambiguous"
         self._journal(
-            confirmed=confirmed,
+            confirmed=False,
             cell_id=cell_id,
             session_id=session_id,
             anchor_id=anchor_id,
             first_failure=first_failure,
         )
         return TrustVerdict(
-            confirmed=confirmed,
+            confirmed=False,
             anchor_id=anchor_id,
             first_failure=first_failure,
             receipt_operation_id=(

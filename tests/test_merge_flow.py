@@ -38,7 +38,7 @@ def test_missing_contract_fails_closed(tmp_path: Path) -> None:
 def test_running_package_ships_the_contract() -> None:
     resolved = merger_contract_path(Path("/nonexistent-config-root"))
     assert resolved.name == "codex-merger.md"
-    assert "BLOCKED_ON_EXTERNAL_INTAKE" in resolved.read_text(encoding="utf-8")
+    assert "Sol merge lead" in resolved.read_text(encoding="utf-8")
 
 
 class _FakeKeychain:
