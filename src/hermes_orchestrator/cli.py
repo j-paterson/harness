@@ -1385,7 +1385,12 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
     from hermes_orchestrator.events import EventStore
 
     def kickstart() -> None:
-        # The fleet restarts as one: both activation-bound jobs.
+        # The fleet restarts as one: both activation-bound jobs. A
+        # kickstart shortly after a prior one can block on launchd's
+        # ThrottleInterval (30s floor), so the client timeout must ride
+        # it out — observed live: a 30s timeout during a rollback
+        # restart turned a recoverable throttle wait into an ambiguous
+        # apply.
         for label in (ORCHESTRATOR_LABEL, OPERATIONS_LABEL):
             subprocess_module.run(
                 (
@@ -1396,7 +1401,7 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
                 ),
                 check=True,
                 capture_output=True,
-                timeout=30,
+                timeout=90,
             )
 
     database = Database.open(settings.state_dir / "state.db")
