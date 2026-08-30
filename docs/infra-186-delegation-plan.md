@@ -214,3 +214,66 @@ both corrected through delegation packets on disjoint files:
   path-coverage gate judges this candidate truthfully — lead work at
   beyond-exception scale is recorded as auditable fable-tier
   packets, never hidden under an exception.
+
+## Sol correction cycle 2 (correction `e8bb3772…`, reviewed `44cc5d6`)
+
+Two further Criticals. Critical A (receipt signing has no OS
+privilege boundary from same-user agents) is recorded as **not
+applicable** under the operator-approved MVP threat model: the
+operator narrowed INFRA-186 at 2026-08-30T03:06:41Z (correction
+`253fdded…`, source `operator_scope`) — same-user
+credential/database compromise is outside the local MVP threat
+model, and a sandbox, separate OS account, hardware-backed key,
+credential-stripped worker environment, or separately privileged
+attestation service is explicitly prohibited. Verifier-produced
+integrity and stale-input checks are preserved unchanged; no
+privilege boundary is implemented. Critical B (path declarations
+are not execution provenance; post-hoc packets — L1–L4
+demonstrably — satisfy the gate) remains in scope and is corrected
+here via packets D1/D2.
+
+### Binding provenance contract (D1 interface, frozen)
+
+- Migration 0047 adds nullable `reserved_blobs_json` and
+  `returned_blobs_json` to `subagent_packets`.
+- Measurement: for each of a packet's `allowed_files`, the sha256
+  hexdigest of the file's bytes in the packet's recorded worktree;
+  a missing file records the sentinel `"absent"`. The reader is an
+  injectable seam (default: filesystem) so tests never need real
+  worktrees.
+- `reserve(...)` measures and stores `reserved_blobs` at the moment
+  of reservation; an unreadable worktree refuses the reservation
+  entirely (CAS untouched).
+- `settle(..., outcome="completed")` measures and stores
+  `returned_blobs`; measurement failure refuses the settlement
+  (packet stays reserved). `failed`/`capped` settlements tolerate
+  missing measurement.
+- `SubagentPacket` gains `reserved_blobs: Mapping[str, str] | None`
+  and `returned_blobs: Mapping[str, str] | None` (None for legacy
+  rows — legacy rows are thereby PERMANENTLY without provenance).
+
+### Emission provenance rules (D2)
+
+A credited packet without both blob maps is refused outright. A
+credited path earns credit only when the packet's
+`reserved_blobs[path] != returned_blobs[path]` (the work happened
+inside the reservation window — a packet created after its claimed
+changes already exist measures no change and earns nothing) AND
+`returned_blobs[path]` equals the sha256 of that path's content at
+the candidate head (the integrated fragment is byte-identical to
+what the settled packet returned). Direct exceptions must be
+measured at record time — absent worktree, git failure, or
+unparsable measurement refuses BEFORE any packet is created — and
+their recorded hashes must match the candidate head for credited
+paths. Agent-authored evidence JSON is never consulted for credit.
+
+### Bootstrap consequence (reported, not bypassed)
+
+Under these rules every packet accepted before migration 0047 lacks
+provenance, so this candidate's own emission fails closed on its
+historical credit ("missing or failed provenance measurement leaves
+the candidate ineligible" — operator test, correction `253fdded…`).
+That is the honest reading of the correction; re-emission of THIS
+branch requires an explicit operator/Hermes bootstrap decision,
+which the lead has requested rather than building a waiver
+mechanism nobody authorized.

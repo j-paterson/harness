@@ -869,15 +869,20 @@ def _measure_direct_exception_diff(
     run: Callable[[Sequence[str]], str],
     worktree: str | None,
     expected_files: Sequence[str],
-) -> int | None:
+) -> int:
     """The authoritative-on-the-cli-side measured added+deleted line total
-    for ``expected_files`` in ``worktree``, or ``None`` when the worktree
-    is absent or the measurement could not be produced (git failure or an
-    unparsable numstat line) — the caller then falls back to the declared
-    cap and the emission-side reconciliation remains the real boundary."""
+    for ``expected_files`` in ``worktree``.
+
+    Measurement must SUCCEED before any direct-exception packet is
+    created — there is no "unmeasured" fallback. Raises ``ValueError``
+    when the worktree is absent, the git measurement command fails, or
+    its numstat output cannot be parsed for a declared file."""
 
     if not worktree:
-        return None
+        raise ValueError(
+            "direct-work exception requires a worktree to measure the "
+            "live diff: refusing before any packet is created"
+        )
     try:
         output = run(
             [
@@ -891,8 +896,11 @@ def _measure_direct_exception_diff(
                 *expected_files,
             ]
         )
-    except Exception:
-        return None
+    except Exception as error:
+        raise ValueError(
+            "direct-work exception could not measure the live diff: "
+            f"git numstat failed: {error}"
+        ) from error
     total = 0
     for line in output.splitlines():
         if not line.strip():
@@ -902,8 +910,11 @@ def _measure_direct_exception_diff(
             continue
         try:
             total += int(parts[0]) + int(parts[1])
-        except ValueError:
-            return None
+        except ValueError as error:
+            raise ValueError(
+                "direct-work exception could not measure the live diff: "
+                f"git numstat produced an unparsable line: {line!r}"
+            ) from error
     return total
 
 
@@ -1096,15 +1107,10 @@ def _hermes_handlers(
         measured_lines = _measure_direct_exception_diff(
             git_diff_run, worktree, command.expected_files
         )
-        if measured_lines is not None and (
-            measured_lines > 30 or measured_lines > command.expected_lines
-        ):
+        if measured_lines > 30 or measured_lines > command.expected_lines:
             raise ValueError(
                 "direct-work exception exceeds the measured diff bound"
             )
-        measured_lines_value = (
-            "unmeasured" if measured_lines is None else str(measured_lines)
-        )
         packet = packets.create(
             issue_id=command.issue_id,
             project_key=_project_key,
@@ -1114,7 +1120,7 @@ def _hermes_handlers(
             model_tier="fable",
             effort="high",
             allowed_files=command.expected_files,
-            worktree=worktree if worktree else cell_id,
+            worktree=worktree,
             red_test="direct-work exception",
             verification=[command.verification],
             invariants=command.reason,
@@ -1132,7 +1138,7 @@ def _hermes_handlers(
             evidence={
                 "exception_reason": command.reason,
                 "expected_lines": str(command.expected_lines),
-                "measured_lines": measured_lines_value,
+                "measured_lines": str(measured_lines),
             },
         )
         return _packet_payload(packet)

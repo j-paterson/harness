@@ -18,12 +18,14 @@ forever.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from hermes_orchestrator.db import Database
@@ -33,10 +35,23 @@ PACKET_MODEL_TIERS = ("haiku", "sonnet", "fable")
 
 _SETTLEMENT_OUTCOMES = ("completed", "failed", "capped")
 
+_ABSENT_BLOB = "absent"
+
 
 class PacketRefused(ValueError):
     """The requested packet creation or transition violates the ledger's
     contract (unknown tier, foreign session, stale CAS, and similar)."""
+
+
+def _read_file_from_disk(path: Path) -> bytes | None:
+    """Default byte-reader: ``None`` when the path does not exist, else
+    the file's raw bytes. Any other OS-level failure (permissions, a
+    directory in place of a file, and similar) propagates as-is."""
+
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +75,8 @@ class SubagentPacket:
     resource_note: str
     state: str
     evidence: dict[str, Any] | None
+    reserved_blobs: Mapping[str, str] | None
+    returned_blobs: Mapping[str, str] | None
     created_at: str
     updated_at: str
 
@@ -74,11 +91,31 @@ class SubagentPackets:
         events: EventStore,
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
+        read_file: Callable[[Path], bytes | None] | None = None,
     ) -> None:
         self._database = database
         self._events = events
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or (lambda: datetime.now(UTC))
+        self._read_file = read_file or _read_file_from_disk
+
+    def _measure(
+        self, worktree: str, allowed_files: Sequence[str]
+    ) -> dict[str, str]:
+        """Measure the sha256 hexdigest of each allowed file's raw bytes
+        as read from ``worktree``; a missing file records the sentinel
+        ``"absent"``. Propagates any OSError the reader raises for a
+        file it cannot account for as simply missing."""
+
+        blobs: dict[str, str] = {}
+        for path in allowed_files:
+            content = self._read_file(Path(worktree) / path)
+            blobs[path] = (
+                _ABSENT_BLOB
+                if content is None
+                else hashlib.sha256(content).hexdigest()
+            )
+        return blobs
 
     def create(
         self,
@@ -176,15 +213,17 @@ class SubagentPackets:
 
         Refuses an unknown packet, a foreign ``session_id`` (one other
         than the packet's bound session), a packet already reserved
-        (or otherwise not ``planned``), or a ``depends_on`` entry that
-        is not yet ``accepted``.
+        (or otherwise not ``planned``), a ``depends_on`` entry that is
+        not yet ``accepted``, or a pre-work measurement of its
+        ``allowed_files`` that raises (an unreadable worktree) — in
+        every refusal case the row is left completely untouched.
         """
 
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             row = connection.execute(
-                "SELECT session_id, depends_on_json FROM subagent_packets "
-                "WHERE packet_id = ?",
+                "SELECT session_id, depends_on_json, allowed_files_json, "
+                "worktree FROM subagent_packets WHERE packet_id = ?",
                 (packet_id,),
             ).fetchone()
             if row is None:
@@ -202,11 +241,24 @@ class SubagentPackets:
                     raise PacketRefused(
                         f"dependency {dependency_id!r} is not accepted"
                     )
+            allowed_files = tuple(json.loads(str(row["allowed_files_json"])))
+            worktree = str(row["worktree"])
+            try:
+                reserved_blobs = self._measure(worktree, allowed_files)
+            except OSError as exc:
+                raise PacketRefused(
+                    f"packet {packet_id!r} worktree is unreadable: {exc}"
+                ) from exc
             cursor = connection.execute(
                 "UPDATE subagent_packets SET state = 'reserved', "
-                "tool_use_id = ?, updated_at = ? "
+                "tool_use_id = ?, reserved_blobs_json = ?, updated_at = ? "
                 "WHERE packet_id = ? AND state = 'planned'",
-                (tool_use_id, stamp, packet_id),
+                (
+                    tool_use_id,
+                    json.dumps(reserved_blobs, sort_keys=True),
+                    stamp,
+                    packet_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise PacketRefused(f"packet {packet_id!r} is not reservable")
@@ -219,6 +271,7 @@ class SubagentPackets:
                     payload={
                         "session_id": session_id,
                         "tool_use_id": tool_use_id,
+                        "measured_files": len(reserved_blobs),
                     },
                 ),
             )
@@ -229,18 +282,52 @@ class SubagentPackets:
     ) -> SubagentPacket:
         """CAS ``reserved`` -> ``returned`` (completed) or ``failed``
         (failed/capped); the settling ``tool_use_id`` must match the
-        one recorded at reservation. Exactly once."""
+        one recorded at reservation. Exactly once.
+
+        A ``completed`` settlement also measures the packet's
+        ``allowed_files`` as returned and stores the mapping; a
+        measurement that raises (an unreadable worktree) refuses the
+        settlement and leaves the packet ``reserved``, untouched. A
+        ``failed``/``capped`` settlement never measures and always
+        leaves the returned snapshot ``NULL``.
+        """
 
         if outcome not in _SETTLEMENT_OUTCOMES:
             raise PacketRefused(f"unknown settlement outcome {outcome!r}")
         target_state = "returned" if outcome == "completed" else "failed"
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            returned_blobs_json: str | None = None
+            measured_files = 0
+            if outcome == "completed":
+                row = connection.execute(
+                    "SELECT worktree, allowed_files_json FROM subagent_packets "
+                    "WHERE packet_id = ? AND state = 'reserved' "
+                    "AND tool_use_id = ?",
+                    (packet_id, tool_use_id),
+                ).fetchone()
+                if row is not None:
+                    allowed_files = tuple(
+                        json.loads(str(row["allowed_files_json"]))
+                    )
+                    worktree = str(row["worktree"])
+                    try:
+                        returned_blobs = self._measure(worktree, allowed_files)
+                    except OSError as exc:
+                        raise PacketRefused(
+                            f"packet {packet_id!r} worktree is unreadable: "
+                            f"{exc}"
+                        ) from exc
+                    returned_blobs_json = json.dumps(
+                        returned_blobs, sort_keys=True
+                    )
+                    measured_files = len(returned_blobs)
             cursor = connection.execute(
-                "UPDATE subagent_packets SET state = ?, updated_at = ? "
+                "UPDATE subagent_packets SET state = ?, "
+                "returned_blobs_json = ?, updated_at = ? "
                 "WHERE packet_id = ? AND state = 'reserved' "
                 "AND tool_use_id = ?",
-                (target_state, stamp, packet_id, tool_use_id),
+                (target_state, returned_blobs_json, stamp, packet_id, tool_use_id),
             )
             if cursor.rowcount != 1:
                 raise PacketRefused(
@@ -253,7 +340,11 @@ class SubagentPackets:
                     event_type=f"subagent_packet.{target_state}",
                     aggregate_type="subagent_packet",
                     aggregate_id=packet_id,
-                    payload={"outcome": outcome, "tool_use_id": tool_use_id},
+                    payload={
+                        "outcome": outcome,
+                        "tool_use_id": tool_use_id,
+                        "measured_files": measured_files,
+                    },
                 ),
             )
         return self.get(packet_id)
@@ -409,6 +500,8 @@ class SubagentPackets:
     @staticmethod
     def _record(row: sqlite3.Row) -> SubagentPacket:
         evidence_json = row["evidence_json"]
+        reserved_blobs_json = row["reserved_blobs_json"]
+        returned_blobs_json = row["returned_blobs_json"]
         return SubagentPacket(
             packet_id=str(row["packet_id"]),
             issue_id=str(row["issue_id"]),
@@ -430,6 +523,16 @@ class SubagentPackets:
                 None
                 if evidence_json is None
                 else dict(json.loads(str(evidence_json)))
+            ),
+            reserved_blobs=(
+                None
+                if reserved_blobs_json is None
+                else dict(json.loads(str(reserved_blobs_json)))
+            ),
+            returned_blobs=(
+                None
+                if returned_blobs_json is None
+                else dict(json.loads(str(returned_blobs_json)))
             ),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),

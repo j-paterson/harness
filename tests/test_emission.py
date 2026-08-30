@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -361,6 +362,13 @@ class FakePacket:
     worktree: str = "/repo"
     generation: int = 1
     updated_at: str = "2026-08-28T00:00:00+00:00"
+    # Measured provenance (D1): ``None`` reproduces a legacy row with no
+    # measurement at all. A real, credit-worthy packet must set both
+    # (regular) or at least ``returned_blobs`` (exception) via the
+    # ``_blob_hash``/``_wire_head_content`` helpers below so the
+    # provenance it carries is coherent with the fake git tree.
+    reserved_blobs: dict[str, str] | None = None
+    returned_blobs: dict[str, str] | None = None
 
 
 @dataclass
@@ -369,6 +377,35 @@ class FakePackets:
 
     def for_issue(self, issue_id: str) -> tuple[FakePacket, ...]:
         return tuple(self.by_issue.get(issue_id, ()))
+
+
+def _blob_hash(content: str) -> str:
+    """Mirror ``CandidateEmitter._head_blob_hash``'s encoding invariant so
+    test fixtures can compute a returned blob that matches a given
+    ``git show`` stub's content exactly."""
+
+    return hashlib.sha256(content.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def _wire_head_content(
+    git: FakeGitRunner, head: str, contents: dict[str, str]
+) -> dict[str, str]:
+    """Stub ``git show <head>:<path>`` for each path in ``contents`` and
+    return the matching ``{path: sha256-hexdigest}`` map — the correct
+    ``returned_blobs`` for a packet credited on exactly those paths."""
+
+    returned: dict[str, str] = {}
+    for path, content in contents.items():
+        git.responses[("show", f"{head}:{path}")] = content
+        returned[path] = _blob_hash(content)
+    return returned
+
+
+def _stale_reserved(returned: dict[str, str]) -> dict[str, str]:
+    """A ``reserved_blobs`` map guaranteed to differ from ``returned`` at
+    every path — i.e. real content actually changed during the window."""
+
+    return {path: f"before:{blob}" for path, blob in returned.items()}
 
 
 def _non_trivial_git() -> FakeGitRunner:
@@ -436,6 +473,11 @@ async def test_non_trivial_candidate_with_one_accepted_packet_publishes(
     # Here the single accepted packet's scope covers both changed files,
     # so the candidate is admitted and the manifest records its credit.
     git = _non_trivial_git()
+    returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -445,6 +487,8 @@ async def test_non_trivial_candidate_with_one_accepted_packet_publishes(
                     packet_id="pkt-1",
                     allowed_files=("src/app.py", "tests/test_app.py"),
                     evidence={},
+                    reserved_blobs=_stale_reserved(returned),
+                    returned_blobs=returned,
                 ),
             ]
         }
@@ -596,6 +640,9 @@ async def test_direct_exception_exceeding_the_credited_file_bound_is_blocked(
             ("c.py", 1, 1),
         )
     )
+    exc_returned = _wire_head_content(
+        git, HEAD, {"a.py": "a new", "b.py": "b new", "c.py": "c new"}
+    )
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -604,6 +651,7 @@ async def test_direct_exception_exceeding_the_credited_file_bound_is_blocked(
                     packet_id="pkt-exc",
                     allowed_files=("a.py", "b.py", "c.py"),
                     evidence={"exception_reason": "typo sweep", "expected_lines": "30"},
+                    returned_blobs=exc_returned,
                 )
             ]
         }
@@ -623,6 +671,11 @@ async def test_direct_exception_exceeding_the_credited_line_bound_is_blocked(
     # Two files, credited lines total 44 > the fixed thirty-line cap even
     # though the packet declared a generous expected_lines.
     git = _non_trivial_git()
+    exc_returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -634,6 +687,7 @@ async def test_direct_exception_exceeding_the_credited_line_bound_is_blocked(
                         "exception_reason": "large exception",
                         "expected_lines": "100",
                     },
+                    returned_blobs=exc_returned,
                 )
             ]
         }
@@ -660,6 +714,10 @@ async def test_direct_exception_exceeding_its_own_declared_expected_lines_is_blo
             ("reg.py", 1, 1),
         )
     )
+    reg_returned = _wire_head_content(git, HEAD, {"reg.py": "reg new content"})
+    exc_returned = _wire_head_content(
+        git, HEAD, {"exc1.py": "exc1 new content", "exc2.py": "exc2 new content"}
+    )
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -668,6 +726,8 @@ async def test_direct_exception_exceeding_its_own_declared_expected_lines_is_blo
                     packet_id="pkt-reg",
                     allowed_files=("reg.py",),
                     evidence={},
+                    reserved_blobs=_stale_reserved(reg_returned),
+                    returned_blobs=reg_returned,
                 ),
                 FakePacket(
                     state="accepted",
@@ -677,6 +737,7 @@ async def test_direct_exception_exceeding_its_own_declared_expected_lines_is_blo
                         "exception_reason": "tight exception",
                         "expected_lines": "20",
                     },
+                    returned_blobs=exc_returned,
                 ),
             ]
         }
@@ -725,6 +786,11 @@ async def test_regular_packet_wins_over_an_exception_on_the_same_path(
     tmp_path: Path,
 ) -> None:
     git = _non_trivial_git()
+    returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -733,12 +799,17 @@ async def test_regular_packet_wins_over_an_exception_on_the_same_path(
                     packet_id="pkt-reg",
                     allowed_files=("src/app.py", "tests/test_app.py"),
                     evidence={},
+                    reserved_blobs=_stale_reserved(returned),
+                    returned_blobs=returned,
                 ),
                 FakePacket(
                     state="accepted",
                     packet_id="pkt-exc",
                     allowed_files=("src/app.py",),
                     evidence={"exception_reason": "also claims it here"},
+                    # Never credited (the regular packet wins the shared
+                    # path), so its own provenance is irrelevant here —
+                    # left at the legacy None default on purpose.
                 ),
             ]
         }
@@ -766,6 +837,9 @@ async def test_fully_covered_candidate_with_regulars_and_a_bounded_exception(
             ("exc.py", 3, 2),
         )
     )
+    reg1_returned = _wire_head_content(git, HEAD, {"reg1.py": "reg1 new content"})
+    reg2_returned = _wire_head_content(git, HEAD, {"reg2.py": "reg2 new content"})
+    exc_returned = _wire_head_content(git, HEAD, {"exc.py": "exc new content"})
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -777,6 +851,8 @@ async def test_fully_covered_candidate_with_regulars_and_a_bounded_exception(
                     session_id="sess-shared",
                     worktree="/wt-shared",
                     generation=3,
+                    reserved_blobs=_stale_reserved(reg1_returned),
+                    returned_blobs=reg1_returned,
                 ),
                 FakePacket(
                     state="accepted",
@@ -786,6 +862,8 @@ async def test_fully_covered_candidate_with_regulars_and_a_bounded_exception(
                     session_id="sess-shared",
                     worktree="/wt-shared",
                     generation=3,
+                    reserved_blobs=_stale_reserved(reg2_returned),
+                    returned_blobs=reg2_returned,
                 ),
                 FakePacket(
                     state="accepted",
@@ -798,6 +876,7 @@ async def test_fully_covered_candidate_with_regulars_and_a_bounded_exception(
                     session_id="sess-shared",
                     worktree="/wt-shared",
                     generation=3,
+                    returned_blobs=exc_returned,
                 ),
             ]
         }
@@ -819,6 +898,10 @@ async def test_fully_covered_candidate_with_regulars_and_a_bounded_exception(
 @pytest.mark.asyncio
 async def test_credited_packet_identity_mismatch_is_blocked(tmp_path: Path) -> None:
     git = _non_trivial_git()
+    a_returned = _wire_head_content(git, HEAD, {"src/app.py": "new src content"})
+    b_returned = _wire_head_content(
+        git, HEAD, {"tests/test_app.py": "new test content"}
+    )
     packets = FakePackets(
         by_issue={
             "ENG-9": [
@@ -830,6 +913,8 @@ async def test_credited_packet_identity_mismatch_is_blocked(tmp_path: Path) -> N
                     session_id="sess-a",
                     worktree="/wt-a",
                     generation=1,
+                    reserved_blobs=_stale_reserved(a_returned),
+                    returned_blobs=a_returned,
                 ),
                 FakePacket(
                     state="accepted",
@@ -839,6 +924,8 @@ async def test_credited_packet_identity_mismatch_is_blocked(tmp_path: Path) -> N
                     session_id="sess-b",
                     worktree="/wt-a",
                     generation=1,
+                    reserved_blobs=_stale_reserved(b_returned),
+                    returned_blobs=b_returned,
                 ),
             ]
         }
@@ -849,6 +936,274 @@ async def test_credited_packet_identity_mismatch_is_blocked(tmp_path: Path) -> N
         await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
 
     assert deliverer.events == []
+
+
+# --- measured execution provenance (Sol reviewer Critical: PR #30) ---------
+#
+# Path coverage and identity agreement are not enough: a credited packet
+# must PROVE — via the ledger's own reserve/settle blob snapshots — that
+# it actually produced the credited fragment. Agent-authored evidence
+# JSON is never consulted for credit decisions.
+
+
+@pytest.mark.asyncio
+async def test_packet_created_after_the_change_earns_no_credit_and_blocks_as_uncovered(
+    tmp_path: Path,
+) -> None:
+    # The packet's reserved and returned blobs are IDENTICAL for both of
+    # its credited paths: nothing changed during its reservation window,
+    # so it was created after the change already existed on disk. It
+    # earns no credit for either path, and since it is the sole
+    # claimant, the emission fails closed as an uncovered path — the
+    # same way a path with no claimant at all does.
+    git = _non_trivial_git()
+    same_blobs = {
+        "src/app.py": _blob_hash("unchanged content"),
+        "tests/test_app.py": _blob_hash("unchanged content 2"),
+    }
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                    reserved_blobs=dict(same_blobs),
+                    returned_blobs=dict(same_blobs),
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("src/app.py")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_returned_blob_mismatching_head_content_is_rejected(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    git.responses[("show", f"{HEAD}:src/app.py")] = "actual head content"
+    git.responses[("show", f"{HEAD}:tests/test_app.py")] = "actual test content"
+    returned = {
+        "src/app.py": _blob_hash("a fragment that is not actually at head"),
+        "tests/test_app.py": _blob_hash("actual test content"),
+    }
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(returned),
+                    returned_blobs=returned,
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("pkt-1")) as excinfo:
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+    assert "src/app.py" in str(excinfo.value)
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_matching_provenance_credits_only_the_actually_changed_paths(
+    tmp_path: Path,
+) -> None:
+    # pkt-1's allowed_files also names a third path never touched by
+    # this candidate's diff; only the two ACTUALLY changed paths are
+    # credited, and only those need measured provenance to line up.
+    git = _non_trivial_git()
+    returned = _wire_head_content(
+        git,
+        HEAD,
+        {"src/app.py": "new src content", "tests/test_app.py": "new test content"},
+    )
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=(
+                        "src/app.py",
+                        "tests/test_app.py",
+                        "unrelated/other.py",
+                    ),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(returned),
+                    returned_blobs=returned,
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-1", "files=2;lines=44") in manifest.verification
+
+
+@pytest.mark.asyncio
+async def test_rich_agent_authored_evidence_without_provenance_cannot_earn_credit(
+    tmp_path: Path,
+) -> None:
+    # The evidence dict looks entirely legitimate (diff summary, proof
+    # references) but the packet was never actually measured at reserve
+    # or settle time — the JSON is never a substitute for the ledger's
+    # own measured blobs.
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-1",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={
+                        "diff": "clean, matches red test",
+                        "red_proof": "pytest -k red passed",
+                        "green_proof": "pytest -q passed",
+                    },
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("pkt-1")) as excinfo:
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+    assert "provenance" in str(excinfo.value)
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_credited_legacy_packet_blocks_emission_naming_the_packet(
+    tmp_path: Path,
+) -> None:
+    # A legacy row (created before D1's measured provenance existed):
+    # ``reserved_blobs``/``returned_blobs`` are both ``None``.
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-legacy",
+                    allowed_files=("src/app.py", "tests/test_app.py"),
+                    evidence={},
+                )
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("pkt-legacy")):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_exception_packet_with_head_matching_returned_blob_is_admitted(
+    tmp_path: Path,
+) -> None:
+    git = _custom_git((("reg.py", 5, 5), ("exc.py", 15, 15)))
+    reg_returned = _wire_head_content(git, HEAD, {"reg.py": "reg new content"})
+    exc_returned = _wire_head_content(git, HEAD, {"exc.py": "exc new content"})
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg",
+                    allowed_files=("reg.py",),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(reg_returned),
+                    returned_blobs=reg_returned,
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("exc.py",),
+                    evidence={
+                        "exception_reason": "bounded exception",
+                        "expected_lines": "40",
+                    },
+                    returned_blobs=exc_returned,
+                ),
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+    manifest = read_manifest(result.manifest_path, root=tmp_path / "manifests")
+    assert ("packet:pkt-exc", "files=1;lines=30") in manifest.verification
+
+
+@pytest.mark.asyncio
+async def test_exception_packet_with_mismatching_returned_blob_is_rejected(
+    tmp_path: Path,
+) -> None:
+    git = _custom_git((("reg.py", 5, 5), ("exc.py", 15, 15)))
+    reg_returned = _wire_head_content(git, HEAD, {"reg.py": "reg new content"})
+    git.responses[("show", f"{HEAD}:exc.py")] = "actual exc head content"
+    exc_returned = {"exc.py": _blob_hash("a totally different fragment")}
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-reg",
+                    allowed_files=("reg.py",),
+                    evidence={},
+                    reserved_blobs=_stale_reserved(reg_returned),
+                    returned_blobs=reg_returned,
+                ),
+                FakePacket(
+                    state="accepted",
+                    packet_id="pkt-exc",
+                    allowed_files=("exc.py",),
+                    evidence={
+                        "exception_reason": "bounded exception",
+                        "expected_lines": "40",
+                    },
+                    returned_blobs=exc_returned,
+                ),
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match=re.escape("pkt-exc")) as excinfo:
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+    assert "exc.py" in str(excinfo.value)
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
 
 
 @pytest.mark.asyncio

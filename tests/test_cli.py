@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 46
+    assert json.loads(result.stdout)["schema_version"] == 47
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -874,7 +874,7 @@ def test_hermes_command_create_accept_reject_packet_lifecycle(
 
 
 def test_hermes_command_record_direct_exception_creates_accepted_packet(
-    configured_repo: tuple[Path, Path],
+    configured_repo: tuple[Path, Path], tmp_path: Path
 ) -> None:
     _repo_root, state_dir = configured_repo
     add = invoke(
@@ -893,6 +893,19 @@ def test_hermes_command_record_direct_exception_creates_accepted_packet(
     assert add.exit_code == 0
     _seed_active_cell(state_dir / "state.db")
 
+    # Measurement must SUCCEED before any packet is created — there is
+    # no "unmeasured" fallback — so the exception's worktree must be a
+    # real git checkout with a real, measurable diff against HEAD.
+    worktree = tmp_path / "direct-exception-worktree"
+    (worktree / "src").mkdir(parents=True)
+    (worktree / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _verifier_git(worktree, "init", "-q")
+    _verifier_git(worktree, "add", "-A")
+    _verifier_git(worktree, "commit", "-qm", "init")
+    (worktree / "src" / "app.py").write_text(
+        "x = 1\ny = 2\nz = 3\n", encoding="utf-8"
+    )
+
     within_scale = invoke(
         [
             *base_arguments(configured_repo),
@@ -906,6 +919,7 @@ def test_hermes_command_record_direct_exception_creates_accepted_packet(
                     "expected_files": ["src/app.py"],
                     "expected_lines": 5,
                     "verification": "pytest -q",
+                    "worktree": str(worktree),
                 }
             ),
         ]
@@ -916,14 +930,14 @@ def test_hermes_command_record_direct_exception_creates_accepted_packet(
     assert payload["state"]["state"] == "accepted"
     assert payload["state"]["model_tier"] == "fable"
     assert payload["state"]["allowed_files"] == ["src/app.py"]
-    # Updated for the CLI-side measurement requirement: with no worktree
-    # declared, the live diff cannot be measured, so evidence records
-    # that explicitly and the existing declared-cap check remains the
-    # deciding factor.
+    # Updated for the CLI-side measurement requirement: the live diff is
+    # now ALWAYS measured before any packet is created (no "unmeasured"
+    # fallback), so evidence records the real added+deleted line count
+    # measured against the worktree's actual git history.
     assert payload["state"]["evidence"] == {
         "exception_reason": "one-line typo fix",
         "expected_lines": "5",
-        "measured_lines": "unmeasured",
+        "measured_lines": "2",
     }
 
     over_scale = invoke(
@@ -1032,6 +1046,83 @@ def test_record_direct_exception_measures_the_live_diff_via_the_run_seam(
         "expected_lines": "20",
         "measured_lines": "8",
     }
+
+
+def test_record_direct_exception_refuses_before_any_packet_when_unmeasurable(
+    tmp_path: Path,
+) -> None:
+    """Measurement must SUCCEED before any packet is created: an absent
+    worktree, a failing git invocation, and unparsable numstat output
+    each refuse with ``ValueError`` before ``packets.create`` runs —
+    there is no "unmeasured" fallback."""
+
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_active_cell(
+        tmp_path / "state.db",
+        project_key="demo",
+        session_id="sess-1",
+        cell_id="cell-1",
+    )
+    events = EventStore(runtime.database)
+    outbox = LeadCorrectionOutbox(
+        database=runtime.database,
+        events=events,
+        project_for_issue=lambda issue_id: "demo",
+    )
+    packets = SubagentPackets(runtime.database, events=events)
+    settings = SimpleNamespace(repo_root=tmp_path)
+
+    def command(**overrides: object) -> object:
+        base: dict[str, object] = {
+            "issue_id": "ENG-9",
+            "reason": "measured exception",
+            "expected_files": ["src/app.py"],
+            "expected_lines": 20,
+            "verification": "pytest -q",
+            "worktree": "/some/worktree",
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    # 1. No worktree at all: git must never even be invoked.
+    def unreached_run(args: list[str]) -> str:
+        raise AssertionError("git must never be invoked without a worktree")
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=unreached_run)
+    with pytest.raises(ValueError, match="worktree"):
+        handlers["record_direct_exception"](command(worktree=None))
+    assert packets.for_issue("ENG-9") == ()
+
+    # 2. The numstat run itself raises (a broken git invocation).
+    def raising_run(args: list[str]) -> str:
+        raise RuntimeError("git binary not found")
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=raising_run)
+    with pytest.raises(ValueError, match="git numstat failed"):
+        handlers["record_direct_exception"](command())
+    assert packets.for_issue("ENG-9") == ()
+
+    # 3. The numstat output cannot be parsed for a declared file.
+    def unparsable_run(args: list[str]) -> str:
+        return "-\t-\tsrc/app.py\n"
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=unparsable_run)
+    with pytest.raises(ValueError, match="unparsable"):
+        handlers["record_direct_exception"](command())
+    assert packets.for_issue("ENG-9") == ()
+
+    # 4. A successful, fully measured path still records real measured_lines
+    # (covered end-to-end above); confirm no stray packets were left behind
+    # by any of the three refused attempts.
+    assert packets.for_issue("ENG-9") == ()
 
 
 def _recording_hermes_config(tmp_path: Path, *, exit_code: int = 0) -> Path:

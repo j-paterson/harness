@@ -11,6 +11,7 @@ registered wake deduplicates.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -124,6 +125,13 @@ class CorrectionSinkPort(Protocol):
 
 class EmissionBlocked(RuntimeError):
     """The local clone is not at a valid immutable freeze boundary."""
+
+
+# The ledger's own absent-file sentinel (``subagent_packets._ABSENT_BLOB``).
+# Duplicated here (rather than imported) because it is a stable, documented
+# string contract between the ledger and every consumer of its blobs, not
+# an implementation detail of the ledger module.
+_ABSENT_BLOB = "absent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,9 +357,23 @@ class CandidateEmitter:
         closed, naming it. Each credited exception's paths and measured
         lines must stay inside both the fixed reviewer-fix scale and its
         own declared ``expected_lines``. Every credited packet must share
-        one ``(session_id, worktree, generation)`` identity. Never
-        inferred — always proven from the durable ledger and the actual
-        git diff.
+        one ``(session_id, worktree, generation)`` identity.
+
+        Path coverage alone is not enough: every credited packet must
+        also carry immutable, MEASURED execution provenance proving it
+        actually produced the credited fragment, never a mere claim in
+        its agent-authored evidence JSON. A regular packet needs both a
+        ``reserved_blobs`` and a ``returned_blobs`` snapshot and is
+        credited for a path only when that path's content changed inside
+        its reservation window (``reserved != returned`` — otherwise the
+        packet was created after its claimed changes already existed and
+        the path has no valid owner). A direct exception needs at least
+        its ``returned_blobs`` snapshot (inherently post-hoc, but still
+        measured at record time). For every credited path, of either
+        kind, the packet's returned blob must equal the sha256 of that
+        path's actual content at the candidate head, proven fresh via
+        ``git show``. Never inferred — always proven from the durable
+        ledger and the actual git diff and tree.
         """
 
         numstat = self._run(repo, "diff", "--numstat", base, head)
@@ -441,6 +463,51 @@ class CandidateEmitter:
         for path, packet in credited_by_path.items():
             packet_paths.setdefault(packet.packet_id, []).append(path)
             packet_by_id[packet.packet_id] = packet
+
+        # Every credited packet must carry immutable, measured execution
+        # provenance — the agent-authored evidence JSON never substitutes
+        # for it. A regular packet needs BOTH its reserve-time and
+        # settle-time blob snapshots; a direct exception (post-hoc by
+        # nature) needs at least its settle-time snapshot. A regular
+        # packet is credited for a path only when that path's content
+        # actually changed inside the packet's reservation window
+        # (reserved != returned) — a packet fabricated after its claimed
+        # changes already existed measures identical blobs and earns
+        # nothing, leaving the path with no valid owner. Every credited
+        # path's returned blob must also equal the sha256 of that path's
+        # ACTUAL content at the candidate head, proven fresh from git —
+        # never inferred from the packet's own say-so.
+        for packet_id, paths in packet_paths.items():
+            packet = packet_by_id[packet_id]
+            evidence = packet.evidence or {}
+            is_exception = "exception_reason" in evidence
+            if is_exception:
+                if packet.returned_blobs is None:
+                    raise EmissionBlocked(
+                        f"packet {packet_id!r} lacks immutable execution "
+                        "provenance: no measured returned blobs"
+                    )
+            elif packet.reserved_blobs is None or packet.returned_blobs is None:
+                raise EmissionBlocked(
+                    f"packet {packet_id!r} lacks immutable execution "
+                    "provenance: no measured reserved/returned blobs"
+                )
+            for path in paths:
+                returned_blob = packet.returned_blobs.get(path)
+                if not is_exception:
+                    reserved_blob = packet.reserved_blobs.get(path)
+                    if reserved_blob == returned_blob:
+                        raise EmissionBlocked(
+                            "delegation evidence missing: "
+                            f"{path!r} is not covered by any accepted "
+                            "subagent packet"
+                        )
+                head_blob = self._head_blob_hash(repo, head, path)
+                if returned_blob != head_blob:
+                    raise EmissionBlocked(
+                        f"packet {packet_id!r} returned blob for {path!r} "
+                        "does not match the candidate head content"
+                    )
 
         for packet in exceptions:
             paths = packet_paths.get(packet.packet_id)
@@ -532,6 +599,34 @@ class CandidateEmitter:
             f"verify --gate {self._candidate_gate_id} -- <full test "
             "command>` on this exact tree"
         )
+
+    def _head_blob_hash(self, repo: Path, head: str, path: str) -> str:
+        """The sha256 hexdigest of ``path``'s content at ``head``, proven
+        fresh from git and comparable against the ledger's raw-byte
+        measurement.
+
+        INVARIANT: the ledger (``SubagentPackets``) measures the sha256
+        of each allowed file's raw bytes read directly off disk, while
+        ``self._run`` returns ``str`` — the git seam's already-decoded
+        subprocess stdout. To keep the two measurements comparable, the
+        shown content is re-encoded as UTF-8 with
+        ``errors="surrogateescape"`` before hashing: this is the exact
+        inverse of the decode step the git seam already performed, so
+        for any content the seam could decode at all, hashing the
+        re-encoded bytes reproduces the hash of the original blob bytes.
+        A path whose head content cannot be shown at all (deleted at
+        head, or any other git failure) is treated as the ledger's own
+        ``"absent"`` sentinel, so it can only match a packet's own
+        ``"absent"`` returned blob.
+        """
+
+        try:
+            content = self._run(repo, "show", f"{head}:{path}")
+        except EmissionBlocked:
+            return _ABSENT_BLOB
+        return hashlib.sha256(
+            content.encode("utf-8", errors="surrogateescape")
+        ).hexdigest()
 
     def _run(self, repo: Path, *args: str) -> str:
         try:

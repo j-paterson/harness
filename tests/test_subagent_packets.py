@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -328,3 +330,171 @@ def test_for_issue_lists_only_that_issues_packets(
     found = packets.for_issue("INFRA-186-a")
 
     assert [packet.packet_id for packet in found] == [a1.packet_id, a2.packet_id]
+
+
+# --- INFRA-194: reservation and settlement carry a measured binding to
+# the work actually performed (execution provenance). ---
+
+
+def test_reserve_stores_measured_blobs_including_absent_sentinel(
+    database: Database,
+) -> None:
+    present_path = "/work/demo/present.py"
+    content = b"print('hello')"
+
+    def read_file(path: Path) -> bytes | None:
+        if str(path) == present_path:
+            return content
+        return None
+
+    packets = SubagentPackets(
+        database, events=EventStore(database), now=lambda: NOW, read_file=read_file
+    )
+    packet = create(packets, allowed_files=("present.py", "missing.py"))
+
+    reserved = packets.reserve(
+        packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+    )
+
+    assert reserved.reserved_blobs == {
+        "present.py": hashlib.sha256(content).hexdigest(),
+        "missing.py": "absent",
+    }
+    assert packets.get(packet.packet_id).reserved_blobs == reserved.reserved_blobs
+
+
+def test_reserve_refuses_when_measurement_raises_and_leaves_packet_planned(
+    database: Database,
+) -> None:
+    def read_file(path: Path) -> bytes | None:
+        raise OSError("worktree unreadable")
+
+    packets = SubagentPackets(
+        database, events=EventStore(database), now=lambda: NOW, read_file=read_file
+    )
+    packet = create(packets)
+
+    with pytest.raises(PacketRefused):
+        packets.reserve(
+            packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+        )
+
+    reloaded = packets.get(packet.packet_id)
+    assert reloaded.state == "planned"
+    assert reloaded.reserved_blobs is None
+
+
+def test_completed_settle_stores_returned_blobs_reflecting_changed_content(
+    database: Database,
+) -> None:
+    path_str = "/work/demo/present.py"
+    state = {"content": b"before"}
+
+    def read_file(path: Path) -> bytes | None:
+        if str(path) == path_str:
+            return state["content"]
+        return None
+
+    packets = SubagentPackets(
+        database, events=EventStore(database), now=lambda: NOW, read_file=read_file
+    )
+    packet = create(packets, allowed_files=("present.py",))
+    reserved = packets.reserve(
+        packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+    )
+    assert reserved.reserved_blobs == {
+        "present.py": hashlib.sha256(b"before").hexdigest()
+    }
+
+    state["content"] = b"after"
+    settled = packets.settle(
+        packet.packet_id, outcome="completed", tool_use_id=TOOL_USE_A
+    )
+
+    assert settled.returned_blobs == {
+        "present.py": hashlib.sha256(b"after").hexdigest()
+    }
+    assert settled.returned_blobs != settled.reserved_blobs
+
+
+def test_completed_settle_refuses_when_measurement_raises_and_leaves_reserved(
+    database: Database,
+) -> None:
+    calls = {"n": 0}
+
+    def read_file(path: Path) -> bytes | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return b"ok"
+        raise OSError("worktree unreadable")
+
+    packets = SubagentPackets(
+        database, events=EventStore(database), now=lambda: NOW, read_file=read_file
+    )
+    packet = create(packets)
+    packets.reserve(
+        packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+    )
+
+    with pytest.raises(PacketRefused):
+        packets.settle(
+            packet.packet_id, outcome="completed", tool_use_id=TOOL_USE_A
+        )
+
+    reloaded = packets.get(packet.packet_id)
+    assert reloaded.state == "reserved"
+    assert reloaded.returned_blobs is None
+
+
+def test_failed_settle_leaves_returned_blobs_none(
+    packets: SubagentPackets,
+) -> None:
+    packet = create(packets)
+    packets.reserve(
+        packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+    )
+
+    settled = packets.settle(
+        packet.packet_id, outcome="failed", tool_use_id=TOOL_USE_A
+    )
+
+    assert settled.state == "failed"
+    assert settled.returned_blobs is None
+
+
+def test_legacy_rows_without_provenance_load_as_none(
+    packets: SubagentPackets, database: Database
+) -> None:
+    packet = create(packets)
+    packets.reserve(
+        packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+    )
+    packets.settle(packet.packet_id, outcome="completed", tool_use_id=TOOL_USE_A)
+    packets.accept(packet.packet_id, evidence={"diff_scope": ["foo.py"]})
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE subagent_packets SET reserved_blobs_json = NULL, "
+            "returned_blobs_json = NULL WHERE packet_id = ?",
+            (packet.packet_id,),
+        )
+
+    reloaded = packets.get(packet.packet_id)
+    assert reloaded.reserved_blobs is None
+    assert reloaded.returned_blobs is None
+
+
+def test_handoff_summary_contains_no_blob_values(
+    packets: SubagentPackets,
+) -> None:
+    packet = create(packets)
+    packets.reserve(
+        packet.packet_id, session_id=SESSION_A, tool_use_id=TOOL_USE_A
+    )
+    packets.settle(packet.packet_id, outcome="completed", tool_use_id=TOOL_USE_A)
+
+    summary = packets.handoff_summary(packet.issue_id)
+
+    rendered = json.dumps(summary)
+    assert "reserved_blobs" not in rendered
+    assert "returned_blobs" not in rendered
