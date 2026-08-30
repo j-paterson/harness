@@ -29,7 +29,10 @@ from hermes_orchestrator.channel_hub import (
     nudge as nudge_channel,
 )
 from hermes_orchestrator.checkpoints import CheckpointDispatcher, CheckpointSafetyStore
-from hermes_orchestrator.claude import ClaudeRunner
+from hermes_orchestrator.claude import (
+    ClaudeRunner,
+    control_launch_failure_recorder,
+)
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
     CHANNEL_ENTRY,
@@ -831,6 +834,11 @@ def _open_rotation_collaborators(
         base_env=environment,
         processes=runtime.processes,
         freeze_dir=settings.state_dir / "freezes",
+        launch_failure_recorder=(
+            control_launch_failure_recorder(runtime.control_operations)
+            if runtime.control_operations is not None
+            else None
+        ),
     )
     cells = ProjectCellService(
         database=database,

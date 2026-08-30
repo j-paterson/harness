@@ -7,7 +7,7 @@ import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -213,6 +213,42 @@ class ProfileLease:
     acquired_at: datetime
 
 
+# Fable budgets cycle weekly. A non-capped attestation older than one
+# full cycle predates the budget window running now, so it says nothing
+# about remaining capacity and no longer counts as current evidence.
+CAPACITY_EVIDENCE_FRESHNESS = timedelta(days=7)
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityObservation:
+    """One durable, model-specific capacity fact about a profile.
+
+    ``state`` is ``available`` (an operator attested remaining budget) or
+    ``capped`` (the provider reported the budget exhausted). A capped
+    observation with a ``resets_at`` horizon evidences availability again
+    once that horizon passes; one without a horizon fails closed until a
+    newer observation supersedes it.
+    """
+
+    profile_alias: str
+    model: str
+    state: str
+    source: str
+    observed_at: datetime
+    resets_at: datetime | None = None
+    detail: str | None = None
+
+
+class CapacityEvidencePort(Protocol):
+    """Read-side boundary for durable capacity observations."""
+
+    def latest(
+        self,
+        profile_alias: str,
+        model: str,
+    ) -> CapacityObservation | None: ...
+
+
 @dataclass(slots=True)
 class _PoolState:
     eligible: bool = False
@@ -228,12 +264,24 @@ class ProfilePool:
         registry: ProfileRegistry,
         *,
         now: Callable[[], datetime] | None = None,
+        capacity_evidence: CapacityEvidencePort | None = None,
     ) -> None:
         self._registry = registry
         self._now = now or (lambda: datetime.now(UTC))
+        # Without a capacity-evidence port the pool keeps its historical
+        # auth-health-only selection, so construction sites that predate
+        # the INFRA-197-C2 wiring keep working unchanged.
+        self._capacity_evidence = capacity_evidence
         self._states = {profile.alias: _PoolState() for profile in registry.profiles}
         self._leases: dict[str, ProfileLease] = {}
         self._replacement_reservations: dict[str, ProfileLease] = {}
+        self._last_refusal: str | None = None
+
+    @property
+    def last_refusal(self) -> str | None:
+        """Why the latest replacement reservation refused its candidates."""
+
+        return self._last_refusal
 
     def acquire(self, project_key: str) -> ProfileLease | None:
         """Return the existing affinity or lease the first available slot."""
@@ -294,7 +342,14 @@ class ProfilePool:
         project_key: str,
         exclude_alias: str,
     ) -> ProfileLease | None:
-        """Reserve another healthy slot while preserving the current lease."""
+        """Reserve another healthy slot while preserving the current lease.
+
+        With a capacity-evidence port injected, a candidate is refused
+        unless it holds current, non-capped fable-capacity evidence: auth
+        health alone once seated a profile whose weekly Fable budget was
+        already exhausted. Each refusal is recorded on ``last_refusal``
+        so the caller's failure message can name the evidence gap.
+        """
 
         existing = self._leases.get(project_key)
         if existing is None or existing.profile_alias != exclude_alias:
@@ -303,6 +358,8 @@ class ProfilePool:
         if reserved is not None:
             return reserved
         now = self._now()
+        self._last_refusal = None
+        refusals: list[str] = []
         replacement_alias = None
         for profile in self._registry.profiles:
             state = self._states[profile.alias]
@@ -315,15 +372,66 @@ class ProfilePool:
                 and not cooling_down
                 and state.active_project_count == 0
             ):
+                refusal = self._capacity_refusal(profile.alias, now)
+                if refusal is not None:
+                    refusals.append(refusal)
+                    continue
                 replacement_alias = profile.alias
                 break
         if replacement_alias is None:
+            if refusals:
+                self._last_refusal = "; ".join(refusals)
             return None
 
         self._states[replacement_alias].active_project_count += 1
         replacement = ProfileLease(project_key, replacement_alias, now)
         self._replacement_reservations[project_key] = replacement
         return replacement
+
+    def _capacity_refusal(self, alias: str, now: datetime) -> str | None:
+        """Fail closed unless current fable-capacity evidence admits alias."""
+
+        if self._capacity_evidence is None:
+            return None
+        observation = self._capacity_evidence.latest(alias, "fable")
+        if observation is None:
+            return f"{alias}: no current fable capacity evidence"
+        if observation.state == "capped":
+            if observation.resets_at is None:
+                return (
+                    f"{alias}: fable-capped with no reset horizon; only a "
+                    "newer capacity observation (operator attestation) "
+                    "clears it"
+                )
+            if observation.resets_at > now:
+                return (
+                    f"{alias}: fable-capped until "
+                    f"{observation.resets_at.isoformat()}"
+                )
+            # The horizon passed: the budget cycled, so the observation
+            # now evidences availability as of its reset time.
+            effective_at = observation.resets_at
+        else:
+            effective_at = observation.observed_at
+        if now - effective_at > CAPACITY_EVIDENCE_FRESHNESS:
+            return (
+                f"{alias}: fable capacity evidence is stale "
+                f"(observed {effective_at.isoformat()})"
+            )
+        return None
+
+    def reserve_context_only(self, project_key: str) -> ProfileLease:
+        """Permit a context-only (session-only) rotation on the same profile.
+
+        Retaining the incumbent consumes no other profile's occupancy and
+        needs no fresh capacity evidence: the seat is already paid for,
+        only the session's context is being renewed.
+        """
+
+        existing = self._leases.get(project_key)
+        if existing is None:
+            raise ValueError("project holds no profile lease to retain")
+        return existing
 
     def cancel_replacement(self, project_key: str) -> None:
         """Release an uncommitted replacement reservation."""

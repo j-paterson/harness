@@ -41,6 +41,7 @@ class RecordingRunner:
         self.resume_count = 0
         self.emit_session_started = True
         self.emit_limit = False
+        self.limit_kind: str | None = None
         self.emit_handoff_ack = False
         self.raise_on_start = False
         self.retired_sessions: list[UUID] = []
@@ -81,6 +82,7 @@ class RecordingRunner:
                 timestamp="2026-08-26T12:01:00Z",
                 usage={},
                 error_code="subscription_limit",
+                limit_kind=self.limit_kind,
             )
         if self.emit_handoff_ack:
             yield ClaudeEvent(
@@ -3318,3 +3320,121 @@ def test_completed_with_wired_packets_but_no_packet_id_only_releases_the_lease(
 
     assert _lease_state(database, "toolu-2") == "released"
     assert database.scalar("SELECT COUNT(*) FROM subagent_packets") == 0
+
+
+# --- INFRA-197 correction C2: fable caps leave durable capacity evidence ---
+#
+# A provider.limit with limit_kind="fable" is a weekly-budget exhaustion:
+# it must write a durable capacity observation and a cooldown honoring the
+# recorded horizon. The sanitized stream exposes no reset time, so the
+# conservative fallback is one full weekly cycle (7 days) — never the flat
+# 1 hour that session/monthly_spend caps keep.
+
+
+def _capacity_rows(database: Database) -> list[dict[str, object]]:
+    rows = database.execute(
+        "SELECT profile_alias, model, state, source, observed_at, "
+        "resets_at, detail FROM profile_capacity_observations "
+        "ORDER BY observation_id"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_fable_limit_records_capacity_observation_and_weekly_cooldown(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+    database: Database,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_limit = True
+    runner.limit_kind = "fable"
+
+    result = await cell_service.dispatch("ENG-9")
+
+    assert result.status == "handoff_required"
+    expected_reset = "2026-09-02T00:00:00+00:00"
+    assert (
+        database.scalar(
+            "SELECT cooldown_until FROM profile_leases "
+            "WHERE profile_alias = 'max-a'"
+        )
+        == expected_reset
+    )
+    rows = _capacity_rows(database)
+    assert len(rows) == 1
+    observation = rows[0]
+    assert observation["profile_alias"] == "max-a"
+    assert observation["model"] == "fable"
+    assert observation["state"] == "capped"
+    assert observation["source"] == "provider_limit"
+    assert observation["observed_at"] == "2026-08-26T00:00:00+00:00"
+    # No reset horizon reaches the sanitized stream, so the recorded
+    # horizon is the documented worst case and the cooldown honors it.
+    assert observation["resets_at"] == expected_reset
+    assert "no reset horizon" in str(observation["detail"])
+
+
+@pytest.mark.asyncio
+async def test_fable_limit_before_session_start_records_weekly_capped_lease(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+    database: Database,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_session_started = False
+    runner.emit_limit = True
+    runner.limit_kind = "fable"
+
+    result = await cell_service.dispatch("ENG-9")
+
+    assert result.status == "start_unconfirmed"
+    expected_reset = "2026-09-02T00:00:00+00:00"
+    assert (
+        database.scalar(
+            "SELECT state FROM profile_leases WHERE profile_alias = 'max-a'"
+        )
+        == "capped"
+    )
+    assert (
+        database.scalar(
+            "SELECT cooldown_until FROM profile_leases "
+            "WHERE profile_alias = 'max-a'"
+        )
+        == expected_reset
+    )
+    rows = _capacity_rows(database)
+    assert len(rows) == 1
+    assert rows[0]["state"] == "capped"
+    assert rows[0]["source"] == "provider_limit"
+    assert rows[0]["resets_at"] == expected_reset
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit_kind", [None, "session", "monthly_spend"])
+async def test_non_fable_limits_keep_the_flat_hour_cooldown(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+    database: Database,
+    limit_kind: str | None,
+) -> None:
+    admit(queue, "ENG-9")
+    runner.emit_limit = True
+    runner.limit_kind = limit_kind
+
+    result = await cell_service.dispatch("ENG-9")
+
+    assert result.status == "handoff_required"
+    assert (
+        database.scalar(
+            "SELECT cooldown_until FROM profile_leases "
+            "WHERE profile_alias = 'max-a'"
+        )
+        == "2026-08-26T01:00:00+00:00"
+    )
+    # Session and spend caps are not fable-capacity evidence: no
+    # observation row is written for them.
+    assert _capacity_rows(database) == []

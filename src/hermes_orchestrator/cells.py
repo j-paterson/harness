@@ -24,11 +24,60 @@ from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.operator_decisions import OperatorDecisions
-from hermes_orchestrator.profiles import ProfilePool
+from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
+
+# A fable cap is a weekly-budget exhaustion, but the sanitized Claude
+# stream exposes no reset horizon. The conservative fallback is one full
+# weekly cycle — the documented worst case — never the flat hour that
+# session and monthly-spend caps keep.
+_FABLE_CAP_FALLBACK = timedelta(days=7)
+_FABLE_CAP_FALLBACK_DETAIL = (
+    "provider fable limit with no reset horizon in the stream; capped for "
+    "the worst-case weekly cycle unless a newer observation clears it"
+)
+
+
+class ProfileCapacityEvidence:
+    """Durable capacity-evidence port backed by the orchestrator database.
+
+    Reads satisfy the ``CapacityEvidencePort`` protocol consumed by
+    ``ProfilePool``; the newest observation per (profile_alias, model)
+    is the current evidence.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def latest(
+        self,
+        profile_alias: str,
+        model: str,
+    ) -> CapacityObservation | None:
+        row = self._database.execute(
+            "SELECT profile_alias, model, state, source, observed_at, "
+            "resets_at, detail FROM profile_capacity_observations "
+            "WHERE profile_alias = ? AND model = ? "
+            "ORDER BY observation_id DESC LIMIT 1",
+            (profile_alias, model),
+        ).fetchone()
+        if row is None:
+            return None
+        resets_at = row["resets_at"]
+        return CapacityObservation(
+            profile_alias=str(row["profile_alias"]),
+            model=str(row["model"]),
+            state=str(row["state"]),
+            source=str(row["source"]),
+            observed_at=datetime.fromisoformat(str(row["observed_at"])),
+            resets_at=(
+                datetime.fromisoformat(str(resets_at)) if resets_at else None
+            ),
+            detail=str(row["detail"]) if row["detail"] else None,
+        )
 
 
 class LeadStream(Protocol):
@@ -388,7 +437,11 @@ class ProjectCellService:
                         limit_kind = event.limit_kind
                         if session_confirmed:
                             handoff_required = True
-                            self._require_handoff(cell, "subscription_limit")
+                            self._require_handoff(
+                                cell,
+                                "subscription_limit",
+                                limit_kind=limit_kind,
+                            )
                         else:
                             start_capped = True
                             break
@@ -409,6 +462,7 @@ class ProjectCellService:
                 issue_id=issue_id,
                 capped=start_capped,
                 already_completed=issue_completed,
+                limit_kind=limit_kind,
             )
 
         if issue_completed:
@@ -737,7 +791,11 @@ class ProjectCellService:
             current.profile_alias,
         )
         if reservation is None:
-            raise RotationBlocked("no different healthy profile is available")
+            message = "no different healthy profile is available"
+            refusal = getattr(self._profiles, "last_refusal", None)
+            if refusal:
+                message = f"{message}: {refusal}"
+            raise RotationBlocked(message)
         replacement_session = getattr(handoff, "replacement_session_id", None)
         already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
         if not isinstance(replacement_session, UUID):
@@ -921,6 +979,7 @@ class ProjectCellService:
         issue_id: str,
         capped: bool = False,
         already_completed: bool = False,
+        limit_kind: str | None = None,
     ) -> bool:
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason="start_failed")
@@ -930,7 +989,9 @@ class ProjectCellService:
             )
         now_value = self._aware_now()
         now = now_value.isoformat()
-        cooldown_until = now_value + timedelta(hours=1) if capped else None
+        cooldown_until = (
+            self._cap_cooldown(now_value, limit_kind) if capped else None
+        )
         with self._database.transaction() as connection:
             updated = connection.execute(
                 "UPDATE project_cells SET state = 'failed', updated_at = ? "
@@ -949,6 +1010,13 @@ class ProjectCellService:
                         cell.profile_alias,
                     ),
                 )
+                if limit_kind == "fable":
+                    self._record_fable_cap(
+                        connection,
+                        cell.profile_alias,
+                        observed_at=now_value,
+                        resets_at=cooldown_until,
+                    )
             else:
                 connection.execute(
                     "DELETE FROM profile_leases WHERE project_key = ? "
@@ -1314,9 +1382,15 @@ class ProjectCellService:
             self._handoffs.request(cell_id, reason)
         return True
 
-    def _require_handoff(self, cell: ProjectCell, reason: str) -> None:
+    def _require_handoff(
+        self,
+        cell: ProjectCell,
+        reason: str,
+        *,
+        limit_kind: str | None = None,
+    ) -> None:
         now = self._aware_now()
-        cooldown_until = now + timedelta(hours=1)
+        cooldown_until = self._cap_cooldown(now, limit_kind)
         with self._database.transaction() as connection:
             updated = connection.execute(
                 "UPDATE project_cells SET state = 'handoff_required', updated_at = ? "
@@ -1330,6 +1404,13 @@ class ProjectCellService:
                 "WHERE profile_alias = ?",
                 (cooldown_until.isoformat(), cell.profile_alias),
             )
+            if limit_kind == "fable":
+                self._record_fable_cap(
+                    connection,
+                    cell.profile_alias,
+                    observed_at=now,
+                    resets_at=cooldown_until,
+                )
             self._events.append(
                 connection,
                 EventInput(
@@ -1345,6 +1426,43 @@ class ProjectCellService:
                 ),
             )
         self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
+
+    @staticmethod
+    def _cap_cooldown(now: datetime, limit_kind: str | None) -> datetime:
+        """Cooldown horizon for a cap: weekly worst case for fable caps.
+
+        A fable cap exhausts a weekly budget; the stream exposes no reset
+        time, so the cooldown conservatively covers one full cycle and the
+        recorded observation carries the same horizon — the two can never
+        disagree. Session and monthly-spend caps (and non-limit handoffs)
+        keep the historical flat hour.
+        """
+
+        if limit_kind == "fable":
+            return now + _FABLE_CAP_FALLBACK
+        return now + timedelta(hours=1)
+
+    def _record_fable_cap(
+        self,
+        connection: sqlite3.Connection,
+        profile_alias: str,
+        *,
+        observed_at: datetime,
+        resets_at: datetime,
+    ) -> None:
+        """Append the durable fable-capacity observation for a provider cap."""
+
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at, "
+            "detail) VALUES (?, 'fable', 'capped', 'provider_limit', ?, ?, ?)",
+            (
+                profile_alias,
+                observed_at.isoformat(),
+                resets_at.isoformat(),
+                _FABLE_CAP_FALLBACK_DETAIL,
+            ),
+        )
 
     def _aware_now(self) -> datetime:
         value = self._now()

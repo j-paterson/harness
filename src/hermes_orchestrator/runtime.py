@@ -25,7 +25,10 @@ from hermes_orchestrator.circleci import (
     CircleCiStatusAdapter,
     HttpxCircleCiTransport,
 )
-from hermes_orchestrator.claude import ClaudeRunner
+from hermes_orchestrator.claude import (
+    ClaudeRunner,
+    control_launch_failure_recorder,
+)
 from hermes_orchestrator.cmux import CMUX_KEYCHAIN_SERVICE, CmuxCliAdapter
 from hermes_orchestrator.cmux_surfaces import (
     CmuxHibernationDriver,
@@ -476,6 +479,9 @@ def open_runtime(
                 base_env=environment,
                 processes=processes,
                 freeze_dir=settings.state_dir / "freezes",
+                launch_failure_recorder=control_launch_failure_recorder(
+                    control_operations
+                ),
             )
             cmux_seater: CmuxLeadSeater | None = None
             if settings.cmux is not None:

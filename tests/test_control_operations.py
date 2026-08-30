@@ -192,3 +192,19 @@ def test_committed_operations_notify_listeners_best_effort(
 
     assert operation is not None
     assert seen == [operation]
+
+
+def test_lead_launch_failed_is_accepted_and_free_text_still_refuses(
+    operations: ControlOperations,
+) -> None:
+    recorded = record(
+        operations,
+        kind="lead.launch_failed",
+        result={"exit_code": 1, "stderr_tail": ""},
+    )
+    assert recorded is not None
+    assert recorded.kind == "lead.launch_failed"
+    assert operations.get(recorded.operation_id).kind == "lead.launch_failed"
+
+    with pytest.raises(ControlOperationRefused, match="unknown"):
+        record(operations, kind="lead.launch_exploded")
