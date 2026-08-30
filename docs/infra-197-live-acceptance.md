@@ -312,3 +312,136 @@ the frozen code candidate.
 
 The candidate proceeds through the Fable→Sol workflow; Fable does not
 merge.
+
+## MVP live proof under scope freeze `18237de4` — 2026-08-30
+
+Recorded by the Fable lead session `3fe1564e` (profile `max-b`, cell
+`b29691ef`, generation-11 seat binding `14503f90`). All rows below are
+2026-08-30 and hash-verified; every correction and directive in the
+chain was delivered via the durable drain with exact acks.
+
+### Correction and scope-freeze chain
+
+- `lead_corrections` `2a74df71` (Critical, rotation failure; directive
+  `infra-197-rotation-failure-20260830T195300Z`, receipt `d905cae5`,
+  packet `9bd60aa7`) — acked via offer `63fe2303`.
+- Scope freeze `18237de4` (directive
+  `infra-197-mvp-scope-freeze-20260830T201711Z`, sha256 `50c46182`) —
+  acked via offer `7a541e0c`. C3–C6 were not launched; C1/C2 were
+  finished in flight.
+
+### C1/C2 correction batch (commit `47bac44`, pushed)
+
+- C1 packet `d781ac9b` (accepted): `lead.launch_failed` durable
+  receipts — bounded 8KiB stderr tail, exact argv, cwd,
+  `CLAUDE_CONFIG_DIR`, profile alias, pid, exit code, session id;
+  wired into both the daemon and rotate-lead paths. Red-first
+  (ImportError + unknown-kind refusal observed; 4 failed/55 passed
+  pre-implementation).
+- C2 packet `c1bd84ce` (accepted): migration 0050
+  `profile_capacity_observations`; `reserve_replacement` fails closed
+  without current fable evidence; horizon-honoring fable cooldowns
+  (`limit_kind` no longer discarded); `reserve_context_only`
+  same-profile path. Red-first (8 failed/68 passed
+  pre-implementation).
+- Direct exceptions: `83f1aae2` (`test_legacy_upgrade`, 4-line,
+  49→50) and `5629ac91` (`test_cli`, 1-line). CORRECTION recorded
+  here: `5629ac91`'s stored evidence cites "51 passed", but the
+  actual run was 44 passed, all green.
+- Provenance note (reconstructed reservations): this seat is
+  unmanaged (no subagent-gate hook; launched outside the managed
+  path), so both packet reservations were reconstructed honestly —
+  work diffs saved (C1 sha256 `308ea5d8…`, C2 sha256 `23a4bacc…`),
+  files reverted to HEAD `7c783ec`, packets reserved against the true
+  pre-work blobs (C2's untracked migration held aside for the absent
+  sentinel), patches re-applied byte-identically, then settled.
+  Reserved→returned deltas are the true work.
+- Full gate at `47bac44`: pytest 2188 passed; ruff clean;
+  hermes-control npm test pass.
+
+### Incident — early live-DB migration (self-inflicted, resolved)
+
+The lead helper's `Database.open` (editable worktree package)
+auto-applied migration 0050 to the LIVE DB at 20:17:13Z
+(schema 49→50) before runtime activation. Additive-only; the running
+daemon was unaffected; but a daemon restart would have failed closed
+(the gen-24 activation proved schema 49). Resolved by activating
+generation 27; no restart occurred inside the exposure window.
+
+### Runtime activation
+
+Generation 27 activated via journaled apply `6301564a` at git sha
+`47bac44` (schema 50); daemon restart verified (pid 23534). The
+durable `daemon.restarted` control op `c18762ee` was delivered via the
+Stop-hook drain and acked (offer `cce79047`); `intake.dedup_repaired`
+`943054ec` (1 superseded event, post-restart sweep) was delivered and
+acked (offer `cb2b8baa`).
+
+### Identity reconcile to max-b (operator gate `MVP_LAUNCH_BLOCKED` `profile_identity_mismatch`)
+
+- The mismatch: the launcher script carried max-d (the retiring
+  session's), the durable cell + binding said max-a, and the session
+  transcript was actually owned by `.claude-personal`.
+- Resolution to max-b: auth probe first-party Max OK; journaled
+  fable-limit observations at 15:20/15:38Z with reset horizon 19:00Z
+  (passed) — the strongest current capacity evidence. max-a was
+  operator-attested capped to 2026-08-31T13:59Z (recorded as an
+  `operator_attestation` observation); max-d excluded (PR2); max-c
+  weaker evidence.
+- Journaled: `project_cell.profile_reconciled`,
+  `cmux_binding.profile_reconciled` (binding `14503f90`),
+  `profile_lease.reconciled`; launch script → max-b with launch-time
+  quiescent transcript sync. Receipt:
+  `.hermes/infra-197-identity-reconcile-receipt.json`.
+- Post-launch process env confirms `CLAUDE_CONFIG_DIR=.claude-max-b`
+  and `HERMES_PROFILE_ALIAS=max-b`:
+  launcher==cell==binding==registration==process.
+
+### S2–S4 live proof receipts (freeze steps 1–4)
+
+- Step 1 (visible managed lead): session `3fe1564e` resumed in the
+  visible cmux seat (binding `14503f90`, workspace `4EBF4B2D`,
+  surface `9AEC09A1`, generation 11) on max-b.
+- Step 2 (auto registration): `channel_registrations` `11e169ca`
+  (20:34:18Z, recapture launch; closed 20:40:59 `disconnected`) and
+  `9033df38` (20:41:07Z, ACTIVE): project agent-orchestration /
+  cell `b29691ef` / session `3fe1564e` / profile max-b /
+  generation 11.
+- Trust: anchor `b2becae3` (prompt unrecoverable by design) retired
+  20:34:03Z; anchor `9703b5e1` captured at the recapture launch,
+  bound to this session/max-b/gen-27 build, PROMPT EVIDENCE BOUND —
+  the operator's one manual Enter at the 20:34 launch is the trust
+  event, per decision `8272377e`.
+- Step 3 (compact notification + exact ACK): four
+  `HERMES_CONTROL_READY` channel wakes delivered post-registration,
+  ONE visible entry per event; each was verified in
+  `control_operations` then acked with the exact packet_id+event_id
+  through the channel op: `19fa337a`/`7b6fbbab`,
+  `0cb74663`/`21c23b6a`, `62c1b63d`/`c6aae54c`,
+  `45675f17`/`5260028b`.
+- Step 4 (restart + replay + exactly-once + no-computer-use
+  auto-confirm): the launch script kickstarted Hermes with the host
+  down, staging `daemon.restarted` `19fa337a` (20:41:06Z) durably
+  PENDING; the fresh registration's replay delivered it
+  (`channel.replayed` `45675f17` replay_count 1;
+  `channel.reregistered` `62c1b63d` prior_registrations 1). The
+  20:41 relaunch of the Fable lead auto-confirmed the channel dialog
+  with NO manual input: `channel.auto_confirmed` receipt `0cb74663`
+  (anchor `9703b5e1`, exact gen-27 build), trust-confirm log
+  `{"confirmed":true}`. Exactly-once effective intake: an immediate
+  duplicate ack of event `7b6fbbab` was REFUSED
+  ("no acknowledgeable event matches").
+
+Freeze workflow note, recorded verbatim: "This run is not
+intervention-free evidence because the operator manually challenged
+Fable's wait" (directive `18237de4`) — the receipts above stand as
+the durable proof trail.
+
+### Deferred per the scope freeze
+
+C3 visible-ack transport, C4 rotation phase restructure, C5
+rotate-lead caller authorization, extra protocol states, and capacity
+analytics. The standing INFRA-197 blockers from the operator
+correction (rotation authority/authorization/selection/scope) remain
+recorded in handoff `c37a0963` and `lead_corrections` `2a74df71` for
+the deferred work.

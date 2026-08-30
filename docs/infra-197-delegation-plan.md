@@ -595,3 +595,13 @@ execution:
 Provenance note: P2 also becomes `cli.py`/`tests/test_cli.py`'s most
 recent in-window claimant, shrinking the approved clause-2 grandfather
 binding's residual to `src/hermes_orchestrator/runtime.py` alone.
+
+## Closing note — concluded under the MVP scope freeze (2026-08-30)
+
+This plan concluded under the MVP scope freeze `18237de4` (directive
+`infra-197-mvp-scope-freeze-20260830T201711Z`): C3–C6 are deferred,
+with the standing blockers and the deferred-work list recorded in
+`lead_corrections` `2a74df71` and handoff `c37a0963`. The live proof
+receipts are recorded in `docs/infra-197-live-acceptance.md`. The
+candidate is frozen for Sol at the head created by the commit that
+adds this document's closing note.
