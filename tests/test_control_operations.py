@@ -72,6 +72,33 @@ def test_free_text_kinds_are_refused(operations: ControlOperations) -> None:
         record(operations, kind="anything.goes")
 
 
+def test_channel_trust_kinds_record_and_free_text_still_refuses(
+    operations: ControlOperations,
+) -> None:
+    confirmed = record(
+        operations,
+        kind="channel.auto_confirmed",
+        result={"anchor_id": "anc-1"},
+    )
+    assert confirmed is not None
+    assert confirmed.kind == "channel.auto_confirmed"
+    assert operations.get(confirmed.operation_id).kind == "channel.auto_confirmed"
+
+    required = record(
+        operations,
+        kind="channel.approval_required",
+        session_id=OTHER_SESSION,
+        result={"first_failure": "entry_sha256"},
+        reason="CHANNEL APPROVAL REQUIRED: entry_sha256 mismatch",
+    )
+    assert required is not None
+    assert required.kind == "channel.approval_required"
+    assert required.reason == "CHANNEL APPROVAL REQUIRED: entry_sha256 mismatch"
+
+    with pytest.raises(ControlOperationRefused, match="unknown"):
+        record(operations, kind="channel.anything_else")
+
+
 def test_a_live_duplicate_is_a_durable_noop(
     operations: ControlOperations, database: Database
 ) -> None:

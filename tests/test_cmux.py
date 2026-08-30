@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -533,6 +534,154 @@ async def test_everything_outside_the_signal_grammar_is_refused(
     assert factory.calls == []
     with pytest.raises(ValueError, match="not allow-listed"):
         await port._run("send")
+
+
+# ---------------------------------------------------------------------------
+# T2 (INFRA-197 v5.1 amendment): the channel-trust gate's bounded read-screen
+# and single-Enter confirmation, per decision
+# infra-197-trusted-channel-auto-approval-20260830-v1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_screen_builds_exact_argv_and_returns_output() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"pane text here\n")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    output = await port.read_screen(ref, lines=42)
+
+    assert output == "pane text here\n"
+    assert factory.calls[0][0] == (
+        "/apps/cmux",
+        "read-screen",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        "--lines",
+        "42",
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_screen_default_lines_is_sixty() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.read_screen(ref)
+
+    assert factory.calls[0][0][-1] == "60"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_lines", [0, -1, -60, 2001, 10_000])
+async def test_read_screen_bounds_refuse_before_any_subprocess(
+    bad_lines: int,
+) -> None:
+    factory = FakeFactory()
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    with pytest.raises(ValueError, match="positive int"):
+        await port.read_screen(ref, lines=bad_lines)
+
+    # Refusal happens before any external effect.
+    assert factory.calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_screen_at_the_upper_bound_is_accepted() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.read_screen(ref, lines=2000)
+
+    assert factory.calls[0][0][-1] == "2000"
+
+
+@pytest.mark.asyncio
+async def test_read_screen_targets_only_the_exact_ref_given() -> None:
+    other_workspace = "77777777-7777-4777-8777-777777777777"
+    other_surface = "77777777-7777-4777-8777-888888888888"
+    factory = FakeFactory(results=[FakeProcess(stdout=b"")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(
+        workspace_uuid=other_workspace, surface_uuid=other_surface
+    )
+
+    await port.read_screen(ref)
+
+    argv = factory.calls[0][0]
+    assert WORKSPACE not in argv and SURFACE not in argv
+    assert other_workspace in argv and other_surface in argv
+
+
+@pytest.mark.asyncio
+async def test_confirm_channel_dialog_sends_exactly_one_enter() -> None:
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.confirm_channel_dialog(ref)
+
+    assert len(factory.calls) == 1
+    assert factory.calls[0][0] == (
+        "/apps/cmux",
+        "send-key",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        "enter",
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_channel_dialog_targets_only_the_exact_ref_given() -> None:
+    other_workspace = "77777777-7777-4777-8777-777777777777"
+    other_surface = "77777777-7777-4777-8777-888888888888"
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(
+        workspace_uuid=other_workspace, surface_uuid=other_surface
+    )
+
+    await port.confirm_channel_dialog(ref)
+
+    argv = factory.calls[0][0]
+    assert WORKSPACE not in argv and SURFACE not in argv
+    assert other_workspace in argv and other_surface in argv
+
+
+def test_confirm_channel_dialog_signature_takes_only_the_ref() -> None:
+    # The Enter key is a fixed literal inside the method, never a
+    # parameter: no caller can express any other key or any text
+    # through this method's signature.
+    signature = inspect.signature(CmuxCliAdapter.confirm_channel_dialog)
+    parameters = list(signature.parameters)
+    assert parameters == ["self", "ref"]
+    for name in parameters:
+        param = signature.parameters[name]
+        assert param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+
+
+@pytest.mark.asyncio
+async def test_screen_and_key_ops_stay_out_of_the_general_vocabulary() -> None:
+    # The general command surface (_run / _ALLOWED_COMMANDS) still
+    # rejects read-screen and send-key outright; these two bounded,
+    # fixed-shape operations are the sole exceptions, reached only
+    # through their own dedicated methods.
+    port = adapter(FakeFactory())
+
+    for forbidden in ("read-screen", "send-key"):
+        with pytest.raises(ValueError, match="not allow-listed"):
+            await port._run(forbidden)
 
 
 # ---------------------------------------------------------------------------

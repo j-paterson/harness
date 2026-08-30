@@ -340,6 +340,34 @@ def _parser() -> argparse.ArgumentParser:
     intake_ack.add_argument("--packet", required=True)
     intake_ack.add_argument("--offer", required=True)
 
+    channel_trust_capture = commands.add_parser(
+        "channel-trust-capture",
+        help=(
+            "persist the single manual channel-trust event's measured "
+            "build/binding evidence as the cell's active trust anchor "
+            "(INFRA-197 v5.1); re-measures from disk and refuses on "
+            "any drift from the recorded evidence"
+        ),
+    )
+    channel_trust_capture.add_argument("--evidence", type=Path, required=True)
+    channel_trust_capture.add_argument("--json", action="store_true")
+
+    channel_trust_confirm = commands.add_parser(
+        "channel-trust-confirm",
+        help=(
+            "watch one lead seat for the hermes-control confirmation "
+            "dialog, then either bind the anchor's pending prompt "
+            "evidence from the live screen (no keypress) or evaluate "
+            "the v5.1 trust gate, which presses Enter only on an "
+            "exact-build full match; any mismatch fails closed as "
+            "CHANNEL APPROVAL REQUIRED"
+        ),
+    )
+    channel_trust_confirm.add_argument("--cell", required=True)
+    channel_trust_confirm.add_argument("--wait-seconds", type=int, default=90)
+    channel_trust_confirm.add_argument("--capture-prompt", action="store_true")
+    channel_trust_confirm.add_argument("--json", action="store_true")
+
     decision_import = commands.add_parser(
         "decision-import",
         help=(
@@ -1958,6 +1986,40 @@ def _intake_poll(args: argparse.Namespace) -> int:
     return 0
 
 
+def _live_claude_argv(session_id: str) -> list[str]:
+    """The live ``claude`` process argv for one exact session.
+
+    Read from ``ps`` at trust-gate time so the gate compares what is
+    actually running against the anchored launch template. The classic
+    command grammar guarantees metacharacter-free, space-free tokens,
+    so a whitespace split reconstructs the argv exactly. Zero or two
+    matching processes both return an empty argv — the gate then fails
+    closed on the template comparison rather than guessing.
+    """
+
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "args="],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    matches = [
+        line.strip()
+        for line in listing.splitlines()
+        if session_id in line
+        and "claude" in line
+        and (" --resume " in line or " --session-id " in line)
+        and "ps -axo" not in line
+    ]
+    if len(matches) != 1:
+        return []
+    return matches[0].split()
+
+
 def _intake_ack(args: argparse.Namespace) -> int:
     """Record the lead's consumption of one exact offer."""
 
@@ -2274,6 +2336,268 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 human=f"Signalled: {envelope}",
             )
             return 0
+
+        if args.command == "channel-trust-capture":
+            from hermes_orchestrator.channel_trust import (
+                ChannelTrustAnchors,
+                TrustRefused,
+            )
+
+            try:
+                evidence = json.loads(args.evidence.read_bytes())
+            except (OSError, ValueError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"evidence unreadable: {error}",
+                )
+                return 1
+            anchors = ChannelTrustAnchors(database, events=EventStore(database))
+            entry_path = Path(str(evidence["canonical_entry_path"]))
+            try:
+                anchor = anchors.capture(
+                    cell_id=str(evidence["cell_id"]),
+                    profile_alias=str(evidence["profile_alias"]),
+                    entry_path=entry_path,
+                    package_root=entry_path.parents[2],
+                    channel_entry=str(evidence["channel_entry"]),
+                    launch_argv_template=list(
+                        evidence["launch_argv_template"]
+                    ),
+                    workspace_uuid=str(evidence["workspace_uuid"]),
+                    surface_uuid=str(evidence["surface_uuid"]),
+                    session_id=str(evidence["session_id"]),
+                    prompt_pattern=evidence.get("prompt_pattern"),
+                )
+            except (TrustRefused, KeyError, OSError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"capture refused: {error}",
+                )
+                return 1
+            # The evidence file records what the manual trust event
+            # measured; a re-measurement that disagrees means the build
+            # drifted between the trust event and this capture, so the
+            # anchor is retired again immediately and the capture
+            # refuses rather than blessing the drifted build.
+            drift = [
+                name
+                for name, recorded, measured in (
+                    ("entry_sha256", evidence.get("entry_sha256"), anchor.entry_sha256),
+                    (
+                        "dist_tree_sha256",
+                        evidence.get("dist_tree_sha256"),
+                        anchor.dist_tree_sha256,
+                    ),
+                    (
+                        "entry_owner_uid",
+                        evidence.get("entry_owner_uid"),
+                        anchor.entry_owner_uid,
+                    ),
+                )
+                if recorded is not None and recorded != measured
+            ]
+            if drift:
+                anchors.retire(anchor.anchor_id)
+                _print(
+                    {"error": "evidence drift", "fields": drift},
+                    json_output=args.json,
+                    human=(
+                        "capture refused: the build drifted from the "
+                        f"recorded trust evidence on {', '.join(drift)}"
+                    ),
+                )
+                return 1
+            _print(
+                {
+                    "anchor_id": anchor.anchor_id,
+                    "prompt_evidence": (
+                        "bound" if anchor.prompt_pattern else "pending"
+                    ),
+                },
+                json_output=args.json,
+                human=(
+                    f"Trust anchor {anchor.anchor_id} captured; prompt "
+                    "evidence "
+                    + ("bound." if anchor.prompt_pattern else "pending.")
+                ),
+            )
+            return 0
+
+        if args.command == "channel-trust-confirm":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            if runtime.control_operations is None:
+                _print(
+                    {"error": "control operations are unavailable"},
+                    json_output=args.json,
+                    human="control operations are unavailable.",
+                )
+                return 1
+            from hermes_orchestrator.channel_trust import (
+                ChannelTrustAnchors,
+                ChannelTrustGate,
+                TrustRefused,
+            )
+            from hermes_orchestrator.runtime import resolve_sidecar_entry
+
+            binding = runtime.cmux_bindings.active_lead(args.cell)
+            if binding is None:
+                _print(
+                    {"error": "no active lead binding for this cell"},
+                    json_output=args.json,
+                    human="no active lead binding for this cell.",
+                )
+                return 1
+            events = EventStore(database)
+            anchors = ChannelTrustAnchors(database, events=events)
+            anchor = anchors.active_for_cell(args.cell)
+            if anchor is None:
+                _print(
+                    {"error": "no active trust anchor for this cell"},
+                    json_output=args.json,
+                    human="no active trust anchor for this cell.",
+                )
+                return 1
+            port = CmuxCliAdapter(
+                settings.cmux.cli,
+                base_env=os.environ,
+                password_source=cmux_password_source(Keychain()),
+            )
+            # Bounded watch: the dialog either appears within the
+            # window or this invocation exits without any durable
+            # trust receipt — a watcher timeout is an absent dialog,
+            # not a trust refusal.
+            deadline = time.monotonic() + max(1, args.wait_seconds)
+            screen = ""
+            dialog_visible = False
+            while time.monotonic() < deadline:
+                try:
+                    screen = asyncio.run(
+                        port.read_screen(binding.ref, lines=200)
+                    )
+                except CmuxError:
+                    screen = ""
+                if (
+                    "Loading development channels" in screen
+                    and "server:hermes-control" in screen
+                ):
+                    dialog_visible = True
+                    break
+                time.sleep(2)
+            if not dialog_visible:
+                _print(
+                    {"error": "dialog not visible within the wait window"},
+                    json_output=args.json,
+                    human=(
+                        "the hermes-control confirmation dialog did not "
+                        "appear within the wait window; nothing recorded."
+                    ),
+                )
+                return 1
+            if anchor.prompt_pattern is None and args.capture_prompt:
+                # The one bounded recapture: bind the prompt evidence
+                # from the LIVE dialog. The operator-recorded normalized
+                # structure must be present or this refuses; no key is
+                # ever pressed here.
+                markers = (
+                    "Loading development channels",
+                    "server:hermes-control",
+                    "I am using this for local development",
+                    "Enter to confirm",
+                )
+                missing = [m for m in markers if m not in screen]
+                if missing or screen.count("server:hermes-control") != 1:
+                    _print(
+                        {
+                            "error": "live dialog does not match the "
+                            "operator-recorded normalized structure",
+                            "missing": missing,
+                        },
+                        json_output=args.json,
+                        human=(
+                            "prompt capture refused: the live dialog "
+                            "does not match the operator-recorded "
+                            "normalized structure."
+                        ),
+                    )
+                    return 1
+                pattern = r"[\s\S]{0,4000}?".join(
+                    re.escape(marker) for marker in markers
+                )
+                try:
+                    anchors.complete_prompt(anchor.anchor_id, pattern)
+                except TrustRefused as error:
+                    _print(
+                        {"error": str(error)},
+                        json_output=args.json,
+                        human=f"prompt binding refused: {error}",
+                    )
+                    return 1
+                _print(
+                    {
+                        "anchor_id": anchor.anchor_id,
+                        "prompt_evidence": "bound",
+                        "manual_press_required": True,
+                    },
+                    json_output=args.json,
+                    human=(
+                        "Prompt evidence bound from the live dialog; "
+                        "this launch still requires the one manual "
+                        "Enter. The next launch auto-confirms."
+                    ),
+                )
+                return 0
+            entry_path = resolve_sidecar_entry(
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            )
+            gate = ChannelTrustGate(
+                database,
+                events=events,
+                anchors=anchors,
+                control=runtime.control_operations,
+                read_screen=lambda: screen,
+                confirm=lambda: asyncio.run(
+                    port.confirm_channel_dialog(binding.ref)
+                ),
+            )
+            verdict = gate.evaluate(
+                cell_id=args.cell,
+                session_id=str(binding.session_id),
+                workspace_uuid=binding.ref.workspace_uuid,
+                surface_uuid=binding.ref.surface_uuid,
+                profile_alias=str(binding.profile_alias),
+                entry_path=entry_path,
+                package_root=entry_path.parents[2],
+                launch_argv=_live_claude_argv(str(binding.session_id)),
+                screen_text=screen,
+            )
+            payload = {
+                "confirmed": verdict.confirmed,
+                "receipt_operation_id": verdict.receipt_operation_id,
+            }
+            if not verdict.confirmed:
+                payload["first_failure"] = verdict.first_failure
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    "Channel confirmed automatically; receipt "
+                    f"{verdict.receipt_operation_id}."
+                    if verdict.confirmed
+                    else "CHANNEL APPROVAL REQUIRED "
+                    f"({verdict.first_failure}); receipt "
+                    f"{verdict.receipt_operation_id}."
+                ),
+            )
+            return 0 if verdict.confirmed else 1
 
         if args.command == "decision-import":
             try:

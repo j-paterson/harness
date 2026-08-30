@@ -36,6 +36,8 @@ CONTROL_KINDS = frozenset(
         "channel.blocked",
         "children.completed",
         "signal.failed",
+        "channel.auto_confirmed",
+        "channel.approval_required",
     }
 )
 

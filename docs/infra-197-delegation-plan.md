@@ -476,3 +476,38 @@ subsumes it — a forward lost to the startup race re-surfaces once the
 window lapses, instead of never (the pre-v5 defect) or every pass (the
 burst). Hub republish cadence is unchanged; exactly-once effect stays
 with the durable drain and ack CAS.
+
+## v5.3 amendment: v5.1 trusted-build auto-confirmation implementation (operator requirement, in-session, 2026-08-30)
+
+The gen-22 cold-start proof still required the manual development-
+channel confirmation; the operator gated candidate publication on
+implementing the v5.1 state machine exactly as the durable decision
+`infra-197-trusted-channel-auto-approval-20260830-v1` specifies.
+
+Architecture (lead-authored): a durable trust anchor captured from ONE
+manual trust event binds canonical sidecar entry path + owner with no
+symlink substitution, plugin identity, manifest name/version, packaged
+digest (deterministic sha256 over the dist tree plus the entry file),
+build timestamp, the exact `claude` launch argument template (only the
+session UUID and the controller-generated config path vary, both
+shape-validated), the exact cmux workspace/surface/profile/session
+binding with a live `claude` process match, the single-channel
+constraint, and the exact hermes-control confirmation prompt shape. A
+confirmation gate re-derives EVERY bound field live; on a full match
+it presses exactly one Enter on the exact validated surface through a
+dedicated non-parameterizable port op and records a durable
+`channel.auto_confirmed` receipt carrying the match evidence; ANY
+mismatch, drift, ambiguity, or missing anchor fails closed with a
+durable `channel.approval_required` receipt reading
+`CHANNEL APPROVAL REQUIRED` and no keypress. No generic keystroke or
+prompt-approval capability exists: the port op sends only the fixed
+Enter literal and the state machine is its only caller.
+
+| Packet | Boundary | Files (disjoint) | Tier | Wave |
+|---|---|---|---|---|
+| T1 | Trust-anchor model, migration 0049 (+ schema pins), verification checks, fail-closed state machine core (collaborators injected), auto_confirmed/approval_required receipt kinds | `src/hermes_orchestrator/channel_trust.py`, `src/hermes_orchestrator/migrations/0049_channel_trust_anchors.sql`, `src/hermes_orchestrator/control_operations.py`, `tests/test_channel_trust.py`, `tests/test_control_operations.py`, `tests/test_db.py`, `tests/test_legacy_upgrade.py` | Sonnet | 1 |
+| T2 | Narrow cmux ops: `read_screen(ref)` and the fixed-literal `confirm_channel_dialog(ref)` Enter press; general send/send-key vocabulary stays rejected | `src/hermes_orchestrator/cmux.py`, `tests/test_cmux.py` | Sonnet | 1 |
+
+Lead-owned: interface contract between T1 and T2, CLI anchor/confirm
+commands, runtime wiring, seat-path hookup, integration gate, and the
+live anchor capture from tonight's manual trust events.
