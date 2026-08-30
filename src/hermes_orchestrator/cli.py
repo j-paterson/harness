@@ -40,6 +40,7 @@ from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
@@ -526,6 +527,7 @@ async def _run_daemon(
     lead_intake: LeadIntakeRouter | None = None,
     channel_hub: ChannelHub | None = None,
     control_operations: ControlOperations | None = None,
+    fakechat_router: FakechatWakeRouter | None = None,
     activation: object | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
@@ -541,6 +543,11 @@ async def _run_daemon(
             # route directly through the in-process router and the
             # nudge op; this sweep recovers whatever those missed.
             await channel_hub.publish_pending()
+        if fakechat_router is not None:
+            # Same recovery shape for the fakechat wake plane: the
+            # commit-time router already signaled fresh envelopes;
+            # this sweep re-wakes whatever stayed announced.
+            fakechat_router.signal_pending()
 
     supervisor = Supervisor(
         service,
@@ -2465,6 +2472,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     lead_intake=runtime.lead_intake,
                     channel_hub=runtime.channel_hub,
                     control_operations=runtime.control_operations,
+                    fakechat_router=runtime.fakechat_router,
                 )
             )
             payload = {

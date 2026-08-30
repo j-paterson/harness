@@ -63,19 +63,26 @@ class SeatAuthRefused(RuntimeError):
 
 # The complete grammar of a classic in-pane lead command: the native
 # interactive Claude TUI addressing exactly one session — never a
-# prompt, flag soup, or credential. The one permitted extension is the
-# controller-generated session-scoped MCP config plus the fixed
-# hermes-control development-channel entry; arbitrary flags, commands,
-# and user-selected paths remain structurally impossible.
+# prompt, flag soup, or credential. Exactly two extensions are
+# permitted, mutually exclusive: the controller-generated
+# session-scoped MCP config plus the fixed hermes-control
+# development-channel entry (kept for any future environment that can
+# load it unattended), or the fixed official fakechat channel plugin
+# literal (INFRA-197 v4 amendment — the substitute that actually
+# launches unattended on a personal Max account). Arbitrary flags,
+# commands, and user-selected paths remain structurally impossible.
 _UUID_PATTERN = (
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 CHANNEL_ENTRY = "server:hermes-control"
+FAKECHAT_CHANNEL_ENTRY = "plugin:fakechat@claude-plugins-official"
 _CLASSIC_COMMAND = re.compile(
-    r"^claude --(resume|session-id) " + _UUID_PATTERN + r"( --mcp-config "
-    r"/[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
-    r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY) + r")?$"
+    r"^claude --(resume|session-id) " + _UUID_PATTERN + r"("
+    r" --mcp-config /[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
+    r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY)
+    + r"| --channels " + re.escape(FAKECHAT_CHANNEL_ENTRY)
+    + r")?$"
 )
 # The config path may hold nothing a shell, cmux, or argv parser could
 # reinterpret — no spaces, quotes, or metacharacters.
@@ -122,6 +129,24 @@ def classic_channel_command(
         f"{base} --mcp-config {path} "
         f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
     )
+
+
+def classic_fakechat_command(session_id: str, *, resume: bool) -> str:
+    """The classic command extended with the fixed fakechat channel.
+
+    INFRA-197 (v4 amendment): the Anthropic-allowlisted ``fakechat``
+    channel plugin substitutes the dev-channel load that can never
+    succeed unattended on a personal Max account. The extension is a
+    single fixed literal — nothing about it is caller-supplied — so
+    the session id round-tripping through :func:`classic_resume_command`
+    is the only variable input, and the workspace's own
+    ``FAKECHAT_PORT`` environment entry (set alongside this command,
+    never inside it) is what gives the plugin its durable, exclusive
+    port.
+    """
+
+    base = classic_resume_command(session_id, resume=resume)
+    return f"{base} --channels {FAKECHAT_CHANNEL_ENTRY}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +219,27 @@ class ChannelLaunchSource(Protocol):
     ) -> Path: ...
 
     def cleanup(self, session_id: str) -> None: ...
+
+
+class FakechatPortSource(Protocol):
+    """Issue and retire durable per-session fakechat port ownership.
+
+    Duck-typed against :class:`hermes_orchestrator.fakechat_signal.
+    FakechatSignalPorts`: this module never imports that class, only
+    its shape, keeping the two packets' files disjoint.
+    """
+
+    def issue(
+        self,
+        *,
+        cell_id: str,
+        session_id: str,
+        binding_id: str,
+        generation: int,
+        port: int | None = None,
+    ) -> Any: ...
+
+    def retire(self, session_id: str) -> None: ...
 
 
 class CmuxSurfaceBindings:
@@ -1067,6 +1113,7 @@ async def _activate_lead_seat(
     replacing: str | None = None,
     replace_reason: str | None = None,
     command: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> CmuxBinding:
     """Create, prepare, and durably bind one lead seat as a write-ahead
     compensated activation from durable identity alone.
@@ -1095,11 +1142,14 @@ async def _activate_lead_seat(
     # (``OK workspace:<n>``) to exactly one workspace through the
     # metadata listing; zero or multiple matches fail closed inside the
     # adapter.
+    env: dict[str, str] = {"CLAUDE_CONFIG_DIR": str(config_dir)}
+    if extra_env:
+        env.update(extra_env)
     ref = await port.create_workspace(
         title=f"{title} {intent.title_marker}",
         cwd=cwd,
         command=command,
-        env={"CLAUDE_CONFIG_DIR": str(config_dir)},
+        env=env,
         resolve_marker=intent.title_marker,
     )
     try:
@@ -1251,6 +1301,7 @@ class CmuxLeadSeater:
         auth_probe: Callable[[str], bool] | None = None,
         channel_launch: ChannelLaunchSource | None = None,
         control: ControlOperations | None = None,
+        signal_ports: FakechatPortSource | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
@@ -1259,6 +1310,7 @@ class CmuxLeadSeater:
         self._auth_probe = auth_probe
         self._channel_launch = channel_launch
         self._control = control
+        self._signal_ports = signal_ports
 
     async def ensure(
         self,
@@ -1322,7 +1374,56 @@ class CmuxLeadSeater:
             config_dir = self._profile_dirs.config_dir(profile_alias)
         except (KeyError, ValueError):
             return None
-        if classic_command is not None and self._channel_launch is not None:
+        extra_env: dict[str, str] | None = None
+        if classic_command is not None and self._signal_ports is not None:
+            # INFRA-197 (v4 amendment): fakechat is the substitute that
+            # actually launches unattended, so its port is issued in
+            # preference to the dev-channel config whenever both this
+            # classic command and a signal_ports collaborator are
+            # present. The port is issued here, before the workspace or
+            # its binding exist — record_intent/bind_intent (inside
+            # _activate_lead_seat below) mint the real binding_id, which
+            # this call cannot see yet. The honest identity available
+            # here instead is session_id itself: it is what the fakechat
+            # port row is keyed on (its own primary key), and it already
+            # durably and uniquely names this exact activation, so it
+            # doubles as the binding_id placeholder rather than
+            # inventing an unrelated value. Both retire() and
+            # active_for_session() key off session_id alone, never off
+            # binding_id, so the placeholder can never be mistaken for
+            # real seat-binding ownership — it is descriptive only. A
+            # failure here — issuance or command build — falls back to
+            # the plain classic command and records one durable
+            # channel.blocked-style receipt, never raising past ensure().
+            try:
+                issued = self._signal_ports.issue(
+                    cell_id=cell_id,
+                    session_id=session_id,
+                    binding_id=session_id,
+                    generation=self._bindings.next_lead_generation(cell_id),
+                    port=None,
+                )
+                classic_command = classic_fakechat_command(
+                    session_id, resume="--resume" in classic_command
+                )
+                extra_env = {"FAKECHAT_PORT": str(issued.port)}
+            except Exception as error:
+                if self._control is not None:
+                    with suppress(Exception):
+                        self._control.record(
+                            kind="channel.blocked",
+                            project_key=project_key,
+                            cell_id=cell_id,
+                            session_id=session_id,
+                            result={"launcher_error": str(error)[:200]},
+                            reason=(
+                                "the fakechat port could not be issued "
+                                "for this seat; the lead runs "
+                                "channel-less on the Stop-hook drain "
+                                "until the signal plane is repaired"
+                            ),
+                        )
+        elif classic_command is not None and self._channel_launch is not None:
             # Channel attachment for the new pane: the session-scoped
             # config and capability are generated under the private
             # state directory and only the sanitized extension grammar
@@ -1371,6 +1472,7 @@ class CmuxLeadSeater:
             session_id=session_id,
             profile_alias=profile_alias,
             command=classic_command,
+            extra_env=extra_env,
         )
         if classic_command is not None:
             self._bindings.record_classic(bound.binding_id, session_id)
@@ -1400,6 +1502,11 @@ class CmuxLeadSeater:
             # config and capability may now be removed.
             with suppress(Exception):
                 self._channel_launch.cleanup(existing.session_id)
+        if self._signal_ports is not None and existing.session_id:
+            # The rotated-away session's fakechat port row is likewise
+            # retired now that its workspace is confirmed closed.
+            with suppress(Exception):
+                self._signal_ports.retire(existing.session_id)
 
     async def _show_issue(self, binding: CmuxBinding, issue_id: str | None) -> None:
         """Display the seat's current issue id; cosmetic, never binding."""

@@ -35,6 +35,7 @@ CONTROL_KINDS = frozenset(
         "intake.dedup_repaired",
         "channel.blocked",
         "children.completed",
+        "signal.failed",
     }
 )
 
