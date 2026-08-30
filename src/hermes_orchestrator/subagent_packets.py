@@ -349,6 +349,46 @@ class SubagentPackets:
                 expired_ids.append(packet_id)
         return tuple(self.get(packet_id) for packet_id in expired_ids)
 
+    def handoff_summary(self, issue_id: str) -> dict[str, Any]:
+        """Reconstruct a lead handoff view from the ledger alone.
+
+        Everything a replacement lead needs to resume orchestration —
+        each packet's objective boundary (allowed files, worktree),
+        dependency order, verification commands, state, and the KEYS of
+        its accepted evidence — derived purely from durable rows, never
+        from conversation context, prompts, or model output.
+        """
+
+        packets = self.for_issue(issue_id)
+        return {
+            "issue_id": issue_id,
+            "packets": [
+                {
+                    "packet_id": packet.packet_id,
+                    "model_tier": packet.model_tier,
+                    "effort": packet.effort,
+                    "allowed_files": list(packet.allowed_files),
+                    "worktree": packet.worktree,
+                    "depends_on": list(packet.depends_on),
+                    "red_test": packet.red_test,
+                    "verification": list(packet.verification),
+                    "invariants": packet.invariants,
+                    "state": packet.state,
+                    "evidence_keys": (
+                        sorted(packet.evidence)
+                        if packet.evidence is not None
+                        else None
+                    ),
+                }
+                for packet in packets
+            ],
+            "outstanding": [
+                packet.packet_id
+                for packet in packets
+                if packet.state not in ("accepted", "rejected")
+            ],
+        }
+
     def for_issue(self, issue_id: str) -> tuple[SubagentPacket, ...]:
         rows = self._database.execute(
             "SELECT * FROM subagent_packets WHERE issue_id = ? "

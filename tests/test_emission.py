@@ -345,3 +345,118 @@ async def test_foreign_checkout_is_refused_before_any_freeze_check(
         "--path-format=absolute",
         "--git-common-dir",
     )
+
+
+# --- delegation-evidence gate (INFRA-186) -----------------------------------
+
+
+@dataclass
+class FakePacket:
+    state: str
+
+
+@dataclass
+class FakePackets:
+    by_issue: dict[str, list[FakePacket]] = field(default_factory=dict)
+
+    def for_issue(self, issue_id: str) -> tuple[FakePacket, ...]:
+        return tuple(self.by_issue.get(issue_id, ()))
+
+
+def _non_trivial_git() -> FakeGitRunner:
+    git = clean_git()
+    git.responses[("diff", "--numstat", BASE, HEAD)] = (
+        "20\t15\tsrc/app.py\n5\t4\ttests/test_app.py\n"
+    )
+    return git
+
+
+def _trivial_git() -> FakeGitRunner:
+    git = clean_git()
+    git.responses[("diff", "--numstat", BASE, HEAD)] = (
+        "3\t2\tsrc/app.py\n1\t1\ttests/test_app.py\n"
+    )
+    return git
+
+
+def _emitter_with_packets(
+    tmp_path: Path, git: FakeGitRunner, packets: FakePackets | None
+) -> tuple[CandidateEmitter, FakeDeliverer]:
+    deliverer = FakeDeliverer()
+    root = tmp_path / "manifests"
+    root.mkdir(exist_ok=True)
+    emitter = CandidateEmitter(
+        projects={
+            "demo": ProjectConfig(
+                linear_team="infrastructure",
+                repo_path=tmp_path,
+                integration_branch="main",
+                github_repo="j-paterson/demo",
+            )
+        },
+        git=git,
+        manifest_root=root,
+        delivery=deliverer,
+        now=lambda: NOW,
+        packets=packets,
+    )
+    return emitter, deliverer
+
+
+@pytest.mark.asyncio
+async def test_non_trivial_candidate_without_accepted_packets_is_blocked(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(by_issue={"ENG-9": [FakePacket(state="rejected")]})
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    with pytest.raises(EmissionBlocked, match="delegation evidence missing"):
+        await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert deliverer.events == []
+    assert list((tmp_path / "manifests").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_non_trivial_candidate_with_one_accepted_packet_publishes(
+    tmp_path: Path,
+) -> None:
+    git = _non_trivial_git()
+    packets = FakePackets(
+        by_issue={
+            "ENG-9": [
+                FakePacket(state="reserved"),
+                FakePacket(state="accepted"),
+            ]
+        }
+    )
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+
+
+@pytest.mark.asyncio
+async def test_trivial_candidate_with_empty_ledger_publishes(tmp_path: Path) -> None:
+    git = _trivial_git()
+    packets = FakePackets()
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, packets)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]
+
+
+@pytest.mark.asyncio
+async def test_no_packets_wired_skips_the_delegation_gate(tmp_path: Path) -> None:
+    git = _non_trivial_git()
+    emitter, deliverer = _emitter_with_packets(tmp_path, git, None)
+
+    result = await emitter.emit("demo", "ENG-9", verification=(("pytest", "ok"),))
+
+    assert result.delivery.delivered is True
+    assert deliverer.events == [("demo", result.event)]

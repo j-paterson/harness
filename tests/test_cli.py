@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 45
+    assert json.loads(result.stdout)["schema_version"] == 46
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -335,6 +335,94 @@ def test_subagent_gate_blocks_only_frozen_sessions(tmp_path: Path) -> None:
         assert main(["subagent-gate", "--freeze-dir", str(freeze_dir)]) == 2
     finally:
         _sys.stdin = stdin
+
+
+def test_subagent_gate_admits_through_the_packet_ledger_when_wired(
+    tmp_path: Path,
+) -> None:
+    import json as _json
+
+    from hermes_orchestrator.cli import subagent_gate
+    from hermes_orchestrator.packet_admission import AdmissionDecision
+
+    freeze_dir = tmp_path / "freezes"
+    freeze_dir.mkdir()
+    packet_id = "a" * 32
+    payload = _json.dumps(
+        {
+            "session_id": "s-1",
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_1",
+            "tool_input": {
+                "description": f"packet:{packet_id} implement the red test",
+                "model": "sonnet",
+                "effort": "high",
+            },
+        }
+    )
+
+    class RecordingAdmission:
+        def __init__(self, allowed: bool, reason: str) -> None:
+            self.allowed = allowed
+            self.reason = reason
+            self.calls: list[dict[str, str]] = []
+
+        def admit(self, **kwargs: str) -> AdmissionDecision:
+            self.calls.append(kwargs)
+            return AdmissionDecision(
+                allowed=self.allowed,
+                reason=self.reason,
+                packet_id=kwargs["packet_id"] if self.allowed else None,
+            )
+
+    refusing = RecordingAdmission(False, "overlapping ownership with reserved packet")
+    code, message = subagent_gate(freeze_dir, payload, admission=refusing)
+    assert code == 2
+    assert "overlapping ownership" in message
+    assert refusing.calls == [
+        {
+            "session_id": "s-1",
+            "packet_id": packet_id,
+            "model": "sonnet",
+            "effort": "high",
+            "tool_use_id": "toolu_1",
+        }
+    ]
+
+    allowing = RecordingAdmission(True, "reserved")
+    assert subagent_gate(freeze_dir, payload, admission=allowing) == (0, "")
+
+    no_marker_payload = _json.dumps(
+        {
+            "session_id": "s-1",
+            "tool_input": {"description": "no marker in this description"},
+        }
+    )
+    # No marker: freeze-only behavior, unchanged whether or not admission
+    # is wired, and admission is never even consulted.
+    assert subagent_gate(freeze_dir, no_marker_payload, admission=refusing) == (
+        0,
+        "",
+    )
+    assert refusing.calls == [
+        {
+            "session_id": "s-1",
+            "packet_id": packet_id,
+            "model": "sonnet",
+            "effort": "high",
+            "tool_use_id": "toolu_1",
+        }
+    ]
+
+    # A marker with no admission wired into this process allows through.
+    assert subagent_gate(freeze_dir, payload, admission=None) == (0, "")
+
+    # The freeze marker still takes priority over admission entirely.
+    (freeze_dir / "s-1.frozen").write_text("rotation_pending: 90%\n")
+    never_consulted = RecordingAdmission(True, "reserved")
+    code, message = subagent_gate(freeze_dir, payload, admission=never_consulted)
+    assert code == 2 and "frozen" in message
+    assert never_consulted.calls == []
 
 
 def test_hermes_stall_cycle_through_the_cli(tmp_path: Path) -> None:
@@ -629,6 +717,231 @@ def test_hermes_command_lists_and_acks_lead_wakes(
         ]
     )
     assert json.loads(relisted.stdout)["state"]["wakes"] == []
+
+
+def _seed_active_cell(
+    database_path: Path,
+    *,
+    project_key: str = "demo",
+    session_id: str = "sess-1",
+    cell_id: str = "cell-1",
+) -> None:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(database_path)
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) VALUES (?, ?, 'active', 'max-a', ?, "
+                "'2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')",
+                (cell_id, project_key, session_id),
+            )
+    finally:
+        database.close()
+
+
+def test_hermes_command_create_accept_reject_packet_lifecycle(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    repo_root, state_dir = configured_repo
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+    _seed_active_cell(state_dir / "state.db")
+
+    def create_packet(worktree: str) -> str:
+        result = invoke(
+            [
+                *base_arguments(configured_repo),
+                "hermes-command",
+                "--json",
+                json.dumps(
+                    {
+                        "intent": "create_packet",
+                        "issue_id": "ENG-9",
+                        "model_tier": "sonnet",
+                        "effort": "high",
+                        "allowed_files": ["src/app.py"],
+                        "worktree": worktree,
+                        "red_test": "pytest -k red",
+                        "verification": ["pytest -q"],
+                        "invariants": "no other files change",
+                        "resource_note": "one sonnet slot",
+                    }
+                ),
+            ]
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["code"] == "accepted"
+        assert payload["state"]["state"] == "planned"
+        return str(payload["state"]["packet_id"])
+
+    accept_packet_id = create_packet(str(repo_root / "accept-worktree"))
+    reject_packet_id = create_packet(str(repo_root / "reject-worktree"))
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        packets = SubagentPackets(database, events=EventStore(database))
+        packets.reserve(accept_packet_id, session_id="sess-1", tool_use_id="tu-1")
+        packets.settle(accept_packet_id, outcome="completed", tool_use_id="tu-1")
+        packets.reserve(reject_packet_id, session_id="sess-1", tool_use_id="tu-2")
+        packets.settle(reject_packet_id, outcome="completed", tool_use_id="tu-2")
+    finally:
+        database.close()
+
+    accept = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "accept_packet",
+                    "packet_id": accept_packet_id,
+                    "evidence": {"diff": "clean"},
+                }
+            ),
+        ]
+    )
+    assert accept.exit_code == 0, accept.output
+    accepted = json.loads(accept.stdout)
+    assert accepted["code"] == "accepted"
+    assert accepted["state"]["state"] == "accepted"
+    assert accepted["state"]["evidence"] == {"diff": "clean"}
+
+    reject = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "reject_packet",
+                    "packet_id": reject_packet_id,
+                    "reason": "scope creep",
+                }
+            ),
+        ]
+    )
+    assert reject.exit_code == 0, reject.output
+    rejected = json.loads(reject.stdout)
+    assert rejected["code"] == "accepted"
+    assert rejected["state"]["state"] == "rejected"
+
+    no_cell = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "create_packet",
+                    "issue_id": "ENG-UNKNOWN",
+                    "model_tier": "sonnet",
+                    "effort": "high",
+                    "allowed_files": ["src/app.py"],
+                    "worktree": str(repo_root),
+                    "red_test": "pytest -k red",
+                    "verification": ["pytest -q"],
+                    "invariants": "no other files change",
+                    "resource_note": "one sonnet slot",
+                }
+            ),
+        ]
+    )
+    assert no_cell.exit_code == 0
+    no_cell_payload = json.loads(no_cell.stdout)
+    assert no_cell_payload["code"] == "rejected"
+    assert "no active cell" in str(no_cell_payload["state"]["reason"])
+
+
+def test_hermes_command_record_direct_exception_creates_accepted_packet(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    _repo_root, state_dir = configured_repo
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+    _seed_active_cell(state_dir / "state.db")
+
+    within_scale = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "record_direct_exception",
+                    "issue_id": "ENG-9",
+                    "reason": "one-line typo fix",
+                    "expected_files": ["src/app.py"],
+                    "expected_lines": 5,
+                    "verification": "pytest -q",
+                }
+            ),
+        ]
+    )
+    assert within_scale.exit_code == 0, within_scale.output
+    payload = json.loads(within_scale.stdout)
+    assert payload["code"] == "accepted"
+    assert payload["state"]["state"] == "accepted"
+    assert payload["state"]["model_tier"] == "fable"
+    assert payload["state"]["allowed_files"] == ["src/app.py"]
+    assert payload["state"]["evidence"] == {
+        "exception_reason": "one-line typo fix",
+        "expected_lines": "5",
+    }
+
+    over_scale = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "record_direct_exception",
+                    "issue_id": "ENG-9",
+                    "reason": "too much for a direct exception",
+                    "expected_files": ["a.py", "b.py", "c.py"],
+                    "expected_lines": 5,
+                    "verification": "pytest -q",
+                }
+            ),
+        ]
+    )
+    assert over_scale.exit_code == 0
+    over_payload = json.loads(over_scale.stdout)
+    assert over_payload["code"] == "rejected"
+    assert "reviewer-fix scale" in str(over_payload["state"]["reason"])
 
 
 def _recording_hermes_config(tmp_path: Path, *, exit_code: int = 0) -> Path:

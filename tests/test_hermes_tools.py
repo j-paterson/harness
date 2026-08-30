@@ -289,3 +289,182 @@ def test_supports_reflects_inline_and_wired_intents(database: Database) -> None:
     wired = HermesCommandService(queue, handlers={"approve_stall": lambda c: {}})
     assert wired.supports("approve_stall")
     assert not wired.supports("request_cleanup")
+
+
+def test_packet_intents_are_strict_and_routed(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def created(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"packet_id": "p-1", "state": "planned"}
+
+    def accepted(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"packet_id": command.packet_id, "state": "accepted"}
+
+    def rejected(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"packet_id": command.packet_id, "state": "rejected"}
+
+    def direct_exception(command: object) -> dict[str, object]:
+        seen.append(command)
+        if len(command.expected_files) > 2 or command.expected_lines > 30:
+            raise ValueError("direct-work exception exceeds the reviewer-fix scale")
+        return {"packet_id": "p-2", "state": "accepted"}
+
+    service = HermesCommandService(
+        queue,
+        handlers={
+            "create_packet": created,
+            "accept_packet": accepted,
+            "reject_packet": rejected,
+            "record_direct_exception": direct_exception,
+        },
+    )
+
+    create_result = service.execute(
+        {
+            "intent": "create_packet",
+            "issue_id": "ENG-9",
+            "model_tier": "sonnet",
+            "effort": "high",
+            "allowed_files": ["src/app.py"],
+            "worktree": "/repo",
+            "red_test": "pytest -k red",
+            "verification": ["pytest -q"],
+            "invariants": "no other files change",
+            "resource_note": "one sonnet slot",
+        }
+    )
+    assert create_result.code == "accepted"
+    assert create_result.state == {"packet_id": "p-1", "state": "planned"}
+    assert seen[0].allowed_files == ["src/app.py"]
+    assert seen[0].depends_on == []
+
+    invalid_create = service.execute(
+        {
+            "intent": "create_packet",
+            "issue_id": "ENG-9",
+            "model_tier": "sonnet",
+            "effort": "high",
+            "allowed_files": ["src/app.py"],
+            "worktree": "/repo",
+            "red_test": "pytest -k red",
+            "verification": ["pytest -q"],
+            "invariants": "no other files change",
+            "resource_note": "one sonnet slot",
+            "extra_field": "nope",
+        }
+    )
+    assert invalid_create.code == "invalid_command"
+
+    accept_result = service.execute(
+        {"intent": "accept_packet", "packet_id": "p-1", "evidence": {"diff": "clean"}}
+    )
+    assert accept_result.code == "accepted"
+    assert accept_result.state == {"packet_id": "p-1", "state": "accepted"}
+
+    reject_result = service.execute(
+        {"intent": "reject_packet", "packet_id": "p-1", "reason": "scope creep"}
+    )
+    assert reject_result.code == "accepted"
+    assert reject_result.state == {"packet_id": "p-1", "state": "rejected"}
+
+    within_scale = service.execute(
+        {
+            "intent": "record_direct_exception",
+            "issue_id": "ENG-9",
+            "reason": "one-line typo fix",
+            "expected_files": ["src/app.py"],
+            "expected_lines": 5,
+            "verification": "pytest -q",
+        }
+    )
+    assert within_scale.code == "accepted"
+    assert within_scale.state == {"packet_id": "p-2", "state": "accepted"}
+
+    over_scale = service.execute(
+        {
+            "intent": "record_direct_exception",
+            "issue_id": "ENG-9",
+            "reason": "too much for a direct exception",
+            "expected_files": ["a.py", "b.py", "c.py"],
+            "expected_lines": 5,
+            "verification": "pytest -q",
+        }
+    )
+    assert over_scale.code == "rejected"
+    assert "reviewer-fix scale" in str(over_scale.state["reason"])
+
+    over_lines = service.execute(
+        {
+            "intent": "record_direct_exception",
+            "issue_id": "ENG-9",
+            "reason": "too many lines for a direct exception",
+            "expected_files": ["a.py"],
+            "expected_lines": 31,
+            "verification": "pytest -q",
+        }
+    )
+    assert over_lines.code == "rejected"
+    assert "reviewer-fix scale" in str(over_lines.state["reason"])
+
+    invalid_lines = service.execute(
+        {
+            "intent": "record_direct_exception",
+            "issue_id": "ENG-9",
+            "reason": "zero lines is not a real exception",
+            "expected_files": ["a.py"],
+            "expected_lines": 0,
+            "verification": "pytest -q",
+        }
+    )
+    assert invalid_lines.code == "invalid_command"
+
+    invalid_files = service.execute(
+        {
+            "intent": "record_direct_exception",
+            "issue_id": "ENG-9",
+            "reason": "no files at all",
+            "expected_files": [],
+            "expected_lines": 5,
+            "verification": "pytest -q",
+        }
+    )
+    assert invalid_files.code == "invalid_command"
+
+
+def test_packet_intents_without_handlers_are_unavailable(
+    command_service: HermesCommandService,
+) -> None:
+    for intent, payload in (
+        (
+            "create_packet",
+            {
+                "issue_id": "ENG-9",
+                "model_tier": "sonnet",
+                "effort": "high",
+                "allowed_files": ["a.py"],
+                "worktree": "/repo",
+                "red_test": "r",
+                "verification": ["v"],
+                "invariants": "i",
+                "resource_note": "n",
+            },
+        ),
+        ("accept_packet", {"packet_id": "p-1", "evidence": {}}),
+        ("reject_packet", {"packet_id": "p-1", "reason": "r"}),
+        (
+            "record_direct_exception",
+            {
+                "issue_id": "ENG-9",
+                "reason": "r",
+                "expected_files": ["a.py"],
+                "expected_lines": 5,
+                "verification": "v",
+            },
+        ),
+    ):
+        result = command_service.execute({"intent": intent, **payload})
+        assert result.code == "intent_unavailable", intent

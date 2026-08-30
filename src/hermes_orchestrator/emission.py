@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from hermes_orchestrator.ci_window import MergeWindowExhausted, PriorMergeFailed
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
@@ -35,6 +35,9 @@ from hermes_orchestrator.manifests import (
 )
 from hermes_orchestrator.review_intake import CandidateRejected
 from hermes_orchestrator.verdicts import CorrectionPacket
+
+if TYPE_CHECKING:
+    from hermes_orchestrator.subagent_packets import SubagentPackets
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +151,7 @@ class CandidateEmitter:
         intake_gate: IntakeGatePort | None = None,
         lead: CorrectionSinkPort | None = None,
         issue_for_failure: Callable[[str, str], str | None] | None = None,
+        packets: SubagentPackets | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -157,6 +161,7 @@ class CandidateEmitter:
         self._intake_gate = intake_gate
         self._lead = lead
         self._issue_for_failure = issue_for_failure
+        self._packets = packets
 
     async def emit(
         self,
@@ -211,6 +216,8 @@ class CandidateEmitter:
         )
         head, branch = facts.head, facts.branch
         base, changed = facts.base, facts.changed_files
+        if self._packets is not None:
+            self._enforce_delegation_evidence(repo, issue_id, base, head, changed)
         # A fresh event per freeze boundary: a deferred candidate must be
         # re-woken as a new event, and the durable wake registry deduplicates
         # by candidate identity, so re-emission is always safe.
@@ -299,6 +306,50 @@ class CandidateEmitter:
         except CandidateRejected as rejected:
             return "rejected", str(rejected)
         return "clear", ""
+
+    def _enforce_delegation_evidence(
+        self,
+        repo: Path,
+        issue_id: str,
+        base: str,
+        head: str,
+        changed: tuple[str, ...],
+    ) -> None:
+        """Refuse a non-trivial candidate with no delegation evidence.
+
+        Triviality is proven from the same freeze-boundary diff: at most
+        two changed files and at most thirty added-plus-deleted lines. A
+        non-trivial diff requires at least one accepted subagent packet
+        for this issue (a direct-work exception is itself recorded as an
+        immediately-accepted packet) — never inferred, always proven from
+        the durable ledger.
+        """
+
+        numstat = self._run(repo, "diff", "--numstat", base, head)
+        total_lines = 0
+        for line in numstat.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            try:
+                total_lines += int(parts[0]) + int(parts[1])
+            except ValueError:
+                continue
+        non_trivial = len(changed) > 2 or total_lines > 30
+        if not non_trivial:
+            return
+        assert self._packets is not None
+        accepted = [
+            packet
+            for packet in self._packets.for_issue(issue_id)
+            if packet.state == "accepted"
+        ]
+        if not accepted:
+            raise EmissionBlocked(
+                "delegation evidence missing: a non-trivial candidate "
+                "requires accepted subagent packets or a recorded "
+                "direct-work exception (record_direct_exception)"
+            )
 
     def _run(self, repo: Path, *args: str) -> str:
         try:

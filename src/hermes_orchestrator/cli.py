@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -57,6 +59,7 @@ from hermes_orchestrator.operator_decisions import (
     DecisionRefused,
     OperatorDecisions,
 )
+from hermes_orchestrator.packet_admission import PacketAdmission
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
 from hermes_orchestrator.remote.auth import (
@@ -84,6 +87,7 @@ from hermes_orchestrator.stalls import (
     StallDiagnosis,
     StallEvidence,
 )
+from hermes_orchestrator.subagent_packets import SubagentPackets
 from hermes_orchestrator.supervisor import Supervisor
 
 
@@ -795,8 +799,44 @@ def _remedy_executor(runtime: Runtime) -> RemedyExecutor:
     )
 
 
+def _active_cell_for_issue(database: Database, issue_id: str) -> tuple[str, str, str]:
+    """Resolve the ``(cell_id, session_id, project_key)`` owning ``issue_id``.
+
+    Looks up the issue's project from ``admitted_issues`` and then the
+    single active cell for that project; refuses closed when either is
+    absent so a packet can never be bound to a stale or foreign cell.
+    """
+
+    issue_row = database.execute(
+        "SELECT project_key FROM admitted_issues WHERE issue_id = ?",
+        (issue_id,),
+    ).fetchone()
+    if issue_row is None:
+        raise ValueError(f"no active cell owns issue {issue_id!r}")
+    project_key = str(issue_row["project_key"])
+    cell_row = database.execute(
+        "SELECT cell_id, session_id, project_key FROM project_cells "
+        "WHERE project_key = ? AND state = 'active'",
+        (project_key,),
+    ).fetchone()
+    if cell_row is None:
+        raise ValueError(f"no active cell for project {project_key!r}")
+    return (
+        str(cell_row["cell_id"]),
+        str(cell_row["session_id"]),
+        str(cell_row["project_key"]),
+    )
+
+
+def _packet_payload(packet: Any) -> dict[str, Any]:
+    return dict(dataclasses.asdict(packet))
+
+
 def _hermes_handlers(
-    settings: Any, runtime: Runtime, outbox: LeadCorrectionOutbox
+    settings: Any,
+    runtime: Runtime,
+    outbox: LeadCorrectionOutbox,
+    packets: SubagentPackets,
 ) -> dict[str, Any]:
     def pending_corrections(command: Any) -> dict[str, Any]:
         items = outbox.pending(command.project_key)
@@ -923,6 +963,75 @@ def _hermes_handlers(
         )
         return {"recorded": True, "success": command.success}
 
+    def create_packet(command: Any) -> dict[str, Any]:
+        cell_id, session_id, project_key = _active_cell_for_issue(
+            runtime.database, command.issue_id
+        )
+        packet = packets.create(
+            issue_id=command.issue_id,
+            project_key=project_key,
+            cell_id=cell_id,
+            session_id=session_id,
+            generation=1,
+            model_tier=command.model_tier,
+            effort=command.effort,
+            allowed_files=command.allowed_files,
+            worktree=command.worktree,
+            depends_on=command.depends_on,
+            red_test=command.red_test,
+            verification=command.verification,
+            invariants=command.invariants,
+            resource_note=command.resource_note,
+        )
+        return _packet_payload(packet)
+
+    def accept_packet(command: Any) -> dict[str, Any]:
+        packet = packets.accept(command.packet_id, evidence=command.evidence)
+        return _packet_payload(packet)
+
+    def reject_packet(command: Any) -> dict[str, Any]:
+        packet = packets.reject(command.packet_id, reason=command.reason)
+        return _packet_payload(packet)
+
+    def record_direct_exception(command: Any) -> dict[str, Any]:
+        if len(command.expected_files) > 2 or command.expected_lines > 30:
+            raise ValueError(
+                "direct-work exception exceeds the reviewer-fix scale"
+            )
+        cell_id, session_id, _project_key = _active_cell_for_issue(
+            runtime.database, command.issue_id
+        )
+        packet = packets.create(
+            issue_id=command.issue_id,
+            project_key=_project_key,
+            cell_id=cell_id,
+            session_id=session_id,
+            generation=1,
+            model_tier="fable",
+            effort="high",
+            allowed_files=command.expected_files,
+            worktree=cell_id,
+            red_test="direct-work exception",
+            verification=[command.verification],
+            invariants=command.reason,
+            resource_note=f"expected_lines={command.expected_lines}",
+        )
+        tool_use_id = f"direct:{command.issue_id}"
+        packets.reserve(
+            packet.packet_id, session_id=session_id, tool_use_id=tool_use_id
+        )
+        packets.settle(
+            packet.packet_id, outcome="completed", tool_use_id=tool_use_id
+        )
+        packet = packets.accept(
+            packet.packet_id,
+            evidence={
+                "exception_reason": command.reason,
+                "expected_lines": str(command.expected_lines),
+            },
+        )
+        return _packet_payload(packet)
+
     return {
         "pending_corrections": pending_corrections,
         "ack_correction": ack_correction,
@@ -934,6 +1043,10 @@ def _hermes_handlers(
         "approve_playbook": approve_playbook,
         "pending_consultations": pending_consultations,
         "record_remedy_result": record_remedy_result,
+        "create_packet": create_packet,
+        "accept_packet": accept_packet,
+        "reject_packet": reject_packet,
+        "record_direct_exception": record_direct_exception,
     }
 
 
@@ -978,12 +1091,25 @@ def _print(payload: Any, *, json_output: bool, human: str) -> None:
         print(human)
 
 
-def subagent_gate(freeze_dir: Path, payload: str) -> tuple[int, str]:
-    """PreToolUse hook: block Agent tool use while the session is frozen.
+_GATE_PACKET_MARKER = re.compile(r"\bpacket:([0-9a-f]{32})\b")
+
+
+def subagent_gate(
+    freeze_dir: Path,
+    payload: str,
+    *,
+    admission: PacketAdmission | None = None,
+) -> tuple[int, str]:
+    """PreToolUse hook: block Agent tool use while the session is frozen,
+    and — once a packet marker is present and packet admission is wired
+    into this process — gate the launch through the durable packet ledger.
 
     Exit 2 blocks the tool call in Claude Code and returns the message to
     the lead; exit 0 allows it. Malformed input never blocks silently: it
     fails closed with exit 2 only when a freeze marker cannot be ruled out.
+    A launch with no ``packet:<hex>`` marker in its description/name, or
+    one wired into a process that has no ``admission`` service, keeps the
+    prior freeze-only behavior unchanged.
     """
 
     try:
@@ -1000,6 +1126,30 @@ def subagent_gate(freeze_dir: Path, payload: str) -> tuple[int, str]:
             "subagent gate: new subwork is frozen for this session "
             f"({reason}); finish current work to a safe boundary and hand off"
         )
+
+    tool_input = document.get("tool_input")
+    packet_id = None
+    if isinstance(tool_input, dict):
+        for field_name in ("description", "name"):
+            text = tool_input.get(field_name)
+            if isinstance(text, str) and (
+                match := _GATE_PACKET_MARKER.search(text)
+            ):
+                packet_id = match.group(1)
+                break
+    if packet_id is None or admission is None:
+        return 0, ""
+
+    tool_use_id = document.get("tool_use_id")
+    decision = admission.admit(
+        session_id=session_id,
+        packet_id=packet_id,
+        model=str(tool_input.get("model") or ""),
+        effort=str(tool_input.get("effort") or "high"),
+        tool_use_id=str(tool_use_id) if tool_use_id else f"gate:{packet_id}",
+    )
+    if not decision.allowed:
+        return 2, f"subagent gate: {decision.reason}"
     return 0, ""
 
 
@@ -2026,10 +2176,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 events=events,
                 project_for_issue=lambda issue_id: queue.get(issue_id).project_key,
             )
+            packets = SubagentPackets(database, events=events)
             result = HermesCommandService(
                 queue,
                 qa=QaRouter(database=database, events=events),
-                handlers=_hermes_handlers(settings, runtime, outbox),
+                handlers=_hermes_handlers(settings, runtime, outbox, packets),
             ).execute(request)
             print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             rejected = {"invalid_command", "intent_not_allowed"}
@@ -2371,6 +2522,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "queue_count": len(queue.list_ranked(datetime.now(UTC))),
                 "project_count": len(settings.projects),
                 "schema_version": database.schema_version(),
+                # INFRA-186: a lead silently doing all implementation is
+                # observable — packet counts, tiers, child lifecycle,
+                # and the Fable-token share.
+                "delegation": runtime.service.status()["delegation"],
             }
             _print(
                 payload,

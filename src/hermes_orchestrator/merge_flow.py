@@ -47,6 +47,7 @@ from hermes_orchestrator.review_intake import (
 )
 from hermes_orchestrator.reviews import LinearProjector, ReviewService
 from hermes_orchestrator.settlement import MergeSettlements
+from hermes_orchestrator.subagent_packets import SubagentPackets
 
 GITHUB_KEYCHAIN_SERVICE = "hermes-orchestrator-github"
 CIRCLECI_KEYCHAIN_SERVICE = "hermes-orchestrator-circleci"
@@ -211,6 +212,9 @@ def build_merge_flow(
         intake_gate=intake_gate,
         lead=outbox,
         issue_for_failure=reviews.issue_for_candidate,
+        # INFRA-186: a non-trivial candidate must carry delegation
+        # evidence from the durable packet ledger, or fail closed.
+        packets=SubagentPackets(database, events=events),
     )
     turns = MergerTurnService(
         database=database,
