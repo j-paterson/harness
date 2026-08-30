@@ -66,7 +66,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 44
+    assert json.loads(result.stdout)["schema_version"] == 47
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -335,6 +335,94 @@ def test_subagent_gate_blocks_only_frozen_sessions(tmp_path: Path) -> None:
         assert main(["subagent-gate", "--freeze-dir", str(freeze_dir)]) == 2
     finally:
         _sys.stdin = stdin
+
+
+def test_subagent_gate_admits_through_the_packet_ledger_when_wired(
+    tmp_path: Path,
+) -> None:
+    import json as _json
+
+    from hermes_orchestrator.cli import subagent_gate
+    from hermes_orchestrator.packet_admission import AdmissionDecision
+
+    freeze_dir = tmp_path / "freezes"
+    freeze_dir.mkdir()
+    packet_id = "a" * 32
+    payload = _json.dumps(
+        {
+            "session_id": "s-1",
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_1",
+            "tool_input": {
+                "description": f"packet:{packet_id} implement the red test",
+                "model": "sonnet",
+                "effort": "high",
+            },
+        }
+    )
+
+    class RecordingAdmission:
+        def __init__(self, allowed: bool, reason: str) -> None:
+            self.allowed = allowed
+            self.reason = reason
+            self.calls: list[dict[str, str]] = []
+
+        def admit(self, **kwargs: str) -> AdmissionDecision:
+            self.calls.append(kwargs)
+            return AdmissionDecision(
+                allowed=self.allowed,
+                reason=self.reason,
+                packet_id=kwargs["packet_id"] if self.allowed else None,
+            )
+
+    refusing = RecordingAdmission(False, "overlapping ownership with reserved packet")
+    code, message = subagent_gate(freeze_dir, payload, admission=refusing)
+    assert code == 2
+    assert "overlapping ownership" in message
+    assert refusing.calls == [
+        {
+            "session_id": "s-1",
+            "packet_id": packet_id,
+            "model": "sonnet",
+            "effort": "high",
+            "tool_use_id": "toolu_1",
+        }
+    ]
+
+    allowing = RecordingAdmission(True, "reserved")
+    assert subagent_gate(freeze_dir, payload, admission=allowing) == (0, "")
+
+    no_marker_payload = _json.dumps(
+        {
+            "session_id": "s-1",
+            "tool_input": {"description": "no marker in this description"},
+        }
+    )
+    # No marker: freeze-only behavior, unchanged whether or not admission
+    # is wired, and admission is never even consulted.
+    assert subagent_gate(freeze_dir, no_marker_payload, admission=refusing) == (
+        0,
+        "",
+    )
+    assert refusing.calls == [
+        {
+            "session_id": "s-1",
+            "packet_id": packet_id,
+            "model": "sonnet",
+            "effort": "high",
+            "tool_use_id": "toolu_1",
+        }
+    ]
+
+    # A marker with no admission wired into this process allows through.
+    assert subagent_gate(freeze_dir, payload, admission=None) == (0, "")
+
+    # The freeze marker still takes priority over admission entirely.
+    (freeze_dir / "s-1.frozen").write_text("rotation_pending: 90%\n")
+    never_consulted = RecordingAdmission(True, "reserved")
+    code, message = subagent_gate(freeze_dir, payload, admission=never_consulted)
+    assert code == 2 and "frozen" in message
+    assert never_consulted.calls == []
 
 
 def test_hermes_stall_cycle_through_the_cli(tmp_path: Path) -> None:
@@ -629,6 +717,412 @@ def test_hermes_command_lists_and_acks_lead_wakes(
         ]
     )
     assert json.loads(relisted.stdout)["state"]["wakes"] == []
+
+
+def _seed_active_cell(
+    database_path: Path,
+    *,
+    project_key: str = "demo",
+    session_id: str = "sess-1",
+    cell_id: str = "cell-1",
+) -> None:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(database_path)
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) VALUES (?, ?, 'active', 'max-a', ?, "
+                "'2026-08-28T00:00:00+00:00', '2026-08-28T00:00:00+00:00')",
+                (cell_id, project_key, session_id),
+            )
+    finally:
+        database.close()
+
+
+def test_hermes_command_create_accept_reject_packet_lifecycle(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    repo_root, state_dir = configured_repo
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+    _seed_active_cell(state_dir / "state.db")
+
+    def create_packet(worktree: str) -> str:
+        result = invoke(
+            [
+                *base_arguments(configured_repo),
+                "hermes-command",
+                "--json",
+                json.dumps(
+                    {
+                        "intent": "create_packet",
+                        "issue_id": "ENG-9",
+                        "model_tier": "sonnet",
+                        "effort": "high",
+                        "allowed_files": ["src/app.py"],
+                        "worktree": worktree,
+                        "red_test": "pytest -k red",
+                        "verification": ["pytest -q"],
+                        "invariants": "no other files change",
+                        "resource_note": "one sonnet slot",
+                    }
+                ),
+            ]
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["code"] == "accepted"
+        assert payload["state"]["state"] == "planned"
+        return str(payload["state"]["packet_id"])
+
+    accept_packet_id = create_packet(str(repo_root / "accept-worktree"))
+    reject_packet_id = create_packet(str(repo_root / "reject-worktree"))
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        packets = SubagentPackets(database, events=EventStore(database))
+        packets.reserve(accept_packet_id, session_id="sess-1", tool_use_id="tu-1")
+        packets.settle(accept_packet_id, outcome="completed", tool_use_id="tu-1")
+        packets.reserve(reject_packet_id, session_id="sess-1", tool_use_id="tu-2")
+        packets.settle(reject_packet_id, outcome="completed", tool_use_id="tu-2")
+    finally:
+        database.close()
+
+    accept = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "accept_packet",
+                    "packet_id": accept_packet_id,
+                    "evidence": {"diff": "clean"},
+                }
+            ),
+        ]
+    )
+    assert accept.exit_code == 0, accept.output
+    accepted = json.loads(accept.stdout)
+    assert accepted["code"] == "accepted"
+    assert accepted["state"]["state"] == "accepted"
+    assert accepted["state"]["evidence"] == {"diff": "clean"}
+
+    reject = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "reject_packet",
+                    "packet_id": reject_packet_id,
+                    "reason": "scope creep",
+                }
+            ),
+        ]
+    )
+    assert reject.exit_code == 0, reject.output
+    rejected = json.loads(reject.stdout)
+    assert rejected["code"] == "accepted"
+    assert rejected["state"]["state"] == "rejected"
+
+    no_cell = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "create_packet",
+                    "issue_id": "ENG-UNKNOWN",
+                    "model_tier": "sonnet",
+                    "effort": "high",
+                    "allowed_files": ["src/app.py"],
+                    "worktree": str(repo_root),
+                    "red_test": "pytest -k red",
+                    "verification": ["pytest -q"],
+                    "invariants": "no other files change",
+                    "resource_note": "one sonnet slot",
+                }
+            ),
+        ]
+    )
+    assert no_cell.exit_code == 0
+    no_cell_payload = json.loads(no_cell.stdout)
+    assert no_cell_payload["code"] == "rejected"
+    assert "no active cell" in str(no_cell_payload["state"]["reason"])
+
+
+def test_hermes_command_record_direct_exception_creates_accepted_packet(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _repo_root, state_dir = configured_repo
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+    _seed_active_cell(state_dir / "state.db")
+
+    # Measurement must SUCCEED before any packet is created — there is
+    # no "unmeasured" fallback — so the exception's worktree must be a
+    # real git checkout with a real, measurable diff against HEAD.
+    worktree = tmp_path / "direct-exception-worktree"
+    (worktree / "src").mkdir(parents=True)
+    (worktree / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _verifier_git(worktree, "init", "-q")
+    _verifier_git(worktree, "add", "-A")
+    _verifier_git(worktree, "commit", "-qm", "init")
+    (worktree / "src" / "app.py").write_text(
+        "x = 1\ny = 2\nz = 3\n", encoding="utf-8"
+    )
+
+    within_scale = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "record_direct_exception",
+                    "issue_id": "ENG-9",
+                    "reason": "one-line typo fix",
+                    "expected_files": ["src/app.py"],
+                    "expected_lines": 5,
+                    "verification": "pytest -q",
+                    "worktree": str(worktree),
+                }
+            ),
+        ]
+    )
+    assert within_scale.exit_code == 0, within_scale.output
+    payload = json.loads(within_scale.stdout)
+    assert payload["code"] == "accepted"
+    assert payload["state"]["state"] == "accepted"
+    assert payload["state"]["model_tier"] == "fable"
+    assert payload["state"]["allowed_files"] == ["src/app.py"]
+    # Updated for the CLI-side measurement requirement: the live diff is
+    # now ALWAYS measured before any packet is created (no "unmeasured"
+    # fallback), so evidence records the real added+deleted line count
+    # measured against the worktree's actual git history.
+    assert payload["state"]["evidence"] == {
+        "exception_reason": "one-line typo fix",
+        "expected_lines": "5",
+        "measured_lines": "2",
+    }
+
+    over_scale = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "record_direct_exception",
+                    "issue_id": "ENG-9",
+                    "reason": "too much for a direct exception",
+                    "expected_files": ["a.py", "b.py", "c.py"],
+                    "expected_lines": 5,
+                    "verification": "pytest -q",
+                }
+            ),
+        ]
+    )
+    assert over_scale.exit_code == 0
+    over_payload = json.loads(over_scale.stdout)
+    assert over_payload["code"] == "rejected"
+    assert "reviewer-fix scale" in str(over_payload["state"]["reason"])
+
+
+def test_record_direct_exception_measures_the_live_diff_via_the_run_seam(
+    tmp_path: Path,
+) -> None:
+    """The declared ``expected_files``/``expected_lines`` are never taken
+    on faith when a worktree is given: ``record_direct_exception`` shells
+    out (through an injectable ``run`` seam) to measure the actual git
+    diff and refuses before creating any packet when the measured total
+    exceeds either the fixed reviewer-fix scale or the caller's own
+    declared bound; within bounds, the measurement is recorded as
+    ``measured_lines`` evidence."""
+
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_active_cell(
+        tmp_path / "state.db",
+        project_key="demo",
+        session_id="sess-1",
+        cell_id="cell-1",
+    )
+    events = EventStore(runtime.database)
+    outbox = LeadCorrectionOutbox(
+        database=runtime.database,
+        events=events,
+        project_for_issue=lambda issue_id: "demo",
+    )
+    packets = SubagentPackets(runtime.database, events=events)
+    settings = SimpleNamespace(repo_root=tmp_path)
+
+    def command(**overrides: object) -> object:
+        base: dict[str, object] = {
+            "issue_id": "ENG-9",
+            "reason": "measured exception",
+            "expected_files": ["src/app.py"],
+            "expected_lines": 20,
+            "verification": "pytest -q",
+            "worktree": "/some/worktree",
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    over_bound_calls: list[list[str]] = []
+
+    def over_bound_run(args: list[str]) -> str:
+        over_bound_calls.append(list(args))
+        return "15\t10\tsrc/app.py\n"  # 25 lines: over the declared cap of 20
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=over_bound_run)
+    with pytest.raises(ValueError, match="measured diff bound"):
+        handlers["record_direct_exception"](command())
+    assert over_bound_calls == [
+        [
+            "git",
+            "-C",
+            "/some/worktree",
+            "diff",
+            "--numstat",
+            "HEAD",
+            "--",
+            "src/app.py",
+        ]
+    ]
+    # No packet was created by the refused attempt.
+    assert packets.for_issue("ENG-9") == ()
+
+    def within_bound_run(args: list[str]) -> str:
+        return "5\t3\tsrc/app.py\n"  # 8 lines: within every bound
+
+    handlers = _hermes_handlers(
+        settings, runtime, outbox, packets, run=within_bound_run
+    )
+    result = handlers["record_direct_exception"](command())
+    assert result["evidence"] == {
+        "exception_reason": "measured exception",
+        "expected_lines": "20",
+        "measured_lines": "8",
+    }
+
+
+def test_record_direct_exception_refuses_before_any_packet_when_unmeasurable(
+    tmp_path: Path,
+) -> None:
+    """Measurement must SUCCEED before any packet is created: an absent
+    worktree, a failing git invocation, and unparsable numstat output
+    each refuse with ``ValueError`` before ``packets.create`` runs —
+    there is no "unmeasured" fallback."""
+
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_active_cell(
+        tmp_path / "state.db",
+        project_key="demo",
+        session_id="sess-1",
+        cell_id="cell-1",
+    )
+    events = EventStore(runtime.database)
+    outbox = LeadCorrectionOutbox(
+        database=runtime.database,
+        events=events,
+        project_for_issue=lambda issue_id: "demo",
+    )
+    packets = SubagentPackets(runtime.database, events=events)
+    settings = SimpleNamespace(repo_root=tmp_path)
+
+    def command(**overrides: object) -> object:
+        base: dict[str, object] = {
+            "issue_id": "ENG-9",
+            "reason": "measured exception",
+            "expected_files": ["src/app.py"],
+            "expected_lines": 20,
+            "verification": "pytest -q",
+            "worktree": "/some/worktree",
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    # 1. No worktree at all: git must never even be invoked.
+    def unreached_run(args: list[str]) -> str:
+        raise AssertionError("git must never be invoked without a worktree")
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=unreached_run)
+    with pytest.raises(ValueError, match="worktree"):
+        handlers["record_direct_exception"](command(worktree=None))
+    assert packets.for_issue("ENG-9") == ()
+
+    # 2. The numstat run itself raises (a broken git invocation).
+    def raising_run(args: list[str]) -> str:
+        raise RuntimeError("git binary not found")
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=raising_run)
+    with pytest.raises(ValueError, match="git numstat failed"):
+        handlers["record_direct_exception"](command())
+    assert packets.for_issue("ENG-9") == ()
+
+    # 3. The numstat output cannot be parsed for a declared file.
+    def unparsable_run(args: list[str]) -> str:
+        return "-\t-\tsrc/app.py\n"
+
+    handlers = _hermes_handlers(settings, runtime, outbox, packets, run=unparsable_run)
+    with pytest.raises(ValueError, match="unparsable"):
+        handlers["record_direct_exception"](command())
+    assert packets.for_issue("ENG-9") == ()
+
+    # 4. A successful, fully measured path still records real measured_lines
+    # (covered end-to-end above); confirm no stray packets were left behind
+    # by any of the three refused attempts.
+    assert packets.for_issue("ENG-9") == ()
 
 
 def _recording_hermes_config(tmp_path: Path, *, exit_code: int = 0) -> Path:
@@ -1134,3 +1628,147 @@ def test_intake_poll_offers_and_only_explicit_ack_delivers(
         ]
     )
     assert duplicate.exit_code == 1
+
+
+# --- verify / verify-check (INFRA-186 P9: any-agent verifier CLI) ----------
+
+
+def _verifier_git(checkout: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ("git", "-C", str(checkout), *args),
+        check=True,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "PATH": "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+            "HOME": str(checkout),
+        },
+    )
+
+
+def _build_verify_target(root: Path) -> Path:
+    target = root / "verify-target"
+    target.mkdir()
+    (target / "README.md").write_text("hello\n")
+    _verifier_git(target, "init", "-q")
+    _verifier_git(target, "add", "-A")
+    _verifier_git(target, "commit", "-qm", "init")
+    return target
+
+
+def test_verify_runs_a_command_and_prints_a_receipt_id(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    target = _build_verify_target(tmp_path)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify",
+            "--gate",
+            "demo-gate",
+            "--cwd",
+            str(target),
+            "--json",
+            "--",
+            "python3",
+            "-c",
+            "print('1 passed')",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["gate_id"] == "demo-gate"
+    assert payload["exit_code"] == 0
+    assert payload["fresh"] is True
+    assert len(payload["receipt_id"]) == 64
+
+
+def test_verify_refuses_an_empty_trailing_command(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    target = _build_verify_target(tmp_path)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify",
+            "--gate",
+            "demo-gate",
+            "--cwd",
+            str(target),
+        ]
+    )
+
+    assert result.exit_code == 2
+    assert "command" in result.output
+
+
+def test_verify_check_is_fresh_then_stale_after_a_tree_change(
+    configured_repo: tuple[Path, Path], tmp_path: Path
+) -> None:
+    target = _build_verify_target(tmp_path)
+    first = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify",
+            "--gate",
+            "demo-gate",
+            "--cwd",
+            str(target),
+            "--json",
+            "--",
+            "python3",
+            "-c",
+            "print('1 passed')",
+        ]
+    )
+    receipt_id = json.loads(first.stdout)["receipt_id"]
+
+    fresh = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify-check",
+            "--gate",
+            "demo-gate",
+            "--receipt",
+            receipt_id,
+            "--cwd",
+            str(target),
+            "--json",
+        ]
+    )
+    assert fresh.exit_code == 0
+    assert json.loads(fresh.stdout) == {
+        "receipt_id": receipt_id,
+        "valid": True,
+        "reason": "fresh",
+    }
+
+    (target / "README.md").write_text("changed\n")
+    _verifier_git(target, "add", "README.md")
+    _verifier_git(target, "commit", "-qm", "change")
+
+    stale = invoke(
+        [
+            *base_arguments(configured_repo),
+            "verify-check",
+            "--gate",
+            "demo-gate",
+            "--receipt",
+            receipt_id,
+            "--cwd",
+            str(target),
+            "--json",
+        ]
+    )
+    assert stale.exit_code == 1
+    payload = json.loads(stale.stdout)
+    assert payload["valid"] is False
+    assert payload["reason"] == "stale: tree changed"

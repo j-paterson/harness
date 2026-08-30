@@ -30,6 +30,11 @@ _LIMIT_RESULT_SUBTYPES = frozenset({"error_during_execution"})
 # boundary discipline as the original subscription-limit match; only the
 # trailing cap phrase differs per family.
 _LIMIT_PREFIX = "^you['\u2019]ve (?:reached|hit) your "
+# INFRA-186: the Agent tool-use input carries an optional redacted packet
+# marker in its description/name fields; only an exact 32-character
+# lowercase hex id is ever accepted, never any other description text.
+_PACKET_MARKER = re.compile(r"\bpacket:([0-9a-f]{32})\b")
+_MODEL_TIERS = frozenset({"haiku", "sonnet", "opus", "fable"})
 _LIMIT_KIND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "fable",
@@ -72,6 +77,11 @@ class ClaudeEvent:
     error_code: str | None = None
     restated_next_action: str | None = None
     limit_kind: str | None = None
+    # INFRA-186 redacted subagent orchestration metadata: only the
+    # packet id carried in the Agent description and the enumerated
+    # model tier — never prompt or response text.
+    packet_id: str | None = None
+    model_tier: str | None = None
 
 
 class ClaudeStreamError(ValueError):
@@ -110,6 +120,8 @@ class ClaudeEventParser:
         error_code = None
         restated_next_action = None
         limit_kind = None
+        packet_id = None
+        model_tier = None
         if original_type == "system" and subtype == "init":
             kind = "session.started"
         elif original_type == "system" and subtype in _COMPACTION_SUBTYPES:
@@ -117,8 +129,14 @@ class ClaudeEventParser:
         elif self._is_context_error(value):
             kind = "context.error"
             error_code = "context_window"
+        elif self._completes_subagent(value):
+            kind = "subagent.completed"
+            packet_id = self._agent_packet_id(self._agent_tool_use(value))
         elif self._starts_subagent(value):
             kind = "subagent.started"
+            agent_block = self._agent_tool_use(value)
+            packet_id = self._agent_packet_id(agent_block)
+            model_tier = self._agent_model_tier(agent_block)
         elif action := self._handoff_acknowledgement(value):
             kind = "handoff.acknowledged"
             restated_next_action = action
@@ -137,6 +155,8 @@ class ClaudeEventParser:
             error_code=error_code,
             restated_next_action=restated_next_action,
             limit_kind=limit_kind,
+            packet_id=packet_id,
+            model_tier=model_tier,
         )
 
     @staticmethod
@@ -186,6 +206,82 @@ class ClaudeEventParser:
             and block.get("name") == "Agent"
             for block in content
         )
+
+    @staticmethod
+    def _completes_subagent(value: dict[str, Any]) -> bool:
+        """A terminal "result" record scoped to one child Agent tool call.
+
+        This mirrors the top-level lead turn's own terminal "result"
+        record, but scoped down via ``parent_tool_use_id`` exactly as
+        every other per-child record in this stream already is. The
+        ``error_during_execution`` subtype is deliberately excluded: that
+        exact shape (a "result" record with parent_tool_use_id and
+        subtype "error_during_execution") is already characterized, and
+        pinned by existing tests, as an ambiguous case (it may just be a
+        suppressed child-scoped subscription-limit message rather than a
+        genuine subagent failure) that must keep falling through to the
+        generic "stream.result" kind. Because that is the only
+        error-shaped terminal record this stream distinguishes, and it is
+        reserved, "subagent.failed" cannot be split out reliably here —
+        only "subagent.completed" is emitted.
+        """
+
+        return (
+            value.get("type") == "result"
+            and value.get("parent_tool_use_id") is not None
+            and value.get("subtype") not in _LIMIT_RESULT_SUBTYPES
+        )
+
+    @staticmethod
+    def _agent_tool_use(value: dict[str, Any]) -> dict[str, Any] | None:
+        """The Agent tool-use content block, when this record carries one."""
+
+        message = value.get("message")
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == "Agent"
+            ):
+                return block
+        return None
+
+    @classmethod
+    def _agent_packet_id(cls, block: dict[str, Any] | None) -> str | None:
+        """Scan only the Agent input's description/name for a packet marker.
+
+        Never reads any other field (never prompt or response text); an
+        absent or malformed marker (wrong length, wrong case, etc.)
+        always yields None.
+        """
+
+        if block is None:
+            return None
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            return None
+        for field in ("description", "name"):
+            text = tool_input.get(field)
+            if isinstance(text, str) and (match := _PACKET_MARKER.search(text)):
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _agent_model_tier(block: dict[str, Any] | None) -> str | None:
+        """The Agent input's model, only when it is a known tier name."""
+
+        if block is None:
+            return None
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            return None
+        model = tool_input.get("model")
+        return model if model in _MODEL_TIERS else None
 
     @classmethod
     def _subscription_limit_kind(cls, value: dict[str, Any]) -> str | None:

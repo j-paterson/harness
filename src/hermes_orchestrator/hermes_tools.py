@@ -156,6 +156,42 @@ class AckWakeCommand(_Command):
     wake_id: NonEmptyText
 
 
+class CreatePacketCommand(_Command):
+    intent: Literal["create_packet"]
+    issue_id: NonEmptyText
+    model_tier: NonEmptyText
+    effort: NonEmptyText
+    allowed_files: list[NonEmptyText] = Field(min_length=1)
+    worktree: NonEmptyText
+    depends_on: list[NonEmptyText] = Field(default_factory=list)
+    red_test: NonEmptyText
+    verification: list[NonEmptyText] = Field(min_length=1)
+    invariants: NonEmptyText
+    resource_note: NonEmptyText
+
+
+class AcceptPacketCommand(_Command):
+    intent: Literal["accept_packet"]
+    packet_id: NonEmptyText
+    evidence: dict[str, str]
+
+
+class RejectPacketCommand(_Command):
+    intent: Literal["reject_packet"]
+    packet_id: NonEmptyText
+    reason: NonEmptyText
+
+
+class RecordDirectExceptionCommand(_Command):
+    intent: Literal["record_direct_exception"]
+    issue_id: NonEmptyText
+    reason: NonEmptyText
+    expected_files: list[NonEmptyText] = Field(min_length=1)
+    expected_lines: int = Field(gt=0)
+    verification: NonEmptyText
+    worktree: str | None = None
+
+
 class ApplyOperatorDecisionCommand(_Command):
     """The only event shape that may resolve a pending decision.
 
@@ -190,7 +226,11 @@ HermesCommand = Annotated[
     | RecordRemedyResultCommand
     | PendingWakesCommand
     | AckWakeCommand
-    | ApplyOperatorDecisionCommand,
+    | ApplyOperatorDecisionCommand
+    | CreatePacketCommand
+    | AcceptPacketCommand
+    | RejectPacketCommand
+    | RecordDirectExceptionCommand,
     Field(discriminator="intent"),
 ]
 
@@ -219,6 +259,10 @@ _ALLOWED_INTENTS = frozenset(
         "pending_wakes",
         "ack_wake",
         "apply_operator_decision",
+        "create_packet",
+        "accept_packet",
+        "reject_packet",
+        "record_direct_exception",
     }
 )
 

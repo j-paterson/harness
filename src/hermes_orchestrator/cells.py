@@ -26,6 +26,7 @@ from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import ProfilePool
 from hermes_orchestrator.queue import QueueService
+from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
@@ -168,6 +169,7 @@ class ProjectCellService:
         classic_seats: bool = False,
         decisions: OperatorDecisions | None = None,
         assignments: LeadAssignments | None = None,
+        packets: SubagentPackets | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -191,6 +193,7 @@ class ProjectCellService:
         self._classic_seats = classic_seats
         self._decisions = decisions
         self._assignments = assignments
+        self._packets = packets
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
 
@@ -692,6 +695,31 @@ class ProjectCellService:
                         cell.project_key,
                         self._aware_now().isoformat(),
                     ),
+                )
+            elif (
+                event.kind in ("subagent.completed", "subagent.failed")
+                and event.parent_tool_use_id is not None
+            ):
+                # Exactly-once lease release: a duplicate terminal event
+                # finds rowcount 0 against the 'active' guard and does
+                # nothing further.
+                connection.execute(
+                    "UPDATE worker_leases SET state = 'released' "
+                    "WHERE lease_id = ? AND state = 'active'",
+                    (event.parent_tool_use_id,),
+                )
+        if (
+            event.kind in ("subagent.completed", "subagent.failed")
+            and event.parent_tool_use_id is not None
+            and self._packets is not None
+            and event.packet_id is not None
+        ):
+            outcome = "completed" if event.kind == "subagent.completed" else "failed"
+            with suppress(PacketRefused):
+                self._packets.settle(
+                    event.packet_id,
+                    outcome=outcome,
+                    tool_use_id=event.parent_tool_use_id,
                 )
         return recorded.event_id
 

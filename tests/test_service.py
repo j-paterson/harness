@@ -421,3 +421,229 @@ def test_tick_consumes_due_scheduled_resets(
     assert database.scalar(
         "SELECT state FROM scheduled_resets WHERE reset_id = ?", (reset_id,)
     ) == "consumed"
+
+
+def test_status_delegation_section_with_packets_and_children(
+    database: Database, event_store: EventStore
+) -> None:
+    queue = QueueService(database, event_store, {"demo"})
+    service = OrchestratorService(
+        database=database,
+        events=event_store,
+        sampler=FakeSampler(),
+        scheduler=Scheduler(queue, mode="observe"),
+        policy=PolicyConfig(),
+        pid_exists=lambda _pid: False,
+    )
+    service.start()
+
+    # Seed subagent_packets with two states and two tiers
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO subagent_packets("
+            "packet_id, issue_id, project_key, cell_id, session_id, generation, "
+            "model_tier, effort, allowed_files_json, worktree, depends_on_json, "
+            "red_test, verification_json, invariants, resource_note, state, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "pkt-1",
+                "INFRA-186",
+                "demo",
+                "cell-1",
+                "s1",
+                1,
+                "sonnet",
+                "medium",
+                "[]",
+                "/tmp/wt1",
+                "[]",
+                "test_red",
+                "[]",
+                "inv1",
+                "note1",
+                "accepted",
+                "2026-08-29T12:00:00Z",
+                "2026-08-29T12:00:00Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO subagent_packets("
+            "packet_id, issue_id, project_key, cell_id, session_id, generation, "
+            "model_tier, effort, allowed_files_json, worktree, depends_on_json, "
+            "red_test, verification_json, invariants, resource_note, state, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "pkt-2",
+                "INFRA-186",
+                "demo",
+                "cell-1",
+                "s1",
+                1,
+                "sonnet",
+                "high",
+                "[]",
+                "/tmp/wt2",
+                "[]",
+                "test_red2",
+                "[]",
+                "inv2",
+                "note2",
+                "reserved",
+                "2026-08-29T12:00:00Z",
+                "2026-08-29T12:00:00Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO subagent_packets("
+            "packet_id, issue_id, project_key, cell_id, session_id, generation, "
+            "model_tier, effort, allowed_files_json, worktree, depends_on_json, "
+            "red_test, verification_json, invariants, resource_note, state, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "pkt-3",
+                "INFRA-186",
+                "demo",
+                "cell-1",
+                "s1",
+                1,
+                "haiku",
+                "low",
+                "[]",
+                "/tmp/wt3",
+                "[]",
+                "test_red3",
+                "[]",
+                "inv3",
+                "note3",
+                "accepted",
+                "2026-08-29T12:00:00Z",
+                "2026-08-29T12:00:00Z",
+            ),
+        )
+
+        # Seed worker_leases: one active claude_subagent, one released
+        connection.execute(
+            "INSERT INTO worker_leases("
+            "lease_id, worker_id, project_key, kind, state, acquired_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "lease-1",
+                "worker-1",
+                "demo",
+                "claude_subagent",
+                "active",
+                "2026-08-29T12:00:00Z",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO worker_leases("
+            "lease_id, worker_id, project_key, kind, state, acquired_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "lease-2",
+                "worker-2",
+                "demo",
+                "claude_subagent",
+                "released",
+                "2026-08-29T12:00:00Z",
+            ),
+        )
+
+        # Seed events with usage payloads: one lead (null parent_tool_use_id),
+        # one child (non-null parent_tool_use_id)
+        connection.execute(
+            "INSERT INTO events("
+            "event_id, occurred_at, event_type, aggregate_type, aggregate_id, "
+            "correlation_id, actor, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "e-1",
+                "2026-08-29T12:00:00Z",
+                "stream.message_start",
+                "project_cell",
+                "cell-1",
+                None,
+                "orchestrator",
+                '{"usage":{"input_tokens":100,"output_tokens":50},"parent_tool_use_id":null}',
+            ),
+        )
+        connection.execute(
+            "INSERT INTO events("
+            "event_id, occurred_at, event_type, aggregate_type, aggregate_id, "
+            "correlation_id, actor, payload_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "e-2",
+                "2026-08-29T12:00:00Z",
+                "subagent.started",
+                "project_cell",
+                "cell-1",
+                None,
+                "orchestrator",
+                '{"usage":{"input_tokens":200,"output_tokens":100},"parent_tool_use_id":"tool-123"}',
+            ),
+        )
+
+    status = service.status()
+
+    # Check delegation section exists
+    assert "delegation" in status
+    delegation = status["delegation"]
+
+    # Check packets section
+    assert "packets" in delegation
+    packets = delegation["packets"]
+    assert "INFRA-186" in packets
+    issue_packets = packets["INFRA-186"]
+    assert issue_packets["states"]["accepted"] == 2
+    assert issue_packets["states"]["reserved"] == 1
+    assert issue_packets["tiers"]["sonnet"] == 2
+    assert issue_packets["tiers"]["haiku"] == 1
+
+    # Check children section
+    assert "children" in delegation
+    children = delegation["children"]
+    assert children["active"] == 1
+    assert children["released"] == 1
+
+    # Check usage_share section
+    assert "usage_share" in delegation
+    usage_share = delegation["usage_share"]
+    assert usage_share["lead"] == 150  # 100 input + 50 output
+    assert usage_share["child"] == 300  # 200 input + 100 output
+    assert usage_share["fable_share"] == 0.33  # 150 / (150 + 300) ≈ 0.33
+
+
+def test_status_delegation_empty_database(
+    database: Database, event_store: EventStore
+) -> None:
+    queue = QueueService(database, event_store, {"demo"})
+    service = OrchestratorService(
+        database=database,
+        events=event_store,
+        sampler=FakeSampler(),
+        scheduler=Scheduler(queue, mode="observe"),
+        policy=PolicyConfig(),
+        pid_exists=lambda _pid: False,
+    )
+    service.start()
+
+    status = service.status()
+
+    # Check delegation section
+    assert "delegation" in status
+    delegation = status["delegation"]
+
+    # Empty packets
+    assert delegation["packets"] == {}
+
+    # Zero children
+    assert delegation["children"] == {}
+
+    # fable_share should be 1.0 when no usage
+    assert delegation["usage_share"]["lead"] == 0
+    assert delegation["usage_share"]["child"] == 0
+    assert delegation["usage_share"]["fable_share"] == 1.0

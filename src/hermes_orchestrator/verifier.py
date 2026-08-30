@@ -1,0 +1,565 @@
+"""Trusted verification runner and content-addressed receipts (INFRA-186).
+
+Receipts come from THIS runner's own measurements of the tree, the
+environment, and the command's execution — never from anything a model
+says happened. A model can request that a gate command be run, but it
+can never author, forge, or backdate a receipt that validates: the
+receipt's identity (``receipt_id``) is the sha256 of a canonical
+binding document built entirely from facts this runner measured
+itself (the git tree, any uncommitted diff, dependency lockfile
+bytes, the runner's own fingerprint, and the command's actual exit
+code / output), and the receipt's ``signature`` is an hmac-sha256 over
+that same document keyed by a secret held only by this runner's state
+directory. Nothing a prompt or model output supplies is ever trusted
+as-is; it is either recomputed by the runner or ignored.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import platform
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventInput, EventStore
+
+RUNNER_VERSION = 2
+
+# The mandatory candidate gate (and any other gate id listed here) is
+# authorized for EXACTLY one command, defined in trusted code — never
+# supplied by a caller. HMAC over a receipt proves this runner executed
+# the given command; it does NOT by itself prove that command was the
+# authorized full suite. ``run_verified`` refuses (before running
+# anything) to mint a receipt for an authorized gate id under any other
+# command, and the authorized specification is bound into the attested
+# document itself (see ``_gate_spec``) so that later tightening or
+# changing an entry here retroactively invalidates receipts signed
+# under the old specification. An unknown/ad-hoc gate id is unrestricted.
+AUTHORIZED_GATES: Mapping[str, str] = {
+    "candidate-full-gate": "uv run pytest -q",
+}
+
+_DEPENDENCY_FILES = ("uv.lock", "pyproject.toml")
+_ABSENT_MARKER = b"<absent>"
+
+_COUNT_PATTERNS = {
+    "passed": re.compile(r"(\d+) passed"),
+    "failed": re.compile(r"(\d+) failed"),
+    "error": re.compile(r"(\d+) error"),
+}
+
+_BINDING_FIELDS = (
+    "schema_version",
+    "gate_id",
+    "command",
+    "gate_spec",
+    "tree_hash",
+    "dirty_patch_hash",
+    "dependency_hash",
+    "runner_fingerprint",
+    "exit_code",
+    "test_counts",
+    "output_hash",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationReceipt:
+    """One content-addressed, signed record of a runner-measured gate run."""
+
+    receipt_id: str
+    schema_version: int
+    gate_id: str
+    command: str
+    tree_hash: str
+    dirty_patch_hash: str
+    dependency_hash: str
+    runner_fingerprint: str
+    exit_code: int
+    test_counts: dict[str, int]
+    duration_seconds: float
+    output_hash: str
+    signature: str
+    created_at: str
+
+
+def _parse_test_counts(output: str) -> dict[str, int]:
+    """Best-effort pytest-style counts from the tail of combined output."""
+
+    lines = [line for line in output.strip().splitlines() if line.strip()]
+    tail = "\n".join(lines[-10:])
+    counts: dict[str, int] = {}
+    for label, pattern in _COUNT_PATTERNS.items():
+        match = pattern.search(tail)
+        if match is not None:
+            counts[label] = int(match.group(1))
+    return counts
+
+
+def _dependency_hash(cwd: Path) -> str:
+    """sha256 over the bytes of the dependency files; a missing file
+    hashes as an absent-marker rather than being skipped."""
+
+    hasher = hashlib.sha256()
+    for name in _DEPENDENCY_FILES:
+        path = cwd / name
+        if path.exists():
+            hasher.update(path.read_bytes())
+        else:
+            hasher.update(_ABSENT_MARKER)
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+def _normalize_command(command: str) -> str:
+    """Canonical form used for every command comparison in this module:
+    re-shell-quoted after splitting, so equivalent commands that differ
+    only in whitespace or quoting style compare and hash identically."""
+
+    return shlex.join(shlex.split(command))
+
+
+def _gate_spec(gate_id: str) -> str:
+    """The authorized command specification bound into the attested
+    document for ``gate_id``, recomputed from the CURRENT
+    ``AUTHORIZED_GATES`` mapping — never stored. An unknown/ad-hoc gate
+    id binds the literal marker ``"adhoc"``. Because this is recomputed
+    at validation time rather than read back from the database,
+    changing ``AUTHORIZED_GATES`` after a receipt was signed changes
+    what this function returns for that receipt's ``gate_id``, which
+    changes the recomputed canonical document, which fails signature
+    verification for every receipt signed under the old specification."""
+
+    authorized_command = AUTHORIZED_GATES.get(gate_id)
+    if authorized_command is None:
+        return "adhoc"
+    return _normalize_command(authorized_command)
+
+
+def _runner_fingerprint() -> str:
+    material = f"{RUNNER_VERSION}:{sys.version}:{platform.platform()}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ("git", "-C", str(cwd), *args),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+class Verifier:
+    """Runs gate commands and records/validates trusted receipts."""
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        events: EventStore,
+        state_dir: Path,
+        run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._database = database
+        self._events = events
+        self._state_dir = state_dir
+        self._run = run or subprocess.run
+        self._now = now or (lambda: datetime.now(UTC))
+        self._key: bytes | None = None
+
+    def _signing_key(self) -> bytes:
+        """Read (or create, once) the 32-byte hex signing key this runner
+        alone holds. The key file is created mode 0600 so nothing but
+        this runner can ever produce a valid signature."""
+
+        if self._key is not None:
+            return self._key
+        self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = self._state_dir / "verifier.key"
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            key_hex = path.read_text(encoding="ascii").strip()
+        else:
+            key_hex = secrets.token_bytes(32).hex()
+            try:
+                os.write(descriptor, key_hex.encode("ascii"))
+            finally:
+                os.close(descriptor)
+        self._key = bytes.fromhex(key_hex)
+        return self._key
+
+    def _context(self, cwd: Path, gate_id: str, command: str) -> dict[str, Any]:
+        """Facts about the tree, dependencies, environment, and command,
+        measured BY THIS RUNNER right now — never taken from a caller's
+        say-so."""
+
+        tree_hash = _git(cwd, "rev-parse", "HEAD^{tree}").strip()
+        diff_output = _git(cwd, "diff", "HEAD")
+        dirty_patch_hash = (
+            ""
+            if diff_output == ""
+            else hashlib.sha256(diff_output.encode("utf-8")).hexdigest()
+        )
+        return {
+            "gate_id": gate_id,
+            "command": _normalize_command(command),
+            "tree_hash": tree_hash,
+            "dirty_patch_hash": dirty_patch_hash,
+            "dependency_hash": _dependency_hash(cwd),
+            "runner_fingerprint": _runner_fingerprint(),
+        }
+
+    def run_verified(
+        self,
+        cwd: Path,
+        *,
+        gate_id: str,
+        command: str,
+        timeout: float = 1800,
+    ) -> VerificationReceipt:
+        """Execute ``command`` under ``cwd`` and record a signed,
+        content-addressed receipt. Reruning the identical command against
+        an unchanged tree yields the identical receipt (same
+        ``receipt_id``) rather than a new row.
+
+        For a gate id listed in ``AUTHORIZED_GATES``, ``command`` MUST
+        normalize to exactly the authorized command for that gate — a
+        caller cannot mint an acceptable receipt for, e.g., the
+        mandatory candidate gate by substituting any other successful
+        command. This check runs before anything is executed and
+        before any receipt is recorded; an unauthorized command fails
+        closed with ``ValueError`` and leaves no trace."""
+
+        authorized_command = AUTHORIZED_GATES.get(gate_id)
+        if authorized_command is not None and _normalize_command(
+            command
+        ) != _normalize_command(authorized_command):
+            raise ValueError(
+                f"gate {gate_id!r} is authorized only for the command "
+                f"{_normalize_command(authorized_command)!r}; refusing to "
+                f"run or record a receipt for {command!r}"
+            )
+
+        context = self._context(cwd, gate_id, command)
+        argv = shlex.split(command)
+        started = time.monotonic()
+        try:
+            completed = self._run(
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            exit_code = int(completed.returncode)
+            combined_output = (completed.stdout or "") + (completed.stderr or "")
+        except subprocess.TimeoutExpired as expired:
+            exit_code = -1
+            stdout = expired.stdout or ""
+            stderr = expired.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            combined_output = stdout + stderr
+        duration_seconds = time.monotonic() - started
+
+        test_counts = _parse_test_counts(combined_output)
+        output_hash = hashlib.sha256(combined_output.encode("utf-8")).hexdigest()
+
+        binding = {
+            "schema_version": RUNNER_VERSION,
+            "gate_id": context["gate_id"],
+            "command": context["command"],
+            "gate_spec": _gate_spec(gate_id),
+            "tree_hash": context["tree_hash"],
+            "dirty_patch_hash": context["dirty_patch_hash"],
+            "dependency_hash": context["dependency_hash"],
+            "runner_fingerprint": context["runner_fingerprint"],
+            "exit_code": exit_code,
+            "test_counts": test_counts,
+            "output_hash": output_hash,
+        }
+        canonical = json.dumps(binding, sort_keys=True)
+        receipt_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        signature = hmac.new(
+            self._signing_key(), canonical.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        stamp = self._now().isoformat()
+
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO verification_receipts("
+                "receipt_id, schema_version, gate_id, command, tree_hash, "
+                "dirty_patch_hash, dependency_hash, runner_fingerprint, "
+                "exit_code, test_counts, duration_seconds, output_hash, "
+                "signature, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    receipt_id,
+                    binding["schema_version"],
+                    binding["gate_id"],
+                    binding["command"],
+                    binding["tree_hash"],
+                    binding["dirty_patch_hash"],
+                    binding["dependency_hash"],
+                    binding["runner_fingerprint"],
+                    binding["exit_code"],
+                    json.dumps(test_counts, sort_keys=True),
+                    duration_seconds,
+                    binding["output_hash"],
+                    signature,
+                    stamp,
+                ),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="verification_receipt.recorded",
+                    aggregate_type="verification_receipt",
+                    aggregate_id=receipt_id,
+                    payload={
+                        "receipt_id": receipt_id,
+                        "gate_id": gate_id,
+                        "exit_code": exit_code,
+                        "tree_hash": context["tree_hash"],
+                    },
+                ),
+            )
+        return self.get(receipt_id)
+
+    def validate(
+        self, receipt_id: str, *, cwd: Path, gate_id: str, command: str
+    ) -> tuple[bool, str]:
+        """Check a receipt's signature and freshness against the CURRENT,
+        runner-measured state of ``cwd``. A hand-inserted or tampered row
+        fails signature verification structurally — it was never signed
+        by this runner's key."""
+
+        row = self._database.execute(
+            "SELECT * FROM verification_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            return False, "unknown receipt"
+
+        stored_test_counts = json.loads(str(row["test_counts"]))
+        stored_gate_id = str(row["gate_id"])
+        stored_binding = {
+            "schema_version": int(row["schema_version"]),
+            "gate_id": stored_gate_id,
+            "command": str(row["command"]),
+            "gate_spec": _gate_spec(stored_gate_id),
+            "tree_hash": str(row["tree_hash"]),
+            "dirty_patch_hash": str(row["dirty_patch_hash"]),
+            "dependency_hash": str(row["dependency_hash"]),
+            "runner_fingerprint": str(row["runner_fingerprint"]),
+            "exit_code": int(row["exit_code"]),
+            "test_counts": stored_test_counts,
+            "output_hash": str(row["output_hash"]),
+        }
+        canonical = json.dumps(stored_binding, sort_keys=True)
+        expected_signature = hmac.new(
+            self._signing_key(), canonical.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, str(row["signature"])):
+            return False, "signature invalid"
+
+        # Defense in depth on top of the signature recomputation above:
+        # for an authorized gate id, the STORED command must still
+        # normalize to the CURRENT authorized command. In practice a
+        # changed AUTHORIZED_GATES entry already changes ``gate_spec``
+        # and so fails the signature check first, but this check stands
+        # on its own regardless of how the signature check is reached.
+        authorized_command = AUTHORIZED_GATES.get(stored_gate_id)
+        if authorized_command is not None and _normalize_command(
+            stored_binding["command"]
+        ) != _normalize_command(authorized_command):
+            return False, "stale: command not authorized"
+
+        context = self._context(cwd, gate_id, command)
+        if (
+            context["tree_hash"] != stored_binding["tree_hash"]
+            or context["dirty_patch_hash"] != stored_binding["dirty_patch_hash"]
+        ):
+            return False, "stale: tree changed"
+        if context["dependency_hash"] != stored_binding["dependency_hash"]:
+            return False, "stale: dependencies changed"
+        if context["command"] != stored_binding["command"]:
+            return False, "stale: command changed"
+        if context["runner_fingerprint"] != stored_binding["runner_fingerprint"]:
+            return False, "stale: runner or environment changed"
+        if stored_binding["exit_code"] != 0:
+            return False, "receipt records a failing run"
+        return True, "fresh"
+
+    def find_fresh(
+        self, cwd: Path, *, gate_id: str, command: str
+    ) -> VerificationReceipt | None:
+        """The newest receipt for ``gate_id`` at the current tree that
+        still validates fresh, or ``None``."""
+
+        context = self._context(cwd, gate_id, command)
+        rows = self._database.execute(
+            "SELECT receipt_id FROM verification_receipts "
+            "WHERE gate_id = ? AND tree_hash = ? "
+            "ORDER BY created_at DESC, rowid DESC",
+            (gate_id, context["tree_hash"]),
+        ).fetchall()
+        for row in rows:
+            receipt_id = str(row["receipt_id"])
+            is_fresh, _ = self.validate(
+                receipt_id, cwd=cwd, gate_id=gate_id, command=command
+            )
+            if is_fresh:
+                return self.get(receipt_id)
+        return None
+
+    def _measured_bindings(self, cwd: Path) -> dict[str, str]:
+        """Tree/dependency/runner facts measured BY THIS RUNNER, right
+        now, independent of any particular gate command — the subset
+        ``validate_for_tree`` needs to prove a green run happened on
+        exactly this tree."""
+
+        tree_hash = _git(cwd, "rev-parse", "HEAD^{tree}").strip()
+        diff_output = _git(cwd, "diff", "HEAD")
+        dirty_patch_hash = (
+            ""
+            if diff_output == ""
+            else hashlib.sha256(diff_output.encode("utf-8")).hexdigest()
+        )
+        return {
+            "tree_hash": tree_hash,
+            "dirty_patch_hash": dirty_patch_hash,
+            "dependency_hash": _dependency_hash(cwd),
+            "runner_fingerprint": _runner_fingerprint(),
+        }
+
+    def validate_for_tree(
+        self, receipt_id: str, *, cwd: Path, gate_id: str
+    ) -> tuple[bool, str]:
+        """Prove that SOME green attested run of ``gate_id`` happened on
+        exactly the current tree — without asserting which command was
+        invoked.
+
+        This is the transition validator for the mandatory candidate
+        gate: the gate's own command is bound INSIDE the attested
+        receipt document and is reported to reviewers from there, so a
+        caller here (Hermes, the candidate gate, or any agent through
+        the ``verify-check`` CLI) does not need to know or restate the
+        exact command to confirm the gate already ran green on this
+        tree. Everything else — signature integrity, the tree/dirty-
+        patch hash, the dependency hash, and the runner fingerprint —
+        is still checked exactly as ``validate`` checks it; only the
+        command comparison is dropped.
+        """
+
+        row = self._database.execute(
+            "SELECT * FROM verification_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            return False, "unknown receipt"
+
+        stored_test_counts = json.loads(str(row["test_counts"]))
+        stored_gate_id = str(row["gate_id"])
+        stored_binding = {
+            "schema_version": int(row["schema_version"]),
+            "gate_id": stored_gate_id,
+            "command": str(row["command"]),
+            "gate_spec": _gate_spec(stored_gate_id),
+            "tree_hash": str(row["tree_hash"]),
+            "dirty_patch_hash": str(row["dirty_patch_hash"]),
+            "dependency_hash": str(row["dependency_hash"]),
+            "runner_fingerprint": str(row["runner_fingerprint"]),
+            "exit_code": int(row["exit_code"]),
+            "test_counts": stored_test_counts,
+            "output_hash": str(row["output_hash"]),
+        }
+        canonical = json.dumps(stored_binding, sort_keys=True)
+        expected_signature = hmac.new(
+            self._signing_key(), canonical.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, str(row["signature"])):
+            return False, "signature invalid"
+
+        # Defense in depth on top of the signature recomputation above:
+        # for an authorized gate id, the STORED command must still
+        # normalize to the CURRENT authorized command. In practice a
+        # changed AUTHORIZED_GATES entry already changes ``gate_spec``
+        # and so fails the signature check first, but this check stands
+        # on its own regardless of how the signature check is reached.
+        authorized_command = AUTHORIZED_GATES.get(stored_gate_id)
+        if authorized_command is not None and _normalize_command(
+            stored_binding["command"]
+        ) != _normalize_command(authorized_command):
+            return False, "stale: command not authorized"
+
+        if stored_binding["gate_id"] != gate_id:
+            return False, "gate mismatch"
+
+        measured = self._measured_bindings(cwd)
+        if (
+            measured["tree_hash"] != stored_binding["tree_hash"]
+            or measured["dirty_patch_hash"] != stored_binding["dirty_patch_hash"]
+        ):
+            return False, "stale: tree changed"
+        if measured["dependency_hash"] != stored_binding["dependency_hash"]:
+            return False, "stale: dependencies changed"
+        if measured["runner_fingerprint"] != stored_binding["runner_fingerprint"]:
+            return False, "stale: runner or environment changed"
+        if stored_binding["exit_code"] != 0:
+            return False, "receipt records a failing run"
+        return True, "fresh"
+
+    def receipt_ids_for_gate(self, gate_id: str) -> tuple[str, ...]:
+        """Every receipt id recorded for ``gate_id``, newest first."""
+
+        rows = self._database.execute(
+            "SELECT receipt_id FROM verification_receipts "
+            "WHERE gate_id = ? ORDER BY created_at DESC, rowid DESC",
+            (gate_id,),
+        ).fetchall()
+        return tuple(str(row["receipt_id"]) for row in rows)
+
+    def get(self, receipt_id: str) -> VerificationReceipt:
+        row = self._database.execute(
+            "SELECT * FROM verification_receipts WHERE receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(receipt_id)
+        return VerificationReceipt(
+            receipt_id=str(row["receipt_id"]),
+            schema_version=int(row["schema_version"]),
+            gate_id=str(row["gate_id"]),
+            command=str(row["command"]),
+            tree_hash=str(row["tree_hash"]),
+            dirty_patch_hash=str(row["dirty_patch_hash"]),
+            dependency_hash=str(row["dependency_hash"]),
+            runner_fingerprint=str(row["runner_fingerprint"]),
+            exit_code=int(row["exit_code"]),
+            test_counts=dict(json.loads(str(row["test_counts"]))),
+            duration_seconds=float(row["duration_seconds"]),
+            output_hash=str(row["output_hash"]),
+            signature=str(row["signature"]),
+            created_at=str(row["created_at"]),
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import signal
@@ -913,3 +914,216 @@ def test_runner_without_freeze_dir_installs_no_hook(
     assert runner.freeze_assignments(
         __import__("uuid").UUID("11111111-1111-4111-8111-111111111111"), "x"
     ) is None
+
+
+# --- INFRA-186: redacted Agent packet_id/model_tier + subagent.completed ---
+
+
+def test_parser_extracts_packet_id_and_model_tier_from_agent_start() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "parent_tool_use_id": None,
+                "message": {
+                    "usage": {"input_tokens": 12, "output_tokens": 3},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-agent-9",
+                            "name": "Agent",
+                            "input": {
+                                "description": "Implement ENG-9 "
+                                "packet:0123456789abcdef0123456789abcdef",
+                                "model": "sonnet",
+                            },
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.started"
+    assert event.packet_id == "0123456789abcdef0123456789abcdef"
+    assert event.model_tier == "sonnet"
+
+
+def test_parser_agent_start_without_marker_yields_no_packet_or_tier() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-agent-10",
+                            "name": "Agent",
+                            "input": {"description": "Implement ENG-9"},
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.started"
+    assert event.packet_id is None
+    assert event.model_tier is None
+
+
+def test_parser_agent_start_with_invalid_tier_yields_none() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-agent-11",
+                            "name": "Agent",
+                            "input": {
+                                "description": "Implement ENG-9 "
+                                "packet:0123456789abcdef0123456789abcdef",
+                                "model": "gpt-4",
+                            },
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.started"
+    assert event.packet_id == "0123456789abcdef0123456789abcdef"
+    assert event.model_tier is None
+
+
+def test_parser_agent_start_rejects_malformed_hex_length_marker() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "assistant",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-agent-12",
+                            "name": "Agent",
+                            "input": {
+                                # 31 hex chars: one short of the required 32.
+                                "description": "Implement ENG-9 "
+                                "packet:0123456789abcdef0123456789abcde",
+                            },
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.started"
+    assert event.packet_id is None
+
+
+def test_parser_classifies_subagent_completed_result() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "parent_tool_use_id": "toolu-agent-9",
+                "timestamp": "2026-08-26T12:00:04Z",
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.completed"
+    assert event.parent_tool_use_id == "toolu-agent-9"
+
+
+def test_parser_recovers_packet_id_on_subagent_completed_when_present() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "parent_tool_use_id": "toolu-agent-9",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-agent-9",
+                            "name": "Agent",
+                            "input": {
+                                "description": "Implement ENG-9 "
+                                "packet:0123456789abcdef0123456789abcdef",
+                            },
+                        }
+                    ],
+                },
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.completed"
+    assert event.packet_id == "0123456789abcdef0123456789abcdef"
+
+
+def test_parser_subagent_completed_never_leaks_prompt_or_response_text() -> None:
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "parent_tool_use_id": "toolu-agent-9",
+                "result": "SENTINEL-RESPONSE-TEXT packet:"
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "errors": ["SENTINEL-ERROR-TEXT"],
+                "structured_output": {"notes": "SENTINEL-STRUCTURED-TEXT"},
+            }
+        ).encode()
+    )
+
+    assert event.kind == "subagent.completed"
+    for field in dataclasses.fields(event):
+        assert "SENTINEL" not in repr(getattr(event, field.name))
+    # A marker embedded in response/result prose (not an Agent tool-use
+    # input) must never be treated as the packet id.
+    assert event.packet_id != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert event.packet_id is None
+
+
+def test_parser_existing_child_error_result_still_stays_stream_result() -> None:
+    """Pinned characterization: this shape is reserved and must not shift.
+
+    A "result" record with parent_tool_use_id and subtype
+    "error_during_execution" is already exercised by
+    test_parser_extracts_session_subagent_and_limit_events,
+    test_parser_ignores_child_agent_terminal_limit_result, and
+    test_parser_classifies_compaction_and_context_errors, all of which
+    require it to remain "stream.result". subagent.completed/failed must
+    not reclassify it.
+    """
+
+    event = ClaudeEventParser().feed(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "parent_tool_use_id": "toolu-agent-9",
+                "errors": ["boom"],
+            }
+        ).encode()
+    )
+
+    assert event.kind == "stream.result"

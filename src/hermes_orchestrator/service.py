@@ -221,6 +221,103 @@ class OrchestratorService:
             resource_actions=resource_actions,
         )
 
+    def status(self) -> dict:
+        """Build operator status view distinguishing lead from child work."""
+
+        delegation = {
+            "packets": self._delegation_packets(),
+            "children": self._delegation_children(),
+            "usage_share": self._delegation_usage_share(),
+        }
+        return {"delegation": delegation}
+
+    def _delegation_packets(self) -> dict:
+        """Count subagent_packets by issue_id, state, and model_tier."""
+
+        packets_by_issue: dict = {}
+        rows = self._database.execute(
+            "SELECT issue_id, state, model_tier FROM subagent_packets"
+        ).fetchall()
+
+        for row in rows:
+            issue_id = str(row["issue_id"])
+            state = str(row["state"])
+            model_tier = str(row["model_tier"])
+
+            if issue_id not in packets_by_issue:
+                packets_by_issue[issue_id] = {"states": {}, "tiers": {}}
+
+            packets_by_issue[issue_id]["states"][state] = (
+                packets_by_issue[issue_id]["states"].get(state, 0) + 1
+            )
+            packets_by_issue[issue_id]["tiers"][model_tier] = (
+                packets_by_issue[issue_id]["tiers"].get(model_tier, 0) + 1
+            )
+
+        return packets_by_issue
+
+    def _delegation_children(self) -> dict:
+        """Count worker_leases by state for kind='claude_subagent'."""
+
+        children_by_state: dict = {}
+        rows = self._database.execute(
+            "SELECT state FROM worker_leases WHERE kind = 'claude_subagent'"
+        ).fetchall()
+
+        for row in rows:
+            state = str(row["state"])
+            children_by_state[state] = children_by_state.get(state, 0) + 1
+
+        return children_by_state
+
+    def _delegation_usage_share(self) -> dict:
+        """Compute usage token totals: lead (parent_tool_use_id null) vs child."""
+
+        lead_usage = 0
+        child_usage = 0
+
+        rows = self._database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type LIKE 'stream.%' OR event_type LIKE 'subagent.%'"
+        ).fetchall()
+
+        for row in rows:
+            payload_str = str(row["payload_json"])
+            try:
+                payload = json.loads(payload_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            # Sum all integer values under "usage" key
+            usage = payload.get("usage", {})
+            if not isinstance(usage, dict):
+                continue
+
+            usage_total = sum(
+                v for v in usage.values() if isinstance(v, int)
+            )
+
+            # Determine if lead or child based on parent_tool_use_id
+            parent_tool_use_id = payload.get("parent_tool_use_id")
+            if parent_tool_use_id is None:
+                lead_usage += usage_total
+            else:
+                child_usage += usage_total
+
+        # Calculate fable_share
+        total_usage = lead_usage + child_usage
+        fable_share = (
+            1.0
+            if total_usage == 0
+            else round(lead_usage / total_usage, 2)
+        )
+
+        return {
+            "lead": lead_usage,
+            "child": child_usage,
+            "fable_share": fable_share,
+        }
+
     def _govern(self, snapshot: ResourceSnapshot) -> tuple[ResourceAction, ...]:
         """Evaluate calibrated admission and journal every planned action."""
 
