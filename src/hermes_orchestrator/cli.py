@@ -2845,7 +2845,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     human=f"{error}.",
                 )
                 return 1
-            repo_path = project.repo_path
+            # Leads and candidates work in a dedicated worktree when
+            # the project configures one; ``repo_path`` itself must
+            # stay the stable primary checkout (see the linked-worktree
+            # rejection in ``load_settings``), so the rotation probe
+            # validates the lead's actual candidate tree instead.
+            lead_worktree = project.lead_worktree or project.repo_path
             rotation = LeadRotation(
                 database=database,
                 handoffs=HandoffService(database),
@@ -2855,7 +2860,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 # The gate calls this with the project key, not the
                 # cell id; the exact worktree path is already resolved
                 # above, so the key itself is accepted but unused.
-                worktree_state=lambda _project_key: _worktree_state(repo_path),
+                worktree_state=lambda _project_key: _worktree_state(lead_worktree),
             )
             report = asyncio.run(rotation.rotate(args.cell))
             payload = dataclasses.asdict(report)

@@ -1546,6 +1546,76 @@ def test_worktree_state_fails_closed_on_a_non_git_directory(tmp_path: Path) -> N
     assert state.dirty is True
 
 
+def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root = tmp_path
+    state_dir = tmp_path / "state"
+    lead_worktree = tmp_path / "lead-worktree"
+    lead_worktree.mkdir()
+    (repo_root / "config").mkdir()
+    (repo_root / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {repo_root}\n"
+        f"    lead_worktree: {lead_worktree}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (repo_root / "config/policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n",
+        encoding="utf-8",
+    )
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+
+    probed: list[Path] = []
+
+    def _fake_worktree_state(path: Path) -> cli_module.WorktreeState:
+        probed.append(path)
+        return cli_module.WorktreeState(
+            branch="main", head="a", origin_head="a", dirty=False
+        )
+
+    monkeypatch.setattr(cli_module, "_worktree_state", _fake_worktree_state)
+    report = _FakeRotationReport(
+        phase="seated",
+        cell_id="cell-1",
+        handoff_id="handoff-1",
+        replacement_session="22222222-2222-4222-8222-222222222222",
+        profile="max-b",
+        binding_id="binding-1",
+        failure=None,
+    )
+    calls = _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--state-dir",
+            str(state_dir),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    # The fake ``LeadRotation`` never calls ``worktree_state`` itself
+    # (it ignores its constructor kwargs), so the closure the CLI wired
+    # up is invoked here directly, exactly as the real gate would call
+    # it: with the project key, not the worktree path.
+    calls[0]["worktree_state"]("demo")
+    assert probed == [lead_worktree]
+
+
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:
     result = invoke(
         [
