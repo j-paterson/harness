@@ -1,114 +1,128 @@
 # INFRA-195 live acceptance evidence
 
 Captured 2026-08-30 (UTC) against the production state database
-(`~/.local/share/hermes-orchestrator/state.db`, schema 44) and
-candidate commits `b8bf678d8b94d475e65cb756374d6a50713f7db8` +
-follow-up, per Sol correction `032cd4a562ae4107aa30e085dd5b2165`.
-Every claim below is bound to a durable row or event id in that
-database; nothing was inferred from terminal observation. The entire
-exercise used **zero Computer Use** and wrote **zero bytes into any
-interactive terminal prompt** — every step ran through CLI
-subprocesses, durable SQLite, launchd, and the Stop-hook offer/ack
-drain (no `intake-signal`, no cmux `send`, no `/mcp`, no manual
-relaunch, no terminal paste).
+(`~/.local/share/hermes-orchestrator/state.db`, schema 44), per Sol
+corrections `032cd4a562ae4107aa30e085dd5b2165` and
+`70e2dcf7fb2e415fb3009b2f02c5b37c`. Every claim is bound to a durable
+row or event id; the final ledger snapshot below was taken at the
+verdict boundary and re-verified after a bounded observation window.
+The entire exercise used **zero Computer Use** and wrote **zero bytes
+into any interactive terminal prompt**: every step ran through CLI
+subprocesses, durable SQLite, launchd, and the dedicated channel. The
+assignment and every control receipt in the definitive sequence (§4–5)
+were fetched and exactly-ACKed **through the dedicated channel by the
+candidate sidecar** — the Stop-hook fallback played no part in it.
 
-## 1. External lifecycle owner (launchd), not cmux
+## 1. External lifecycle owner: launchd, bound to immutable artifacts
 
-- Prior state (Sol's finding, reproduced): daemon PID 75049 parented
-  by the cmux login pane (PGID 74939); terminated 2026-08-30T00:05Z.
-- Guarded install (`deploy-install --execute`): journaled steps all
-  rc 0; plists installed at
-  `~/Library/LaunchAgents/com.josystem.hermes-orchestrator.plist` (+
-  operations); job runs the stable wrapper binary
-  `~/.local/share/hermes-orchestrator/bin/hermes-orchestrator`
-  invoking `runtime-exec`, which resolves the durable activation.
-- Parentage proof: the supervised chain roots at launchd —
-  `ps -o pid,ppid -p 98856` → `98856 1` (and after the apply below,
-  the verified daemon PID 99611's chain likewise roots at PID 1).
-  Daemon lifetime is independent of cmux panes, worktree shells, and
-  model sessions by construction (no ancestor belongs to any of them).
+- The prior cmux-pane-owned daemon (PID 75049) was terminated; the
+  earlier hand-written wrapper was removed.
+- `deploy-render` + `deploy-install --execute` (journaled, completed
+  with no compensations) installed the **rendered, worktree-independent
+  bootstrap** to `~/.local/share/hermes-orchestrator/bin/hermes-orchestrator`
+  and both launchd jobs; the bootstrap resolves the derived
+  `runtimes/ACTIVE` pointer the activator maintains and falls back to
+  the durable config clone — it references no issue worktree.
+- Supervised chain, observed live: `launchctl` job → PID with **PPID
+  1** → `runtime-exec` → daemon executing
+  `~/.local/share/hermes-orchestrator/runtimes/<sha>/.venv/bin/hermes-orchestrator`
+  — every path in the chain lives under the state directory or the
+  config clone. Kill-and-restart and both `runtime-activate --apply`
+  runs below all restarted onto this chain with no terminal or model
+  intervention.
 
-## 2. Activation identity and journaled apply
+## 2. Activation identity, journaled applies, fail-closed refusals
 
-- Activation generation 1: row `1016a5e2546540cf9ef641c10e0fc73f`
-  (`runtime_activations`), checkout
-  `/Users/josystem/hermes-orchestrator-live` @
-  `b8bf678d8b94d475e65cb756374d6a50713f7db8`, schema 44.
-- First supervised start proof: event
-  `01a04ffd-e153-7f9f-882a-6f7bd9979734` (`daemon.started`,
-  2026-08-30T00:07:13Z, `activation_generation: 1`,
-  `matches_active: true`).
-- Journaled apply: row `55c0affbad424e0782d467966f83bb3c`
-  (`activation_applies`) — intent → activated → restarted →
-  **verified**; target generation 2; the freshly supervised daemon
-  itself reported the exact generation via event
-  `01a05001-f1ac-7a66-8b21-352935fbd3f7` (`daemon.started`,
-  2026-08-30T00:11:39Z, `activation_generation: 2`), verified PID
-  99611. Rollback and ambiguity paths are proven by
-  `tests/test_activation.py::TestApplyProtocol` (process-level
-  rollback with health verification before `rolled_back` is recorded;
-  unprovable outcomes journal `ambiguous` and fail closed).
+- Active at the verdict boundary: **generation 8**, immutable artifact
+  of `904c9f606714476a43e700af9fa2dc07ca3363b0` (the candidate's
+  implementation head), activation row in `runtime_activations`,
+  `database_schema 44`.
+- Apply journal (`activation_applies`): `55c0affb…` verified (gen 2),
+  `09822c64…` verified (gen 3), `449267032d404a269c38ff621e130e92`
+  **refused** (a deliberate apply invoked from an artifact context has
+  no git source — journaled fail-closed, no process touched), and
+  `ab8a90fd4a4d4c979d16a1243cac9f54` verified (gen 8, PID 57731
+  self-reported the exact generation via `daemon.started`).
+- Full-identity startup confirmation is live: `daemon.started` event
+  `01a05023-46f7-733e-9243-d2d99d7f0386` (gen 7) and successors carry
+  checkout root, observed commit, binary path, and schema, and
+  `matches_active` is computed from all four (see
+  `TestFullIdentityConfirmation`).
+- Live findings fixed during this acceptance, each now regression
+  tested: a stale uv-cached wheel could poison a fresh artifact
+  (source-hash `cache-keys` + pre-record `_warm_artifact` proof), and
+  a WAL database is not shell-readable (the derived `ACTIVE` pointer).
 
 ## 3. Daemon kill and automatic supervised restart
 
-- `kill -KILL 98310` at 2026-08-30T00:09:10Z.
-- launchd restarted the job with no terminal or model intervention:
-  event `01a04fff-bdd9-70f9-9249-3bd8398958cd` (`daemon.started`,
-  2026-08-30T00:09:15Z, `activation_generation: 1` — the exact active
-  generation).
-- Restart receipt `3785401c041b4a50bb3a04dc189f81ce`
-  (`daemon.restarted`, carrying the full activation identity) was
-  fetched from durable state and exactly-ACKed once.
+- `kill -KILL` of the supervised daemon at 2026-08-30T00:09:10Z was
+  restarted by launchd in five seconds (`daemon.started`
+  `01a04fff-bdd9-70f9-9249-3bd8398958cd`, 00:09:15Z, on the exact
+  active generation); later kickstarts during the applies repeated the
+  proof (e.g. `01a05025-14db-76a2-978a-4d944a836721`, gen 7;
+  gen-8 start verified by apply `ab8a90fd…`).
 
-## 4. Forced channel disconnect and non-interactive recovery
+## 4. Candidate sidecar: disconnect, re-registration, direct channel
 
-- The daemon restarts forcibly dropped the live hub connection; the
-  session's sidecar re-registered non-interactively with the correct
-  generation and capability: receipts `eeef653433da4ff29ae7982430717a3d`
-  and `3c4ab2726c5b4b2a8e3c55709dce4995` (`channel.reregistered`,
-  `generation: 2`), each exactly-ACKed once.
-- Replay counts receipted explicitly (including the count semantics):
-  `910476cd95044e8ebc143cf24d561fee` (`channel.replayed`,
-  `{"replay_count": 1}`) and successors, exactly-ACKed.
-- This session's sidecar predates the new event kinds (it was
-  launched before this candidate existed) and rejected them as
-  protocol violations; the deliberate capability retirement then
-  produced exactly one durable, actionable blocked receipt
-  `567f100b49974f53842e867671b169fb` (`channel.blocked`), exactly-ACKed
-  — the fail-closed path the correction requires, with the session
-  continuing on the Stop-hook drain throughout. A lead launched under
-  the current sidecar build parses all four kinds (23 sidecar tests).
-- Dedup repair receipted: `31a01c8ac74c4cd8a4c4c79aac121c52`
-  (`intake.dedup_repaired`), exactly-ACKed.
+The exact candidate `hermes-control` build (dist of this branch) ran
+for this session, driven over MCP stdio precisely as the host drives
+it; its structured log is the per-event record.
 
-## 5. Real dispatch to the idle lead with exact fetch/ACK
+- Registration: `channel_registrations` row `bf8c80117999460988bb5aaa1d33c544`
+  active at 00:48:58Z with the correct binding **generation 2** and a
+  reissued capability.
+- Forced disconnect: `launchctl kickstart -k` at 00:49:57Z destroyed
+  the hub; the sidecar retried with bounded backoff (logged ENOENT
+  attempts 00:49:57–00:50:00) and re-registered **non-interactively**
+  after the daemon returned (00:50:02Z), then received and
+  channel-ACKed the fresh `daemon.restarted`, `channel.reregistered`,
+  and `channel.replayed` receipts (e.g. events `0b68234d…`,
+  `d43d167c…`, `c847146e…` at 00:50:04Z, each `ack_ok`).
+- The one legacy incompatibility (this Claude session's pre-candidate
+  sidecar) was **stopped through its owner path**: SIGTERM at
+  00:39:23Z, process exited, and the registration count stayed frozen
+  (317 before and after) — it can no longer register or receive.
+
+## 5. Real dispatch to the idle lead over the dedicated channel
 
 - INFRA-195 was requeued through the queue's own transition API
-  (`issue.transitioned`, actor
-  `lead:5158cb1c-4ff8-41be-a686-5ace1a81e2a2`, with an explicit
-  reason) so the supervised daemon would perform a real dispatch.
-- The daemon dispatched and atomically published assignment
-  `93916b6c57f34616bf842095ed0f9be9` (`lead_assignments`,
-  2026-08-30T00:10:18Z) bound to project `agent-orchestration`, issue
-  `INFRA-195`, cell `b29691ef-850b-4461-9af3-c8645252f65e`, session
-  `5158cb1c-4ff8-41be-a686-5ace1a81e2a2`, profile `max-c`, instruction
-  `codex-goal-infra195-20260829`, transition
-  `queued->in_development`.
-- The lead fetched the durable packet by id and exactly-ACKed it
-  through the offer/ack handshake: ledger `acknowledged` at
-  2026-08-30T00:11:03Z; the issue returned to `in_development` by the
-  dispatch itself; the lead's turn continued the assigned work
-  (this document is part of that turn).
+  (journaled `issue.transitioned`, explicit reason).
+- The supervised artifact daemon dispatched it: assignment
+  **`385da7c92b704227941aa07fbf18922a`** committed atomically with the
+  `queued->in_development` transition, bound to project
+  `agent-orchestration`, cell `b29691ef-…`, session `5158cb1c-…`,
+  profile `max-c`, instruction `codex-goal-infra195-20260829`; the
+  consumed prior packet `93916b6c…` was superseded by the fresh epoch.
+- Delivery was **direct-channel**: `HERMES_ASSIGNMENT_READY` event
+  `733be0943ce94d87b9f36608a6066936` reached the candidate sidecar at
+  00:49:36Z and was exactly-ACKed through its own tool in the same
+  second; the ledger shows `acknowledged` at 00:49:36.682Z and the
+  issue back `in_development`. No Stop-hook offer touched this packet
+  (its delivery row records no offer), and the lead's turn continued
+  the assigned work.
+
+## 6. Final authoritative snapshot (00:54:34Z, re-verified after a bounded window)
+
+- `control_operations` for this session: 27 receipts, **every one
+  `acknowledged`**, zero `published`.
+- `lead_assignments`: `385da7c9…` acknowledged; `93916b6c…`
+  superseded; nothing published.
+- `lead_intake_deliveries`: **zero** non-terminal rows (the router's
+  residue repair supersedes any delivery whose packet ledger is
+  terminal — added and regression tested after this audit found
+  `announced` residue).
+- `channel_events`: **zero** pending or published for this session.
+- Every ACK is a rowcount-checked compare-and-swap bound to session,
+  packet, and event/offer identity: exactly-once by construction.
 
 ## Notes
 
-- Every ACK above is a rowcount-checked compare-and-swap bound to the
-  exact session, packet, and offer token; each receipt moved
-  `published → acknowledged` exactly once, and re-polls offered
-  nothing further (`drained`).
-- The one supervision property not exercised destructively is killing
-  cmux and the model sessions themselves: the parentage evidence in
-  §1 (launchd is PID 1's direct child chain; no cmux/login/session
-  ancestor) establishes the daemon's independence structurally, and a
-  lead session cannot safely terminate itself to observe its own
+- Killing cmux and this model session itself was not exercised
+  destructively; §1's parentage evidence (no cmux/login/session
+  ancestor anywhere in the supervised chain) establishes the
+  independence structurally, and a lead session cannot observe its own
   absence.
+- The evidence commit itself is documentation-only; upon it, one final
+  verified `runtime-activate --apply` activates the exact candidate
+  SHA, with its apply id and generation recorded in the emission
+  manifest's verification entries.
