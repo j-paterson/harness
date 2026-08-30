@@ -1262,6 +1262,53 @@ def _runtime_exec(args: argparse.Namespace) -> int:
     return 1  # pragma: no cover — exec never returns
 
 
+def _warm_artifact(artifact: Path) -> None:
+    """Build the artifact environment from source and prove it runnable.
+
+    The forced source reinstall defeats any stale cached wheel for the
+    unchanged package version, and the help proof requires the entry
+    point the supervised job will exec — a wrongly built artifact can
+    never become the active runtime.
+    """
+
+    import shutil
+    import subprocess
+
+    uv_binary = shutil.which("uv") or "/opt/homebrew/bin/uv"
+    subprocess.run(
+        (
+            uv_binary,
+            "sync",
+            "--project",
+            str(artifact),
+            "--reinstall-package",
+            "hermes-orchestrator",
+        ),
+        check=True,
+        capture_output=True,
+        timeout=600,
+    )
+    proof = subprocess.run(
+        (
+            uv_binary,
+            "run",
+            "--project",
+            str(artifact),
+            "hermes-orchestrator",
+            "--help",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if "runtime-exec" not in proof.stdout:
+        raise RuntimeError(
+            "the artifact CLI does not expose runtime-exec; a stale "
+            "build was produced"
+        )
+
+
 def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
     """Deliberate approved-version activation with safe rollback."""
 
@@ -1280,6 +1327,7 @@ def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
             activation = activator.activate_artifact(
                 source_checkout=_code_checkout_root(),
                 state_dir=settings.state_dir,
+                prepare=_warm_artifact,
             )
         except ActivationRefused as error:
             current = activator.current()
@@ -1322,7 +1370,6 @@ def _runtime_activate(args: argparse.Namespace, settings: Settings) -> int:
 def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
     """Journaled apply: activate, kickstart, verify, or proven rollback."""
 
-    import shutil as shutil_module
     import subprocess as subprocess_module
 
     from hermes_orchestrator.activation import (
@@ -1354,28 +1401,11 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
             database,
             kickstart=kickstart,
         )
-        def warm(artifact: Path) -> None:
-            # Prove the artifact runnable (and build its environment)
-            # before the supervised job is pointed at it.
-            subprocess_module.run(
-                (
-                    shutil_module.which("uv") or "/opt/homebrew/bin/uv",
-                    "run",
-                    "--project",
-                    str(artifact),
-                    "hermes-orchestrator",
-                    "--help",
-                ),
-                check=True,
-                capture_output=True,
-                timeout=300,
-            )
-
         try:
             report = applier.apply(
                 checkout_root=_code_checkout_root(),
                 artifact_state_dir=settings.state_dir,
-                prepare=warm,
+                prepare=_warm_artifact,
             )
         except (ActivationRefused, ApplyFailed) as error:
             _print(

@@ -254,14 +254,21 @@ class RuntimeActivator:
         return current if matches else None
 
     def activate_artifact(
-        self, *, source_checkout: Path, state_dir: Path
+        self,
+        *,
+        source_checkout: Path,
+        state_dir: Path,
+        prepare: Callable[[Path], None] | None = None,
     ) -> RuntimeActivation:
         """Prove the source checkout, then activate its immutable artifact.
 
         The runtime identity that becomes active is the exported
         artifact under the state directory — independent of the
         disposable checkout it came from — with the artifact's own
-        interpreter entry point as the recorded binary.
+        interpreter entry point as the recorded binary. ``prepare``
+        runs between materialization and the ledger write, so an
+        artifact that cannot be built or proven runnable never becomes
+        active (the failure is a durable ``failed`` attempt).
         """
 
         git_sha = self._validate(source_checkout)
@@ -271,6 +278,24 @@ class RuntimeActivator:
             git_sha=git_sha,
             run=self._run,
         )
+        if prepare is not None:
+            try:
+                prepare(artifact)
+            except Exception as error:
+                refusal = ActivationRefused(
+                    f"artifact preparation failed: {error}"
+                )
+                self._record_attempt(
+                    state="failed",
+                    binary_path=artifact
+                    / ".venv"
+                    / "bin"
+                    / "hermes-orchestrator",
+                    checkout_root=artifact,
+                    git_sha=git_sha,
+                    reason=str(refusal),
+                )
+                raise refusal from error
         return self._record_attempt(
             state="active",
             binary_path=artifact / ".venv" / "bin" / "hermes-orchestrator",
@@ -585,10 +610,13 @@ class ActivationApplier:
         try:
             if artifact_state_dir is not None:
                 # The activated identity is the immutable exported
-                # artifact, never the disposable source checkout.
+                # artifact, never the disposable source checkout; it
+                # must build and prove runnable BEFORE it becomes
+                # active.
                 activation = self._activator.activate_artifact(
                     source_checkout=checkout_root,
                     state_dir=artifact_state_dir,
+                    prepare=prepare,
                 )
             else:
                 if binary_path is None:
@@ -598,8 +626,8 @@ class ActivationApplier:
                 activation = self._activator.activate(
                     checkout_root=checkout_root, binary_path=binary_path
                 )
-            if prepare is not None:
-                prepare(Path(activation.checkout_root))
+                if prepare is not None:
+                    prepare(Path(activation.checkout_root))
         except ActivationRefused as refusal:
             self._journal(
                 apply_id, state="refused", reason=str(refusal)
