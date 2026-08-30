@@ -111,9 +111,13 @@ class LeadAssignments:
         """Publish one packet inside the caller's dispatch transaction.
 
         Any live assignment for the same issue bound to a different
-        (stale) session is superseded first; a live assignment for this
-        exact issue and session makes the dispatch a durable no-op and
-        returns None, so re-dispatch never duplicates the contract.
+        (stale) session is superseded first. For this exact issue and
+        session, an UNCONSUMED ``published`` packet makes the dispatch
+        a durable no-op (retries never duplicate the live contract),
+        while an already-acknowledged packet was consumed by a
+        completed delivery: a fresh dispatch epoch supersedes it and
+        publishes a new packet, so a requeued issue wakes the idle
+        lead again.
         """
 
         stamp = self._now().isoformat()
@@ -138,12 +142,35 @@ class LeadAssignments:
                 ),
             )
         existing = connection.execute(
-            "SELECT assignment_id FROM lead_assignments "
+            "SELECT assignment_id, state FROM lead_assignments "
             "WHERE issue_id = ? AND session_id = ? AND state != 'superseded'",
             (issue_id, session_id),
         ).fetchone()
         if existing is not None:
-            return None
+            if str(existing["state"]) == "published":
+                return None
+            consumed = connection.execute(
+                "UPDATE lead_assignments SET state = 'superseded', "
+                "updated_at = ? WHERE assignment_id = ? "
+                "AND state = 'acknowledged'",
+                (stamp, str(existing["assignment_id"])),
+            )
+            if consumed.rowcount != 1:
+                return None
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="assignment.superseded",
+                    aggregate_type="lead_assignment",
+                    aggregate_id=str(existing["assignment_id"]),
+                    payload={
+                        "issue_id": issue_id,
+                        "reason": "consumed packet replaced by a fresh "
+                        "dispatch epoch",
+                        "session_id": session_id,
+                    },
+                ),
+            )
         assignment_id = self._ids()
         connection.execute(
             "INSERT INTO lead_assignments("

@@ -142,3 +142,26 @@ def test_notify_committed_isolates_listener_failures(
     assignments.notify_committed(record)
 
     assert seen == [record]
+
+
+def test_a_consumed_packet_is_replaced_by_a_fresh_dispatch_epoch(
+    assignments: LeadAssignments, database: Database
+) -> None:
+    """A live published packet dedups retries; an acknowledged one was
+    consumed, so a requeued issue's dispatch supersedes it and wakes
+    the idle lead with a fresh packet."""
+
+    first = publish(assignments, database)
+    assert first is not None
+    assert publish(assignments, database) is None  # live: retry dedups
+    assert assignments.acknowledge(
+        first.assignment_id, session_id=SESSION_A
+    )
+
+    fresh = publish(assignments, database)
+
+    assert fresh is not None
+    assert fresh.assignment_id != first.assignment_id
+    assert assignments.get(first.assignment_id).state == "superseded"
+    [pending] = assignments.pending_for_session(SESSION_A)
+    assert pending.assignment_id == fresh.assignment_id
