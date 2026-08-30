@@ -61,7 +61,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
-from hermes_orchestrator.merger_turns import TurnOutcome
+from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
 from hermes_orchestrator.migration_gate import (
     MigrationGate,
     jo_loans_commands,
@@ -194,6 +194,27 @@ def _parser() -> argparse.ArgumentParser:
     )
     merger_turn.add_argument("--project", required=True)
     merger_turn.add_argument("--json", action="store_true")
+
+    submit_review = commands.add_parser(
+        "submit-review",
+        help=(
+            "submit Sol's explicit final review verdict for the "
+            "outstanding wake and settle it exactly once (operator "
+            "correction ec1f6bdf); the verdict is submitted, never "
+            "inferred from an idle thread"
+        ),
+    )
+    submit_review.add_argument("--project", required=True)
+    submit_review.add_argument("--issue", required=True)
+    submit_review.add_argument("--event", required=True)
+    submit_review.add_argument("--candidate-sha", required=True)
+    submit_review.add_argument("--thread", required=True)
+    submit_review.add_argument("--generation", type=int, required=True)
+    submit_review.add_argument(
+        "--verdict",
+        required=True,
+        help="path to the verdict JSON document, or - to read stdin",
+    )
 
     reviewer_fix = commands.add_parser(
         "reviewer-fix",
@@ -533,22 +554,32 @@ def _print_merger_turn(outcome: TurnOutcome) -> None:
 async def _settle_idle_merger_thread(
     flow: MergeFlow, projects: Sequence[str], thread_id: str
 ) -> TurnOutcome | None:
-    """Settle a project-bound Merger thread that went idle with a wake owed.
+    """Crash-recovery fallback for an explicitly submitted verdict.
 
-    Fast-lane a3aa8cd8: a completed Merger turn can surface only as a
-    ``thread/status/changed`` idle report when its ``turn/completed``
-    notification is lost. When the idle thread is a project's bound
-    reviewer channel and that project's wake is outstanding (delivered
-    or admitted), the existing merger-turn settlement path is invoked
-    exactly once; its durable claim keeps a racing or replayed
-    notification idempotent. No new settlement or polling machinery.
+    SR2 (supersedes fast-lane a3aa8cd8's idle-primary design): the
+    verdict is submitted, never inferred. An idle
+    ``thread/status/changed`` for the project's bound reviewer channel
+    resumes settlement ONLY when a durable ``submitted_verdicts`` row in
+    state ``'submitted'`` already exists for the project's outstanding
+    wake — an explicit ``submit-review`` whose settlement a crash cut
+    short. ``handle_turn`` then settles that durable document (it
+    resumes the pending submission before ever pulling the thread), so
+    idle never triggers a thread-pull-and-infer settlement. Without the
+    durable pending submission, idle is a no-op; ``turn/completed``
+    observation keeps its existing behavior.
     """
 
     for project_key in projects:
         channel = flow.merger.read_channel(project_key)
         if channel is None or channel.thread_id != thread_id:
             continue
-        if flow.turns.outstanding_wake(project_key) is None:
+        outstanding = flow.turns.outstanding_wake(project_key)
+        if outstanding is None:
+            return None
+        event, _state = outstanding
+        # The durable-read guard: MergerTurnService's own pending-
+        # submission read (the same one its resume path settles from).
+        if flow.turns._pending_submission(project_key, event.event_id) is None:
             return None
         return await flow.turns.handle_turn(project_key)
     return None
@@ -3396,6 +3427,52 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             if settings.cmux is not None:
                 # A settled Merger turn may have journalled correction
+                # packets; route them to a registered channel now.
+                nudge_channel(hub_socket_path(settings.state_dir))
+            return 0
+
+        if args.command == "submit-review":
+            if re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha) is None:
+                print(
+                    "--candidate-sha must be the full 40-hex candidate SHA",
+                    file=sys.stderr,
+                )
+                return 1
+            if args.verdict == "-":
+                verdict_json = sys.stdin.read()
+            else:
+                try:
+                    verdict_json = Path(args.verdict).read_text(encoding="utf-8")
+                except OSError as error:
+                    print(
+                        f"cannot read verdict document: {error}", file=sys.stderr
+                    )
+                    return 1
+            if not verdict_json.strip():
+                print("verdict document is empty", file=sys.stderr)
+                return 1
+            # Strictly local: the submitted document is settled from
+            # durable state — the thread is never pulled, so the App
+            # Server is not started, watched, or polled.
+            flow = _open_merge_flow(settings, runtime)
+            try:
+                outcome = asyncio.run(
+                    flow.turns.submit_review(
+                        args.project,
+                        issue_id=args.issue,
+                        event_id=args.event,
+                        candidate_sha=args.candidate_sha,
+                        reviewed_thread_id=args.thread,
+                        reviewed_generation=args.generation,
+                        verdict_json=verdict_json,
+                    )
+                )
+            except SubmissionRejected as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print_merger_turn(outcome)
+            if settings.cmux is not None:
+                # A settled submission may have journalled correction
                 # packets; route them to a registered channel now.
                 nudge_channel(hub_socket_path(settings.state_dir))
             return 0

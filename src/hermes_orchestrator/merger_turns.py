@@ -13,6 +13,7 @@ delivered wake or a completed-turn notification.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from hermes_orchestrator.ci_window import (
     MergeWindowExhausted,
     PriorMergeFailed,
 )
-from hermes_orchestrator.codex_merger import CodexMerger
+from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
 from hermes_orchestrator.codex_rpc import RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
@@ -47,6 +48,7 @@ from hermes_orchestrator.verdicts import (
     VerdictBinding,
     VerdictError,
     parse_turn_report,
+    parse_verdict,
 )
 
 TURN_COMPLETED_METHODS = frozenset({"turn/completed", "thread/turn/completed"})
@@ -128,6 +130,53 @@ class TurnOutcome:
     reason: str
     review_id: str | None = None
     merge_sha: str | None = None
+
+
+class SubmissionRejected(ValueError):
+    """An explicit Sol submission that fails closed with no side effects."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Submission:
+    """One durable exactly-once row of the submitted_verdicts table."""
+
+    event_id: str
+    project_key: str
+    issue_id: str
+    candidate_sha: str
+    reviewed_thread_id: str
+    reviewed_generation: int
+    verdict_json: str
+    state: str
+    result_json: str | None
+
+
+def _outcome_to_json(outcome: TurnOutcome) -> str:
+    return json.dumps(
+        {
+            "project_key": outcome.project_key,
+            "kind": outcome.kind,
+            "event_id": outcome.event_id,
+            "issue_id": outcome.issue_id,
+            "reason": outcome.reason,
+            "review_id": outcome.review_id,
+            "merge_sha": outcome.merge_sha,
+        },
+        sort_keys=True,
+    )
+
+
+def _outcome_from_json(text: str) -> TurnOutcome:
+    value = json.loads(text)
+    return TurnOutcome(
+        project_key=str(value["project_key"]),
+        kind=str(value["kind"]),
+        event_id=value["event_id"],
+        issue_id=value["issue_id"],
+        reason=str(value["reason"]),
+        review_id=value["review_id"],
+        merge_sha=value["merge_sha"],
+    )
 
 
 class MergerTurnService:
@@ -250,6 +299,39 @@ class MergerTurnService:
                 "no delivered candidate wake; terminal idle",
             )
         event, state = outstanding
+        # Crash-recovery fallback only: a verdict already durably written
+        # by an explicit submission whose settlement did not complete is
+        # resumed here. Observation never writes a submitted_verdicts row
+        # and never infers a fresh verdict from idle.
+        submitted = self._pending_submission(project_key, event.event_id)
+        outcome = await self._settle_wake(
+            project, project_key, channel, event, state, submitted=submitted
+        )
+        if submitted is not None:
+            self._record_settled(event.event_id, outcome)
+        return outcome
+
+    async def _settle_wake(
+        self,
+        project: ProjectConfig,
+        project_key: str,
+        channel: ReviewerChannel,
+        event: WakeEvent,
+        state: str,
+        *,
+        submitted: _Submission | None,
+    ) -> TurnOutcome:
+        """Admit the wake and settle one verdict source, exactly once.
+
+        The shared downstream settlement for both verdict sources: the
+        explicit Sol submission (``submitted`` set — its durable verdict
+        document is settled) and the completed-turn observation fallback
+        (``submitted`` is ``None`` — the thread's latest report is
+        pulled). Everything after the verdict source — admission gates,
+        the live pull-request check, parsing against the admitted
+        binding, and the idempotent review drive — is identical.
+        """
+
         if state == "delivered":
             try:
                 admitted = self._admission.admit(
@@ -318,7 +400,10 @@ class MergerTurnService:
         # (report missing or malformed) are not rejections and replay this
         # event-bound close idempotently.
         self._close_bound_failure(project_key, admitted.manifest)
-        text = await self._reports.latest_report(channel.thread_id)
+        if submitted is not None:
+            text: str | None = submitted.verdict_json
+        else:
+            text = await self._reports.latest_report(channel.thread_id)
         if text is None:
             return TurnOutcome(
                 project_key, "report_unavailable", event.event_id,
@@ -357,6 +442,283 @@ class MergerTurnService:
             merge_sha=outcome.merge_sha,
         )
 
+    async def submit_review(
+        self,
+        project_key: str,
+        *,
+        issue_id: str,
+        event_id: str,
+        candidate_sha: str,
+        reviewed_thread_id: str,
+        reviewed_generation: int,
+        verdict_json: str,
+    ) -> TurnOutcome:
+        """Accept Sol's explicit final verdict and settle it exactly once.
+
+        Operator correction ec1f6bdf: the verdict is submitted, never
+        inferred. Every field is validated against the outstanding
+        admitted/delivered wake, the immutable manifest, and the ready
+        reviewer-channel binding before anything durable happens; the
+        verdict is then persisted exactly once (event_id is the
+        compare-and-set key) and the shared idempotent settlement path
+        runs immediately. An identical duplicate returns the recorded
+        result; a conflicting or stale submission raises
+        :class:`SubmissionRejected` with no side effects.
+        """
+
+        project = self._projects.get(project_key)
+        if project is None:
+            raise SubmissionRejected(f"unknown project {project_key!r}")
+        existing = self._read_submission(event_id)
+        if existing is not None:
+            return await self._resolve_duplicate(
+                existing,
+                project_key=project_key,
+                issue_id=issue_id,
+                event_id=event_id,
+                candidate_sha=candidate_sha,
+                reviewed_thread_id=reviewed_thread_id,
+                reviewed_generation=reviewed_generation,
+                verdict_json=verdict_json,
+            )
+        channel = self._merger.read_channel(project_key)
+        if channel is None or channel.state != "ready":
+            raise SubmissionRejected(
+                "the project's reviewer channel is not ready"
+            )
+        if (
+            channel.thread_id != reviewed_thread_id
+            or channel.generation != reviewed_generation
+        ):
+            raise SubmissionRejected(
+                "submission does not match the ready reviewer-channel "
+                "binding (thread or generation)"
+            )
+        await self._reviews.resume_settlements(project_key)
+        outstanding = self.outstanding_wake(project_key)
+        if outstanding is None:
+            raise SubmissionRejected(
+                "no outstanding admitted or delivered wake for the project"
+            )
+        event, state = outstanding
+        if event.event_id != event_id:
+            raise SubmissionRejected(
+                "submission event does not match the outstanding wake"
+            )
+        if event.issue_id != issue_id or event.candidate_sha != candidate_sha:
+            raise SubmissionRejected(
+                "submission does not match the outstanding wake's issue "
+                "or candidate SHA"
+            )
+        try:
+            snapshot = read_manifest_snapshot(
+                Path(event.manifest_path),
+                root=self._manifest_root,
+                expected_digest=event.manifest_digest,
+            )
+        except ManifestError as error:
+            raise SubmissionRejected(
+                f"immutable manifest is invalid: {error}"
+            ) from error
+        manifest = snapshot.manifest
+        if (
+            manifest.event_id != event_id
+            or manifest.candidate_sha != candidate_sha
+            or issue_id not in manifest.linear_issues
+        ):
+            raise SubmissionRejected(
+                "submission does not match the immutable manifest"
+            )
+        binding = VerdictBinding(
+            repository=project.github_repo,
+            branch=manifest.branch,
+            pr_number=self._document_pr_number(verdict_json),
+            reviewed_sha=candidate_sha,
+        )
+        try:
+            parse_verdict(verdict_json, expected=binding)
+        except VerdictError as error:
+            raise SubmissionRejected(
+                f"verdict document is invalid: {error}"
+            ) from error
+        submission = self._persist_submission(
+            event_id=event_id,
+            project_key=project_key,
+            issue_id=issue_id,
+            candidate_sha=candidate_sha,
+            reviewed_thread_id=reviewed_thread_id,
+            reviewed_generation=reviewed_generation,
+            verdict_json=verdict_json,
+        )
+        if submission is None:
+            # Lost the exactly-once CAS to a concurrent submission.
+            raced = self._read_submission(event_id)
+            if raced is None:  # pragma: no cover - CAS row cannot vanish
+                raise SubmissionRejected("submission row disappeared")
+            return await self._resolve_duplicate(
+                raced,
+                project_key=project_key,
+                issue_id=issue_id,
+                event_id=event_id,
+                candidate_sha=candidate_sha,
+                reviewed_thread_id=reviewed_thread_id,
+                reviewed_generation=reviewed_generation,
+                verdict_json=verdict_json,
+            )
+        outcome = await self._settle_wake(
+            project, project_key, channel, event, state, submitted=submission
+        )
+        self._record_settled(event_id, outcome)
+        return outcome
+
+    async def _resolve_duplicate(
+        self,
+        existing: _Submission,
+        *,
+        project_key: str,
+        issue_id: str,
+        event_id: str,
+        candidate_sha: str,
+        reviewed_thread_id: str,
+        reviewed_generation: int,
+        verdict_json: str,
+    ) -> TurnOutcome:
+        """Idempotent identical duplicate; conflicting one fails closed."""
+
+        identical = (
+            existing.project_key == project_key
+            and existing.issue_id == issue_id
+            and existing.candidate_sha == candidate_sha
+            and existing.reviewed_thread_id == reviewed_thread_id
+            and existing.reviewed_generation == reviewed_generation
+            and existing.verdict_json == verdict_json
+        )
+        if not identical:
+            raise SubmissionRejected(
+                "a conflicting verdict submission already exists for "
+                "this wake event"
+            )
+        if existing.state == "settled" and existing.result_json is not None:
+            return _outcome_from_json(existing.result_json)
+        # Durably submitted, settlement incomplete: resume its settlement.
+        outstanding = self.outstanding_wake(project_key)
+        if outstanding is not None and outstanding[0].event_id == event_id:
+            return await self.handle_turn(project_key)
+        await self._reviews.resume_settlements(project_key)
+        outcome = TurnOutcome(
+            project_key, "no_outstanding_wake", event_id, issue_id,
+            "the submitted verdict's wake is no longer outstanding; "
+            "prior settlement was reconciled",
+        )
+        self._record_settled(event_id, outcome)
+        return outcome
+
+    @staticmethod
+    def _document_pr_number(verdict_json: str) -> int:
+        """Extract the document's own pull-request number for parsing.
+
+        Only the shape is read here; :func:`parse_verdict` re-validates
+        it, and the live single-open-pull-request check inside the shared
+        settlement path binds it to reality.
+        """
+
+        try:
+            value = json.loads(verdict_json)
+        except json.JSONDecodeError as error:
+            raise SubmissionRejected(
+                "verdict document is invalid: not valid JSON"
+            ) from error
+        pr_number = value.get("pr_number") if isinstance(value, dict) else None
+        if (
+            not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number < 1
+        ):
+            raise SubmissionRejected(
+                "verdict document is invalid: pr_number is invalid"
+            )
+        return pr_number
+
+    def _read_submission(self, event_id: str) -> _Submission | None:
+        row = self._database.execute(
+            "SELECT event_id, project_key, issue_id, candidate_sha, "
+            "reviewed_thread_id, reviewed_generation, verdict_json, state, "
+            "result_json FROM submitted_verdicts WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return None if row is None else _row_to_submission(row)
+
+    def _pending_submission(
+        self, project_key: str, event_id: str
+    ) -> _Submission | None:
+        row = self._database.execute(
+            "SELECT event_id, project_key, issue_id, candidate_sha, "
+            "reviewed_thread_id, reviewed_generation, verdict_json, state, "
+            "result_json FROM submitted_verdicts "
+            "WHERE event_id = ? AND project_key = ? AND state = 'submitted'",
+            (event_id, project_key),
+        ).fetchone()
+        return None if row is None else _row_to_submission(row)
+
+    def _persist_submission(
+        self,
+        *,
+        event_id: str,
+        project_key: str,
+        issue_id: str,
+        candidate_sha: str,
+        reviewed_thread_id: str,
+        reviewed_generation: int,
+        verdict_json: str,
+    ) -> _Submission | None:
+        now = self._now().isoformat()
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO submitted_verdicts(event_id, project_key, "
+                    "issue_id, candidate_sha, reviewed_thread_id, "
+                    "reviewed_generation, verdict_json, state, created_at, "
+                    "updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ?)",
+                    (
+                        event_id,
+                        project_key,
+                        issue_id,
+                        candidate_sha,
+                        reviewed_thread_id,
+                        reviewed_generation,
+                        verdict_json,
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            return None
+        return _Submission(
+            event_id=event_id,
+            project_key=project_key,
+            issue_id=issue_id,
+            candidate_sha=candidate_sha,
+            reviewed_thread_id=reviewed_thread_id,
+            reviewed_generation=reviewed_generation,
+            verdict_json=verdict_json,
+            state="submitted",
+            result_json=None,
+        )
+
+    def _record_settled(self, event_id: str, outcome: TurnOutcome) -> None:
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE submitted_verdicts SET state = 'settled', "
+                "result_json = ?, updated_at = ? "
+                "WHERE event_id = ? AND state = 'submitted'",
+                (
+                    _outcome_to_json(outcome),
+                    self._now().isoformat(),
+                    event_id,
+                ),
+            )
+
     def _close_bound_failure(
         self, project_key: str, manifest: CandidateManifest
     ) -> None:
@@ -390,6 +752,21 @@ class MergerTurnService:
         if len(summaries) != 1 or len(matching) != 1:
             return None
         return matching[0].number
+
+
+def _row_to_submission(row: sqlite3.Row) -> _Submission:
+    result_json = row["result_json"]
+    return _Submission(
+        event_id=str(row["event_id"]),
+        project_key=str(row["project_key"]),
+        issue_id=str(row["issue_id"]),
+        candidate_sha=str(row["candidate_sha"]),
+        reviewed_thread_id=str(row["reviewed_thread_id"]),
+        reviewed_generation=int(row["reviewed_generation"]),
+        verdict_json=str(row["verdict_json"]),
+        state=str(row["state"]),
+        result_json=None if result_json is None else str(result_json),
+    )
 
 
 def _row_to_event(row: sqlite3.Row) -> WakeEvent:
