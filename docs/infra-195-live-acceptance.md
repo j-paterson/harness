@@ -115,6 +115,23 @@ it; its structured log is the per-event record.
 - Every ACK is a rowcount-checked compare-and-swap bound to session,
   packet, and event/offer identity: exactly-once by construction.
 
+## 7. One coherent fleet (Sol 3be95878, verified live)
+
+- The ACTIVE pointer publishes only after the ledger commits, a failed
+  publish compensates the ledger back to the prior activation, a stale
+  pointer self-heals at the next confirmed startup, and every injected
+  failure mode is regression tested (`TestFleetCoherence`).
+- `serve-console` is activation-bound: it confirms the complete
+  runtime identity, journals `console.started`, and refuses a
+  mismatched artifact.
+- The apply protocol restarts and verifies BOTH launchd jobs. Live:
+  apply `4f629ec4d80f44fd8eeb66bf7bff6a78` (generation 10) restarted
+  the fleet and both durable proofs landed — `console.started`
+  01:08:49Z and `daemon.started` 01:08:53Z, both
+  `activation_generation: 10` — and `ps` shows both process chains
+  executing the generation's artifact. The final apply recorded in the
+  emission manifest repeats the proof at the exact candidate SHA.
+
 ## Notes
 
 - Killing cmux and this model session itself was not exercised
