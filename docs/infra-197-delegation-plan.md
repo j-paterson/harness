@@ -541,3 +541,57 @@ failing closed exactly as before; nothing else about the gate changes.
 Publication remains gated (operator correction, same message) on the
 outstanding live sequence: the bounded prompt recapture and the
 following no-computer-use auto-confirm restart.
+
+## v5.5 amendment: first-class lead rotation (operator directive e57b1b4c…)
+
+Durable directive `infra-197-first-class-profile-rotation-20260830-v1`
+(SHA-validated packet, operator text: "We need that rotation to be a
+first class capability, not hacked around with one off scripts",
+approval "Yes, go for it"): lead rotation becomes one idempotent
+command composed from the EXISTING primitives — the durable handoff
+row, profile leases, project cells, the classic cmux seater and
+channel launch, and the binding intent/residual machinery. The
+generated one-off max-c launcher is retired unrun; the first live
+max-d→max-c rotation is performed BY the new command once its focused
+tests are green.
+
+Architecture (lead-owned): `rotate-lead --cell <id>` derives its phase
+from durable rows on every invocation — never from memory — so any
+crash before launch, after launch, before ACK, after ACK, or mid
+transfer resumes without duplicate leads or duplicate handoff
+execution:
+
+1. Preconditions (fail closed): the cell is active with an incumbent
+   session; the newest cell handoff row is complete and `submitted`;
+   the project worktree is clean and its HEAD equals the pushed
+   origin branch head (the checkpoint).
+2. Reserve a DIFFERENT healthy first-party Max profile through the
+   existing lease reservation (auth-probed); cancellation on any
+   later refusal.
+3. Acknowledgment: the replacement session acknowledges the exact
+   handoff row and restates the next action through the existing
+   rotation core (`ProjectCellService.rotate`'s runner-driven ack
+   turn) — reused, not reimplemented.
+4. Atomic transfer: one transaction swaps the profile lease, rotates
+   `project_cells` to the acknowledged session, and retires the
+   incumbent binding while activating the replacement seat via the
+   existing write-ahead intent/`activate_residual(replacing=…)`
+   primitives — the same one-transaction supersede the binding layer
+   already guarantees.
+5. Seat: the acknowledged session is seated through the STANDARD
+   managed classic-cmux path (`classic_resume_command`, which carries
+   `--dangerously-skip-permissions` by the S1 grammar, plus the
+   channel/fakechat extension exactly as the seater decides), with
+   exact project/cell/session/profile/generation binding and classic
+   evidence recorded.
+6. Projection: local operator surface only — active rotation or one
+   actionable failure; no Linear workflow states.
+
+| Packet | Boundary | Files (disjoint) | Tier | Wave |
+|---|---|---|---|---|
+| P1 | Idempotent rotation transition: durable phase derivation, precondition gate, lease reserve/cancel, ack via the existing rotate core, atomic transfer + seat activation, crash-resume tests at every phase boundary, duplicate-lead/duplicate-ack refusal tests | `src/hermes_orchestrator/lead_rotation.py` (new), `tests/test_lead_rotation.py` (new) | Sonnet | 1 |
+| P2 | CLI surface: `rotate-lead` subcommand wiring the transition with real collaborators; focused CLI tests | `src/hermes_orchestrator/cli.py`, `tests/test_cli.py` | Sonnet | 2 (after P1) |
+
+Provenance note: P2 also becomes `cli.py`/`tests/test_cli.py`'s most
+recent in-window claimant, shrinking the approved clause-2 grandfather
+binding's residual to `src/hermes_orchestrator/runtime.py` alone.

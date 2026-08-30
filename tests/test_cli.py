@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
@@ -1364,6 +1366,184 @@ def test_cmux_focus_fails_closed_from_binding_to_socket(
     # binding is untouched; only the error type is ever printed.
     assert denied.exit_code == 1
     assert json.loads(denied.stdout)["error"] == "CmuxUnavailable"
+
+
+def _write_cmux_config(repo_root: Path) -> None:
+    (repo_root / "config" / "cmux.yaml").write_text(
+        "cli:\n  - /usr/bin/false\n", encoding="utf-8"
+    )
+
+
+def _write_profiles_config(repo_root: Path) -> None:
+    (repo_root / "config" / "profiles.yaml").write_text(
+        "profiles:\n"
+        "  - alias: max-a\n"
+        "    config_dir: profiles/max-a\n"
+        "  - alias: max-b\n"
+        "    config_dir: profiles/max-b\n"
+        "  - alias: max-c\n"
+        "    config_dir: profiles/max-c\n"
+        "  - alias: max-d\n"
+        "    config_dir: profiles/max-d\n",
+        encoding="utf-8",
+    )
+
+
+def _bind_rotate_lead_cell(state_dir: Path, *, cell_id: str) -> None:
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        CmuxSurfaceBindings(database=database, events=EventStore(database)).bind_lead(
+            project_key="demo",
+            cell_id=cell_id,
+            session_id="11111111-1111-4111-8111-111111111111",
+            profile_alias="max-a",
+            ref=CmuxSurfaceRef(
+                workspace_uuid="22222222-2222-4222-8222-222222222222",
+                surface_uuid="33333333-3333-4333-8333-333333333333",
+            ),
+        )
+    finally:
+        database.close()
+
+
+@dataclass
+class _FakeRotationReport:
+    """Mirrors the lead's ``RotationReport`` contract for INFRA-197 P2."""
+
+    phase: str
+    cell_id: str
+    handoff_id: str | None
+    replacement_session: str | None
+    profile: str | None
+    binding_id: str | None
+    failure: str | None
+
+
+def _install_fake_lead_rotation(
+    monkeypatch: pytest.MonkeyPatch, *, report: _FakeRotationReport
+) -> list[dict[str, object]]:
+    """Stub the CLI's lazily-imported rotation boundary.
+
+    ``hermes_orchestrator.lead_rotation`` is concurrently authored by
+    another packet in this same worktree, so the real module is never
+    imported here: a fake module is injected into ``sys.modules`` ahead
+    of the CLI's own ``from hermes_orchestrator.lead_rotation import
+    LeadRotation``, which resolves it without touching the file on disk.
+    Returns the list of constructor kwargs the CLI passed, for callers
+    that want to assert on the collaborators it wired up.
+    """
+
+    calls: list[dict[str, object]] = []
+
+    class _FakeLeadRotation:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        async def rotate(self, cell_id: str) -> _FakeRotationReport:
+            assert cell_id == report.cell_id
+            return report
+
+    fake_module = types.ModuleType("hermes_orchestrator.lead_rotation")
+    fake_module.LeadRotation = _FakeLeadRotation  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_orchestrator.lead_rotation", fake_module)
+    return calls
+
+
+def test_rotate_lead_requires_cmux_configuration(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "cmux is not configured"
+
+
+def test_rotate_lead_reports_a_successful_rotation(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+    report = _FakeRotationReport(
+        phase="seated",
+        cell_id="cell-1",
+        handoff_id="handoff-1",
+        replacement_session="22222222-2222-4222-8222-222222222222",
+        profile="max-b",
+        binding_id="binding-1",
+        failure=None,
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "seated"
+    assert payload["cell_id"] == "cell-1"
+    assert payload["handoff_id"] == "handoff-1"
+    assert payload["profile"] == "max-b"
+    assert payload["binding_id"] == "binding-1"
+    assert payload["failure"] is None
+
+
+def test_rotate_lead_refuses_with_one_actionable_message(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+    report = _FakeRotationReport(
+        phase="refused",
+        cell_id="cell-1",
+        handoff_id=None,
+        replacement_session=None,
+        profile=None,
+        binding_id=None,
+        failure="no different healthy profile is available",
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [*base_arguments(configured_repo), "rotate-lead", "--cell", "cell-1"]
+    )
+
+    assert result.exit_code == 1
+    assert "no different healthy profile is available" in result.output
+
+
+def test_worktree_state_fails_closed_on_a_non_git_directory(tmp_path: Path) -> None:
+    from hermes_orchestrator.cli import _worktree_state
+
+    state = _worktree_state(tmp_path)
+
+    assert state.branch == ""
+    assert state.head == ""
+    assert state.origin_head == ""
+    assert state.dirty is True
 
 
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:

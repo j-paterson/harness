@@ -13,13 +13,14 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
+from hermes_orchestrator.cells import ProjectCellService
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
     hub_socket_path,
@@ -27,14 +28,18 @@ from hermes_orchestrator.channel_hub import (
 from hermes_orchestrator.channel_hub import (
     nudge as nudge_channel,
 )
-from hermes_orchestrator.checkpoints import CheckpointDispatcher
+from hermes_orchestrator.checkpoints import CheckpointDispatcher, CheckpointSafetyStore
+from hermes_orchestrator.claude import ClaudeRunner
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
     CHANNEL_ENTRY,
     CmuxHibernationDriver,
+    CmuxLeadSeater,
     CmuxSurfaceReconciler,
+    RegistryProfileDirectory,
 )
 from hermes_orchestrator.config import Settings, load_settings
+from hermes_orchestrator.context import ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
@@ -42,6 +47,7 @@ from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
+from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
@@ -63,6 +69,11 @@ from hermes_orchestrator.operator_decisions import (
     OperatorDecisions,
 )
 from hermes_orchestrator.packet_admission import PacketAdmission
+from hermes_orchestrator.profiles import (
+    ClaudeProfileProbe,
+    ProfilePool,
+    ProfileRegistry,
+)
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
 from hermes_orchestrator.remote.auth import (
@@ -368,6 +379,22 @@ def _parser() -> argparse.ArgumentParser:
     channel_trust_confirm.add_argument("--wait-seconds", type=int, default=90)
     channel_trust_confirm.add_argument("--capture-prompt", action="store_true")
     channel_trust_confirm.add_argument("--json", action="store_true")
+
+    rotate_lead = commands.add_parser(
+        "rotate-lead",
+        help=(
+            "first-class idempotent lead rotation: validates the "
+            "submitted handoff and clean pushed checkpoint, reserves a "
+            "different healthy first-party Max profile, drives exact "
+            "handoff acknowledgment, atomically transfers the cell and "
+            "lease, and seats the replacement through the managed "
+            "classic path; any failure is one actionable message "
+            "(operator directive "
+            "infra-197-first-class-profile-rotation-20260830-v1)"
+        ),
+    )
+    rotate_lead.add_argument("--cell", required=True)
+    rotate_lead.add_argument("--json", action="store_true")
 
     decision_import = commands.add_parser(
         "decision-import",
@@ -705,6 +732,97 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
         base_env=os.environ,
         processes=runtime.processes,
     )
+
+
+class _NoDispatchLinear:
+    """Placeholder Linear projector for one-shot lead rotation.
+
+    ``ProjectCellService.rotate`` never dispatches a fresh issue or
+    projects a Linear status — only ``dispatch`` does that — so
+    ``_open_rotation_collaborators`` builds its cell service without the
+    live Linear router the daemon needs for admission, avoiding a
+    network/Keychain dependency the rotation itself never exercises.
+    Either method being called here would be a programming error, not
+    an operator refusal, so both raise loudly rather than returning
+    anything.
+    """
+
+    async def validate(self, project_key: str, issue_id: str) -> object:
+        raise AssertionError("lead rotation never validates a Linear issue")
+
+    async def project(self, issue_id: str, target: Any, effect_id: str) -> object:
+        raise AssertionError("lead rotation never projects a Linear status")
+
+
+def _open_rotation_collaborators(
+    settings: Settings, runtime: Runtime
+) -> tuple[ProjectCellService, CmuxLeadSeater]:
+    """Compose the project cell service and classic seater rotation needs.
+
+    Neither is exposed on :class:`Runtime`: ``cells`` is only assembled
+    for the live daemon (``enable_live``), and the classic
+    :class:`CmuxLeadSeater` was never stored on the runtime graph at
+    all — ``open_runtime`` builds it as a local variable and hands it
+    straight to ``ProjectCellService`` without keeping a reference. Both
+    are constructed here from the same local, credential-free
+    collaborators ``open_runtime`` uses for them (profile registry, the
+    auth-status probe, the cmux CLI adapter), mirroring
+    ``_open_merge_flow``'s reuse-else-construct idiom. Raises
+    ``ValueError`` with an actionable message when a required local file
+    (``config/profiles.yaml``) is missing; the caller turns that into a
+    clean refusal rather than a traceback.
+    """
+
+    assert settings.cmux is not None
+    assert runtime.cmux_bindings is not None
+    database = runtime.database
+    events = EventStore(database)
+    profile_path = settings.repo_root / "config" / "profiles.yaml"
+    if not profile_path.exists():
+        raise ValueError("the cell service or seater is unavailable")
+    registry = ProfileRegistry.load(profile_path)
+    environment = dict(os.environ)
+    probe = ClaudeProfileProbe(registry, base_env=environment)
+    project_paths: Mapping[str, Path] = {
+        alias: project.repo_path for alias, project in settings.projects.items()
+    }
+    cmux_port = CmuxCliAdapter(
+        settings.cmux.cli,
+        base_env=environment,
+        password_source=cmux_password_source(Keychain()),
+    )
+    seater = CmuxLeadSeater(
+        bindings=runtime.cmux_bindings,
+        port=cmux_port,
+        project_paths=project_paths,
+        profile_dirs=RegistryProfileDirectory(registry),
+        auth_probe=lambda alias: probe.check(alias).eligible,
+        control=runtime.control_operations,
+    )
+    if runtime.cells is not None:
+        return runtime.cells, seater
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=settings.repo_root / "prompts" / "claude-lead.md",
+        base_env=environment,
+        processes=runtime.processes,
+        freeze_dir=settings.state_dir / "freezes",
+    )
+    cells = ProjectCellService(
+        database=database,
+        events=events,
+        queue=runtime.queue,
+        profiles=ProfilePool(registry),
+        runner=runner,
+        linear=_NoDispatchLinear(),
+        project_paths=project_paths,
+        handoffs=HandoffService(database),
+        safety=CheckpointSafetyStore(database, events),
+        checkpoints=runtime.checkpoints,
+        context=ContextMonitor(database, events, policy=settings.policy),
+        surfaces=seater,
+    )
+    return cells, seater
 
 
 async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
@@ -1987,6 +2105,66 @@ def _intake_poll(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class WorktreeState:
+    """One bounded snapshot of a project worktree's git state.
+
+    Structurally matches the rotation gate's own ``WorktreeState``
+    (``branch``, ``head``, ``origin_head``, ``dirty``): the gate reads
+    these fields directly and refuses when ``head != origin_head`` or
+    ``dirty`` is true, so an unknown value here must resolve to
+    something that fails that comparison rather than to ``None``,
+    which the gate never expects.
+    """
+
+    branch: str
+    head: str
+    origin_head: str
+    dirty: bool
+
+
+def _worktree_state(path: Path) -> WorktreeState:
+    """The worktree's branch, HEAD, origin HEAD, and dirtiness.
+
+    Read via a handful of bounded ``git`` subprocess calls so the
+    rotation gate can verify the submitted handoff names a clean,
+    pushed checkpoint before any lead identity moves. Any git failure
+    (missing worktree, detached HEAD with no branch, no upstream, git
+    itself absent) is mapped fail-closed here rather than left for the
+    gate to interpret: a string field that could not be read resolves
+    to ``""`` — never coincidentally equal to another unknown value —
+    and cleanliness that could not be measured resolves to
+    ``dirty=True``; unknown cleanliness must refuse, never pass as
+    clean. The gate remains the boundary that acts on these values, but
+    the probe itself now only ever hands it fail-closed data.
+    """
+
+    def _run(args: list[str]) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip()
+
+    branch = _run(["branch", "--show-current"]) or ""
+    head = _run(["rev-parse", "HEAD"]) or ""
+    origin_head = (_run(["rev-parse", f"origin/{branch}"]) or "") if branch else ""
+    status = _run(["status", "--porcelain"])
+    dirty = status is None or status != ""
+    return WorktreeState(
+        branch=branch,
+        head=head,
+        origin_head=origin_head,
+        dirty=dirty,
+    )
+
+
 def _live_claude_argv(session_id: str) -> list[str]:
     """The live ``claude`` process argv for one exact session.
 
@@ -2631,6 +2809,73 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             )
             return 0 if verdict.confirmed else 1
+
+        if args.command == "rotate-lead":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            from hermes_orchestrator.lead_rotation import LeadRotation
+
+            binding = runtime.cmux_bindings.active_lead(args.cell)
+            if binding is None or binding.project_key is None:
+                _print(
+                    {"error": "no active lead binding for this cell"},
+                    json_output=args.json,
+                    human="no active lead binding for this cell.",
+                )
+                return 1
+            project = settings.projects.get(binding.project_key)
+            if project is None:
+                _print(
+                    {"error": "the cell's project is not configured"},
+                    json_output=args.json,
+                    human="the cell's project is not configured.",
+                )
+                return 1
+            try:
+                cells, seater = _open_rotation_collaborators(settings, runtime)
+            except (OSError, ValueError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"{error}.",
+                )
+                return 1
+            repo_path = project.repo_path
+            rotation = LeadRotation(
+                database=database,
+                handoffs=HandoffService(database),
+                cells=cells,
+                bindings=runtime.cmux_bindings,
+                seater=seater,
+                # The gate calls this with the project key, not the
+                # cell id; the exact worktree path is already resolved
+                # above, so the key itself is accepted but unused.
+                worktree_state=lambda _project_key: _worktree_state(repo_path),
+            )
+            report = asyncio.run(rotation.rotate(args.cell))
+            payload = dataclasses.asdict(report)
+            if report.failure:
+                _print(
+                    payload,
+                    json_output=args.json,
+                    human=f"lead rotation refused: {report.failure}",
+                )
+                return 1
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    f"Lead rotated for cell {report.cell_id}: session "
+                    f"{report.replacement_session} seated on "
+                    f"{report.profile} (binding {report.binding_id})."
+                ),
+            )
+            return 0
 
         if args.command == "decision-import":
             try:
