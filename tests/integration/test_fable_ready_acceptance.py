@@ -712,7 +712,7 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
             "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
         )
         assert outcome.kind == "rejected"
-        assert "exactly one open pull request" in outcome.reason
+        assert "not the head of the sole open pull request" in outcome.reason
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
         assert flow.window.stored_failure("demo") is not None
         assert flow.github.merge_calls[-1]["expected_head_sha"] == SHA_A

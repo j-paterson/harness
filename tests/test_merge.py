@@ -422,12 +422,17 @@ def test_gate_admits_single_matching_open_pull(
     assert github.merge_calls == []
 
 
-def test_gate_rejects_missing_pull(
+def test_gate_admits_a_clean_zero_pull_candidate(
     gate: GitHubIntakeGate, github: FakeGitHub
 ) -> None:
+    """INFRA-202: Sol owns the sole PR, so a candidate pushed with no open
+    pull request is admissible on the freeze gate's proof alone."""
+
     github.open_pulls = ()
-    with pytest.raises(CandidateRejected, match="exactly one open pull request"):
-        gate.validate("demo", candidate_manifest())
+    gate.validate("demo", candidate_manifest())
+    assert github.list_calls == [(REPOSITORY, "main")]
+    assert github.get_calls == []
+    assert github.merge_calls == []
 
 
 def test_gate_rejects_second_pull_toward_integration(
@@ -437,7 +442,7 @@ def test_gate_rejects_second_pull_toward_integration(
         open_summary(),
         open_summary(number=15, head_ref="feature/x"),
     )
-    with pytest.raises(CandidateRejected, match="exactly one open pull request"):
+    with pytest.raises(CandidateRejected, match="at most one open pull request"):
         gate.validate("demo", candidate_manifest())
     assert github.get_calls == []
 

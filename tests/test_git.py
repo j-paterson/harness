@@ -90,6 +90,23 @@ def test_tree_of_returns_validated_tree_id(
     assert verifier.tree_of(REPO, CANDIDATE) == TREE
 
 
+def test_head_of_returns_validated_commit_id(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "rev-parse", "--verify", "origin/main^{commit}")
+    runner.results[argv] = GitResult(0, MERGE_SHA + "\n", "")
+    assert verifier.head_of(REPO, "origin/main") == MERGE_SHA
+
+
+def test_head_of_failure_fails_closed(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "rev-parse", "--verify", "origin/main^{commit}")
+    runner.results[argv] = GitResult(128, "", "fatal: needed a single revision")
+    with pytest.raises(GitError, match="rev-parse"):
+        verifier.head_of(REPO, "origin/main")
+
+
 def test_tree_of_rejects_malformed_output(
     verifier: GitVerifier, runner: FakeRunner
 ) -> None:

@@ -111,7 +111,11 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
 
     Stale or foreign verdicts — any envelope or packet whose repository,
     branch, pull request, or reviewed SHA differs from the admitted
-    candidate — fail closed.
+    candidate — fail closed. ``pr_number`` may be ``0`` (no pull request
+    open yet) only when it matches the admitted binding's ``pr_number``;
+    an ``approved`` verdict against a ``0`` binding is refused since Sol
+    must open the sole pull request before approving, while
+    ``corrections_required`` may be returned with no pull request open.
     """
 
     try:
@@ -155,6 +159,11 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
         raise VerdictError(
             "corrections_required requires at least one correction packet"
         )
+    if verdict == "approved" and binding.pr_number == 0:
+        raise VerdictError(
+            "approval requires the sole open pull request at the candidate "
+            "head; create it before approving"
+        )
     return ReviewVerdict(
         verdict=verdict,
         repository=binding.repository,
@@ -171,7 +180,7 @@ def _parse_binding(value: dict[str, Any]) -> VerdictBinding:
             raise VerdictError(f"verdict {field} is invalid")
     pr_number = value["pr_number"]
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or (
-        pr_number < 1
+        pr_number < 0
     ):
         raise VerdictError("verdict pr_number is invalid")
     reviewed_sha = value["reviewed_sha"]
@@ -211,7 +220,7 @@ def _parse_packet(entry: Any) -> CorrectionPacket:
             raise VerdictError(f"correction packet {field} is invalid")
     pr_number = entry["pr_number"]
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or (
-        pr_number < 1
+        pr_number < 0
     ):
         raise VerdictError("correction packet pr_number is invalid")
     reviewed_sha = entry["reviewed_sha"]

@@ -423,7 +423,7 @@ class MergerTurnService:
             self._merger.complete_admitted_wake(project_key, event.event_id)
             return TurnOutcome(
                 project_key, "rejected", event.event_id, event.issue_id,
-                "the candidate is no longer the head of exactly one open pull "
+                "the candidate is not the head of the sole open pull "
                 "request toward the integration branch",
             )
         # Every rejection-capable validation — manifest, channel generation,
@@ -689,7 +689,7 @@ class MergerTurnService:
         if (
             not isinstance(pr_number, int)
             or isinstance(pr_number, bool)
-            or pr_number < 1
+            or pr_number < 0
         ):
             raise SubmissionRejected(
                 "verdict document is invalid: pr_number is invalid"
@@ -868,18 +868,30 @@ class MergerTurnService:
     def _pull_number(
         self, project: ProjectConfig, admitted: AdmittedCandidate
     ) -> int | None:
+        """Resolve the settled binding's pull request number, or ``None``.
+
+        Zero open pull requests toward the integration branch is
+        admissible — Sol may still be reviewing without one, so this
+        returns ``0``. Exactly one open pull request whose head matches
+        the candidate returns its number. Two or more open pull requests,
+        or one that does not match the candidate, is an invariant breach
+        and returns ``None`` so the caller rejects the settlement.
+        """
+
         summaries = self._github.list_open_pulls(
             project.github_repo, base=project.integration_branch
         )
-        matching = [
-            summary
-            for summary in summaries
-            if summary.head_ref == admitted.manifest.branch
-            and summary.head_sha == admitted.manifest.candidate_sha
-        ]
-        if len(summaries) != 1 or len(matching) != 1:
+        if not summaries:
+            return 0
+        if len(summaries) > 1:
             return None
-        return matching[0].number
+        (only,) = summaries
+        if (
+            only.head_ref == admitted.manifest.branch
+            and only.head_sha == admitted.manifest.candidate_sha
+        ):
+            return only.number
+        return None
 
 
 def _row_to_submission(row: sqlite3.Row) -> _Submission:

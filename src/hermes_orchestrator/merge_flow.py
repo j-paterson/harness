@@ -179,7 +179,7 @@ def build_merge_flow(
     admission = CandidateAdmission(
         channels=merger,
         manifest_root=manifest_root,
-        branch_head=_branch_head(settings, github),
+        branch_head=_branch_head(settings, GitVerifier(runner=runner)),
         base_policy=_base_policy(settings, GitVerifier(runner=runner)),
         intake_gate=intake_gate,
     )
@@ -246,17 +246,22 @@ def build_merge_flow(
     )
 
 
-def _branch_head(settings: Settings, github: GitHubClient) -> Callable[[str, str], str]:
-    """Resolve the remote branch head from the one open pull request."""
+def _branch_head(settings: Settings, git: GitVerifier) -> Callable[[str, str], str]:
+    """Resolve the remote branch head from git, never from open pull requests.
+
+    Fetches the branch from ``origin`` and resolves ``origin/<branch>`` to
+    its commit SHA; any fetch or resolution failure returns "" rather than
+    raising, since this feeds an admission comparison, not a proof gate
+    (INFRA-202).
+    """
 
     def head(project_key: str, branch: str) -> str:
         project = settings.projects[project_key]
-        for summary in github.list_open_pulls(
-            project.github_repo, base=project.integration_branch
-        ):
-            if summary.head_ref == branch:
-                return summary.head_sha
-        return ""
+        try:
+            git.fetch(project.repo_path, "origin", branch)
+            return git.head_of(project.repo_path, f"origin/{branch}")
+        except Exception:
+            return ""
 
     return head
 

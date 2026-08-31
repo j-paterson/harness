@@ -97,6 +97,21 @@ class GitVerifier:
             f"git merge-base --is-ancestor failed with exit code {result.returncode}"
         )
 
+    def head_of(self, repo_path: Path, ref: str) -> str:
+        """Return the commit SHA that ``ref`` currently resolves to."""
+
+        result = self._runner.run(
+            ("git", "rev-parse", "--verify", f"{ref}^{{commit}}"), repo_path
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git rev-parse failed with exit code {result.returncode}"
+            )
+        sha = result.stdout.strip()
+        if _SHA_PATTERN.match(sha) is None:
+            raise GitError("git rev-parse returned an invalid commit identity")
+        return sha
+
     def tree_of(self, repo_path: Path, commit: str) -> str:
         """Return the tree object identity recorded by one exact commit."""
 

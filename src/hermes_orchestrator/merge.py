@@ -249,9 +249,12 @@ class GitHubIntakeGate:
 
     Runs after local candidate validation and before the admission
     compare-and-swap. It is strictly read-only: it proves the candidate is
-    the head of exactly one open pull request toward the integration branch
+    the head of at most one open pull request toward the integration branch
     — the one-PR-at-a-time invariant — and fails closed by raising
-    :class:`CandidateRejected` on any mismatch.
+    :class:`CandidateRejected` on any mismatch. A clean pushed candidate
+    with zero open pull requests is admitted without further checks: the
+    freeze gate already proved the pushed head, branch, and base, and the
+    Merger (Sol) creates and owns the sole pull request (INFRA-202).
     """
 
     def __init__(
@@ -270,10 +273,12 @@ class GitHubIntakeGate:
         summaries = self._github.list_open_pulls(
             project.github_repo, base=project.integration_branch
         )
-        if len(summaries) != 1:
+        if len(summaries) == 0:
+            return
+        if len(summaries) > 1:
             raise CandidateRejected(
-                "exactly one open pull request toward the integration branch "
-                f"is required, found {len(summaries)}"
+                "at most one open pull request toward the integration "
+                f"branch is permitted, found {len(summaries)}"
             )
         # The list schema carries no merge-decision fields; eligibility is
         # always decided on a fresh full read of the one listed pull request.
