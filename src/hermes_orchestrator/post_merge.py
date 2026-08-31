@@ -40,6 +40,7 @@ remaining step, and nothing here is ever done twice.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import signal
@@ -55,7 +56,7 @@ from typing import Any, Protocol
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
-from hermes_orchestrator.git import WorktreeGit
+from hermes_orchestrator.git import GitError, GitVerifier, WorktreeGit
 from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 from hermes_orchestrator.queue import QueueService
 
@@ -70,6 +71,17 @@ class WorktreeGitPort(Protocol):
     def fetch(self, path: Path, remote: str, branch: str) -> None: ...
 
     def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None: ...
+
+
+class AncestryPort(Protocol):
+    """The exact commit-reachability proof this module needs.
+
+    ``is_ancestor`` returns a decision only for git's documented exit
+    codes 0 and 1; anything else — an unknown commit, a corrupt
+    repository — raises :class:`GitError` and the caller fails closed.
+    """
+
+    def is_ancestor(self, repo_path: Path, commit: str, ref: str) -> bool: ...
 
 
 Spawn = Callable[..., Awaitable[Any]]
@@ -89,6 +101,7 @@ class PostMergeAdvance:
         state_dir: Path,
         registry: ProcessRegistry | None = None,
         git: WorktreeGitPort | None = None,
+        ancestry: AncestryPort | None = None,
         uv_binary: str | None = None,
         spawn: Spawn | None = None,
         now: Callable[[], datetime] | None = None,
@@ -102,6 +115,9 @@ class PostMergeAdvance:
         self.state_dir = state_dir
         self.registry = registry
         self.git: WorktreeGitPort = git if git is not None else WorktreeGit()
+        self.ancestry: AncestryPort = (
+            ancestry if ancestry is not None else GitVerifier()
+        )
         self.uv_binary = uv_binary or (shutil.which("uv") or "/opt/homebrew/bin/uv")
         self.spawn: Spawn = spawn or asyncio.create_subprocess_exec
         self._now = now or (lambda: datetime.now(UTC))
@@ -342,18 +358,27 @@ class PostMergeAdvance:
         (Sol correction e716a420 / INFRA-198 P3): the durable
         ``merge.advanced`` event on the review is the sole discovery
         gate, so this stays correct forever, across every restart. A
-        self-host merge newer than the active activation gates through
-        the ordinary intent path (:meth:`on_merged`); a self-host merge
-        that already predates whatever generation is active is advanced
-        directly, with reason ``predates_active_generation``, and never
-        creates — or re-creates — an activation intent: reactivating an
-        already-superseded checkout would be wrong.
+        self-host merge the active generation does not provably contain
+        gates through the ordinary intent path (:meth:`on_merged`); a
+        self-host merge the active generation provably already contains
+        — the exact active ``git_sha``, or a verified ancestor of it —
+        is advanced directly, with reason ``predates_active_generation``,
+        and never creates — or re-creates — an activation intent:
+        reactivating an already-superseded checkout would be wrong.
+
+        Sol correction c5600e31: containment is never inferred from
+        timestamp ordering — a later unrelated activation, or a
+        rollback, orders after the merge without containing it. Only
+        :meth:`_proven_in_active_generation`'s exact-SHA or verified-
+        ancestry proof releases here; absent proof, the merge falls
+        through to :meth:`on_merged` and its successor stays blocked
+        until its own ``activate:<sha>`` intent durably verifies.
         """
 
         if not self.projects:
             return
         current = self._current_activation()
-        threshold = None if current is None else str(current["activated_at"])
+        active_sha = None if current is None else str(current["git_sha"])
         placeholders = ",".join("?" for _ in self.projects)
         rows = self.database.execute(
             "SELECT review_id, project_key, issue_id, merge_sha, updated_at "
@@ -371,8 +396,7 @@ class PostMergeAdvance:
             if (
                 project is not None
                 and project.self_host
-                and threshold is not None
-                and str(row["updated_at"]) <= threshold
+                and active_sha is not None
             ):
                 # Only a merge with no existing intent at all predates
                 # tracking entirely: the merge that produced the very
@@ -385,7 +409,9 @@ class PostMergeAdvance:
                     "SELECT 1 FROM activation_applies WHERE apply_id = ?",
                     (f"activate:{merge_sha}",),
                 ).fetchone()
-                if existing_intent is None:
+                if existing_intent is None and self._proven_in_active_generation(
+                    merge_sha, active_sha=active_sha
+                ):
                     self._advance_successor(
                         project_key,
                         review_id=review_id,
@@ -398,6 +424,31 @@ class PostMergeAdvance:
                 review_id=review_id,
                 merge_sha=merge_sha,
             )
+
+    def _proven_in_active_generation(
+        self, merge_sha: str, *, active_sha: str
+    ) -> bool:
+        """Whether the active generation provably contains this merge.
+
+        Proof is exact: the merge SHA is the active generation's own
+        ``git_sha``, or ``git merge-base --is-ancestor`` verifies it is
+        reachable from that exact SHA in ``repo_root`` (never from a
+        branch tip, which could have moved past the activation). A
+        :class:`GitError` — an unknown commit, a corrupt repository, any
+        undocumented exit — is not a decision and fails closed: no
+        release, and the ordinary intent path keeps the successor
+        blocked until the activation itself verifies (Sol correction
+        c5600e31).
+        """
+
+        if merge_sha == active_sha:
+            return True
+        try:
+            return self.ancestry.is_ancestor(
+                self.repo_root, merge_sha, active_sha
+            )
+        except GitError:
+            return False
 
     def _recover_verified_successor_releases(self) -> None:
         """Recover a verified self-host activation whose release never landed.
@@ -435,7 +486,8 @@ class PostMergeAdvance:
             "ORDER BY created_at DESC LIMIT 1",
             (target_checkout, apply_id),
         ).fetchone()
-        lease = self._active_applier_lease(merge_sha)
+        lease = self._active_applier_lease(merge_sha, target_checkout)
+        unbound_running = self._unbound_applier_running(merge_sha)
         if applier_row is not None:
             applier_state = str(applier_row["state"])
             if applier_state in _TERMINAL_APPLIER_STATES:
@@ -445,18 +497,22 @@ class PostMergeAdvance:
                     reason=f"applier:{applier_row['apply_id']}",
                 )
                 return
-            if lease is None:
+            if lease is None and not unbound_running:
                 self._mark_intent(
                     apply_id,
                     state="ambiguous",
                     reason="applier exited without a terminal apply record",
                 )
-            # Otherwise the applier is mid-flight under its own live
-            # lease; nothing to do this tick.
+            # Otherwise an applier is mid-flight under a live lease —
+            # the journal-bound one, or an unprovable survivor whose own
+            # apply row may still turn terminal; nothing to do this tick.
             return
-        if lease is not None:
+        if lease is not None or unbound_running:
             # Spawned and still running, but the applier has not written
-            # its own row yet; wait for it.
+            # its own row yet; wait for it. An unbound live
+            # runtime_applier for this sha is never "the applier" (Sol
+            # correction c5600e31) yet also forbids spawning beside it:
+            # two concurrent applies must be impossible.
             return
         if self._has_spawn_event(apply_id):
             # We spawned an applier before, its lease is gone, and it
@@ -567,20 +623,104 @@ class PostMergeAdvance:
             "WHERE state = 'active'"
         ).fetchone()
 
-    def _active_applier_lease(self, merge_sha: str) -> Any | None:
+    def _active_applier_lease(
+        self, merge_sha: str, target_checkout: str
+    ) -> Any | None:
+        """Resolve exactly the journal-bound live applier lease, or None.
+
+        Sol correction c5600e31: "the applier" is never resolved by a
+        ``(kind, worker_id)`` scan — two live leases can share a
+        worker_id, and only one of them is the process this module
+        spawned. The lease counts if and only if its ``lease_id`` equals
+        the non-null ``lease_id`` journaled by this module's own latest
+        ``activation.applier_spawned`` event for ``activate:<sha>`` AND
+        its kind, worker_id, and cwd match the applier's exact identity
+        (``runtime_applier``, the merge sha, the intent's target
+        checkout). A null or absent journaled lease_id excuses nothing
+        and resolves nothing — fail closed.
+
+        A bound lease whose process is gone with nothing recording its
+        exit is reaped here, by exact lease_id, so the ambiguous rule in
+        :meth:`_advance_intent` fires deterministically instead of
+        blocking admission on this lease forever (Sol correction
+        e716a420).
+        """
+
         if self.registry is None:
             return None
+        bound_lease_id = self._journaled_applier_lease_id(
+            f"activate:{merge_sha}"
+        )
+        if bound_lease_id is None:
+            return None
         for lease in self.registry.active():
-            if lease.kind == "runtime_applier" and lease.worker_id == merge_sha:
-                if not self.registry.snapshot(lease.lease_id).alive:
-                    # The applier process is gone but nothing recorded its
-                    # exit; reap it here, by exact identity, so the
-                    # ambiguous rule below fires deterministically
-                    # instead of blocking admission on this lease forever
-                    # (Sol correction e716a420).
-                    self.registry.mark_exited(lease.lease_id)
-                    return None
-                return lease
+            if lease.lease_id != bound_lease_id:
+                continue
+            if (
+                lease.kind != "runtime_applier"
+                or lease.worker_id != merge_sha
+                or lease.cwd != target_checkout
+            ):
+                # The journaled binding no longer describes this lease's
+                # identity: unprovable, never "the applier".
+                return None
+            if not self.registry.snapshot(lease.lease_id).alive:
+                self.registry.mark_exited(lease.lease_id)
+                return None
+            return lease
+        return None
+
+    def _unbound_applier_running(self, merge_sha: str) -> bool:
+        """Whether a live ``runtime_applier`` for this sha lacks the binding.
+
+        Such a survivor is never "the applier" (Sol correction
+        c5600e31) — reconciliation reports it as a blocking orphan — but
+        the tick must neither spawn a second applier beside it nor
+        declare the intent ambiguous while its own apply row may still
+        turn terminal: it only ever waits.
+        """
+
+        if self.registry is None:
+            return False
+        bound_lease_id = self._journaled_applier_lease_id(
+            f"activate:{merge_sha}"
+        )
+        for lease in self.registry.active():
+            if lease.kind != "runtime_applier" or lease.worker_id != merge_sha:
+                continue
+            if lease.lease_id == bound_lease_id:
+                continue
+            if self.registry.snapshot(lease.lease_id).alive:
+                return True
+        return False
+
+    def _journaled_applier_lease_id(self, apply_id: str) -> str | None:
+        """The non-null lease_id from the latest journaled applier spawn.
+
+        :meth:`_spawn_applier` journals ``activation.applier_spawned``
+        with the exact ``register_spawned`` lease_id; that durable
+        record is the only activation-to-lease binding. A missing event,
+        an unreadable payload, or a null lease_id (a spawn with no
+        registry) binds nothing — fail closed.
+        """
+
+        row = self.database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'activation.applier_spawned' "
+            "AND aggregate_id = ? ORDER BY sequence DESC LIMIT 1",
+            (apply_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return None
+        lease_id = (
+            payload.get("lease_id") if isinstance(payload, dict) else None
+        )
+        if isinstance(lease_id, str) and lease_id:
+            return lease_id
         return None
 
     def _has_spawn_event(self, apply_id: str) -> bool:

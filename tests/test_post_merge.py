@@ -13,8 +13,9 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.git import GitError
 from hermes_orchestrator.post_merge import PostMergeAdvance
-from hermes_orchestrator.processes import ProcessRegistry
+from hermes_orchestrator.processes import ProcessLeaseInput, ProcessRegistry
 from hermes_orchestrator.queue import QueueService
 from tests.test_processes import FakeInfo, FakeOs
 
@@ -99,6 +100,21 @@ class FakeGit:
         path.mkdir(parents=True, exist_ok=True)
 
 
+@dataclass
+class FakeAncestry:
+    """Scripted ancestry proof; defaults to fail-closed (not an ancestor)."""
+
+    result: bool = False
+    error: Exception | None = None
+    calls: list[tuple[Path, str, str]] = field(default_factory=list)
+
+    def is_ancestor(self, repo_path: Path, commit: str, ref: str) -> bool:
+        self.calls.append((repo_path, commit, ref))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
 def _registry(database: Database, events: EventStore) -> ProcessRegistry:
     os_port = FakeOs()
     info = FakeInfo()
@@ -135,6 +151,7 @@ def make_advance(
     registry: ProcessRegistry | None = None,
     spawn: FakeSpawn | None = None,
     git: FakeGit | None = None,
+    ancestry: FakeAncestry | None = None,
 ) -> PostMergeAdvance:
     return PostMergeAdvance(
         database=database,
@@ -145,6 +162,7 @@ def make_advance(
         state_dir=tmp_path / "state",
         registry=registry,
         git=git if git is not None else FakeGit(),
+        ancestry=ancestry if ancestry is not None else FakeAncestry(),
         uv_binary="/usr/bin/uv",
         spawn=spawn if spawn is not None else FakeSpawn(),
     )
@@ -513,18 +531,88 @@ async def test_tick_discovers_non_self_host_merge_and_releases_once_across_resta
     )
 
 
-# -- older self-host merges predate the active generation -----------------
+# -- historical self-host merges the active generation provably contains --
 
 
 @pytest.mark.asyncio
-async def test_tick_advances_self_host_merge_predating_active_generation(
+async def test_tick_advances_self_host_merge_matching_active_sha_exactly(
     database: Database, events: EventStore, tmp_path: Path
 ) -> None:
-    """A self-host merge with no existing activation intent, older than
-    the currently active generation, is journaled advanced with
-    ``predates_active_generation`` and is never re-activated: no
-    activation intent is ever created for it, and it is never
-    respawned or re-verified."""
+    """A self-host merge with no existing activation intent whose SHA IS
+    the active generation's git_sha is proven contained without any
+    ancestry call: journaled advanced with ``predates_active_generation``
+    exactly once, never re-activated, and a restart replays nothing."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-old",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T09:00:00+00:00",
+    )
+    seed_active_generation(
+        database,
+        generation=5,
+        git_sha=MERGE_SHA,
+        activated_at="2026-08-31T11:00:00+00:00",
+    )
+    ancestry = FakeAncestry(result=False)
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        ancestry=ancestry,
+    )
+
+    await advance.tick()
+
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    row = database.execute(
+        "SELECT payload_json FROM events WHERE event_type = 'merge.advanced' "
+        "AND aggregate_id = 'review:demo:evt-old'"
+    ).fetchone()
+    assert row is not None
+    assert "predates_active_generation" in row["payload_json"]
+    assert queue.get("ENG-1").dependency_ready is True
+    assert advance.spawn.calls == []  # type: ignore[attr-defined]
+    # The exact-SHA proof needs no ancestry call at all.
+    assert ancestry.calls == []
+
+    # Released exactly once: a restart over the same durable rows
+    # creates no intent, spawns nothing, and journals nothing new.
+    restarted = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        ancestry=ancestry,
+    )
+    await restarted.tick()
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 1
+    )
+    assert restarted.spawn.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_tick_advances_proven_ancestor_self_host_merge_exactly_once(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A historical self-host merge with no existing activation intent
+    releases only on verified ancestry against the active generation's
+    exact git_sha (Sol correction c5600e31) — and exactly once: a
+    restart replay never double-releases."""
 
     queue = QueueService(database=database, events=events, registered_projects={"demo"})
     queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
@@ -544,12 +632,20 @@ async def test_tick_advances_self_host_merge_predating_active_generation(
         git_sha=MERGE_SHA,
         activated_at="2026-08-31T11:00:00+00:00",
     )
+    ancestry = FakeAncestry(result=True)
     advance = make_advance(
-        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        ancestry=ancestry,
     )
 
     await advance.tick()
 
+    # Ancestry was proven against the active git_sha, never a branch tip.
+    assert ancestry.calls == [(tmp_path / "repo", old_sha, MERGE_SHA)]
     assert database.scalar("SELECT count(*) FROM activation_applies") == 0
     row = database.execute(
         "SELECT payload_json FROM events WHERE event_type = 'merge.advanced' "
@@ -560,11 +656,139 @@ async def test_tick_advances_self_host_merge_predating_active_generation(
     assert queue.get("ENG-1").dependency_ready is True
     assert advance.spawn.calls == []  # type: ignore[attr-defined]
 
-    # Never re-activated: another tick creates no intent and spawns
-    # nothing for this old merge.
-    await advance.tick()
+    # Never re-activated or double-released across restarts.
+    restarted = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        ancestry=ancestry,
+    )
+    await restarted.tick()
     assert database.scalar("SELECT count(*) FROM activation_applies") == 0
-    assert advance.spawn.calls == []  # type: ignore[attr-defined]
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 1
+    )
+    assert restarted.spawn.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_tick_keeps_unproven_self_host_merge_blocked_behind_an_intent(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A later UNRELATED active generation orders after the merge by
+    timestamp but does not contain it (ancestry false): the tick must
+    never release with ``predates_active_generation`` — it creates the
+    activation intent and the successor stays blocked until that intent
+    durably verifies (Sol correction c5600e31)."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    old_sha = "b" * 40
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-old",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=old_sha,
+        updated_at="2026-08-31T09:00:00+00:00",
+    )
+    # An unrelated branch's (or rolled-forward) activation with a LATER
+    # timestamp whose history does not reach this merge.
+    seed_active_generation(
+        database,
+        generation=5,
+        git_sha=MERGE_SHA,
+        activated_at="2026-08-31T11:00:00+00:00",
+    )
+    ancestry = FakeAncestry(result=False)
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        ancestry=ancestry,
+    )
+
+    await advance.tick()
+
+    assert ancestry.calls == [(tmp_path / "repo", old_sha, MERGE_SHA)]
+    # The intent path was taken: the durable activate:<sha> row exists
+    # and nothing released.
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM activation_applies WHERE apply_id = ?",
+            (f"activate:{old_sha}",),
+        )
+        == 1
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 0
+    )
+    assert queue.get("ENG-1").dependency_ready is False
+
+
+@pytest.mark.asyncio
+async def test_tick_ancestry_git_error_fails_closed_to_the_intent_path(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A GitError from the ancestry proof (unknown commit, corrupt
+    repository) is never a decision: no release, and the merge falls
+    through to the ordinary activation-intent path."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    old_sha = "b" * 40
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-old",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=old_sha,
+        updated_at="2026-08-31T09:00:00+00:00",
+    )
+    seed_active_generation(
+        database,
+        generation=5,
+        git_sha=MERGE_SHA,
+        activated_at="2026-08-31T11:00:00+00:00",
+    )
+    ancestry = FakeAncestry(error=GitError("missing object"))
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        ancestry=ancestry,
+    )
+
+    await advance.tick()
+
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM activation_applies WHERE apply_id = ?",
+            (f"activate:{old_sha}",),
+        )
+        == 1
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 0
+    )
+    assert queue.get("ENG-1").dependency_ready is False
 
 
 # -- (ii) tick spawns exactly one registered runtime_applier --------------
@@ -903,3 +1127,168 @@ async def test_tick_reaps_dead_applier_lease_without_manual_mark_exited(
     assert row["state"] == "ambiguous"
     assert row["reason"] == "applier exited without a terminal apply record"
     assert len(spawn.calls) == 1  # never respawned
+
+
+# -- the applier is resolved by exact journaled lease binding --------------
+
+
+IMPOSTOR_PID = 5555
+
+
+def _registry_with_impostor_room(
+    database: Database, events: EventStore
+) -> tuple[ProcessRegistry, FakeInfo]:
+    """A registry whose fake liveness evidence knows two pids, so a test
+    can register a second runtime_applier-shaped lease beside the one the
+    tick spawns."""
+
+    os_port = FakeOs()
+    info = FakeInfo()
+    os_port.info = info
+    for pid in (FAKE_PID, IMPOSTOR_PID):
+        os_port.groups[pid] = pid
+        info.create_times[pid] = 1.0
+        info.running.add(pid)
+    return ProcessRegistry(database, events, os_port=os_port, info=info), info
+
+
+def _register_impostor(
+    registry: ProcessRegistry, *, cwd: str
+) -> str:
+    """Register a live lease matching the applier's (kind, worker_id) —
+    but never journaled as the spawned applier's binding."""
+
+    lease = registry.register(
+        ProcessLeaseInput(
+            pid=IMPOSTOR_PID,
+            pgid=IMPOSTOR_PID,
+            project_key="demo",
+            kind="runtime_applier",
+            worker_id=MERGE_SHA,
+            executable="/usr/bin/uv",
+            cwd=cwd,
+        )
+    )
+    return lease.lease_id
+
+
+@pytest.mark.asyncio
+async def test_tick_never_treats_an_unbound_kind_worker_match_as_the_applier(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A live runtime_applier lease matching (kind, worker_id) with no
+    journaled ``activation.applier_spawned`` binding is never "the
+    applier" (Sol correction c5600e31) — yet the tick also never spawns
+    a second applier beside it, and never declares the intent ambiguous
+    while it may still write its own terminal row: it waits."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry, _info = _registry_with_impostor_room(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    target_checkout = str(tmp_path / "state" / "checkouts" / MERGE_SHA)
+    _register_impostor(registry, cwd=target_checkout)
+
+    await advance.tick()
+    await advance.tick()
+
+    assert spawn.calls == []
+    row = database.execute(
+        "SELECT state FROM activation_applies WHERE apply_id = ?", (apply_id,)
+    ).fetchone()
+    assert row["state"] == "intended"
+
+
+@pytest.mark.asyncio
+async def test_tick_reaps_exactly_the_bound_lease_beside_a_live_duplicate(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """Two live runtime_applier leases share the worker_id; only the
+    journaled binding names the real applier. When the bound one exits,
+    the tick reaps exactly that lease_id — the duplicate is never
+    signaled or reaped, and its unprovable survival keeps the intent
+    out of ``ambiguous``."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry, info = _registry_with_impostor_room(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    await advance.tick()
+    assert len(spawn.calls) == 1
+    bound = registry.active()[0]
+    # The journaled binding names exactly this lease.
+    journaled = database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'activation.applier_spawned' AND aggregate_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert f'"{bound.lease_id}"' in journaled["payload_json"]
+
+    target_checkout = str(tmp_path / "state" / "checkouts" / MERGE_SHA)
+    duplicate_id = _register_impostor(registry, cwd=target_checkout)
+
+    # With both alive, nothing respawns and nothing turns ambiguous.
+    await advance.tick()
+    assert len(spawn.calls) == 1
+
+    # The bound applier process exits; the duplicate stays alive.
+    info.running.discard(FAKE_PID)
+    await advance.tick()
+
+    reaped = registry.get(bound.lease_id)
+    assert (reaped.state, reaped.stop_reason) == ("stopped", "exited")
+    assert registry.get(duplicate_id).state == "active"
+    row = database.execute(
+        "SELECT state FROM activation_applies WHERE apply_id = ?", (apply_id,)
+    ).fetchone()
+    # The unprovable duplicate forbids both a second spawn and a
+    # premature ambiguous verdict; the intent simply waits.
+    assert row["state"] == "intended"
+    assert len(spawn.calls) == 1

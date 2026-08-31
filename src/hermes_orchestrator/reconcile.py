@@ -656,12 +656,26 @@ class Reconciler:
         lease is excused — every other surviving lease, including any
         other ``runtime_applier``, stays a fail-closed orphan.
 
-        The lease is expected if and only if its ``worker_id`` (the
-        merge sha) has an ``activate:<sha>`` intent still ``intended``,
-        or the applier's own apply row for that same target checkout is
-        ``intended``, ``activated``, or ``restarted`` — anything else
-        (no intent at all, or a terminal outcome already recorded)
-        fails closed.
+        Sol correction c5600e31: "bound" is exact identity, never a
+        ``(kind, worker_id)`` scan — two live leases can share a
+        worker_id and at most one of them is the spawned applier. The
+        lease is expected if and only if ALL of these hold:
+
+        * its kind is ``runtime_applier`` and its ``worker_id`` (the
+          merge sha) has an ``activate:<sha>`` intent still
+          ``intended``, or the applier's own apply row for that same
+          target checkout is ``intended``, ``activated``, or
+          ``restarted`` — no intent at all, or a terminal outcome
+          already recorded, fails closed;
+        * the latest journaled ``activation.applier_spawned`` event for
+          ``activate:<sha>`` carries a non-null lease_id equal to this
+          lease's lease_id — a null or absent journaled lease_id
+          excuses NOTHING;
+        * the lease's cwd is the intent row's exact target checkout.
+
+        Liveness and identity validity are already proven upstream:
+        ``find_orphans`` only ever surfaces live, identity-valid leases,
+        and nothing here weakens that.
         """
 
         if getattr(lease, "kind", None) != "runtime_applier":
@@ -677,6 +691,13 @@ class Reconciler:
         ).fetchone()
         if intent is None:
             return False
+        journaled_lease_id = self._journaled_applier_lease_id(apply_id)
+        if journaled_lease_id is None:
+            return False
+        if journaled_lease_id != str(getattr(lease, "lease_id", "")):
+            return False
+        if getattr(lease, "cwd", None) != str(intent["target_checkout"]):
+            return False
         if str(intent["state"]) == "intended":
             return True
         applier_row = self._database.execute(
@@ -686,6 +707,35 @@ class Reconciler:
             (apply_id, str(intent["target_checkout"])),
         ).fetchone()
         return applier_row is not None
+
+    def _journaled_applier_lease_id(self, apply_id: str) -> str | None:
+        """The non-null lease_id from the latest journaled applier spawn.
+
+        The post-merge advance journals ``activation.applier_spawned``
+        on the ``activate:<sha>`` intent with the exact registered
+        lease_id; that durable record is the only activation-to-lease
+        binding. A missing event, an unreadable payload, or a null
+        lease_id (a spawn with no registry) binds nothing — fail closed.
+        """
+
+        row = self._database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'activation.applier_spawned' "
+            "AND aggregate_id = ? ORDER BY sequence DESC LIMIT 1",
+            (apply_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return None
+        lease_id = (
+            payload.get("lease_id") if isinstance(payload, dict) else None
+        )
+        if isinstance(lease_id, str) and lease_id:
+            return lease_id
+        return None
 
     # -- stage 3: worker sessions ------------------------------------------
 
