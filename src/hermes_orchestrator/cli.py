@@ -172,6 +172,39 @@ def _parser() -> argparse.ArgumentParser:
     cmux_focus.add_argument("--project", default=None)
     cmux_focus.add_argument("--json", action="store_true")
 
+    orchestrator_ws = commands.add_parser(
+        "orchestrator-workspace",
+        help=(
+            "ensure or smoke-test the recoverable two-pane Orchestrator "
+            "workspace (upper supervisor/dashboard pane, lower Nous "
+            "Hermes classic durable session)"
+        ),
+    )
+    orchestrator_ws.add_argument("action", choices=("ensure", "smoke"))
+    orchestrator_ws.add_argument("--name", default="orchestrator")
+    orchestrator_ws.add_argument("--title", default="Orchestrator")
+    orchestrator_ws.add_argument(
+        "--session",
+        default=None,
+        help="Hermes durable session name (default: the workspace name)",
+    )
+    orchestrator_ws.add_argument(
+        "--interval", type=_watch_interval, default=300
+    )
+    orchestrator_ws.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=8.0,
+        help="smoke: seconds to let pane processes start before inspection",
+    )
+    orchestrator_ws.add_argument(
+        "--cmux-cli",
+        type=Path,
+        default=None,
+        help="cmux CLI path when config/cmux.yaml is absent",
+    )
+    orchestrator_ws.add_argument("--json", action="store_true")
+
     candidate = commands.add_parser(
         "candidate-ready",
         help="publish an immutable candidate manifest and wake the Merger",
@@ -3046,6 +3079,74 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             )
             return 0
+
+        if args.command == "orchestrator-workspace":
+            from hermes_orchestrator.orchestrator_workspace import (
+                OrchestratorWorkspaceLifecycle,
+                WorkspaceRefused,
+                run_smoke,
+            )
+
+            cmux_cli = (
+                [str(args.cmux_cli)]
+                if args.cmux_cli is not None
+                else (settings.cmux.cli if settings.cmux else None)
+            )
+            if cmux_cli is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human=(
+                        "cmux is not configured "
+                        "(config/cmux.yaml or --cmux-cli)."
+                    ),
+                )
+                return 1
+            port = CmuxCliAdapter(
+                cmux_cli,
+                base_env=os.environ,
+                password_source=cmux_password_source(Keychain()),
+            )
+            try:
+                lifecycle = OrchestratorWorkspaceLifecycle(
+                    port=port,
+                    bindings=runtime.cmux_bindings,
+                    repo_root=settings.repo_root,
+                    state_dir=settings.state_dir,
+                    name=args.name,
+                    title=args.title,
+                    interval=args.interval,
+                    session_name=args.session,
+                )
+                if args.action == "ensure":
+                    state = asyncio.run(lifecycle.ensure())
+                    payload = state.payload()
+                    human = (
+                        f"Orchestrator workspace {state.outcome}: "
+                        f"{state.workspace_uuid}"
+                    )
+                    _print(payload, json_output=args.json, human=human)
+                    return 0
+                evidence = asyncio.run(
+                    run_smoke(
+                        lifecycle,
+                        port,
+                        settle_seconds=args.settle_seconds,
+                    )
+                )
+            except (WorkspaceRefused, CmuxError) as error:
+                _print(
+                    {"error": f"{type(error).__name__}: {error}"},
+                    json_output=args.json,
+                    human=f"orchestrator workspace failed: {error}",
+                )
+                return 1
+            _print(
+                evidence,
+                json_output=args.json,
+                human=json.dumps(evidence, indent=2),
+            )
+            return 0 if evidence["passed"] else 1
 
         if args.command == "cmux-focus":
             if settings.cmux is None or runtime.cmux_bindings is None:
