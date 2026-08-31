@@ -11,6 +11,7 @@ once.
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,9 @@ import pytest
 
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import MergeResult
+from hermes_orchestrator.manifests import read_manifest_snapshot
 from hermes_orchestrator.settlement import (
     MergeSettlements,
     SettlementBinding,
@@ -155,6 +158,95 @@ class TestSettlementLedger:
             database.transaction() as connection,
         ):
             settlements.record_in(connection, conflicting)
+
+    def test_reopen_failed_cas_returns_a_failed_row_to_recorded(
+        self, settlements: MergeSettlements
+    ) -> None:
+        token = settlements.claim("review:demo:evt-9")
+        assert token is not None
+        settlements.mark_failed(
+            "review:demo:evt-9", token=token, reason="merge blocked by GitHub"
+        )
+
+        settlements.reopen_failed("review:demo:evt-9", reason="proof now succeeds")
+
+        row = settlements.get("review:demo:evt-9")
+        assert row.state == "recorded"
+        assert row.owner_token is None
+        assert row.lease_expires_at is None
+        assert row.merge_sha is None
+        assert row.path == "guarded"
+        [resumable] = settlements.resumable("demo")
+        assert resumable.settlement_id == "review:demo:evt-9"
+
+    def test_reopen_failed_journals_one_settlement_reopened_event(
+        self, database: Database, settlements: MergeSettlements
+    ) -> None:
+        token = settlements.claim("review:demo:evt-9")
+        assert token is not None
+        settlements.mark_failed("review:demo:evt-9", token=token, reason="boom")
+
+        settlements.reopen_failed("review:demo:evt-9", reason="reconciled")
+
+        row = database.execute(
+            "SELECT payload_json FROM events WHERE event_type = "
+            "'settlement.reopened' AND aggregate_id = 'review:demo:evt-9'"
+        ).fetchone()
+        assert row is not None
+        assert json.loads(row["payload_json"]) == {"reason": "reconciled"}
+
+    def test_reopen_failed_refuses_a_recorded_row(
+        self, settlements: MergeSettlements
+    ) -> None:
+        with pytest.raises(SettlementConflict):
+            settlements.reopen_failed("review:demo:evt-9", reason="x")
+
+    def test_reopen_failed_refuses_a_merging_row(
+        self, settlements: MergeSettlements
+    ) -> None:
+        token = settlements.claim("review:demo:evt-9")
+        assert token is not None
+
+        with pytest.raises(SettlementConflict):
+            settlements.reopen_failed("review:demo:evt-9", reason="x")
+
+    def test_reopen_failed_refuses_a_merged_row(
+        self, settlements: MergeSettlements
+    ) -> None:
+        token = settlements.claim("review:demo:evt-9")
+        assert token is not None
+        settlements.mark_merged("review:demo:evt-9", token=token, merge_sha="e" * 40)
+
+        with pytest.raises(SettlementConflict):
+            settlements.reopen_failed("review:demo:evt-9", reason="x")
+
+    def test_reopen_failed_refuses_a_settled_row(
+        self, settlements: MergeSettlements
+    ) -> None:
+        token = settlements.claim("review:demo:evt-9")
+        assert token is not None
+        settlements.mark_merged("review:demo:evt-9", token=token, merge_sha="e" * 40)
+        settlements.mark_settled("review:demo:evt-9", token=token)
+
+        with pytest.raises(SettlementConflict):
+            settlements.reopen_failed("review:demo:evt-9", reason="x")
+
+    def test_a_reopened_settlement_claims_and_settles_again(
+        self, settlements: MergeSettlements
+    ) -> None:
+        token = settlements.claim("review:demo:evt-9")
+        assert token is not None
+        settlements.mark_failed("review:demo:evt-9", token=token, reason="boom")
+        settlements.reopen_failed("review:demo:evt-9", reason="reconciled")
+
+        second = settlements.claim("review:demo:evt-9")
+        assert second is not None
+        settlements.mark_merged(
+            "review:demo:evt-9", token=second, merge_sha="e" * 40
+        )
+        settlements.mark_settled("review:demo:evt-9", token=second)
+
+        assert settlements.get("review:demo:evt-9").state == "settled"
 
 
 @pytest.mark.asyncio
@@ -1047,3 +1139,298 @@ class TestDirectExactHeadMerge:
         assert outcome.state == "reconciliation_required"
         assert acceptance.github.merge_calls == []
         assert acceptance.settlements.get(record.review_id).state == "failed"
+
+
+PARENT_SHA = "7" * 40
+ADVANCED_PATHS = ("A\tsrc/new.py", "M\tsrc/app.py")
+STABLE_APPLIED_TREE = "8" * 40
+
+
+def _wire_patch_equivalence(
+    acceptance: Any, candidate: str, merge_sha: str, *, base: str = BASE
+) -> None:
+    """Force the three existing proofs to fail and only the fourth —
+    patch equivalence against an advanced base — to succeed, mirroring
+    the live INFRA-209/PR#39 shape (main advanced past the candidate's
+    recorded base before the guarded merge's post-merge proof ran)."""
+
+    acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+    acceptance.git.ancestor[(candidate, merge_sha)] = False
+    acceptance.git.trees[merge_sha] = STABLE_APPLIED_TREE
+    acceptance.git.trees[candidate] = "tree-" + candidate
+    acceptance.git.ancestor[(base, PARENT_SHA)] = True
+    acceptance.git.parents[merge_sha] = PARENT_SHA
+    acceptance.git.paths[(base, candidate)] = ADVANCED_PATHS
+    acceptance.git.paths[(PARENT_SHA, merge_sha)] = ADVANCED_PATHS
+    acceptance.git.applied_trees[(base, candidate, PARENT_SHA)] = (
+        STABLE_APPLIED_TREE
+    )
+
+
+def _manifest_for(acceptance: Any, event: Any) -> Any:
+    snapshot = read_manifest_snapshot(
+        acceptance.root / f"{event.event_id}.json", root=acceptance.root
+    )
+    return snapshot.manifest
+
+
+def _merge_proven_payload(acceptance: Any, review_id: str) -> dict[str, Any]:
+    rows = acceptance.database.execute(
+        "SELECT payload_json FROM events WHERE event_type = 'merge.proven' "
+        "AND aggregate_id = ?",
+        (review_id,),
+    ).fetchall()
+    assert len(rows) == 1, f"expected exactly one merge.proven event, found {rows}"
+    return dict(json.loads(rows[0]["payload_json"]))
+
+
+@pytest.mark.asyncio
+class TestReconciliationAfterProofFailure:
+    """INFRA-210: the observed PR #39 shape — a guarded merge's own
+    completed merge effect whose post-merge proof failed (main advanced
+    past the recorded base) is later reconciled, exactly once, from a
+    fresh proof bound to that same recorded base."""
+
+    async def _guarded_merge_that_fails_proof(self, acceptance: Any) -> Any:
+        event, branch, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        merge_sha = merge_sha_for(GOOD)
+        admitted = acceptance.admission.admit("demo", event, received_generation=1)
+        record = await acceptance.service.record_verdict(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+        _wire_patch_equivalence(acceptance, GOOD, merge_sha)
+        # The historical incident: the post-merge proof could not be
+        # computed at all (stand-in for "main advanced past what the old
+        # three-relation proof could reconcile"); the guarded merge itself
+        # still completed and journaled.
+        acceptance.git.first_parent_error = GitError("git rev-parse failed")
+
+        outcome = await acceptance.service.merge_approved(record.review_id)
+
+        # GitHub itself now reports the pull request merged with this exact
+        # commit, as it would for the real guarded mutation that just ran.
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=GOOD,
+            head_ref=branch,
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+        assert outcome.state == "reconciliation_required"
+        assert len(acceptance.github.merge_calls) == 1
+        settlement = acceptance.settlements.get(record.review_id)
+        assert settlement.state == "failed"
+        effect = acceptance.guarded_github.journal.get(f"merge:{record.review_id}")
+        assert effect is not None
+        assert effect.state == "completed"
+        assert effect.response == {"merged": True, "sha": merge_sha}
+        acceptance.git.first_parent_error = None
+        return record, event, branch, number, merge_sha
+
+    async def test_a_failed_post_merge_proof_reconciles_via_patch_equivalence(
+        self, acceptance: Any
+    ) -> None:
+        record, event, _branch, number, merge_sha = (
+            await self._guarded_merge_that_fails_proof(acceptance)
+        )
+        manifest = _manifest_for(acceptance, event)
+
+        outcome = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        assert outcome.state == "merged"
+        assert outcome.merge_sha == merge_sha
+        review_state, review_sha = acceptance.database.execute(
+            "SELECT state, merge_sha FROM reviews WHERE review_id = ?",
+            (record.review_id,),
+        ).fetchone()
+        assert str(review_state) == "merged"
+        assert str(review_sha) == merge_sha
+        settlement = acceptance.settlements.get(record.review_id)
+        assert settlement.state == "settled"
+        assert settlement.path == "guarded"
+        assert settlement.merge_sha == merge_sha
+        # Never a second GitHub mutation: the original guarded merge call
+        # is the only one, and its journal row is untouched, not duplicated.
+        assert len(acceptance.github.merge_calls) == 1
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 1
+        )
+        assert (
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM ci_merge_ledger WHERE merge_sha = ?",
+                (merge_sha,),
+            )
+            == 1
+        )
+        done_targets = [
+            target for target in acceptance.linear.targets if target[1] == "Done"
+        ]
+        assert done_targets == [("ENG-9", "Done", "operator")]
+        payload = _merge_proven_payload(acceptance, record.review_id)
+        assert payload["relation"] == "patch_equivalent"
+        assert payload["base_sha"] == BASE
+        assert payload["merge_sha"] == merge_sha
+
+    async def test_a_second_reconcile_call_is_a_no_op(self, acceptance: Any) -> None:
+        record, event, _branch, number, _merge_sha = (
+            await self._guarded_merge_that_fails_proof(acceptance)
+        )
+        manifest = _manifest_for(acceptance, event)
+        first = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        replay = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        assert first.state == replay.state == "merged"
+        assert len(acceptance.github.merge_calls) == 1
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM reviews") == 1
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 1
+        )
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM ci_merge_ledger") == 1
+        assert len(
+            [t for t in acceptance.linear.targets if t[1] == "Done"]
+        ) == 1
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge.proven' "
+            "AND aggregate_id = ?",
+            (record.review_id,),
+        ) == 1
+
+    async def test_resume_settlements_after_reconciliation_changes_nothing(
+        self, acceptance: Any
+    ) -> None:
+        record, event, _branch, number, _merge_sha = (
+            await self._guarded_merge_that_fails_proof(acceptance)
+        )
+        manifest = _manifest_for(acceptance, event)
+        await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        outcomes = await acceptance.service.resume_settlements()
+
+        assert outcomes == ()
+        assert len(acceptance.github.merge_calls) == 1
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 1
+        )
+        assert acceptance.settlements.get(record.review_id).state == "settled"
+
+    async def test_a_failed_settlement_without_a_completed_effect_is_not_reopened(
+        self, acceptance: Any
+    ) -> None:
+        """A direct-Sol-merge proof failure never journals a merge effect
+        for this review at all; a later successful proof must not reopen
+        a settlement with nothing completed to reconcile against."""
+
+        event, branch, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        merge_sha = merge_sha_for(GOOD)
+        admitted = acceptance.admission.admit("demo", event, received_generation=1)
+        record = await acceptance.service.record_verdict(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=GOOD,
+            head_ref=branch,
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+        acceptance.git.ancestor[(merge_sha, "origin/main")] = False
+
+        outcome = await acceptance.service.merge_approved(record.review_id)
+
+        assert outcome.state == "reconciliation_required"
+        assert acceptance.github.merge_calls == []
+        assert acceptance.settlements.get(record.review_id).state == "failed"
+        assert (
+            acceptance.guarded_github.journal.get(f"merge:{record.review_id}")
+            is None
+        )
+
+        # The ancestry read is fixed and a fresh proof now succeeds, but
+        # the failed settlement owns no completed merge effect to
+        # reconcile against, so it must stay exactly as it was.
+        acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        manifest = _manifest_for(acceptance, event)
+
+        outcome2 = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        assert outcome2.state == "reconciliation_required"
+        settlement = acceptance.settlements.get(record.review_id)
+        assert settlement.state == "failed"
+        assert settlement.merge_sha is None
+        assert acceptance.github.merge_calls == []
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 0
+        )
+
+    async def test_guarded_merge_threads_base_sha_into_the_proof(
+        self, acceptance: Any
+    ) -> None:
+        """(e) guarded path: patch equivalence only succeeds because the
+        settlement's recorded base_sha reaches ``merge_approved``."""
+
+        event, branch, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        merge_sha = merge_sha_for(GOOD)
+        _wire_patch_equivalence(acceptance, GOOD, merge_sha)
+        admitted = acceptance.admission.admit("demo", event, received_generation=1)
+
+        outcome = await acceptance.service.complete_review(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+
+        assert outcome.state == "merged"
+        payload = _merge_proven_payload(acceptance, outcome.review_id)
+        assert payload["relation"] == "patch_equivalent"
+        assert payload["base_sha"] == BASE
+        assert payload["merge_parent_sha"] == PARENT_SHA
+
+    async def test_direct_sol_merge_threads_base_sha_into_the_proof(
+        self, acceptance: Any
+    ) -> None:
+        """(e) direct-Sol path: ``prove_landed`` inside ``_drive_merge``'s
+        direct-merge branch is given the settlement's recorded base_sha."""
+
+        event, branch, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        merge_sha = merge_sha_for(GOOD)
+        _wire_patch_equivalence(acceptance, GOOD, merge_sha)
+        admitted = acceptance.admission.admit("demo", event, received_generation=1)
+        record = await acceptance.service.record_verdict(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=GOOD,
+            head_ref=branch,
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+
+        outcome = await acceptance.service.merge_approved(record.review_id)
+
+        assert outcome.state == "merged"
+        assert "externally merged; reconciled patch_equivalent" in outcome.reason
+        assert acceptance.github.merge_calls == []
+        payload = _merge_proven_payload(acceptance, record.review_id)
+        assert payload["relation"] == "patch_equivalent"
+        assert payload["base_sha"] == BASE
+        assert payload["merge_parent_sha"] == PARENT_SHA

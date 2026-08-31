@@ -265,6 +265,33 @@ class MergeSettlements:
             reason=reason,
         )
 
+    def reopen_failed(self, settlement_id: str, *, reason: str) -> None:
+        """CAS a ``failed`` settlement back to ``recorded`` for repair.
+
+        Used only when a post-merge proof failure is later reconciled
+        against the exact same completed merge effect: the row becomes
+        claimable again (owner token and lease cleared, ``merge_sha``
+        stays NULL, ``path`` untouched) so the caller can drive it to
+        ``merged`` -> ``settled`` through the ordinary claim path. Any
+        state other than ``failed`` refuses.
+        """
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE merge_settlements SET state = 'recorded', "
+                "owner_token = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE settlement_id = ? AND state = 'failed'",
+                (stamp, settlement_id),
+            )
+            if cursor.rowcount != 1:
+                raise SettlementConflict(
+                    f"settlement {settlement_id} is not in state 'failed'"
+                )
+            self._append(
+                connection, settlement_id, "settlement.reopened", {"reason": reason}
+            )
+
     def release(self, settlement_id: str, *, token: str) -> None:
         """Return a claimed settlement to ``recorded`` (e.g. a full
         merge window); nothing external happened under this claim."""
