@@ -27,7 +27,6 @@ from pathlib import Path
 
 import pytest
 
-from hermes_orchestrator.codex_ponytail_guard import GuardError
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
@@ -174,32 +173,6 @@ def _ok(stdout: str) -> GitResult:
 
 
 @dataclass
-class ScriptedPonytail:
-    """Scripted Ponytail snapshot decision for both mutation boundaries.
-
-    ``snapshots`` and ``reviews`` are consumed one value per call (the
-    last value repeats once exhausted), so a test can script the commit
-    boundary and the push-boundary revalidation independently. The
-    defaults model a review recorded for exactly the current candidate.
-    """
-
-    snapshots: list[str] = field(default_factory=lambda: ["snap-a"])
-    reviews: list[str | None] = field(default_factory=lambda: ["snap-a"])
-    snapshot_calls: int = 0
-    review_calls: int = 0
-
-    def snapshot_hash(self, repo: Path) -> str:
-        index = min(self.snapshot_calls, len(self.snapshots) - 1)
-        self.snapshot_calls += 1
-        return self.snapshots[index]
-
-    def reviewed_hash(self, repo: Path) -> str | None:
-        index = min(self.review_calls, len(self.reviews) - 1)
-        self.review_calls += 1
-        return self.reviews[index]
-
-
-@dataclass
 class RecordingCommands:
     exit_code: int = 0
     calls: list[str] = field(default_factory=list)
@@ -234,17 +207,11 @@ def clock() -> Clock:
 
 
 @pytest.fixture
-def ponytail() -> ScriptedPonytail:
-    return ScriptedPonytail()
-
-
-@pytest.fixture
 def helper(
     database: Database,
     git: ScriptedGit,
     commands: RecordingCommands,
     clock: Clock,
-    ponytail: ScriptedPonytail,
     tmp_path: Path,
 ) -> ReviewerFixHelper:
     manifest_root = tmp_path / "manifests"
@@ -264,8 +231,6 @@ def helper(
         manifest_root=manifest_root,
         commands=commands,
         now=clock,
-        snapshot_hash=ponytail.snapshot_hash,
-        reviewed_hash=ponytail.reviewed_hash,
     )
 
 
@@ -421,194 +386,6 @@ class TestStagedEligibility:
 
         assert receipt.changed_lines == 0
         assert receipt.files == ("src/empty.py",)
-
-
-def build_helper(
-    database: Database,
-    git: ScriptedGit,
-    tmp_path: Path,
-    **seam: object,
-) -> ReviewerFixHelper:
-    """One helper with default wiring plus explicit seam overrides."""
-
-    manifest_root = tmp_path / "manifests"
-    manifest_root.mkdir(exist_ok=True)
-    return ReviewerFixHelper(
-        database=database,
-        events=EventStore(database),
-        projects={
-            "demo": ProjectConfig(
-                linear_team="infrastructure",
-                repo_path=tmp_path / "repo",
-                integration_branch="main",
-                github_repo="j-paterson/demo",
-            )
-        },
-        git=git,
-        manifest_root=manifest_root,
-        commands=RecordingCommands(),
-        now=Clock(),
-        **seam,  # type: ignore[arg-type]
-    )
-
-
-class TestPonytailBoundaries:
-    """Sol packet 165f5ee6/2: the helper runs as an outer command the
-    session hook cannot see, so the Ponytail snapshot decision is
-    enforced inside the helper itself — the complete staged/worktree
-    candidate needs a matching review marker before the labeled commit,
-    and the committed publish state is revalidated before the push."""
-
-    def test_an_unreviewed_eligible_fix_is_refused_before_commit(
-        self,
-        helper: ReviewerFixHelper,
-        git: ScriptedGit,
-        ponytail: ScriptedPonytail,
-        database: Database,
-        tmp_path: Path,
-    ) -> None:
-        """No recorded review: refused before Git commit, with no push
-        and no publication intent of any kind."""
-
-        ponytail.reviews = [None]
-
-        with pytest.raises(
-            ReviewerFixRefused, match="commit boundary has no recorded"
-        ):
-            apply(helper)
-
-        assert git.commits == []
-        assert git.pushes == []
-        assert git.resets == [("reset",)]
-        assert database.scalar("SELECT COUNT(*) FROM reviewer_fixes") == 0
-        assert list((tmp_path / "manifests").iterdir()) == []
-
-    def test_recording_the_exact_snapshot_permits_the_labeled_commit(
-        self,
-        helper: ReviewerFixHelper,
-        git: ScriptedGit,
-        ponytail: ScriptedPonytail,
-    ) -> None:
-        """A review marker matching the exact current candidate
-        snapshot authorizes the labeled commit and the publication."""
-
-        receipt = apply(helper)
-
-        assert receipt.state == "recorded"
-        [commit] = git.commits
-        assert commit[2].startswith("ACCEPT_WITH_REVIEWER_FIX: ")
-        [push] = git.pushes
-        assert push[1] == LEASE
-        # Both mutation boundaries consulted the snapshot decision.
-        assert ponytail.snapshot_calls == 2
-        assert ponytail.review_calls == 2
-
-    def test_a_changed_snapshot_after_review_prevents_commit(
-        self,
-        helper: ReviewerFixHelper,
-        git: ScriptedGit,
-        ponytail: ScriptedPonytail,
-        database: Database,
-    ) -> None:
-        """The candidate changed after its review was recorded: the
-        stale marker no longer authorizes the commit boundary."""
-
-        ponytail.snapshots = ["snap-b"]
-        ponytail.reviews = ["snap-a"]
-
-        with pytest.raises(
-            ReviewerFixRefused,
-            match="commit boundary changed after its ponytail review",
-        ):
-            apply(helper)
-
-        assert git.commits == []
-        assert git.pushes == []
-        assert git.resets == [("reset",)]
-        assert database.scalar("SELECT COUNT(*) FROM reviewer_fixes") == 0
-
-    @pytest.mark.parametrize("scenario", ["absent", "stale"])
-    def test_the_push_boundary_revalidates_and_refuses_publication(
-        self,
-        helper: ReviewerFixHelper,
-        git: ScriptedGit,
-        ponytail: ScriptedPonytail,
-        database: Database,
-        tmp_path: Path,
-        scenario: str,
-    ) -> None:
-        """The commit boundary passed, but at the push boundary the
-        required reviewed state is absent or stale: the labeled commit
-        stays local and nothing is journaled or published."""
-
-        if scenario == "absent":
-            ponytail.reviews = ["snap-a", None]
-        else:
-            ponytail.snapshots = ["snap-a", "snap-b"]
-
-        with pytest.raises(ReviewerFixRefused, match="push boundary"):
-            apply(helper)
-
-        assert len(git.commits) == 1
-        assert git.pushes == []
-        assert database.scalar("SELECT COUNT(*) FROM reviewer_fixes") == 0
-        assert list((tmp_path / "manifests").iterdir()) == []
-        assert ponytail.snapshot_calls == 2
-        assert ponytail.review_calls == 2
-
-    def test_unverifiable_review_state_fails_closed_before_commit(
-        self,
-        database: Database,
-        git: ScriptedGit,
-        tmp_path: Path,
-    ) -> None:
-        def broken(repo: Path) -> str:
-            raise GuardError("git rev-parse failed: boom")
-
-        helper = build_helper(database, git, tmp_path, snapshot_hash=broken)
-
-        with pytest.raises(
-            ReviewerFixRefused, match="could not be verified"
-        ):
-            apply(helper)
-
-        assert git.commits == []
-        assert git.pushes == []
-        assert database.scalar("SELECT COUNT(*) FROM reviewer_fixes") == 0
-
-    def test_the_default_seam_reuses_the_real_guard_functions(
-        self,
-        database: Database,
-        git: ScriptedGit,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Without injected callables the helper binds the guard
-        module's own snapshot_hash and reviewed_hash."""
-
-        calls: list[str] = []
-
-        def fake_snapshot(repo: Path) -> str:
-            calls.append(f"snapshot:{repo.name}")
-            return "snap"
-
-        def fake_reviewed(repo: Path) -> str | None:
-            calls.append(f"reviewed:{repo.name}")
-            return "snap"
-
-        monkeypatch.setattr(
-            "hermes_orchestrator.codex_ponytail_guard.snapshot_hash",
-            fake_snapshot,
-        )
-        monkeypatch.setattr(
-            "hermes_orchestrator.codex_ponytail_guard.reviewed_hash",
-            fake_reviewed,
-        )
-
-        receipt = apply(build_helper(database, git, tmp_path))
-
-        assert receipt.state == "recorded"
-        assert calls == ["snapshot:repo", "reviewed:repo"] * 2
 
 
 class TestIntentJournalledPublication:

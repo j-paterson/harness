@@ -382,15 +382,24 @@ class ReviewService:
             return _outcome(record, reason=record.reason or "merged")
         if settlement.state == "failed":
             return _outcome(record, reason=settlement.reason or record.state)
-        if record.state == "approved":
-            # Settlement-claim fence (Sol 165f5ee6 packet 3): every
-            # recovery entry — startup resume, intake-boundary resume,
-            # the merge-settle CLI, and the direct submission drive —
-            # converges here, so a settlement whose stored reviewer
-            # thread/generation is no longer the live ready channel is
-            # never claimed. Only a review still awaiting its mutation
-            # is fenced; a ``merged`` settlement's receipt tail replays
-            # for a mutation that already exists.
+        if record.state == "approved" and settlement.state == "recorded":
+            # Settlement-claim fence (Sol 165f5ee6 packet 3, scope
+            # refined by Sol eadf249b packet 2): every recovery entry —
+            # startup resume, intake-boundary resume, the merge-settle
+            # CLI, and the direct submission drive — converges here, and
+            # a PRE-MUTATION ``recorded`` settlement whose stored
+            # reviewer thread/generation is no longer the live ready
+            # channel is never claimed: nothing external can have
+            # happened, so the stale refusal is immediate. An in-flight
+            # ``merging`` row is NOT fenced at this boundary — its
+            # previous owner may have crossed the GitHub boundary before
+            # crashing, so once its lease expires it is claimed and
+            # driven: the drive inspects authoritative PR/effect state,
+            # reconciles an already-completed exact-head merge into its
+            # receipts, and still applies the final pre-mutation
+            # revalidation before any NEW merge call. A ``merged``
+            # settlement's receipt tail replays for a mutation that
+            # already exists.
             stale = self._stale_settlement_reason(settlement)
             if stale is not None:
                 return _outcome(record, state=STALE_SETTLEMENT, reason=stale)

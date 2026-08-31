@@ -871,6 +871,98 @@ async def test_replaced_channel_keeps_the_approved_settlement_non_settling(
 
 
 @pytest.mark.asyncio
+async def test_an_expired_in_flight_merge_reconciles_after_channel_replacement(
+    flow: ProductionShapedFlow,
+) -> None:
+    """Sol eadf249b packet 2 required test 1, production-shaped.
+
+    The settlement owner crashed after GitHub completed the exact-head
+    merge but before any ledger/review receipt; the reviewer channel was
+    replaced before restart. The daemon's startup recovery claims the
+    expired in-flight ``merging`` row and reconciles the existing merge
+    into its receipts — no new mutation, nothing stranded — instead of
+    refusing it at the claim boundary as a stale pre-mutation row.
+    """
+
+    import json as jsonlib
+
+    from hermes_orchestrator.verdicts import VerdictBinding, parse_verdict
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    admitted = flow.admission.admit("demo", emitted.event, received_generation=1)
+    verdict = parse_verdict(
+        jsonlib.dumps(
+            {
+                "verdict": "approved",
+                "repository": REPOSITORY,
+                "branch": branch,
+                "pr_number": 14,
+                "reviewed_sha": SHA_A,
+                "packets": [],
+            }
+        ),
+        expected=VerdictBinding(
+            repository=REPOSITORY, branch=branch, pr_number=14, reviewed_sha=SHA_A
+        ),
+    )
+    record = await flow.reviews.record_verdict(admitted, "ENG-9", verdict)
+    assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
+    # The previous owner claimed the settlement and GitHub completed the
+    # squash merge, then the process died before any receipt was written.
+    token = flow.settlements.claim(record.review_id)
+    assert token is not None
+    flow.github.full_pulls[14] = open_pull(
+        number=14,
+        head_sha=SHA_A,
+        head_ref=branch,
+        state="closed",
+        merged=True,
+        mergeable=None,
+        merge_commit_sha=merge_sha_for(SHA_A),
+    )
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "UPDATE merge_settlements SET lease_expires_at = ? "
+            "WHERE settlement_id = ?",
+            ("2000-01-01T00:00:00+00:00", record.review_id),
+        )
+    flow.merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_legacy",
+        expected_generation=1,
+        reason="reviewer channel rotated",
+    )
+    flow.merger.complete_replacement(
+        "demo",
+        expected_thread_id="thr_legacy",
+        expected_generation=1,
+        new_thread_id="thr_new",
+    )
+
+    outcomes = await flow.reviews.resume_settlements()
+
+    assert [outcome.state for outcome in outcomes] == ["merged"]
+    assert "externally merged; reconciled" in outcomes[0].reason
+    # The completed merge was reconciled, never repeated: the transport
+    # was not touched during recovery.
+    assert flow.github.merge_calls == []
+    settlement = flow.settlements.get(record.review_id)
+    assert settlement.state == "settled"
+    assert settlement.merge_sha == merge_sha_for(SHA_A)
+    assert flow.ledger_state(merge_sha_for(SHA_A)) == "unresolved"
+    review_state = flow.database.scalar(
+        "SELECT state FROM reviews WHERE review_id = ?", (record.review_id,)
+    )
+    assert str(review_state) == "merged"
+    assert flow.queue.get("ENG-9").state is IssueState.DONE
+    # Stable: a second startup pass finds nothing left to drive.
+    assert await flow.reviews.resume_settlements() == ()
+    assert flow.github.merge_calls == []
+
+
+@pytest.mark.asyncio
 async def test_a_direct_sol_merge_reconciles_at_the_next_intake_boundary(
     flow: ProductionShapedFlow,
 ) -> None:
