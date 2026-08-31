@@ -13,6 +13,7 @@ import pytest
 from hermes_orchestrator.channel_trust import (
     APPROVED_PROMPT_PATTERN,
     ChannelTrustAnchors,
+    TrustVerdict,
 )
 from hermes_orchestrator.cmux import (
     CmuxAccessDenied,
@@ -258,6 +259,7 @@ def reconciler(
     profiles: dict[str, Path] | None = None,
     channel_launch: FakeChannelLaunch | None = None,
     control: ControlOperations | None = None,
+    channel_trust: object | None = None,
 ) -> CmuxSurfaceReconciler:
     return CmuxSurfaceReconciler(
         bindings=bindings,
@@ -277,6 +279,7 @@ def reconciler(
             )
         ),
         control=control,
+        channel_trust=channel_trust,
     )
 
 
@@ -391,8 +394,16 @@ async def test_stale_lead_surface_is_replaced_with_exact_identity(
     first = bind_demo_lead(bindings)
     port = FakePort(next_refs=[FRESH])
     launch = FakeChannelLaunch(config=Path(f"/state/channels/{SESSION}.mcp.json"))
+    # Sol correction c5600e31: restart recovery now fails closed on
+    # channel trust — a trigger that confirms is composed here so this
+    # test still exercises the surface-replacement mechanics; the
+    # trust-gating contract itself is covered by
+    # ``TestReconcilerChannelTrust``.
+    trust = FakeTrustTrigger(verdict=TrustVerdict(confirmed=True))
 
-    report = await reconciler(bindings, port, channel_launch=launch).reconcile()
+    report = await reconciler(
+        bindings, port, channel_launch=launch, channel_trust=trust
+    ).reconcile()
 
     successor = bindings.active_lead("cell-demo")
     assert report.replaced == (successor.binding_id,)
@@ -1217,8 +1228,12 @@ async def test_interrupted_replacement_recovers_one_seat(
         reason="activation_pending",
     )
     port = FakePort(live={FRESH}, next_refs=[THIRD])
+    # Sol correction c5600e31: restart recovery fails closed on channel
+    # trust; a confirming trigger keeps this test focused on the
+    # write-ahead reclaim mechanics it exercises.
+    trust = FakeTrustTrigger(verdict=TrustVerdict(confirmed=True))
 
-    report = await reconciler(bindings, port).reconcile()
+    report = await reconciler(bindings, port, channel_trust=trust).reconcile()
 
     # Startup reconciliation closes the write-ahead workspace by exact
     # identity and reseats the still-active old generation once: one
@@ -1940,15 +1955,20 @@ def control_operation_kinds(database: Database) -> list[str]:
 
 
 class FakeTrustTrigger:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        verdict: TrustVerdict | None = None,
+    ) -> None:
         self.calls: list[object] = []
         self.error = error
+        self.verdict = verdict
 
     async def confirm_seat(self, binding: object) -> object | None:
         self.calls.append(binding)
         if self.error is not None:
             raise self.error
-        return None
+        return self.verdict
 
 
 @dataclass
@@ -2646,3 +2666,260 @@ class TestChannelTrustLifecycle:
         assert "sidecar build is missing" in str(
             receipt.result["launcher_error"]
         )
+
+
+# --------------------------------------------------------------------
+# Restart recovery fails closed on channel trust (Sol correction
+# c5600e31): unlike the seater's best-effort one-shot trigger, a
+# restart-recovered lead may not sit active/classic in durable state
+# until it completes the same bounded channel-trust confirmation and
+# registration path normal seating runs.
+# --------------------------------------------------------------------
+
+
+class TestReconcilerChannelTrust:
+    @pytest.mark.asyncio
+    async def test_restart_recovery_confirms_trust_before_going_active(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """The exact same bounded watch-then-gate path normal seating
+        triggers now runs for the restart-recovered successor: the
+        anchor trusted on the dying seat's own surface (LEAD) is
+        carried forward to the freshly created replacement surface
+        (FRESH) — the INFRA-208 rebind-and-confirm mechanics
+        ``ChannelTrustConfirmer`` already provides — and the seat only
+        stays active/classic once that gate presses the one Enter."""
+
+        seed_cell(database)
+        bind_demo_lead(bindings)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)  # anchored to LEAD's surface
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[FRESH], screen=f"...\n{DIALOG_TEXT}\n")
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=confirmer,
+        ).reconcile()
+
+        successor = bindings.active_lead("cell-demo")
+        assert successor is not None
+        assert successor.state == "active"
+        assert successor.ref == FRESH
+        assert bindings.is_classic(successor.binding_id, SESSION) is True
+        assert report.replaced == (successor.binding_id,)
+        assert report.lost == ()
+        # The Enter landed on the exact bound (new) surface, never the
+        # dead predecessor's.
+        assert port.confirmed == [FRESH]
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        active_anchor = anchors.active_for_cell("cell-demo")
+        assert active_anchor is not None
+        assert active_anchor.surface_uuid == FRESH.surface_uuid
+        assert active_anchor.session_id == SESSION
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_confirmation_leaves_no_active_binding(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+    ) -> None:
+        """The bounded watch never sees the dialog (``confirm_seat``
+        returns ``None``): exactly as unproven as an explicit refusal,
+        so the successor is recorded lost, never active/classic, with
+        one durable actionable ``channel.blocked`` receipt."""
+
+        bind_demo_lead(bindings)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[FRESH])
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        trigger = FakeTrustTrigger()  # always returns None
+
+        report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=trigger,
+        ).reconcile()
+
+        assert report.replaced == ()
+        [lost_id] = report.lost
+        assert bindings.get(lost_id).state == "lost"
+        assert bindings.active_lead("cell-demo") is None
+        # The trust trigger saw the exact successor binding — the new
+        # surface, not the dead predecessor's.
+        [seen] = trigger.calls
+        assert seen.binding_id == lost_id
+        assert seen.ref == FRESH
+        [receipt] = control.pending_for_session(SESSION)
+        assert receipt.kind == "channel.blocked"
+        assert "CHANNEL TRUST UNCONFIRMED" in str(receipt.reason)
+        assert receipt.result["successor_binding_id"] == lost_id
+
+    @pytest.mark.asyncio
+    async def test_a_raising_trigger_leaves_no_active_binding(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+    ) -> None:
+        bind_demo_lead(bindings)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[FRESH])
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        trigger = FakeTrustTrigger(error=RuntimeError("watcher exploded"))
+
+        report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=trigger,
+        ).reconcile()
+
+        assert report.replaced == ()
+        assert len(report.lost) == 1
+        assert bindings.active_lead("cell-demo") is None
+        [receipt] = control.pending_for_session(SESSION)
+        assert receipt.kind == "channel.blocked"
+        assert receipt.result["trigger_error"] == "watcher exploded"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_verdict_leaves_no_active_binding(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """The dialog appears but the gate's own full re-derivation
+        refuses it (content drift here): a non-confirmed
+        ``TrustVerdict``, not ``None`` — handled identically."""
+
+        seed_cell(database)
+        bind_demo_lead(bindings)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry)
+        # The build at this same path changed after the anchor was
+        # trusted, so the gate's content re-derivation refuses.
+        entry.write_text("console.log('a different build');\n", encoding="utf-8")
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[FRESH], screen=f"...\n{DIALOG_TEXT}\n")
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=confirmer,
+        ).reconcile()
+
+        assert report.replaced == ()
+        assert len(report.lost) == 1
+        assert bindings.active_lead("cell-demo") is None
+        assert port.confirmed == []
+        # The gate's own refusal receipt still records; the reconciler
+        # adds its own seat-level channel.blocked receipt on top.
+        assert "channel.approval_required" in control_operation_kinds(database)
+        assert "channel.blocked" in control_operation_kinds(database)
+
+    @pytest.mark.asyncio
+    async def test_a_launcher_without_a_trust_trigger_fails_closed(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+    ) -> None:
+        """A reconciler composed with a channel launcher but no
+        ``channel_trust`` collaborator can never obtain proof of trust
+        either, so restart recovery fails exactly the same way as a
+        timed-out or refused confirmation."""
+
+        bind_demo_lead(bindings)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[FRESH])
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+
+        report = await reconciler(
+            bindings, port, channel_launch=launch, control=control
+        ).reconcile()
+
+        assert report.replaced == ()
+        assert len(report.lost) == 1
+        assert bindings.active_lead("cell-demo") is None
+        [receipt] = control.pending_for_session(SESSION)
+        assert receipt.kind == "channel.blocked"
+        assert "CHANNEL TRUST UNCONFIRMED" in str(receipt.reason)
+
+    @pytest.mark.asyncio
+    async def test_normal_seating_and_restart_recovery_bind_identical_identity(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+    ) -> None:
+        """Both paths hand the exact same trigger the exact same
+        binding-identity fields — cell, session, and profile — for the
+        one launch this cell owns; only the surface identity differs
+        because restart recovery necessarily creates a new workspace."""
+
+        normal_trigger = FakeTrustTrigger()
+        seat_port = FakePort(next_refs=[LEAD])
+        seated = await seater(
+            bindings,
+            seat_port,
+            channel_launch=FakeChannelLaunch(
+                config=Path(f"/state/channels/{SESSION}.mcp.json")
+            ),
+            control=ControlOperations(database, events=EventStore(database)),
+            channel_trust=normal_trigger,
+        ).ensure(
+            **demo_seat(),
+            classic_command=(
+                f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}"
+            ),
+        )
+        [normal_seen] = normal_trigger.calls
+        assert normal_seen.binding_id == seated.binding_id
+
+        recovery_trigger = FakeTrustTrigger()
+        recovery_port = FakePort(next_refs=[FRESH])
+        await reconciler(
+            bindings,
+            recovery_port,
+            channel_launch=FakeChannelLaunch(
+                config=Path(f"/state/channels/{SESSION}.mcp.json")
+            ),
+            control=ControlOperations(database, events=EventStore(database)),
+            channel_trust=recovery_trigger,
+        ).reconcile()
+        [recovery_seen] = recovery_trigger.calls
+
+        assert normal_seen.cell_id == recovery_seen.cell_id == "cell-demo"
+        assert normal_seen.session_id == recovery_seen.session_id == SESSION
+        assert normal_seen.profile_alias == recovery_seen.profile_alias == "max-a"
+        assert normal_seen.project_key == recovery_seen.project_key == "demo"
+        # Only the surface identity differs — a genuinely new workspace.
+        assert normal_seen.ref == LEAD
+        assert recovery_seen.ref == FRESH

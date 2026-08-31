@@ -713,6 +713,12 @@ def open_runtime(
                     # never an active binding over a blank terminal.
                     channel_launch=channel_launcher,
                     control=control_operations,
+                    # Sol correction c5600e31: the exact same trust
+                    # trigger the seater uses, so restart recovery
+                    # completes the same bounded channel-trust
+                    # confirmation and registration path normal seating
+                    # runs before durable state calls the seat usable.
+                    channel_trust=channel_confirmer,
                 )
                 cmux_hibernation = CmuxHibernationDriver(
                     gate=CmuxHibernationGate(

@@ -625,6 +625,13 @@ def test_active_runtime_composes_seats_on_hermes_control_without_fakechat(
         assert runtime.cmux_reconciler is not None
         assert runtime.cmux_reconciler._channel_launch is seater._channel_launch
         assert runtime.cmux_reconciler._control is not None
+        # Sol correction c5600e31: restart recovery completes the same
+        # bounded channel-trust confirmation and registration path as
+        # normal seating — the reconciler is composed with the exact
+        # same trust trigger the seater uses, never a separate or
+        # missing one.
+        assert runtime.cmux_reconciler._channel_trust is seater._channel_trust
+        assert runtime.cmux_reconciler._channel_trust is not None
     finally:
         runtime.close()
 

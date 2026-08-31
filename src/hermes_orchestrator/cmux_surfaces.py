@@ -948,6 +948,27 @@ class CmuxSurfaceReconciler:
     otherwise it is recorded lost and the operator relaunches the pane,
     so ownership never transfers silently. When the socket denies or
     fails, durable state is left untouched.
+
+    Sol correction c5600e31: a channel-launched recovered lead must
+    complete the exact same bounded channel-trust confirmation and
+    registration path normal seating runs (:class:`CmuxLeadSeater`)
+    BEFORE durable state may call it usable — UNLIKE the seater's
+    best-effort, fire-and-forget one-shot trigger, restart recovery
+    FAILS CLOSED on the outcome. ``ChannelTrustGate.evaluate``
+    (``channel_trust.py``) never produces a confirmed
+    :class:`~hermes_orchestrator.channel_trust.TrustVerdict` without a
+    freshly re-read, exactly matching development-channel dialog on the
+    live surface — there is no persistent-trust bypass anywhere in that
+    gate, so a dialog that never appears inside the confirmer's bounded
+    watch window is exactly as unproven as one the gate explicitly
+    refuses. ``channel_trust.confirm_seat`` returning ``None``, a
+    non-confirmed verdict, or raising are therefore all handled
+    identically: the successor binding is recorded lost (never left
+    active/classic) with one durable ``channel.blocked`` receipt naming
+    why, so ``rotate-lead`` can reseat the cell once an operator
+    resolves it. A reconciler composed with a launcher but no
+    ``channel_trust`` trigger can never obtain that proof either, so it
+    fails exactly the same way.
     """
 
     def __init__(
@@ -960,6 +981,7 @@ class CmuxSurfaceReconciler:
         environ: Mapping[str, str],
         channel_launch: ChannelLaunchSource | None = None,
         control: ControlOperations | None = None,
+        channel_trust: ChannelTrustTrigger | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
@@ -968,6 +990,7 @@ class CmuxSurfaceReconciler:
         self._environ = dict(environ)
         self._channel_launch = channel_launch
         self._control = control
+        self._channel_trust = channel_trust
 
     def own_seat(self) -> CmuxSurfaceRef | None:
         """The cmux seat this very process runs in, if any."""
@@ -1169,7 +1192,64 @@ class CmuxSurfaceReconciler:
         # channel hub both require, recorded exactly as normal seating
         # records it.
         self._bindings.record_classic(successor.binding_id, session_id)
-        replaced.append(successor.binding_id)
+        # Sol correction c5600e31: restart recovery fails closed on
+        # trust — see the class docstring for the exact contract.
+        # ``confirm_seat`` runs the same bounded watch-then-gate path
+        # normal seating triggers, for this exact successor binding;
+        # only an explicit confirmed verdict retains the active/classic
+        # seat.
+        verdict: TrustVerdict | None = None
+        trust_error: str | None = None
+        try:
+            if self._channel_trust is None:
+                raise CmuxBindingConflict(
+                    "no channel-trust trigger is composed for restart "
+                    "recovery"
+                )
+            verdict = await self._channel_trust.confirm_seat(successor)
+        except Exception as error:
+            trust_error = str(error)[:200]
+        if verdict is not None and verdict.confirmed:
+            replaced.append(successor.binding_id)
+            return
+        # Unconfirmed, refused, ambiguous, or never-attempted: durable
+        # state may not call this seat usable. The gate itself already
+        # records its own receipt for a refusal it actually reached
+        # (e.g. ``channel.approval_required``); this receipt is the
+        # seat-level record that restart recovery could not hand off a
+        # usable lead, covering the timeout/no-trigger cases the gate
+        # never sees too.
+        if self._control is not None:
+            with suppress(Exception):
+                self._control.record(
+                    kind="channel.blocked",
+                    project_key=binding.project_key,
+                    cell_id=cell_id,
+                    session_id=session_id,
+                    result={
+                        "successor_binding_id": successor.binding_id,
+                        "first_failure": (
+                            verdict.first_failure
+                            if verdict is not None
+                            else None
+                        ),
+                        "trigger_error": trust_error,
+                    },
+                    reason=(
+                        "CHANNEL TRUST UNCONFIRMED: the restart-recovered "
+                        "lead seat did not complete the bounded channel-"
+                        "trust confirmation and registration path within "
+                        "the window; the seat is recorded lost instead "
+                        "of an active binding over an unconfirmed "
+                        "channel — confirm the development-channel "
+                        "dialog manually, then rotate-lead reseats the "
+                        "cell"
+                    ),
+                )
+        self._bindings.mark_lost(
+            successor.binding_id, reason="channel_trust_unconfirmed"
+        )
+        lost.append(successor.binding_id)
 
 
 async def _activate_lead_seat(
