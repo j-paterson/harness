@@ -660,3 +660,49 @@ def test_height_budgeting_with_two_line_capacity_rows_keeps_exact_height() -> No
         lines = render_frame(snapshot, width=46, height=height, now=_NOW)
         assert len(lines) == height
         assert all(visible_length(line) == 46 for line in lines)
+
+
+# Sol correction deacc190 (INFRA-209 / INFRA-202): pr_number 0 is the
+# explicit no-PR state of a corrections_required verdict returned before
+# Sol opens the sole pull request. It must never render as PR#0.
+def test_zero_pr_correction_renders_as_pre_pr_in_the_work_row() -> None:
+    task = _task(
+        issue_id="INFRA-209", pr_number=0, review_state="corrections_required"
+    )
+    lines = render_frame(
+        _frame_snapshot(tasks=(task,)), width=76, height=20, now=_NOW
+    )
+    joined = "\n".join(lines)
+    work_row = next(line for line in lines if line.startswith("INFRA-209"))
+    assert "pre-PR corrections" in work_row
+    assert "PR#0" not in joined
+    assert "PR#" not in joined
+
+
+def test_zero_pr_correction_in_attention_never_references_a_pull_request() -> None:
+    task = _task(
+        issue_id="INFRA-209", pr_number=0, review_state="corrections_required"
+    )
+    lines = render_frame(
+        _frame_snapshot(tasks=(task,)), width=76, height=20, now=_NOW
+    )
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+    assert attention_line.strip() == "corrections requested before PR (INFRA-209)"
+    assert "PR#" not in attention_line
+
+
+def test_positive_pr_numbers_still_render_as_pr_n_in_work_and_attention() -> None:
+    task = _task(
+        issue_id="INFRA-208", pr_number=35, review_state="corrections_required"
+    )
+    lines = render_frame(
+        _frame_snapshot(tasks=(task,)), width=76, height=20, now=_NOW
+    )
+    work_row = next(line for line in lines if line.startswith("INFRA-208"))
+    assert "PR#35 corrections" in work_row
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+    assert attention_line.strip() == "corrections requested on PR#35 (INFRA-208)"

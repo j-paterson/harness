@@ -415,6 +415,11 @@ def _pr_text(
         if review_state
         else "?"
     )
+    # Sol correction deacc190: pr_number 0 is the explicit no-PR state a
+    # corrections_required verdict may carry before Sol opens the sole
+    # pull request (INFRA-202). Never point the operator at PR#0.
+    if pr_number == 0:
+        return f"pre-PR {label}"
     text = f"PR#{pr_number} {label}"
     if settlement_state:
         text += f" {settlement_state}"
@@ -988,6 +993,10 @@ def _attention_text(snapshot: DashboardSnapshot, now: datetime) -> str:
         None,
     )
     if corrections is not None:
+        if not corrections.pr_number:
+            # No pull request exists yet (pr_number 0/None): a pre-PR
+            # correction, never a reference to a nonexistent PR#0.
+            return f"corrections requested before PR ({corrections.issue_id})"
         return (
             f"corrections requested on PR#{corrections.pr_number} "
             f"({corrections.issue_id})"
