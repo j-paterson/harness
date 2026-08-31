@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
-from hermes_orchestrator.cells import ProjectCellService
+from hermes_orchestrator.cells import ProfileCapacityEvidence, ProjectCellService
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
     hub_socket_path,
@@ -956,7 +956,12 @@ def _open_rotation_collaborators(
     # profile's probe failing must not crash the others: it is recorded
     # as an ineligible, reasoned ``ProfileHealth`` instead of raising
     # past this builder.
-    pool = ProfilePool(registry)
+    # INFRA-205: replacement selection fails closed on durable Fable
+    # capacity evidence, not auth health alone — the live defect seated
+    # max-a while profile_capacity_observations recorded it capped.
+    pool = ProfilePool(
+        registry, capacity_evidence=ProfileCapacityEvidence(database)
+    )
     for profile in registry.profiles:
         try:
             health = probe.check(profile.alias)
