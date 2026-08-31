@@ -1780,8 +1780,43 @@ def _seed_capacity_observation(
         database.close()
 
 
+def _seed_channel_registration(
+    state_dir: Path,
+    *,
+    project_key: str,
+    cell_id: str,
+    session_id: str,
+    profile_alias: str,
+) -> None:
+    """One active ``channel_registrations`` row, as the sidecar leaves
+    behind once a freshly seated session registers (migration 0033)."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO channel_registrations("
+                "registration_id, project_key, cell_id, session_id, "
+                "profile_alias, generation, state, connected_at"
+                ") VALUES (?, ?, ?, ?, ?, 1, 'active', ?)",
+                (
+                    f"registration-{session_id}",
+                    project_key,
+                    cell_id,
+                    session_id,
+                    profile_alias,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+    finally:
+        database.close()
+
+
 def _install_rotation_process_and_probe_fakes(
     monkeypatch: pytest.MonkeyPatch,
+    state_dir: Path,
 ) -> list[str]:
     """Fake ONLY the rotate-lead seams that reach outside the process.
 
@@ -1791,9 +1826,11 @@ def _install_rotation_process_and_probe_fakes(
     rows — runs for real. Faked seams: the profile auth probe (every
     profile authenticated), the worktree gate (clean and pushed), the
     lead process runner (confirms the replacement session and
-    acknowledges the handoff), and the cmux seat activation. Returns the
-    list of profile aliases the runner was asked to start a replacement
-    on, in order.
+    acknowledges the handoff), and the cmux seat activation, which also
+    inserts an active channel registration for the seated session so
+    the completion gate sees a real registered replacement, exactly as
+    the sidecar would leave behind. Returns the list of profile aliases
+    the runner was asked to start a replacement on, in order.
     """
 
     import hermes_orchestrator.cli as cli_module
@@ -1856,6 +1893,13 @@ def _install_rotation_process_and_probe_fakes(
     monkeypatch.setattr(cli_module, "ClaudeRunner", _FakeLeadRunner)
 
     async def _fake_ensure(self: object, **kwargs: object) -> object:
+        _seed_channel_registration(
+            state_dir,
+            project_key=str(kwargs["project_key"]),
+            cell_id=str(kwargs["cell_id"]),
+            session_id=str(kwargs["session_id"]),
+            profile_alias=str(kwargs["profile_alias"]),
+        )
         return types.SimpleNamespace(binding_id="binding-rotated")
 
     monkeypatch.setattr(cli_module.CmuxLeadSeater, "ensure", _fake_ensure)
@@ -1888,7 +1932,7 @@ def test_rotate_lead_skips_a_fable_capped_profile_and_rotates_to_the_next(
     _seed_capacity_observation(
         state_dir, "max-c", "available", observed_at=now - timedelta(hours=1)
     )
-    started = _install_rotation_process_and_probe_fakes(monkeypatch)
+    started = _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
 
     result = invoke(
         [
@@ -1958,7 +2002,7 @@ def test_rotate_lead_fails_closed_when_every_replacement_is_fable_capped(
             observed_at=now - timedelta(hours=1),
             resets_at=now + timedelta(hours=11),
         )
-    started = _install_rotation_process_and_probe_fakes(monkeypatch)
+    started = _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
 
     result = invoke(
         [
@@ -2009,6 +2053,40 @@ def test_rotate_lead_fails_closed_when_every_replacement_is_fable_capped(
         assert binding.session_id == "11111111-1111-4111-8111-111111111111"
     finally:
         database.close()
+
+
+def test_open_rotation_collaborators_wires_channel_launch_and_trust_with_node(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-207: the one-shot rotate-lead seater must carry the same
+    channel launcher and trust confirmer the live daemon composes —
+    otherwise a rotated-in lead is seated without the hermes-control
+    channel."""
+
+    import hermes_orchestrator.cli as cli_module
+    import hermes_orchestrator.runtime as runtime_module
+    from hermes_orchestrator.config import load_settings
+    from hermes_orchestrator.runtime import open_runtime
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    fake_node = repo_root / "fake-node"
+    fake_node.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(
+        runtime_module.shutil,
+        "which",
+        lambda name: str(fake_node) if name == "node" else None,
+    )
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        _cells, seater = cli_module._open_rotation_collaborators(settings, runtime)
+        assert seater._channel_launch is not None
+        assert seater._channel_trust is not None
+    finally:
+        runtime.close()
 
 
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:

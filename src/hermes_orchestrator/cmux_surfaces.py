@@ -1124,8 +1124,11 @@ async def _activate_lead_seat(
     before the external create, and the create carries that identity
     inside the workspace title. The workspace carries the recorded
     project cwd and the profile's exact CLAUDE_CONFIG_DIR; its native
-    resume command is the sanitized ``claude --resume <session>`` — never
-    a prompt or credential. Once cmux returns, the identities bind
+    resume command is the ``--resume`` form of the exact, already
+    grammar-validated ``command`` that was launched (so a restored pane
+    keeps its channel extension), or the sanitized plain
+    ``claude --resume <session>`` when none was given — never a prompt
+    or credential. Once cmux returns, the identities bind
     atomically to the intent as a residual row, then promote to the
     active seat (retiring ``replacing`` in the same transaction). A
     failure or crash at any point therefore leaves either nothing, a
@@ -1163,7 +1166,15 @@ async def _activate_lead_seat(
         raise
     try:
         await port.set_surface_resume(
-            ref, classic_resume_command(session_id, resume=True)
+            ref,
+            # A restore must always RESUME the session: the launched
+            # command's ``--session-id`` form (fresh session) maps to
+            # ``--resume`` while keeping the exact channel extension.
+            classic_resume_command(session_id, resume=True)
+            if command is None
+            else command.replace(
+                f"--session-id {session_id}", f"--resume {session_id}", 1
+            ),
         )
         active = bindings.activate_residual(
             pending.binding_id, replacing=replacing, reason=replace_reason

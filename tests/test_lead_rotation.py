@@ -83,17 +83,54 @@ class RecordingLinear:
         return object()
 
 
+def insert_active_registration(
+    database: Database,
+    *,
+    session_id: str,
+    project_key: str = "demo",
+    cell_id: str = "cell-demo",
+    profile_alias: str = "max-b",
+) -> None:
+    """Durably record one active ``channel_registrations`` row, exactly
+    as the hermes-control sidecar does when it registers a freshly
+    seated session (migration 0033_channel_hub.sql)."""
+
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO channel_registrations("
+            "registration_id, project_key, cell_id, session_id, "
+            "profile_alias, generation, state, connected_at"
+            ") VALUES (?, ?, ?, ?, ?, 1, 'active', ?)",
+            (
+                f"registration-{session_id}",
+                project_key,
+                cell_id,
+                session_id,
+                profile_alias,
+                NOW.isoformat(),
+            ),
+        )
+
+
 class RecordingSeater:
     """A managed-seat fake that durably retires/binds through the REAL
     CmuxSurfaceBindings, so LeadRotation's own idempotency read of
     ``bindings.active_lead`` reflects genuine seat state across calls —
     exactly what the real CmuxLeadSeater.ensure() would leave behind."""
 
-    def __init__(self, bindings: CmuxSurfaceBindings) -> None:
+    def __init__(
+        self,
+        bindings: CmuxSurfaceBindings,
+        database: Database,
+        *,
+        registers_channel: bool = True,
+    ) -> None:
         self._bindings = bindings
+        self._database = database
         self._refs = iter(range(1, 1000))
         self.calls: list[dict[str, object]] = []
         self.fail_next = False
+        self.registers_channel = registers_channel
 
     async def ensure(self, **identity: object) -> object:
         self.calls.append(dict(identity))
@@ -109,13 +146,24 @@ class RecordingSeater:
             self._bindings.mark_closed(existing.binding_id, reason="session_rotated")
         n = next(self._refs)
         ref = CmuxSurfaceRef(workspace_uuid=f"ws-{n}", surface_uuid=f"sf-{n}")
-        return self._bindings.bind_lead(
+        bound = self._bindings.bind_lead(
             project_key=str(identity["project_key"]),
             cell_id=cell_id,
             session_id=session_id,
             profile_alias=str(identity["profile_alias"]),
             ref=ref,
         )
+        if self.registers_channel:
+            # Simulates the sidecar registering on the hermes-control
+            # channel the moment the seat's pane comes up.
+            insert_active_registration(
+                self._database,
+                session_id=session_id,
+                project_key=str(identity["project_key"]),
+                cell_id=cell_id,
+                profile_alias=str(identity["profile_alias"]),
+            )
+        return bound
 
 
 def make_worktree_state(
@@ -238,8 +286,8 @@ def bindings(database: Database) -> CmuxSurfaceBindings:
 
 
 @pytest.fixture
-def seater(bindings: CmuxSurfaceBindings) -> RecordingSeater:
-    return RecordingSeater(bindings)
+def seater(bindings: CmuxSurfaceBindings, database: Database) -> RecordingSeater:
+    return RecordingSeater(bindings, database)
 
 
 def make_rotation(
@@ -250,6 +298,7 @@ def make_rotation(
     seater: RecordingSeater,
     *,
     worktree: WorktreeState | None = None,
+    registration_wait_seconds: float = 0,
 ) -> LeadRotation:
     state = worktree or make_worktree_state()
     return LeadRotation(
@@ -259,6 +308,7 @@ def make_rotation(
         bindings=bindings,
         seater=seater,
         worktree_state=lambda project_key: state,
+        registration_wait_seconds=registration_wait_seconds,
     )
 
 
@@ -828,3 +878,54 @@ async def test_fully_identified_acknowledged_handoff_still_recovers_without_rela
     assert database.scalar(
         "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
     ) == "max-b"
+
+
+@pytest.mark.asyncio
+async def test_replacement_without_channel_registration_blocks_until_it_lands(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-207: a seat with no active hermes-control registration is
+    reported blocked (never complete); transfer, handoff, and the bound
+    seat are untouched, and a rerun after the registration lands
+    completes idempotently with no extra seater calls or runner starts."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    seater = RecordingSeater(bindings, database, registers_channel=False)
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    first = await rotation.rotate("cell-demo")
+
+    assert first.ok is False
+    assert first.phase == "channel_registration"
+    assert first.cell_id == "cell-demo"
+    assert first.handoff_id == handoff_id
+    assert first.replacement_session == str(REPLACEMENT_SESSION)
+    assert first.profile == "max-b"
+    assert first.binding_id is not None
+    assert str(REPLACEMENT_SESSION) in (first.failure or "")
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)
+    assert handoffs.get(handoff_id).state == "acknowledged"
+    binding = bindings.active_lead("cell-demo")
+    assert binding is not None
+    assert binding.session_id == str(REPLACEMENT_SESSION)
+    assert binding.binding_id == first.binding_id
+    calls_after_first = len(seater.calls)
+    start_count_after_first = runner.start_count
+
+    insert_active_registration(database, session_id=str(REPLACEMENT_SESSION))
+    second = await rotation.rotate("cell-demo")
+
+    assert second.ok is True
+    assert second.phase == "complete"
+    assert second.binding_id == first.binding_id
+    assert len(seater.calls) == calls_after_first
+    assert runner.start_count == start_count_after_first

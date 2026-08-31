@@ -15,12 +15,18 @@ primitives — it reimplements none of their logic:
 Every invocation derives its phase from durable rows alone — never from
 in-memory phase flags — so a crash between any two of these primitives'
 own transactions resumes correctly on the next call rather than
-repeating already-durable work.
+repeating already-durable work. A seat is not reported ``complete``
+until the replacement session's active ``channel_registrations`` row
+is durably observed (a bounded, injectable-sleep wait) — a rotation
+whose seat came up without its hermes-control channel is reported
+blocked, never a false success, and rerunning once the registration
+lands completes idempotently.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -90,6 +96,8 @@ class LeadRotation:
         bindings: CmuxSurfaceBindings,
         seater: SeatEnsurer,
         worktree_state: Callable[[str], WorktreeState],
+        registration_wait_seconds: float = 60.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._database = database
         self._handoffs = handoffs
@@ -97,6 +105,8 @@ class LeadRotation:
         self._bindings = bindings
         self._seater = seater
         self._worktree_state = worktree_state
+        self._registration_wait_seconds = registration_wait_seconds
+        self._sleep = sleep
 
     async def rotate(self, cell_id: str) -> RotationReport:
         """Advance one cell's lead rotation exactly as far as durable
@@ -212,13 +222,11 @@ class LeadRotation:
             existing_binding is not None
             and existing_binding.session_id == replacement_session
         ):
-            return RotationReport(
-                ok=True,
-                phase="complete",
+            return await self._completion_report(
                 cell_id=cell_id,
                 handoff_id=handoff_id,
                 replacement_session=replacement_session,
-                profile=profile_alias,
+                profile_alias=profile_alias,
                 binding_id=existing_binding.binding_id,
             )
         classic_command = classic_resume_command(replacement_session, resume=True)
@@ -250,15 +258,74 @@ class LeadRotation:
                 profile=profile_alias,
                 failure="lead seat could not be activated for the replacement session",
             )
+        return await self._completion_report(
+            cell_id=cell_id,
+            handoff_id=handoff_id,
+            replacement_session=replacement_session,
+            profile_alias=profile_alias,
+            binding_id=binding.binding_id,
+        )
+
+    async def _completion_report(
+        self,
+        *,
+        cell_id: str,
+        handoff_id: str,
+        replacement_session: str,
+        profile_alias: str | None,
+        binding_id: str,
+    ) -> RotationReport:
+        """Report ``complete`` only once the replacement session's active
+        hermes-control registration is durably observed — a bound seat
+        without its channel is reported blocked instead of a false
+        success. The seat itself is never retired, closed, or otherwise
+        modified here: a rerun re-enters the idempotent short-circuit
+        above and re-checks the registration."""
+
+        if await self._replacement_is_registered(replacement_session):
+            return RotationReport(
+                ok=True,
+                phase="complete",
+                cell_id=cell_id,
+                handoff_id=handoff_id,
+                replacement_session=replacement_session,
+                profile=profile_alias,
+                binding_id=binding_id,
+            )
         return RotationReport(
-            ok=True,
-            phase="complete",
+            ok=False,
+            phase="channel_registration",
             cell_id=cell_id,
             handoff_id=handoff_id,
             replacement_session=replacement_session,
             profile=profile_alias,
-            binding_id=binding.binding_id,
+            binding_id=binding_id,
+            failure=(
+                f"replacement session {replacement_session} has no active "
+                "hermes-control registration after "
+                f"{self._registration_wait_seconds:g}s; the seat stays "
+                "bound and drains on the Stop-hook poll; rerun rotate-lead "
+                "once the channel launch is repaired"
+            ),
         )
+
+    async def _replacement_is_registered(self, session_id: str) -> bool:
+        """Poll immediately, then every 1.0s (via the injected sleep)
+        until an active registration for ``session_id`` is observed or
+        ``registration_wait_seconds`` elapses (0 checks exactly once)."""
+
+        elapsed = 0.0
+        while True:
+            if self._database.execute(
+                "SELECT 1 FROM channel_registrations "
+                "WHERE session_id = ? AND state = 'active' LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None:
+                return True
+            if elapsed >= self._registration_wait_seconds:
+                return False
+            await self._sleep(1.0)
+            elapsed += 1.0
 
     def _cell_row(self, cell_id: str) -> object | None:
         return self._database.execute(
