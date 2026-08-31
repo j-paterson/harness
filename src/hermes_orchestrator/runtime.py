@@ -89,6 +89,7 @@ from hermes_orchestrator.orchestrator_workspace import (
     OrchestratorWorkspaceOwner,
     WorkspaceRefused,
 )
+from hermes_orchestrator.post_merge import PostMergeAdvance
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -206,6 +207,7 @@ class Runtime:
     cells: ProjectCellService | None
     profile_health: tuple[ProfileHealth, ...]
     merge_flow: MergeFlow | None = None
+    post_merge: PostMergeAdvance | None = None
     processes: ProcessRegistry | None = None
     checkpoints: CheckpointRequests | None = None
     resets: ScheduledResets | None = None
@@ -541,6 +543,7 @@ def open_runtime(
         cells: ProjectCellService | None = None
         dispatch: Dispatch | None = None
         merge_flow: MergeFlow | None = None
+        post_merge: PostMergeAdvance | None = None
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
@@ -599,6 +602,22 @@ def open_runtime(
                 base_env=environment,
                 processes=processes,
             )
+            # INFRA-198 P2: composed only in live/active mode, where a
+            # durable database exists. ReviewService is built inside
+            # ``build_merge_flow`` (out of reach here), so the fast
+            # ``on_merged`` accelerator is attached to the already-built
+            # instance as a public attribute; the daemon's 30s tick is
+            # the restart-safe, always-correct discovery path regardless.
+            post_merge = PostMergeAdvance(
+                database=database,
+                events=events,
+                projects=settings.projects,
+                queue=queue,
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+                registry=processes,
+            )
+            merge_flow.reviews.on_merged = post_merge.on_merged
             runner = ClaudeRunner(
                 registry,
                 prompt_file=prompt_path,
@@ -794,6 +813,7 @@ def open_runtime(
             cells=cells,
             profile_health=profile_health,
             merge_flow=merge_flow,
+            post_merge=post_merge,
             processes=processes,
             checkpoints=checkpoints,
             resets=resets,

@@ -81,6 +81,7 @@ from hermes_orchestrator.orchestrator_workspace import (
     OrchestratorWorkspaceOwner,
 )
 from hermes_orchestrator.packet_admission import PacketAdmission
+from hermes_orchestrator.post_merge import PostMergeAdvance
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
     ProfileHealth,
@@ -749,6 +750,7 @@ async def _run_daemon(
     activation: object | None = None,
     dashboard_refresh: DashboardRefreshAction | None = None,
     orchestrator_workspace: OrchestratorWorkspaceOwner | None = None,
+    post_merge: PostMergeAdvance | None = None,
 ) -> Supervisor:
     # INFRA-198 P1: bound to the merge flow's lifetime once merge_flow is
     # created below (only in the non-``once`` path); the maintenance
@@ -789,6 +791,12 @@ async def _run_daemon(
             # commit-time router already signaled fresh envelopes;
             # this sweep re-wakes whatever stayed announced.
             fakechat_router.signal_pending()
+        if post_merge is not None:
+            # INFRA-198 P2: discover any terminal merge the review
+            # flow's fast path missed, and advance any pending
+            # self-host activation intent or successor dependency
+            # flip from durable rows. Contains its own failures.
+            await post_merge.tick()
 
     supervisor = Supervisor(
         service,
@@ -806,6 +814,7 @@ async def _run_daemon(
                 and dashboard_refresh is None
                 and orchestrator_workspace is None
                 and merge_flow is None
+                and post_merge is None
             )
             else _maintenance
         ),
@@ -3670,6 +3679,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     dashboard_refresh=runtime.dashboard_refresh,
                     orchestrator_workspace=runtime.orchestrator_workspace,
                     fakechat_router=runtime.fakechat_router,
+                    post_merge=runtime.post_merge,
                 )
             )
             payload = {

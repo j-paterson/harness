@@ -34,6 +34,13 @@ class ProjectConfig(BaseModel):
     # durably as ``ci_not_configured`` with zero CircleCI calls. A CI 404
     # is never inferred as ``none``.
     ci: Literal["circleci", "none"] = "circleci"
+    # INFRA-198 P2: true only for the project whose merged integration
+    # branch IS this orchestrator's own runtime (agent-orchestration).
+    # A terminal merge of a self-host project triggers a durable
+    # self-host activation intent (see ``post_merge.PostMergeAdvance``)
+    # instead of waiting on a manual operator-side ``runtime-activate
+    # --apply``.
+    self_host: bool = False
 
 
 class LinearStatusIds(BaseModel):

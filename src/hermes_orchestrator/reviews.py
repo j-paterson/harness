@@ -14,6 +14,7 @@ the lead. CircleCI is never polled here.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -140,6 +141,7 @@ class ReviewService:
         settlements: MergeSettlements,
         merge_journal: MergeEffectJournal | None = None,
         now: Callable[[], datetime] | None = None,
+        on_merged: Callable[..., None] | None = None,
     ) -> None:
         for name, port in (
             ("github", github),
@@ -165,6 +167,15 @@ class ReviewService:
         self._settlements = settlements
         self._merge_journal = merge_journal
         self._now = now or (lambda: datetime.now(UTC))
+        # INFRA-198 P2: an optional accelerator over durable rows, wired
+        # by the caller (never by this constructor's own defaults) as a
+        # public attribute so it can be attached after construction —
+        # ``ReviewService`` is built inside ``merge_flow.build_merge_flow``,
+        # outside the post-merge-advance composition boundary. When unset,
+        # the daemon's post-merge tick discovers every terminal merge from
+        # durable rows instead; either path is idempotent and safe to run
+        # more than once for the same merge.
+        self.on_merged = on_merged
 
     # -- verdicts ---------------------------------------------------------
 
@@ -582,6 +593,24 @@ class ReviewService:
             merge_sha=proven.merge_sha,
             projection=projection,
         )
+        if self.on_merged is not None:
+            # Fast path only: the daemon's 30s post-merge tick discovers
+            # and idempotently repairs this exact merge from durable rows
+            # regardless, so a failure here must never interrupt the
+            # settlement it rides on.
+            try:
+                self.on_merged(
+                    project_key=record.project_key,
+                    issue_id=record.issue_id,
+                    review_id=record.review_id,
+                    merge_sha=record.merge_sha,
+                )
+            except Exception as error:
+                print(
+                    "post-merge advance fast path failed for "
+                    f"{record.review_id!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
         self._record_merge_proven(record, proven, reason=reason)
         await self._project_after_merge(record)
         return _outcome(record, reason=record.reason or "merged")

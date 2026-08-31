@@ -219,6 +219,50 @@ class QueueService:
             )
         return self.get(issue_id)
 
+    def mark_dependency_ready(
+        self, project_key: str, *, actor: str, reason: str
+    ) -> tuple[str, ...]:
+        """Flip one project's blocked, not-yet-ready issues to ready.
+
+        INFRA-198 P2: called after a merge settles (directly, or from
+        the daemon's post-merge tick) so the existing ranked dispatch
+        can admit the next explicitly admitted successor. Only rows
+        with ``state = 'blocked'`` and ``dependency_ready = 0`` are
+        touched; ``paused`` issues are an operator hold and are never
+        auto-advanced. Idempotent: a rerun after every row is already
+        flipped touches and journals nothing.
+        """
+
+        if not reason.strip():
+            raise ValueError("reason is required")
+        now = self._aware_now().isoformat()
+        flipped: list[str] = []
+        with self._database.transaction() as connection:
+            rows = connection.execute(
+                "SELECT issue_id FROM admitted_issues WHERE project_key = ? "
+                "AND state = ? AND dependency_ready = 0 ORDER BY issue_id ASC",
+                (project_key, IssueState.BLOCKED.value),
+            ).fetchall()
+            for row in rows:
+                issue_id = str(row["issue_id"])
+                connection.execute(
+                    "UPDATE admitted_issues SET dependency_ready = 1, "
+                    "updated_at = ? WHERE issue_id = ?",
+                    (now, issue_id),
+                )
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="issue.dependency_ready",
+                        aggregate_type="issue",
+                        aggregate_id=issue_id,
+                        actor=actor,
+                        payload={"reason": reason},
+                    ),
+                )
+                flipped.append(issue_id)
+        return tuple(flipped)
+
     def get(self, issue_id: str) -> QueuedIssue:
         """Read one admitted issue."""
 

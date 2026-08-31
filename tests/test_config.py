@@ -234,6 +234,45 @@ def test_project_ci_policy_is_explicit_and_closed(tmp_path: Path) -> None:
         load_settings(tmp_path, tmp_path / "state")
 
 
+def test_self_host_defaults_false_and_parses_true(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n", encoding="utf-8"
+    )
+    base = (
+        "    linear_team: ENG\n"
+        "    repo_path: /tmp/x\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/x\n"
+    )
+    (tmp_path / "config/projects.yaml").write_text(
+        f"projects:\n  quiet:\n{base}  loud:\n{base}    self_host: true\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(tmp_path, tmp_path / "state")
+    assert settings.projects["quiet"].self_host is False
+    assert settings.projects["loud"].self_host is True
+
+
+def test_project_config_still_forbids_unknown_fields(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\n", encoding="utf-8"
+    )
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        "    repo_path: /tmp/demo\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n"
+        "    unexpected_field: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        load_settings(tmp_path, tmp_path / "state")
+
+
 def _write_minimal_config(tmp_path: Path) -> None:
     (tmp_path / "config").mkdir()
     (tmp_path / "config/projects.yaml").write_text(

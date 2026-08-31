@@ -734,6 +734,25 @@ class WorktreeGit:
             f"{result.returncode}"
         )
 
+    def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None:
+        """Materialize one bounded, detached worktree at an exact commit.
+
+        INFRA-198 P2: the daemon's post-merge advance uses this to
+        materialize a clean checkout at a merge SHA before spawning the
+        activation applier. ``sha`` is a full lowercase commit hex and
+        ``path`` an absolute filesystem path — both validated before
+        reaching the argv vector. No ``--force``: an existing populated
+        path fails the underlying git invocation rather than silently
+        being overwritten.
+        """
+
+        _require_sha(sha)
+        if not path.is_absolute():
+            raise GitError("worktree path must be absolute")
+        self._run(
+            ("git", "worktree", "add", "--detach", str(path), sha), repo_path
+        )
+
     def worktree_remove(self, repo_path: Path, path: Path) -> None:
         self._run(("git", "worktree", "remove", "--", str(path)), repo_path)
 

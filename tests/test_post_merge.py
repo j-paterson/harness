@@ -1,0 +1,588 @@
+"""Verify deterministic, idempotent post-merge activation and advance."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hermes_orchestrator.config import ProjectConfig
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.domain import AdmissionRequest, IssueState
+from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.post_merge import PostMergeAdvance
+from hermes_orchestrator.processes import ProcessRegistry
+from hermes_orchestrator.queue import QueueService
+from tests.test_processes import FakeInfo, FakeOs
+
+MERGE_SHA = "d" * 40
+FAKE_PID = 4321
+
+SELF_HOST = ProjectConfig(
+    linear_team="infra",
+    repo_path=Path("/repo/self-host"),
+    integration_branch="main",
+    github_repo="acme/self-host",
+    self_host=True,
+)
+PLAIN = ProjectConfig(
+    linear_team="infra",
+    repo_path=Path("/repo/plain"),
+    integration_branch="main",
+    github_repo="acme/plain",
+)
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Iterator[Database]:
+    value = Database.open(tmp_path / "state.db")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+@pytest.fixture
+def events(database: Database) -> EventStore:
+    return EventStore(database)
+
+
+def _request(
+    issue_id: str,
+    instruction_id: str,
+    *,
+    project_key: str = "demo",
+    dependency_ready: bool = True,
+) -> AdmissionRequest:
+    return AdmissionRequest(
+        issue_id=issue_id,
+        project_key=project_key,
+        linear_priority=2,
+        admitted_by="operator",
+        instruction_id=instruction_id,
+        dependency_ready=dependency_ready,
+    )
+
+
+@dataclass
+class FakeProcess:
+    pid: int
+    returncode: int | None = 0
+
+    async def wait(self) -> int:
+        return self.returncode or 0
+
+
+@dataclass
+class FakeSpawn:
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
+    pid: int = FAKE_PID
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> FakeProcess:
+        self.calls.append((args, kwargs))
+        return FakeProcess(pid=self.pid)
+
+
+@dataclass
+class FakeGit:
+    fetch_calls: list[tuple[Path, str, str]] = field(default_factory=list)
+    worktree_calls: list[tuple[Path, Path, str]] = field(default_factory=list)
+
+    def fetch(self, path: Path, remote: str, branch: str) -> None:
+        self.fetch_calls.append((path, remote, branch))
+
+    def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None:
+        self.worktree_calls.append((repo_path, path, sha))
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _registry(database: Database, events: EventStore) -> ProcessRegistry:
+    os_port = FakeOs()
+    info = FakeInfo()
+    os_port.info = info
+    os_port.groups[FAKE_PID] = FAKE_PID
+    info.create_times[FAKE_PID] = 1.0
+    info.running.add(FAKE_PID)
+    return ProcessRegistry(database, events, os_port=os_port, info=info)
+
+
+def make_advance(
+    database: Database,
+    events: EventStore,
+    *,
+    projects: dict[str, ProjectConfig],
+    queue: QueueService,
+    tmp_path: Path,
+    registry: ProcessRegistry | None = None,
+    spawn: FakeSpawn | None = None,
+    git: FakeGit | None = None,
+) -> PostMergeAdvance:
+    return PostMergeAdvance(
+        database=database,
+        events=events,
+        projects=projects,
+        queue=queue,
+        repo_root=tmp_path / "repo",
+        state_dir=tmp_path / "state",
+        registry=registry,
+        git=git if git is not None else FakeGit(),
+        uv_binary="/usr/bin/uv",
+        spawn=spawn if spawn is not None else FakeSpawn(),
+    )
+
+
+def seed_merged_review(
+    database: Database,
+    *,
+    review_id: str,
+    project_key: str,
+    issue_id: str,
+    merge_sha: str,
+    updated_at: str,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO reviews("
+            "review_id, project_key, issue_id, event_id, repository, branch, "
+            "pr_number, reviewed_sha, state, merge_sha, reason, "
+            "projection_json, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?, 'proven', NULL, "
+            "?, ?)",
+            (
+                review_id,
+                project_key,
+                issue_id,
+                f"evt:{review_id}",
+                "acme/repo",
+                "main",
+                1,
+                merge_sha,
+                merge_sha,
+                updated_at,
+                updated_at,
+            ),
+        )
+
+
+def seed_active_generation(
+    database: Database, *, generation: int, git_sha: str, activated_at: str
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO runtime_activations("
+            "activation_id, schema_version, generation, binary_path, "
+            "checkout_root, git_sha, database_schema, state, reason, "
+            "activated_at, updated_at"
+            ") VALUES (?, 1, ?, '/bin/hermes-orchestrator', '/checkout', ?, "
+            "1, 'active', NULL, ?, ?)",
+            (
+                f"activation-{generation}",
+                generation,
+                git_sha,
+                activated_at,
+                activated_at,
+            ),
+        )
+
+
+def seed_applier_row(
+    database: Database,
+    *,
+    apply_id: str,
+    target_checkout: str,
+    state: str,
+    created_at: str,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO activation_applies("
+            "apply_id, target_checkout, prior_generation, target_generation, "
+            "state, reason, created_at, updated_at"
+            ") VALUES (?, ?, NULL, NULL, ?, 'test', ?, ?)",
+            (apply_id, target_checkout, state, created_at, created_at),
+        )
+
+
+# -- (i) terminal merge of a self-host project ---------------------------
+
+
+def test_on_merged_records_intent_and_flips_blocked_dependents(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    queue.admit(_request("ENG-2", "chat-2", dependency_ready=False))
+    queue.transition("ENG-2", IssueState.BLOCKED, actor="op", reason="dep")
+    queue.admit(_request("ENG-3", "chat-3", dependency_ready=False))
+    queue.transition("ENG-3", IssueState.PAUSED, actor="op", reason="hold")
+
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-0",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    apply_id = f"activate:{MERGE_SHA}"
+    row = database.execute(
+        "SELECT * FROM activation_applies WHERE apply_id = ?", (apply_id,)
+    ).fetchone()
+    assert row is not None
+    assert row["state"] == "intended"
+    assert row["target_checkout"] == str(
+        tmp_path / "state" / "checkouts" / MERGE_SHA
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM activation_applies WHERE apply_id = ?",
+            (apply_id,),
+        )
+        == 1
+    )
+    assert queue.get("ENG-1").dependency_ready is True
+    assert queue.get("ENG-2").dependency_ready is True
+    assert queue.get("ENG-3").dependency_ready is False  # paused: never touched
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready'"
+        )
+        == 2
+    )
+
+    # Idempotent: calling again records nothing new.
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-0",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM activation_applies WHERE apply_id = ?",
+            (apply_id,),
+        )
+        == 1
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready'"
+        )
+        == 2
+    )
+
+
+# -- (v) non-self-host project --------------------------------------------
+
+
+def test_on_merged_non_self_host_flips_dependencies_without_intent(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(
+        database=database, events=events, registered_projects={"plain"}
+    )
+    queue.admit(
+        _request("ENG-9", "chat-9", project_key="plain", dependency_ready=False)
+    )
+    queue.transition("ENG-9", IssueState.BLOCKED, actor="op", reason="dep")
+
+    advance = make_advance(
+        database, events, projects={"plain": PLAIN}, queue=queue, tmp_path=tmp_path
+    )
+
+    advance.on_merged(
+        project_key="plain",
+        issue_id="ENG-8",
+        review_id="review:plain:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    assert queue.get("ENG-9").dependency_ready is True
+
+
+# -- (ii) tick spawns exactly one registered runtime_applier --------------
+
+
+@pytest.mark.asyncio
+async def test_tick_spawns_registered_applier_once(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry = _registry(database, events)
+    spawn = FakeSpawn()
+    git = FakeGit()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+        git=git,
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    await advance.tick()
+
+    target_checkout = tmp_path / "state" / "checkouts" / MERGE_SHA
+    assert git.fetch_calls == [(tmp_path / "repo", "origin", "main")]
+    assert git.worktree_calls == [(tmp_path / "repo", target_checkout, MERGE_SHA)]
+    assert len(spawn.calls) == 1
+    args, kwargs = spawn.calls[0]
+    assert args == (
+        "/usr/bin/uv",
+        "run",
+        "--project",
+        str(target_checkout),
+        "hermes-orchestrator",
+        "--repo-root",
+        str(tmp_path / "repo"),
+        "--state-dir",
+        str(tmp_path / "state"),
+        "runtime-activate",
+        "--apply",
+        "--json",
+    )
+    assert kwargs["start_new_session"] is True
+    leases = registry.active()
+    assert len(leases) == 1
+    assert leases[0].kind == "runtime_applier"
+    assert leases[0].worker_id == MERGE_SHA
+    assert leases[0].project_key == "demo"
+    row = database.execute(
+        "SELECT state FROM activation_applies WHERE apply_id = ?", (apply_id,)
+    ).fetchone()
+    assert row["state"] == "intended"
+
+    # A second tick must spawn nothing while the lease is active.
+    await advance.tick()
+    assert len(spawn.calls) == 1
+
+    # A restart (a fresh PostMergeAdvance over the same durable rows)
+    # must spawn nothing either, for the same reason.
+    restarted = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+        git=git,
+    )
+    await restarted.tick()
+    assert len(spawn.calls) == 1
+
+
+# -- (iii) applier terminal state propagates to our intent -----------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state", ["verified", "rolled_back", "ambiguous", "refused"]
+)
+async def test_tick_propagates_applier_terminal_state(
+    database: Database, events: EventStore, tmp_path: Path, terminal_state: str
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    target_checkout = str(tmp_path / "state" / "checkouts" / MERGE_SHA)
+    seed_applier_row(
+        database,
+        apply_id="applier-uuid-1",
+        target_checkout=target_checkout,
+        state=terminal_state,
+        created_at="2026-08-31T10:05:00+00:00",
+    )
+
+    await advance.tick()
+
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == terminal_state
+    assert row["reason"] == "applier:applier-uuid-1"
+    assert advance.spawn.calls == []  # type: ignore[attr-defined]
+
+
+# -- (iv) active generation already matches ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_marks_verified_when_active_generation_matches(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    seed_active_generation(
+        database,
+        generation=37,
+        git_sha=MERGE_SHA,
+        activated_at="2026-08-31T11:00:00+00:00",
+    )
+
+    await advance.tick()
+
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == "verified"
+    assert row["reason"] == "active generation matches"
+    assert advance.spawn.calls == []  # type: ignore[attr-defined]
+
+
+# -- (vii) nothing pending: a full no-op ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_is_a_noop_with_nothing_pending(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    before_events = database.scalar("SELECT count(*) FROM events")
+
+    await advance.tick()
+
+    assert advance.spawn.calls == []  # type: ignore[attr-defined]
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    assert database.scalar("SELECT count(*) FROM events") == before_events
+
+
+# -- (viii) restart between merge and intent --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_discovers_merge_without_intent_after_restart(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-2",
+        project_key="demo",
+        issue_id="ENG-2",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:07:00+00:00",
+    )
+    registry = _registry(database, events)
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+
+    await advance.tick()
+    await advance.tick()
+
+    count = database.scalar(
+        "SELECT count(*) FROM activation_applies WHERE apply_id = ?", (apply_id,)
+    )
+    assert count == 1
+    intent_events = database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'activation.intended' "
+        "AND aggregate_id = ?",
+        (apply_id,),
+    )
+    assert intent_events == 1
+
+
+# -- applier lease exits without ever writing a terminal row ---------------
+
+
+@pytest.mark.asyncio
+async def test_tick_marks_ambiguous_when_applier_lease_exits_without_a_row(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry = _registry(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    await advance.tick()
+    assert len(spawn.calls) == 1
+    lease = registry.active()[0]
+    registry.mark_exited(lease.lease_id, exit_code=1)
+
+    await advance.tick()
+
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == "ambiguous"
+    assert row["reason"] == "applier exited without a terminal apply record"
+    assert len(spawn.calls) == 1  # never respawned
