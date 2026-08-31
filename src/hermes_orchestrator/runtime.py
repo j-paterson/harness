@@ -33,7 +33,11 @@ from hermes_orchestrator.claude import (
     ClaudeRunner,
     control_launch_failure_recorder,
 )
-from hermes_orchestrator.cmux import CMUX_KEYCHAIN_SERVICE, CmuxCliAdapter
+from hermes_orchestrator.cmux import (
+    CMUX_KEYCHAIN_SERVICE,
+    CmuxCliAdapter,
+    CmuxControlPort,
+)
 from hermes_orchestrator.cmux_surfaces import (
     ChannelTrustConfirmer,
     CmuxHibernationDriver,
@@ -303,6 +307,72 @@ def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
         / "src"
         / "main.js"
     )
+
+
+def build_channel_collaborators(
+    *,
+    settings: Settings,
+    database: Database,
+    events: EventStore,
+    control_operations: ControlOperations,
+    cmux_port: CmuxControlPort,
+    capabilities: ChannelCapabilities | None = None,
+) -> tuple[ChannelLauncher | None, ChannelTrustConfirmer | None]:
+    """Compose the hermes-control channel launcher and trust confirmer.
+
+    Shared by ``open_runtime``'s live daemon composition and the
+    one-shot ``rotate-lead`` CLI command's collaborators, so a
+    Hermes-managed lead rotation seats the replacement with exactly the
+    same channel launch and trust-confirmation path the daemon uses —
+    never a plain classic seat missing the hermes-control channel.
+    """
+
+    channel_capabilities = (
+        capabilities
+        if capabilities is not None
+        else ChannelCapabilities(database=database, state_dir=settings.state_dir)
+    )
+    # Sol correction b4b545f3 (v5): the fakechat wake plane (the v4
+    # substitute) is retired from production composition — the
+    # hermes-control channel is the wake accelerator, and the
+    # announcements plus the Stop-hook poll remain the automatic
+    # fallback.
+    node_binary = shutil.which("node")
+    channel_launcher = (
+        None
+        if node_binary is None
+        else ChannelLauncher(
+            state_dir=settings.state_dir,
+            capabilities=channel_capabilities,
+            sidecar_entry=resolve_sidecar_entry(
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            ),
+            node_binary=Path(node_binary),
+        )
+    )
+    # Sol correction f0a5a403 (packet 4): the trust gate is part of the
+    # production managed-seat lifecycle — the seater triggers one
+    # bounded gate evaluation for each newly created channel-launched
+    # binding, so a trusted launch auto-confirms without the manual
+    # channel-trust-confirm command. The entry path is re-resolved per
+    # trigger so the gate always measures the ACTIVE artifact identity
+    # of that moment.
+    channel_confirmer = (
+        None
+        if channel_launcher is None
+        else ChannelTrustConfirmer(
+            database=database,
+            events=events,
+            control=control_operations,
+            port=cmux_port,
+            entry_resolver=lambda: resolve_sidecar_entry(
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            ),
+        )
+    )
+    return channel_launcher, channel_confirmer
 
 
 def build_linear_router(
@@ -576,46 +646,13 @@ def open_runtime(
                 channel_router.attach(lead_assignments)
                 channel_router.attach(control_operations)
                 channel_router.attach(merge_flow.outbox)
-                # Sol correction b4b545f3 (v5): the fakechat wake plane
-                # (the v4 substitute) is retired from production
-                # composition — the hermes-control channel is the wake
-                # accelerator, and the announcements plus the Stop-hook
-                # poll remain the authoritative drain.
-                node_binary = shutil.which("node")
-                channel_launcher = (
-                    None
-                    if node_binary is None
-                    else ChannelLauncher(
-                        state_dir=settings.state_dir,
-                        capabilities=channel_capabilities,
-                        sidecar_entry=resolve_sidecar_entry(
-                            repo_root=settings.repo_root,
-                            state_dir=settings.state_dir,
-                        ),
-                        node_binary=Path(node_binary),
-                    )
-                )
-                # Sol correction f0a5a403 (packet 4): the trust gate is
-                # part of the production managed-seat lifecycle — the
-                # seater triggers one bounded gate evaluation for each
-                # newly created channel-launched binding, so a trusted
-                # launch auto-confirms without the manual
-                # channel-trust-confirm command. The entry path is
-                # re-resolved per trigger so the gate always measures
-                # the ACTIVE artifact identity of that moment.
-                channel_confirmer = (
-                    None
-                    if channel_launcher is None
-                    else ChannelTrustConfirmer(
-                        database=database,
-                        events=events,
-                        control=control_operations,
-                        port=cmux_port,
-                        entry_resolver=lambda: resolve_sidecar_entry(
-                            repo_root=settings.repo_root,
-                            state_dir=settings.state_dir,
-                        ),
-                    )
+                channel_launcher, channel_confirmer = build_channel_collaborators(
+                    settings=settings,
+                    database=database,
+                    events=events,
+                    control_operations=control_operations,
+                    cmux_port=cmux_port,
+                    capabilities=channel_capabilities,
                 )
                 cmux_seater = CmuxLeadSeater(
                     bindings=cmux_bindings,

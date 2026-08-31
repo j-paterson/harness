@@ -99,6 +99,7 @@ from hermes_orchestrator.runtime import (
     Dispatch,
     Runtime,
     acquire_workspace_fence,
+    build_channel_collaborators,
     build_linear_router,
     cmux_password_source,
     open_runtime,
@@ -896,6 +897,12 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
     )
 
 
+ROTATION_REGISTRATION_WAIT_SECONDS = 60.0
+"""How long ``rotate-lead`` waits for the replacement session's active
+hermes-control channel registration before reporting the rotation
+blocked (see ``LeadRotation``'s completion gate)."""
+
+
 class _NoDispatchLinear:
     """Placeholder Linear projector for one-shot lead rotation.
 
@@ -981,13 +988,26 @@ def _open_rotation_collaborators(
         base_env=environment,
         password_source=cmux_password_source(Keychain()),
     )
+    # INFRA-207: the one-shot seater must carry the same hermes-control
+    # channel launcher and trust confirmer the live daemon composes —
+    # otherwise a lead rotation seats the replacement without its
+    # channel.
+    channel_launcher, channel_confirmer = build_channel_collaborators(
+        settings=settings,
+        database=database,
+        events=events,
+        control_operations=runtime.control_operations,
+        cmux_port=cmux_port,
+    )
     seater = CmuxLeadSeater(
         bindings=runtime.cmux_bindings,
         port=cmux_port,
         project_paths=project_paths,
         profile_dirs=RegistryProfileDirectory(registry),
         auth_probe=lambda alias: probe.check(alias).eligible,
+        channel_launch=channel_launcher,
         control=runtime.control_operations,
+        channel_trust=channel_confirmer,
     )
     if runtime.cells is not None:
         return runtime.cells, seater
@@ -3231,6 +3251,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 # cell id; the exact worktree path is already resolved
                 # above, so the key itself is accepted but unused.
                 worktree_state=lambda _project_key: _worktree_state(lead_worktree),
+                registration_wait_seconds=ROTATION_REGISTRATION_WAIT_SECONDS,
             )
             report = asyncio.run(rotation.rotate(args.cell))
             payload = dataclasses.asdict(report)

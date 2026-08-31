@@ -1647,6 +1647,17 @@ class TestChannelLaunch:
         assert generated["session_id"] == SESSION
         assert generated["generation"] == 1
         assert bindings.is_classic(seat.binding_id, SESSION) is True
+        # INFRA-207: the surface's native resume keeps the launched
+        # channel extension (as ``--resume``), so a cmux-restored pane
+        # does not silently drop the hermes-control channel.
+        assert port.resumes == [
+            (
+                LEAD,
+                f"claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG} "
+                f"--mcp-config /state/channels/{SESSION}.mcp.json "
+                "--dangerously-load-development-channels server:hermes-control",
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_the_channel_seat_carries_no_fakechat_material(
