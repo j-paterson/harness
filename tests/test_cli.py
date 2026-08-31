@@ -3338,3 +3338,128 @@ def test_channel_trust_confirm_exit_codes_fail_closed(
     if first_failure is not None:
         # The non-success state — ambiguous included — is visible.
         assert payload["first_failure"] == first_failure
+
+
+# Sol correction a06cbce0: prompt capture validates exactly one
+# DISPLAYED Channels entry inside the confirmation dialog, ignoring an
+# echoed shell launch command that legitimately repeats the channel
+# token above the dialog in a full-scrollback capture.
+
+_CAPTURE_DIALOG = (
+    "Loading development channels\n"
+    "server:hermes-control\n"
+    "I am using this for local development\n"
+    "Enter to confirm\n"
+)
+
+
+def _invoke_channel_trust_confirm_capture(
+    configured_repo: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    screen: str,
+) -> tuple[CliResult, list[tuple[str, str]]]:
+    import hermes_orchestrator.channel_trust as channel_trust_module
+    import hermes_orchestrator.cli as cli_module
+    import hermes_orchestrator.runtime as runtime_module
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-demo")
+
+    entry = state_dir / "sidecar" / "dist" / "channel" / "entry.js"
+
+    async def _fake_read_screen(self: object, ref: object, lines: int = 200) -> str:
+        return screen
+
+    monkeypatch.setattr(cli_module.CmuxCliAdapter, "read_screen", _fake_read_screen)
+    monkeypatch.setattr(
+        channel_trust_module.ChannelTrustAnchors,
+        "active_for_cell",
+        lambda self, cell_id: types.SimpleNamespace(
+            anchor_id="anchor-1",
+            prompt_pattern=None,
+            canonical_entry_path=str(entry),
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "resolve_sidecar_entry",
+        lambda *, repo_root, state_dir: entry,
+    )
+    monkeypatch.setattr(
+        cli_module, "_live_claude_argv", lambda session_id: ["claude"]
+    )
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        channel_trust_module.ChannelTrustAnchors,
+        "complete_prompt",
+        lambda self, anchor_id, pattern: calls.append((anchor_id, pattern)),
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "channel-trust-confirm",
+            "--cell",
+            "cell-demo",
+            "--wait-seconds",
+            "1",
+            "--capture-prompt",
+            "--json",
+        ]
+    )
+    return result, calls
+
+
+def test_channel_trust_confirm_capture_ignores_echoed_launch_argv(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full-scrollback capture legitimately shows the shell's own
+    ``--dangerously-load-development-channels server:hermes-control``
+    launch argument above a well-formed, single-entry dialog. That
+    echoed argv must not be conjured into a second Channels entry."""
+
+    from hermes_orchestrator.channel_trust import APPROVED_PROMPT_PATTERN
+
+    screen = (
+        "claude --resume 11111111-1111-4111-8111-111111111111 "
+        "--dangerously-skip-permissions "
+        "--mcp-config /tmp/11111111-1111-4111-8111-111111111111.mcp.json "
+        "--dangerously-load-development-channels server:hermes-control\n"
+        "\n" + _CAPTURE_DIALOG
+    )
+
+    result, calls = _invoke_channel_trust_confirm_capture(
+        configured_repo, monkeypatch, screen
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["prompt_evidence"] == "bound"
+    assert calls == [("anchor-1", APPROVED_PROMPT_PATTERN)]
+
+
+def test_channel_trust_confirm_capture_fails_closed_on_extra_displayed_channel(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second development-channel entry actually DISPLAYED inside the
+    dialog — not merely echoed argv above it — still fails closed."""
+
+    screen = (
+        "Loading development channels\n"
+        "server:hermes-control\n"
+        "server:evil\n"
+        "I am using this for local development\n"
+        "Enter to confirm\n"
+    )
+
+    result, calls = _invoke_channel_trust_confirm_capture(
+        configured_repo, monkeypatch, screen
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert (
+        "operator-recorded normalized structure" in payload["error"]
+    )
+    assert calls == []

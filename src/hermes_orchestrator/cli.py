@@ -3082,6 +3082,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ChannelTrustAnchors,
                 ChannelTrustGate,
                 TrustRefused,
+                displayed_channel_entries_valid,
             )
             from hermes_orchestrator.runtime import resolve_sidecar_entry
 
@@ -3160,7 +3161,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     "Enter to confirm",
                 )
                 missing = [m for m in markers if m not in screen]
-                if missing or screen.count("server:hermes-control") != 1:
+                if missing or not displayed_channel_entries_valid(screen):
                     _print(
                         {
                             "error": "live dialog does not match the "
