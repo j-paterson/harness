@@ -938,12 +938,16 @@ class CmuxSurfaceReconciler:
     Each active binding is validated against the exact live workspace and
     surface UUIDs. A missing lead surface is replaced with one new
     generation whose workspace carries the recorded project cwd, the
-    profile's CLAUDE_CONFIG_DIR, and a sanitized native resume command —
-    never a prompt or credential. A missing Orchestrator seat is rebound
-    only to this process's own cmux seat (from the environment cmux
-    itself injected); otherwise it is recorded lost and the operator
-    relaunches the pane, so ownership never transfers silently. When the
-    socket denies or fails, durable state is left untouched.
+    profile's CLAUDE_CONFIG_DIR, and the same channel-enabled classic
+    launch command normal seating composes (Sol correction a06cbce0) —
+    never a prompt, credential, or blank terminal: when the channel
+    launch cannot be built, the seat is recorded lost with one durable
+    ``channel.blocked`` receipt instead of an active binding over an
+    empty pane. A missing Orchestrator seat is rebound only to this
+    process's own cmux seat (from the environment cmux itself injected);
+    otherwise it is recorded lost and the operator relaunches the pane,
+    so ownership never transfers silently. When the socket denies or
+    fails, durable state is left untouched.
     """
 
     def __init__(
@@ -954,12 +958,16 @@ class CmuxSurfaceReconciler:
         project_paths: Mapping[str, Path],
         profile_dirs: ProfileDirectory,
         environ: Mapping[str, str],
+        channel_launch: ChannelLaunchSource | None = None,
+        control: ControlOperations | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
         self._profile_dirs = profile_dirs
         self._environ = dict(environ)
+        self._channel_launch = channel_launch
+        self._control = control
 
     def own_seat(self) -> CmuxSurfaceRef | None:
         """The cmux seat this very process runs in, if any."""
@@ -1088,18 +1096,79 @@ class CmuxSurfaceReconciler:
             )
             lost.append(binding.binding_id)
             return
+        cell_id = str(binding.cell_id)
+        session_id = str(binding.session_id)
+        # Sol correction a06cbce0: restart recovery relaunches the same
+        # managed channel-enabled classic seat normal seating composes.
+        # The session-scoped config is stamped with the generation the
+        # successor binding will carry — the predecessor is still the
+        # cell's highest generation, so ``next_lead_generation`` reports
+        # exactly the successor's — and only the sanitized extension
+        # grammar can carry it, so the hub's generation check passes for
+        # the reseated lead and for nothing else.
+        try:
+            if self._channel_launch is None:
+                raise CmuxBindingConflict(
+                    "no channel launcher is composed for restart recovery"
+                )
+            config = self._channel_launch.generate(
+                project_key=binding.project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias=binding.profile_alias,
+                generation=self._bindings.next_lead_generation(cell_id),
+            )
+            command = classic_channel_command(
+                session_id, resume=True, channel_config=config
+            )
+        except Exception as error:
+            # Fail closed: no launch command, no replacement seat. An
+            # active binding over a blank terminal would satisfy the
+            # ledger while running no Claude process and registering no
+            # channel, so the seat is recorded lost — never silently:
+            # one durable, actionable channel.blocked receipt records
+            # exactly why, and rotate-lead reseats the cell once the
+            # sidecar build or launcher composition is repaired.
+            if self._control is not None:
+                with suppress(Exception):
+                    self._control.record(
+                        kind="channel.blocked",
+                        project_key=binding.project_key,
+                        cell_id=cell_id,
+                        session_id=session_id,
+                        result={"launcher_error": str(error)[:200]},
+                        reason=(
+                            "the channel-enabled classic launch command "
+                            "could not be built during restart "
+                            "recovery; the seat is recorded lost "
+                            "instead of an active binding over a blank "
+                            "terminal — repair the sidecar build or "
+                            "launcher composition, then rotate-lead "
+                            "reseats the cell"
+                        ),
+                    )
+            self._bindings.mark_lost(
+                binding.binding_id, reason="channel_launch_unavailable"
+            )
+            lost.append(binding.binding_id)
+            return
         successor = await _activate_lead_seat(
             self._port,
             self._bindings,
             project_key=binding.project_key,
             cwd=cwd,
             config_dir=config_dir,
-            cell_id=str(binding.cell_id),
-            session_id=str(binding.session_id),
+            cell_id=cell_id,
+            session_id=session_id,
             profile_alias=binding.profile_alias,
             replacing=binding.binding_id,
             replace_reason="surface_missing",
+            command=command,
         )
+        # The classic-seat evidence the lead-intake transport and the
+        # channel hub both require, recorded exactly as normal seating
+        # records it.
+        self._bindings.record_classic(successor.binding_id, session_id)
         replaced.append(successor.binding_id)
 
 

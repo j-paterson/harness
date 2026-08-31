@@ -29,6 +29,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxSurfaceBindings,
     CmuxSurfaceReconciler,
     HibernationDecision,
+    classic_channel_command,
 )
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
@@ -225,12 +226,38 @@ class FakeProfileDirs:
         return self._dirs[alias]
 
 
+class FakeChannelLaunch:
+    """Records launch-material generation and retirement."""
+
+    def __init__(
+        self,
+        config: Path | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.config = config
+        self.error = error
+        self.generated: list[dict[str, object]] = []
+        self.cleaned: list[str] = []
+
+    def generate(self, **kwargs: object) -> Path:
+        self.generated.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        assert self.config is not None
+        return self.config
+
+    def cleanup(self, session_id: str) -> None:
+        self.cleaned.append(session_id)
+
+
 def reconciler(
     bindings: CmuxSurfaceBindings,
     port: FakePort,
     *,
     environ: dict[str, str] | None = None,
     profiles: dict[str, Path] | None = None,
+    channel_launch: FakeChannelLaunch | None = None,
+    control: ControlOperations | None = None,
 ) -> CmuxSurfaceReconciler:
     return CmuxSurfaceReconciler(
         bindings=bindings,
@@ -240,6 +267,16 @@ def reconciler(
             profiles if profiles is not None else {"max-a": Path("/profiles/max-a")}
         ),
         environ=environ or {},
+        # Sol correction a06cbce0: restart recovery relaunches through
+        # the channel launcher, so the tests compose one by default.
+        channel_launch=(
+            channel_launch
+            if channel_launch is not None
+            else FakeChannelLaunch(
+                config=Path(f"/state/channels/{SESSION}.mcp.json")
+            )
+        ),
+        control=control,
     )
 
 
@@ -353,8 +390,9 @@ async def test_stale_lead_surface_is_replaced_with_exact_identity(
 ) -> None:
     first = bind_demo_lead(bindings)
     port = FakePort(next_refs=[FRESH])
+    launch = FakeChannelLaunch(config=Path(f"/state/channels/{SESSION}.mcp.json"))
 
-    report = await reconciler(bindings, port).reconcile()
+    report = await reconciler(bindings, port, channel_launch=launch).reconcile()
 
     successor = bindings.active_lead("cell-demo")
     assert report.replaced == (successor.binding_id,)
@@ -369,20 +407,92 @@ async def test_stale_lead_surface_is_replaced_with_exact_identity(
         "cmux_binding.replaced",
         "cmux_binding.bound",
     ]
-    # The replacement workspace is created from durable identity alone:
-    # recorded project cwd, the profile's exact CLAUDE_CONFIG_DIR, and the
-    # sanitized native resume command for the exact Claude session. The
-    # requested title carries the write-ahead intent's unique marker; the
-    # visible title is restored once the identities are durably bound.
+    # Sol correction a06cbce0: the replacement workspace is created from
+    # durable identity alone — recorded project cwd, the profile's exact
+    # CLAUDE_CONFIG_DIR, and the exact channel-enabled classic launch
+    # command normal seating composes for this Claude session; never a
+    # blank terminal. The requested title carries the write-ahead
+    # intent's unique marker; the visible title is restored once the
+    # identities are durably bound.
+    channel_command = classic_channel_command(
+        SESSION,
+        resume=True,
+        channel_config=Path(f"/state/channels/{SESSION}.mcp.json"),
+    )
     [created] = port.created
     assert created["cwd"] == Path("/repos/demo")
-    assert created["command"] is None
+    assert created["command"] == channel_command
     assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
     assert str(created["title"]).startswith("demo lead")
     assert port.titles[FRESH.workspace_uuid] == "demo lead"
-    assert port.resumes == [
-        (FRESH, f"claude --resume {SESSION} {SKIP_PERMISSIONS_FLAG}")
-    ]
+    assert port.resumes == [(FRESH, channel_command)]
+    # The config is generation-stamped for the successor binding, so the
+    # hub's registration check accepts exactly the reseated lead.
+    [generated] = launch.generated
+    assert generated["session_id"] == SESSION
+    assert generated["generation"] == successor.generation
+    # Classic-seat evidence is recorded exactly as normal seating
+    # records it; the lead-intake transport and hub both require it.
+    assert bindings.is_classic(successor.binding_id, SESSION) is True
+
+
+@pytest.mark.asyncio
+async def test_failed_channel_generation_fails_the_replacement_closed(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """Sol correction a06cbce0: a replacement that cannot carry the
+    channel-enabled classic launch command never binds an active seat
+    over a blank terminal — the seat is recorded lost with one durable,
+    actionable channel.blocked receipt."""
+
+    first = bind_demo_lead(bindings)
+    port = FakePort(next_refs=[FRESH])
+    launch = FakeChannelLaunch(error=FileNotFoundError("no build"))
+    control = ControlOperations(database, events=EventStore(database))
+
+    report = await reconciler(
+        bindings, port, channel_launch=launch, control=control
+    ).reconcile()
+
+    assert report.completed is True
+    assert report.replaced == ()
+    assert report.lost == (first.binding_id,)
+    assert bindings.get(first.binding_id).state == "lost"
+    assert bindings.active_lead("cell-demo") is None
+    # No workspace is created and no resume is set: nothing visible
+    # exists for the unlaunched seat.
+    assert port.created == []
+    assert port.resumes == []
+    [receipt] = control.pending_for_session(SESSION)
+    assert receipt.kind == "channel.blocked"
+    assert receipt.result["launcher_error"] == "no build"
+    assert "blank terminal" in str(receipt.reason)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_without_a_launcher_never_seats_a_blank_terminal(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    first = bind_demo_lead(bindings)
+    port = FakePort(next_refs=[FRESH])
+    control = ControlOperations(database, events=EventStore(database))
+    bare = CmuxSurfaceReconciler(
+        bindings=bindings,
+        port=port,
+        project_paths={"demo": Path("/repos/demo")},
+        profile_dirs=FakeProfileDirs({"max-a": Path("/profiles/max-a")}),
+        environ={},
+        control=control,
+    )
+
+    report = await bare.reconcile()
+
+    assert report.replaced == ()
+    assert report.lost == (first.binding_id,)
+    assert bindings.get(first.binding_id).state == "lost"
+    assert port.created == []
+    [receipt] = control.pending_for_session(SESSION)
+    assert receipt.kind == "channel.blocked"
 
 
 @pytest.mark.asyncio
@@ -1568,30 +1678,6 @@ class TestClassicSeats:
         assert probed == ["max-a"]
         assert port.created == []
         assert bindings.active_lead("cell-demo") is None
-
-
-class FakeChannelLaunch:
-    """Records launch-material generation and retirement."""
-
-    def __init__(
-        self,
-        config: Path | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.config = config
-        self.error = error
-        self.generated: list[dict[str, object]] = []
-        self.cleaned: list[str] = []
-
-    def generate(self, **kwargs: object) -> Path:
-        self.generated.append(kwargs)
-        if self.error is not None:
-            raise self.error
-        assert self.config is not None
-        return self.config
-
-    def cleanup(self, session_id: str) -> None:
-        self.cleaned.append(session_id)
 
 
 class TestChannelLaunch:

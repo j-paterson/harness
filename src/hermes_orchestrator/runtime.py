@@ -693,6 +693,13 @@ def open_runtime(
                     project_paths=cmux_project_paths,
                     profile_dirs=cmux_profile_dirs,
                     environ=environment,
+                    # Sol correction a06cbce0: restart recovery reseats a
+                    # missing lead through the same hermes-control
+                    # channel launcher the seater uses, and records the
+                    # durable channel.blocked receipt when it cannot —
+                    # never an active binding over a blank terminal.
+                    channel_launch=channel_launcher,
+                    control=control_operations,
                 )
                 cmux_hibernation = CmuxHibernationDriver(
                     gate=CmuxHibernationGate(

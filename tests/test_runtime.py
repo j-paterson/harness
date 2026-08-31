@@ -609,6 +609,13 @@ def test_active_runtime_composes_seats_on_hermes_control_without_fakechat(
         # fakechat port source of any kind.
         assert isinstance(seater._channel_launch, ChannelLauncher)
         assert getattr(seater, "_signal_ports", None) is None
+        # Sol correction a06cbce0: startup reconciliation reseats a
+        # missing lead through the same channel launcher the seater
+        # uses — with the control ledger for the fail-closed
+        # channel.blocked receipt — never a blank replacement terminal.
+        assert runtime.cmux_reconciler is not None
+        assert runtime.cmux_reconciler._channel_launch is seater._channel_launch
+        assert runtime.cmux_reconciler._control is not None
     finally:
         runtime.close()
 
