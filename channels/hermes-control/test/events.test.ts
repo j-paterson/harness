@@ -83,6 +83,61 @@ test("distinct event ids always forward independently", async () => {
   }
 });
 
+test("an event delivered before initialize is queued and flushed exactly once after initialize; a within-window resend is not forwarded again", async () => {
+  // Hub registration is independent of MCP `initialize`: the sidecar
+  // connects to the hub at startup regardless of the JSON-RPC
+  // handshake state. Register and deliver an event first, without
+  // ever calling initializeSidecar, to prove the notification is
+  // held rather than written (or dropped).
+  const fx = await startFixture();
+  try {
+    const conn = await registerAndGetConn(fx);
+
+    const packetId = "a".repeat(32);
+    conn.send({
+      op: "event",
+      event_id: "evt-1",
+      kind: "HERMES_WORK_READY",
+      packet_id: packetId,
+      session_id: fx.session,
+    });
+
+    // Not yet answered `initialize`: nothing should reach stdout yet.
+    await assert.rejects(
+      () => fx.sidecar.nextMessage((m) => m.method === "notifications/claude/channel", 300),
+      /timed out/
+    );
+
+    await initializeSidecar(fx.sidecar);
+
+    const notif1 = await fx.sidecar.nextMessage(
+      (m) => m.method === "notifications/claude/channel"
+    );
+    assert.equal(notif1.params.content, `HERMES_WORK_READY ${packetId}`);
+    assert.deepEqual(notif1.params.meta, {
+      kind: "HERMES_WORK_READY",
+      packet_id: packetId,
+      event_id: "evt-1",
+    });
+
+    // A resend of the same event_id within the coalesce window must
+    // not be forwarded again.
+    conn.send({
+      op: "event",
+      event_id: "evt-1",
+      kind: "HERMES_WORK_READY",
+      packet_id: packetId,
+      session_id: fx.session,
+    });
+    await assert.rejects(
+      () => fx.sidecar.nextMessage((m) => m.method === "notifications/claude/channel", 300),
+      /timed out/
+    );
+  } finally {
+    await fx.teardown();
+  }
+});
+
 test("a replayed event_id within the coalesce window forwards exactly once", async () => {
   // The hub re-sends every unacknowledged event on each registration and
   // on each publish pass (which fires per maintenance tick AND per
@@ -111,7 +166,7 @@ test("a replayed event_id within the coalesce window forwards exactly once", asy
     );
     assert.equal(notif1.params.meta.event_id, "evt-1");
 
-    // Immediate re-send (well inside the default 60s coalesce window):
+    // Immediate re-send (well inside the default 15-minute coalesce window):
     // must NOT produce a second visible notification.
     sendEvent();
 
@@ -161,12 +216,12 @@ test("a replayed event_id forwards again once the coalesce window lapses (genuin
   }
 });
 
-test("re-registration after reconnect replays the same event_id immediately (reconnect retry)", async () => {
-  // A reconnect begins a new connection epoch: the coalescing map is
-  // per-epoch, so a replay following re-registration must forward
-  // immediately even though the prior forward of the same event_id was
-  // very recent — the coalesce window must never suppress delivery
-  // across a genuine reconnect.
+test("re-registration after reconnect does not re-surface a still-unacknowledged event_id within the coalesce window, but a new event_id forwards immediately", async () => {
+  // forwardedAt is process-scoped now (not cleared on registration):
+  // a reconnect must not cause a still-unacknowledged event to
+  // re-surface before its coalesce window lapses. A brand-new
+  // event_id on the new connection is unaffected and still forwards
+  // right away.
   const fx = await startFixture();
   try {
     await initializeSidecar(fx.sidecar);
@@ -193,9 +248,9 @@ test("re-registration after reconnect replays the same event_id immediately (rec
     await second.waitForLine((m) => m.op === "register");
     second.send({ op: "registered", proto: 1 });
 
-    // Replay of the same event_id immediately after re-registration:
-    // must forward right away, not be coalesced against the pre-reconnect
-    // forward.
+    // Replay of the SAME event_id right after re-registration: still
+    // within the coalesce window, so it must NOT produce a second
+    // visible notification.
     second.send({
       op: "event",
       event_id: "evt-1",
@@ -203,12 +258,24 @@ test("re-registration after reconnect replays the same event_id immediately (rec
       packet_id: packetId,
       session_id: fx.session,
     });
+    await assert.rejects(
+      () => fx.sidecar.nextMessage((m) => m.method === "notifications/claude/channel", 300),
+      /timed out/
+    );
 
+    // A NEW event_id on the same (new) connection still forwards
+    // immediately: coalescing never blocks a genuinely new event.
+    second.send({
+      op: "event",
+      event_id: "evt-2",
+      kind: "HERMES_WORK_READY",
+      packet_id: "b".repeat(32),
+      session_id: fx.session,
+    });
     const notif2 = await fx.sidecar.nextMessage(
       (m) => m.method === "notifications/claude/channel"
     );
-    assert.deepEqual(notif2.params.meta, notif1.params.meta);
-    assert.equal(notif2.params.content, notif1.params.content);
+    assert.equal(notif2.params.meta.event_id, "evt-2");
   } finally {
     await fx.teardown();
   }

@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from hermes_orchestrator.control_operations import (
+    CONTROL_KINDS,
+    LEAD_ACTIONABLE_CONTROL_KINDS,
+    MAINTENANCE_CONTROL_KINDS,
     ControlOperationRefused,
     ControlOperations,
 )
@@ -266,3 +269,70 @@ def test_lead_launch_failed_is_accepted_and_free_text_still_refuses(
 
     with pytest.raises(ControlOperationRefused, match="unknown"):
         record(operations, kind="lead.launch_exploded")
+
+
+def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
+    """INFRA-201: maintenance receipts are pure transport/lifecycle
+    churn; everything else — including any future kind — is
+    lead-actionable by default."""
+
+    assert MAINTENANCE_CONTROL_KINDS <= CONTROL_KINDS
+    assert LEAD_ACTIONABLE_CONTROL_KINDS | MAINTENANCE_CONTROL_KINDS == (
+        CONTROL_KINDS
+    )
+    assert set() == LEAD_ACTIONABLE_CONTROL_KINDS & MAINTENANCE_CONTROL_KINDS
+    assert {
+        "daemon.restarted",
+        "channel.reregistered",
+        "channel.replayed",
+        "intake.dedup_repaired",
+        "channel.auto_confirmed",
+        "channel.confirm_claimed",
+    } == MAINTENANCE_CONTROL_KINDS
+    assert {
+        "channel.blocked",
+        "children.completed",
+        "signal.failed",
+        "channel.approval_required",
+        "channel.confirm_ambiguous",
+        "lead.launch_failed",
+        "channel.rebind_refused",
+    } == LEAD_ACTIONABLE_CONTROL_KINDS
+
+
+def test_settle_maintenance_for_session_acks_only_that_sessions_maintenance(
+    operations: ControlOperations, database: Database
+) -> None:
+    maintenance = record(operations, kind="channel.replayed")
+    other_session_maintenance = record(
+        operations, kind="daemon.restarted", session_id=OTHER_SESSION
+    )
+    actionable = record(
+        operations,
+        kind="children.completed",
+        result={"issue_id": "ENG-9"},
+    )
+    assert maintenance is not None
+    assert other_session_maintenance is not None
+    assert actionable is not None
+
+    settled = operations.settle_maintenance_for_session(SESSION)
+
+    assert settled == (maintenance.operation_id,)
+    assert operations.get(maintenance.operation_id).state == "acknowledged"
+    assert operations.get(actionable.operation_id).state == "published"
+    assert (
+        operations.get(other_session_maintenance.operation_id).state
+        == "published"
+    )
+    journaled = [
+        str(row["aggregate_id"])
+        for row in database.execute(
+            "SELECT aggregate_id FROM events "
+            "WHERE event_type = 'control_operation.acknowledged'"
+        ).fetchall()
+    ]
+    assert journaled == [maintenance.operation_id]
+
+    # Idempotent: nothing left to settle.
+    assert operations.settle_maintenance_for_session(SESSION) == ()

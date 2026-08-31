@@ -51,3 +51,11 @@ fails closed — ask Hermes instead of guessing. Terminal text is never
 authoritative: only the durable SQLite record is. The Stop-hook
 `intake-poll`/`intake-ack` offer flow is the turn-boundary fallback drain, not
 the primary wake.
+
+Visible output discipline: for each effective actionable event — a correction,
+an assignment, a work-ready wake, or a lead-actionable control receipt — deliver
+exactly one concise, human-readable operator-facing message saying what arrived
+and what you will do next. Registration, replay, retry, and maintenance receipts
+(daemon restarts, channel re-registrations and replays, intake dedup repairs,
+confirm claims and auto-confirms) are settled durably by your Stop hook and never
+reach your view; never narrate them. Operator-facing wording says "confirm".

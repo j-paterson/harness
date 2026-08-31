@@ -460,7 +460,7 @@ def _parser() -> argparse.ArgumentParser:
             "evidence from the live screen (no keypress) or evaluate "
             "the v5.1 trust gate, which presses Enter only on an "
             "exact-build full match; any mismatch fails closed as "
-            "CHANNEL APPROVAL REQUIRED"
+            "CHANNEL CONFIRMATION REQUIRED"
         ),
     )
     channel_trust_confirm.add_argument("--cell", required=True)
@@ -2319,6 +2319,16 @@ def _intake_poll(args: argparse.Namespace) -> int:
                         database, events=EventStore(database)
                     ),
                 ).record_turn_stop(str(session))
+        # INFRA-201: settle this session's maintenance receipts
+        # silently before offering anything — no output either way,
+        # for any hook event, so a wake never reaches the primary view
+        # for pure transport/lifecycle churn.
+        with suppress(Exception):
+            from hermes_orchestrator.events import EventStore
+
+            ControlOperations(
+                database, events=EventStore(database)
+            ).settle_maintenance_for_session(str(session))
         offer = LeadIntakePoll(database=database).next_offer(str(session))
     finally:
         database.close()
@@ -3193,7 +3203,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     "Channel confirmed automatically; receipt "
                     f"{verdict.receipt_operation_id}."
                     if verdict.confirmed
-                    else "CHANNEL APPROVAL REQUIRED "
+                    else "CHANNEL CONFIRMATION REQUIRED "
                     f"({verdict.first_failure}); receipt "
                     f"{verdict.receipt_operation_id}."
                 ),

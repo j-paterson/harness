@@ -45,6 +45,40 @@ CONTROL_KINDS = frozenset(
     }
 )
 
+# INFRA-201: the vocabulary splits into two disjoint classes. A
+# maintenance receipt reports pure transport/lifecycle churn — a
+# reconnect, a repaired duplicate, a routine restart — whose only lead
+# action is to acknowledge it; delivering 91 wakes for 10 such
+# receipts in one live session was the measured problem. A
+# maintenance receipt stays exactly as durable as before: the same
+# ``record``/``record_in``, the same dedup key, the same exact-session
+# ``acknowledge`` and its ``control_operation.acknowledged`` event. The
+# only thing that changes is who settles it and how visibly — the
+# lead's own Stop hook now settles it silently
+# (``settle_maintenance_for_session``) instead of a dedicated wake
+# reaching the primary view through the channel, the seat announce, or
+# the Stop-hook offer. Everything else — every kind not listed here,
+# and any kind added to CONTROL_KINDS in the future — is
+# lead-actionable by default and keeps reaching the primary view
+# exactly as before.
+MAINTENANCE_CONTROL_KINDS = frozenset(
+    {
+        "daemon.restarted",
+        "channel.reregistered",
+        "channel.replayed",
+        "intake.dedup_repaired",
+        "channel.auto_confirmed",
+        "channel.confirm_claimed",
+    }
+)
+LEAD_ACTIONABLE_CONTROL_KINDS = CONTROL_KINDS - MAINTENANCE_CONTROL_KINDS
+
+
+def is_maintenance_kind(kind: str) -> bool:
+    """Whether ``kind`` is pure transport/maintenance churn (INFRA-201)."""
+
+    return kind in MAINTENANCE_CONTROL_KINDS
+
 
 class ControlOperationRefused(ValueError):
     """The operation is outside the durable lifecycle vocabulary."""
@@ -300,6 +334,37 @@ class ControlOperations:
             (session_id,),
         ).fetchall()
         return tuple(self._record(row) for row in rows)
+
+    def settle_maintenance_for_session(
+        self, session_id: str
+    ) -> tuple[str, ...]:
+        """Acknowledge this session's published maintenance receipts.
+
+        Scoped to exactly ``session_id`` and to
+        ``MAINTENANCE_CONTROL_KINDS``: an actionable receipt, or a
+        maintenance receipt bound to another session, is never
+        touched. Settlement goes through the same exact-session
+        :meth:`acknowledge` used everywhere else, so the durable row
+        and its ``control_operation.acknowledged`` event are unchanged
+        in shape — only who settles them, and when, differs
+        (INFRA-201). Idempotent: a second call finds nothing left
+        ``published`` and returns an empty tuple.
+        """
+
+        placeholders = ",".join("?" * len(MAINTENANCE_CONTROL_KINDS))
+        rows = self._database.execute(
+            "SELECT operation_id FROM control_operations "
+            "WHERE session_id = ? AND state = 'published' "
+            f"AND kind IN ({placeholders}) "
+            "ORDER BY created_at ASC, rowid ASC",
+            (session_id, *MAINTENANCE_CONTROL_KINDS),
+        ).fetchall()
+        settled: list[str] = []
+        for row in rows:
+            operation_id = str(row["operation_id"])
+            if self.acknowledge(operation_id, session_id=session_id):
+                settled.append(operation_id)
+        return tuple(settled)
 
     @staticmethod
     def _record(row: sqlite3.Row) -> ControlOperation:

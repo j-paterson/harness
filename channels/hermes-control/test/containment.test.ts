@@ -98,7 +98,12 @@ test("McpServer.notifyChannelEvent contains a throwing writer and keeps working 
         throw new Error("stdout write boom");
       }
       written.push(line);
-    }
+    },
+    // Drive notifyChannelEvent directly without a JSON-RPC
+    // `initialize` round-trip: treat the server as already
+    // initialized so notifications write immediately instead of
+    // queueing.
+    true
   );
 
   const packetId = "c".repeat(32);
@@ -126,7 +131,10 @@ test("McpServer.notifyChannelEvent refuses malformed content: not sent, logged, 
   const mcp = new McpServer(
     stubHub() as any,
     (message) => logs.push(message),
-    (line) => written.push(line)
+    (line) => written.push(line),
+    // See the previous test: no JSON-RPC `initialize` round-trip
+    // here, so treat the server as already initialized.
+    true
   );
 
   // Unknown kind: the composed envelope would not match the client's
