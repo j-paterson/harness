@@ -573,10 +573,14 @@ def open_runtime(
             # Sol correction a06cbce0: the daemon's readiness seeding
             # gates on the same deterministic bootstrap as rotate-lead,
             # so an authenticated but uninitialized profile never seats.
+            # Sol correction c5600e31: bootstrap trust is derived from
+            # the same canonical ``project.lead_cwd`` that seat and cell
+            # composition below use, so an eligible profile can never
+            # pass bootstrap against one path while the seat launches in
+            # another.
             managed_repo_paths = tuple(
                 dict.fromkeys(
-                    project.lead_worktree or project.repo_path
-                    for project in settings.projects.values()
+                    project.lead_cwd for project in settings.projects.values()
                 )
             )
             probe = ClaudeProfileProbe(
@@ -652,8 +656,12 @@ def open_runtime(
                     base_env=environment,
                     password_source=cmux_password_source(reader),
                 )
+                # Sol correction c5600e31: the canonical managed lead
+                # cwd — with a configured lead_worktree this is now the
+                # worktree, not repo_path, so the seat launches in the
+                # same directory bootstrap already trusted.
                 cmux_project_paths = {
-                    alias: project.repo_path
+                    alias: project.lead_cwd
                     for alias, project in settings.projects.items()
                 }
                 cmux_profile_dirs = RegistryProfileDirectory(registry)
@@ -776,8 +784,12 @@ def open_runtime(
                 profiles=pool,
                 runner=runner,
                 linear=linear,
+                # Sol correction c5600e31: same canonical lead cwd as
+                # ``cmux_project_paths`` above and the bootstrap trust
+                # paths — cell composition must agree with the seat it
+                # launches into.
                 project_paths={
-                    alias: project.repo_path
+                    alias: project.lead_cwd
                     for alias, project in settings.projects.items()
                 },
                 handoffs=HandoffService(database),

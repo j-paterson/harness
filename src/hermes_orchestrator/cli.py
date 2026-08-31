@@ -1009,13 +1009,16 @@ def _open_rotation_collaborators(
     # once its onboarding/theme/trust state is deterministically
     # established for exactly the managed repositories a seated lead
     # actually runs from — the same paths the seater launches from (see
-    # ``lead_worktree = project.lead_worktree or project.repo_path`` at
-    # this command's rotation call site) — otherwise a restored session
-    # can still stop on a first-run dialog instead of Hermes's handoff.
+    # ``lead_worktree = project.lead_cwd`` at this command's rotation
+    # call site) — otherwise a restored session can still stop on a
+    # first-run dialog instead of Hermes's handoff.
+    # Sol correction c5600e31: derived from ``project.lead_cwd`` — the
+    # one canonical managed lead cwd — so bootstrap trust and the
+    # ``project_paths`` handed to the seater/cell service below can
+    # never disagree.
     managed_repo_paths = tuple(
         dict.fromkeys(
-            project.lead_worktree or project.repo_path
-            for project in settings.projects.values()
+            project.lead_cwd for project in settings.projects.values()
         )
     )
     bootstrap = ProfileBootstrap(registry, repo_paths=managed_repo_paths)
@@ -1048,8 +1051,11 @@ def _open_rotation_collaborators(
                 last_checked_at=datetime.now(UTC),
             )
         pool.record_health(health)
+    # Sol correction c5600e31: the same canonical ``lead_cwd`` used for
+    # ``managed_repo_paths`` above — the seater and cell service must
+    # launch into exactly the directory bootstrap already trusted.
     project_paths: Mapping[str, Path] = {
-        alias: project.repo_path for alias, project in settings.projects.items()
+        alias: project.lead_cwd for alias, project in settings.projects.items()
     }
     cmux_port = CmuxCliAdapter(
         settings.cmux.cli,
@@ -3337,8 +3343,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             # the project configures one; ``repo_path`` itself must
             # stay the stable primary checkout (see the linked-worktree
             # rejection in ``load_settings``), so the rotation probe
-            # validates the lead's actual candidate tree instead.
-            lead_worktree = project.lead_worktree or project.repo_path
+            # validates the lead's actual candidate tree instead. Sol
+            # correction c5600e31: derived from the same canonical
+            # ``project.lead_cwd`` the seater/cell composition and
+            # bootstrap trust in ``_open_rotation_collaborators`` use.
+            lead_worktree = project.lead_cwd
             rotation = LeadRotation(
                 database=database,
                 handoffs=HandoffService(database),

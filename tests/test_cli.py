@@ -2425,8 +2425,67 @@ def test_open_rotation_collaborators_composes_bootstrap_with_managed_repo_paths(
 
     assert len(captured_repo_paths) == 1
     project = settings.projects["demo"]
-    expected = project.lead_worktree or project.repo_path
+    expected = project.lead_cwd
     assert captured_repo_paths[0] == (expected,)
+
+
+def test_open_rotation_collaborators_agrees_bootstrap_and_seat_paths_on_lead_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sol correction c5600e31: bootstrap trust and the ``project_paths``
+    handed to the seater/cell service must derive from the same
+    canonical ``project.lead_cwd`` — with a dedicated ``lead_worktree``
+    configured, both must agree on the worktree, never a mix of
+    worktree-for-bootstrap and repo_path-for-the-seat that would still
+    land an eligible profile on the repository trust prompt."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
+    from hermes_orchestrator.runtime import open_runtime
+
+    repo_root = tmp_path
+    state_dir = tmp_path / "state"
+    lead_worktree = tmp_path / "lead-worktree"
+    lead_worktree.mkdir()
+    (repo_root / "config").mkdir()
+    (repo_root / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {repo_root}\n"
+        f"    lead_worktree: {lead_worktree}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (repo_root / "config/policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n",
+        encoding="utf-8",
+    )
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    captured_repo_paths: list[tuple[object, ...]] = []
+
+    class _FakeBootstrap:
+        def __init__(self, registry: object, *, repo_paths: object) -> None:
+            captured_repo_paths.append(tuple(repo_paths))
+
+        def ensure(self, alias: str) -> bool:
+            return True
+
+    monkeypatch.setattr(cli_module, "ProfileBootstrap", _FakeBootstrap)
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        cells, seater = cli_module._open_rotation_collaborators(settings, runtime)
+    finally:
+        runtime.close()
+
+    assert captured_repo_paths == [(lead_worktree,)]
+    assert seater._project_paths == {"demo": lead_worktree}
+    assert cells._project_paths == {"demo": lead_worktree}
 
 
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:

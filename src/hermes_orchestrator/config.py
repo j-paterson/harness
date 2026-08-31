@@ -42,6 +42,23 @@ class ProjectConfig(BaseModel):
     # --apply``.
     self_host: bool = False
 
+    @property
+    def lead_cwd(self) -> Path:
+        """The one canonical managed lead cwd for this project.
+
+        Sol correction c5600e31: bootstrap trust, cmux seat/cell launch,
+        rotation, and restart reconciliation must all agree on a single
+        directory, or an eligible profile can pass bootstrap against one
+        path while the actual Claude seat launches in another — landing
+        on the untrusted repository trust prompt. This property is that
+        single source of truth: every site that used to read
+        ``project.lead_worktree or project.repo_path`` inline, or
+        ``project.repo_path`` alone for seat/cell composition, must read
+        ``project.lead_cwd`` instead.
+        """
+
+        return self.lead_worktree or self.repo_path
+
 
 class LinearStatusIds(BaseModel):
     """Team-specific workflow identifiers for the approved projection states."""

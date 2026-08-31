@@ -57,7 +57,9 @@ class FakeKeychain:
         return "linear-token"
 
 
-def active_repo(tmp_path: Path) -> tuple[Path, Path]:
+def active_repo(
+    tmp_path: Path, lead_worktree: Path | None = None
+) -> tuple[Path, Path]:
     config = tmp_path / "config"
     config.mkdir()
     (tmp_path / "prompts").mkdir()
@@ -66,11 +68,15 @@ def active_repo(tmp_path: Path) -> tuple[Path, Path]:
         "Work only on explicitly queued work.\n",
         encoding="utf-8",
     )
+    lead_worktree_line = (
+        f"    lead_worktree: {lead_worktree}\n" if lead_worktree is not None else ""
+    )
     (config / "projects.yaml").write_text(
         "projects:\n"
         "  demo:\n"
         "    linear_team: engineering\n"
         f"    repo_path: {tmp_path}\n"
+        f"{lead_worktree_line}"
         "    integration_branch: main\n"
         "    github_repo: owner/demo\n",
         encoding="utf-8",
@@ -454,10 +460,12 @@ HUB_SEAT = CmuxSurfaceRef(
 PACKET_ID = "b" * 32
 
 
-def cmux_repo(base: Path) -> tuple[Path, Path]:
+def cmux_repo(
+    base: Path, lead_worktree: Path | None = None
+) -> tuple[Path, Path]:
     """An active repo with cmux configured and a sidecar build present."""
 
-    repo_root, state_dir = active_repo(base)
+    repo_root, state_dir = active_repo(base, lead_worktree=lead_worktree)
     (repo_root / "config/cmux.yaml").write_text(
         "cli:\n  - /apps/cmux\n", encoding="utf-8"
     )
@@ -632,6 +640,54 @@ def test_active_runtime_composes_seats_on_hermes_control_without_fakechat(
         # missing one.
         assert runtime.cmux_reconciler._channel_trust is seater._channel_trust
         assert runtime.cmux_reconciler._channel_trust is not None
+    finally:
+        runtime.close()
+
+
+def test_live_runtime_composes_every_lead_cwd_from_the_dedicated_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sol correction c5600e31: with a dedicated ``lead_worktree``
+    configured, bootstrap trust and every seat/cell composition site
+    must agree on ``project.lead_cwd`` — never a mix of ``lead_worktree``
+    for bootstrap and ``repo_path`` for the actual seat/cell cwd, which
+    would let an eligible profile still hit the repository trust prompt
+    in the launched seat.
+    """
+
+    lead_worktree = tmp_path / "demo-lead"
+    lead_worktree.mkdir()
+    repo_root, state_dir = cmux_repo(tmp_path, lead_worktree=lead_worktree)
+    fake_node(tmp_path, monkeypatch)
+    settings = load_settings(repo_root, state_dir)
+    assert settings.projects["demo"].lead_cwd == lead_worktree
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        assert runtime.cells is not None
+        seater = runtime.cells._surfaces
+        assert isinstance(seater, CmuxLeadSeater)
+        assert seater._project_paths == {"demo": lead_worktree}
+        assert runtime.cmux_reconciler is not None
+        assert runtime.cmux_reconciler._project_paths == {"demo": lead_worktree}
+        assert runtime.cells._project_paths == {"demo": lead_worktree}
+        # The bootstrap trust document is written for the exact
+        # directory the seat launches from (lead_worktree), not the
+        # stable primary checkout (repo_path) — otherwise an eligible
+        # profile would still stop at the trust prompt in the seat.
+        document = json.loads(
+            (tmp_path / "max-a" / ".claude.json").read_text(encoding="utf-8")
+        )
+        assert document["hasCompletedOnboarding"] is True
+        trusted = document["projects"][str(lead_worktree)]
+        assert trusted["hasTrustDialogAccepted"] is True
+        assert str(tmp_path) not in document["projects"]
     finally:
         runtime.close()
 
