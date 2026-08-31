@@ -33,8 +33,15 @@ def test_accepted_packets_reconstruct_a_handoff_without_conversation(
     accepted-evidence keys — with no prompt or response text anywhere
     in the reconstruction."""
 
+    # Deterministic packet ids: the leak assertion below checks that the
+    # evidence VALUE "12" never appears, so random hex ids (which may
+    # legitimately contain "12") must not be able to trip it.
+    fixed_ids = iter(("a" * 32, "b" * 32))
     packets = SubagentPackets(
-        database, events=EventStore(database), now=lambda: NOW
+        database,
+        events=EventStore(database),
+        now=lambda: NOW,
+        ids=lambda: next(fixed_ids),
     )
     first = packets.create(
         issue_id="INFRA-186",
