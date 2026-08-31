@@ -17,7 +17,7 @@ from hermes_orchestrator.claude import (
 )
 from hermes_orchestrator.cmux_surfaces import SKIP_PERMISSIONS_FLAG
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.domain import AdmissionRequest
+from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.lead_assignments import LeadAssignments
@@ -224,11 +224,74 @@ async def test_two_issues_share_one_project_lead(
     admit(queue, "ENG-10")
 
     first = await cell_service.dispatch("ENG-9")
+    # One issue in_development per project (INFRA-199): ENG-9 must leave
+    # in_development before ENG-10 may start. Sharing the lead cell/session
+    # sequentially is still legal; only concurrent in_development is not.
+    queue.complete("ENG-9", reason="shipped", evidence="pr-merged")
     second = await cell_service.dispatch("ENG-10")
 
     assert first.cell_id == second.cell_id
     assert first.session_id == second.session_id == SESSION_ID
     assert runner.start_count == 1
+    assert runner.resume_count == 1
+
+
+@pytest.mark.asyncio
+async def test_second_issue_refused_while_first_in_development(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    database: Database,
+) -> None:
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+
+    first = await cell_service.dispatch("ENG-9")
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+
+    events_before = database.execute(
+        "SELECT COUNT(*) AS n FROM events"
+    ).fetchone()["n"]
+
+    second = await cell_service.dispatch("ENG-10")
+
+    assert second.status == "project_busy"
+    assert second.cell_id is None
+    assert second.session_id is None
+    assert queue.get("ENG-10").state == IssueState.QUEUED
+    assert ("demo", "ENG-10") not in linear.validations
+    assert runner.start_count == 1
+    assert runner.resume_count == 0
+    events_after = database.execute(
+        "SELECT COUNT(*) AS n FROM events"
+    ).fetchone()["n"]
+    assert events_after == events_before
+
+    # Dispatching (resuming) the ALREADY in_development issue itself is
+    # untouched by the guard: only a DIFFERENT queued issue is refused.
+    resumed = await cell_service.dispatch("ENG-9")
+    assert resumed.cell_id == first.cell_id
+    assert resumed.session_id == first.session_id
+    assert runner.resume_count == 1
+
+
+@pytest.mark.asyncio
+async def test_second_issue_dispatches_once_first_leaves_in_development(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+) -> None:
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+
+    await cell_service.dispatch("ENG-9")
+    queue.complete("ENG-9", reason="shipped", evidence="pr-merged")
+
+    second = await cell_service.dispatch("ENG-10")
+
+    assert second.status != "project_busy"
+    assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
     assert runner.resume_count == 1
 
 
@@ -1245,8 +1308,11 @@ async def test_concurrent_dispatch_waits_for_initial_session_confirmation(
     admit(queue, "ENG-9")
     first = asyncio.create_task(service.dispatch("ENG-9"))
     await start_entered.wait()
-    admit(queue, "ENG-10")
-    second = asyncio.create_task(service.dispatch("ENG-10"))
+    # A second, in-flight dispatch of the SAME issue (e.g. a racing resume
+    # after restart) must still be served once the lock frees up (INFRA-199
+    # forbids starting a DIFFERENT queued issue while one is in_development,
+    # not re-dispatching the one already in flight).
+    second = asyncio.create_task(service.dispatch("ENG-9"))
     await asyncio.sleep(0)
 
     assert resume_entered.is_set() is False
@@ -1257,7 +1323,7 @@ async def test_concurrent_dispatch_waits_for_initial_session_confirmation(
     assert first_result.status == "working"
     assert second_result.status == "working"
     assert resume_entered.is_set() is True
-    assert queue.get("ENG-10").state.value == "in_development"
+    assert queue.get("ENG-9").state.value == "in_development"
     assert (
         database.scalar("SELECT state FROM project_cells WHERE cell_id = 'cell-demo'")
         == "active"
@@ -1274,14 +1340,16 @@ async def test_handoff_required_cell_does_not_resume(
     admit(queue, "ENG-9")
     runner.emit_limit = True
     await cell_service.dispatch("ENG-9")
-    admit(queue, "ENG-10")
     runner.emit_limit = False
 
-    result = await cell_service.dispatch("ENG-10")
+    # Re-dispatching the SAME (still in_development) issue is the resume
+    # path the guard must leave untouched; it should still see the cell's
+    # own handoff_required gate rather than a project-busy refusal.
+    result = await cell_service.dispatch("ENG-9")
 
     assert result.status == "handoff_required"
     assert runner.resume_count == 0
-    assert queue.get("ENG-10").state.value == "queued"
+    assert queue.get("ENG-9").state.value == "in_development"
 
 
 @pytest.mark.asyncio
@@ -1319,7 +1387,10 @@ async def test_turn_completion_records_session_bound_safe_boundary(
         "SELECT count(*) FROM events WHERE event_id = ?", (evidence.evidence_id,)
     ) == 1
 
-    # New work on the same cell invalidates the boundary until the turn ends.
+    # New work on the same cell invalidates the boundary until the turn
+    # ends. ENG-9 must leave in_development first (INFRA-199: one issue
+    # in_development per project) before ENG-10 may start on this cell.
+    queue.complete("ENG-9", reason="shipped", evidence="pr-merged")
     admit(queue, "ENG-10")
     seen: list[bool] = []
     original = cells.record
@@ -1494,7 +1565,10 @@ async def test_six_active_hours_counts_execution_not_wall_time(
     assert result.status == "working"
     assert handoff_reasons(database) == []
     # A further turn pushes active time past six hours; rotation waits for
-    # the turn boundary and then requires the handoff.
+    # the turn boundary and then requires the handoff. ENG-9 must leave
+    # in_development first (INFRA-199: one issue in_development per
+    # project) before ENG-10 may start on this cell.
+    queue.complete("ENG-9", reason="shipped", evidence="pr-merged")
     clock.append(clock[-1] + timedelta(minutes=40))
     admit(queue, "ENG-10")
     tracker.open(f"cell-demo:{SESSION_ID}", clock[-2])
@@ -2067,6 +2141,9 @@ async def test_each_turn_commits_a_distinct_wake(
     service, sink = sink_cells(database, queue, profiles, runner, linear, tmp_path)
 
     await service.dispatch("ENG-9")
+    # ENG-9 must leave in_development first (INFRA-199: one issue
+    # in_development per project) before ENG-10 may start on this cell.
+    queue.complete("ENG-9", reason="shipped", evidence="pr-merged")
     await service.dispatch("ENG-10")
 
     assert [wake.kind for wake in sink.wakes] == ["completed", "completed"]

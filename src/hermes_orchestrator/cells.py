@@ -275,6 +275,19 @@ class ProjectCellService:
         """Dispatch one issue while holding its project-wide in-process lock."""
 
         issue = self._queue.get(issue_id)
+        # One issue in_development per project (INFRA-199, daemon side): a
+        # DIFFERENT queued issue never starts while this project already
+        # has one mid-flight. Dispatching that same in_development issue
+        # itself (resume after restart, reconciliation, handoff) is
+        # untouched — only a distinct issue_id is refused here, and the
+        # refusal is a plain read with zero writes.
+        busy = self._database.execute(
+            "SELECT 1 FROM admitted_issues WHERE project_key = ? AND state = ? "
+            "AND issue_id != ? LIMIT 1",
+            (issue.project_key, IssueState.IN_DEVELOPMENT.value, issue_id),
+        ).fetchone()
+        if busy is not None:
+            return DispatchResult(status="project_busy", issue_id=issue_id)
         await self._linear.validate(issue.project_key, issue_id)
         cell = self._find_active_cell(issue.project_key)
         created = False
