@@ -950,3 +950,124 @@ def test_deletion_above_the_hunk_yields_negative_shift_and_still_proves(
 
     assert outcome.relation == "patch_equivalent"
     assert outcome.applied_tree_sha == outcome.merge_tree_sha
+
+
+# -- diff.context=0 repositories (Sol correction 2b0e51aa) --------------------
+#
+# A repository configured with diff.context=0 emits contextless insertion
+# hunks (old_len=0, empty preimage). The proof must not inherit that
+# configuration: patch generation forces --unified=3, so every text-file
+# hunk carries an anchorable preimage, and an insertion relocated by the
+# squash (here: to end of file) is rejected instead of silently accepted.
+#
+# The file carries header and trailer padding so the reviewed hunk neither
+# starts at line 1 nor ends at end of file: git apply anchors such hunks to
+# the file boundaries and refuses to shift them at all (a separate, also
+# fail-closed, behaviour exercised by the minimal-file case below).
+
+_CTX_HEAD = "h1\nh2\nh3\nh4\nh5\n"
+_CTX_TAIL = "t1\nt2\nt3\nt4\nt5\n"
+
+
+def _build_contextless_base(tmp_path: Path) -> tuple[Repo, str, str, str]:
+    repo = Repo(tmp_path)
+    _git(repo.path, "config", "diff.context", "0")
+    (repo.path / "ctx.txt").write_text(_CTX_HEAD + "a\nb\nc\n" + _CTX_TAIL)
+    base_sha = repo.commit_all("base")
+
+    repo.checkout_new("candidate", base_sha)
+    (repo.path / "ctx.txt").write_text(_CTX_HEAD + "a\nb\nX\nc\n" + _CTX_TAIL)
+    candidate_sha = repo.commit_all("candidate: insert X after b")
+
+    repo.checkout("main")
+    (repo.path / "ctx.txt").write_text("P\n" + _CTX_HEAD + "a\nb\nc\n" + _CTX_TAIL)
+    advanced_sha = repo.commit_all("advance main: insert P above")
+    return repo, base_sha, candidate_sha, advanced_sha
+
+
+def test_contextless_insertion_relocated_to_eof_requires_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Regression: with diff.context=0 configured, the reviewed patch still
+    carries --unified=3 context, so the insertion is anchored after ``b``;
+    a squash that put X at end of file does not reproduce the tree."""
+
+    repo, base_sha, candidate_sha, advanced_sha = _build_contextless_base(tmp_path)
+    assert _git(repo.path, "config", "--get", "diff.context") == "0"
+    repo.checkout_new("squash-eof", advanced_sha)
+    (repo.path / "ctx.txt").write_text(
+        "P\n" + _CTX_HEAD + "a\nb\nc\n" + _CTX_TAIL + "X\n"
+    )
+    merge_sha = repo.commit_all("squash: X at end of file instead")
+    repo.push_main(merge_sha)
+
+    with pytest.raises(ReconciliationRequired, match="does not reproduce"):
+        _executor(repo).prove_landed(
+            "demo",
+            candidate_sha=candidate_sha,
+            candidate_branch="candidate",
+            pr_number=1,
+            merge_sha=merge_sha,
+            base_sha=base_sha,
+        )
+
+
+def test_contextless_repository_still_proves_the_mapped_insertion(
+    tmp_path: Path,
+) -> None:
+    """Control: the same configured repository, squash inserts X at the
+    mapped reviewed target (shifted by the inserted P) -- proves."""
+
+    repo, base_sha, candidate_sha, advanced_sha = _build_contextless_base(tmp_path)
+    repo.checkout_new("squash-mapped", advanced_sha)
+    (repo.path / "ctx.txt").write_text(
+        "P\n" + _CTX_HEAD + "a\nb\nX\nc\n" + _CTX_TAIL
+    )
+    merge_sha = repo.commit_all("squash: X after b at its shifted position")
+    repo.push_main(merge_sha)
+
+    outcome = _executor(repo).prove_landed(
+        "demo",
+        candidate_sha=candidate_sha,
+        candidate_branch="candidate",
+        pr_number=1,
+        merge_sha=merge_sha,
+        base_sha=base_sha,
+    )
+
+    assert outcome.relation == "patch_equivalent"
+    assert outcome.applied_tree_sha == outcome.merge_tree_sha
+
+
+def test_contextless_minimal_file_insertion_cannot_shift_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A whole-file hunk (starts at line 1, ends at EOF) is anchored to the
+    file boundaries by git apply itself, so once P is inserted above the
+    reviewed patch no longer applies as reviewed: fail closed, never
+    relocate."""
+
+    repo = Repo(tmp_path)
+    _git(repo.path, "config", "diff.context", "0")
+    (repo.path / "min.txt").write_text("a\nb\nc\n")
+    base_sha = repo.commit_all("base")
+    repo.checkout_new("candidate", base_sha)
+    (repo.path / "min.txt").write_text("a\nb\nX\nc\n")
+    candidate_sha = repo.commit_all("candidate")
+    repo.checkout("main")
+    (repo.path / "min.txt").write_text("P\na\nb\nc\n")
+    advanced_sha = repo.commit_all("advance")
+    repo.checkout_new("squash-min", advanced_sha)
+    (repo.path / "min.txt").write_text("P\na\nb\nc\nX\n")
+    merge_sha = repo.commit_all("squash: X at EOF")
+    repo.push_main(merge_sha)
+
+    with pytest.raises(ReconciliationRequired):
+        _executor(repo).prove_landed(
+            "demo",
+            candidate_sha=candidate_sha,
+            candidate_branch="candidate",
+            pr_number=1,
+            merge_sha=merge_sha,
+            base_sha=base_sha,
+        )

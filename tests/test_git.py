@@ -222,6 +222,7 @@ def _diff_argv(base: str, head: str) -> tuple[str, ...]:
         "--no-renames",
         "--no-textconv",
         "--no-ext-diff",
+        "--unified=3",
         base,
         head,
     )

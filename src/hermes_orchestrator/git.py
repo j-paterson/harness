@@ -435,6 +435,12 @@ class GitVerifier:
                 "--no-renames",
                 "--no-textconv",
                 "--no-ext-diff",
+                # Sol correction 2b0e51aa: never inherit diff.context — a
+                # repository configured with diff.context=0 would emit
+                # contextless insertions (empty preimage) that no
+                # positional proof can anchor. A fixed nonzero context is
+                # part of the proof's own contract.
+                "--unified=3",
                 base,
                 head,
             ),
@@ -553,9 +559,15 @@ class GitVerifier:
             mapped_positions: dict[int, int] = {}
             for hunk_number, hunk in enumerate(reviewed_file.hunks, start=1):
                 if not hunk.preimage:
-                    # Only possible when the base file is itself empty;
-                    # there is no preimage range to check or map.
-                    continue
+                    # A text-file hunk against an existing file with no
+                    # preimage cannot be anchored to a target or an
+                    # offset (added/deleted files never reach here, and
+                    # --unified=3 rules out configured contextless
+                    # diffs), so it can never participate in the proof.
+                    raise GitError(
+                        "reviewed hunk has no positional preimage: "
+                        f"{reviewed_file.path} hunk #{hunk_number}"
+                    )
                 range_start = hunk.old_start
                 range_end = hunk.old_start + hunk.old_len - 1
                 for edit in edits:
