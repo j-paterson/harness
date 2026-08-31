@@ -28,7 +28,9 @@ from hermes_orchestrator.orchestrator_workspace import (
     dashboard_pane_command,
     hermes_pane_command,
     inspect_workspace,
+    legacy_workspace_marker,
     run_smoke,
+    state_namespace,
     workspace_marker,
 )
 
@@ -47,6 +49,9 @@ LOWER_WRAPPED = (
 )
 UPPER_WRAPPED = f"/repo/orchestrator/.venv/bin/python3 /x/bin/{UPPER_MARKER}"
 HERMES_COMMAND = "hermes chat --continue orch --create-if-missing"
+NS = state_namespace(STATE_DIR)
+MARKER = f"[hermes-orch:{NS}:orch]"
+LEGACY_MARKER = "[hermes-orch:orch]"
 
 
 @dataclass
@@ -254,6 +259,11 @@ class FakeWorkspacePort:
             if title_marker in workspace.title.split()
         )
 
+    async def rename_workspace(
+        self, workspace_uuid: str, title: str
+    ) -> None:
+        self.workspaces[workspace_uuid].title = title
+
     async def respawn_surface(
         self, ref: CmuxSurfaceRef, command: str
     ) -> None:
@@ -366,7 +376,9 @@ def test_hermes_session_name_is_grammar_bound(name: str) -> None:
     with pytest.raises(WorkspaceRefused):
         hermes_pane_command(name)
     with pytest.raises(WorkspaceRefused):
-        workspace_marker(name)
+        workspace_marker(name, namespace=NS)
+    with pytest.raises(WorkspaceRefused):
+        legacy_workspace_marker(name)
 
 
 # ---------------------------------------------------------------------------
@@ -385,8 +397,8 @@ async def test_create_builds_two_stacked_panes_and_binds_durably(
 
     assert state.outcome == "created"
     [created] = port.created
-    assert created["title"] == "Orchestrator [hermes-orch:orch]"
-    assert created["resolve_marker"] == "[hermes-orch:orch]"
+    assert created["title"] == f"Orchestrator {MARKER}"
+    assert created["resolve_marker"] == MARKER
     assert created["cwd"] == REPO_ROOT
     assert created["upper_command"] == DASHBOARD_COMMAND
     assert created["lower_command"] == HERMES_COMMAND
@@ -549,7 +561,7 @@ async def test_unowned_marker_workspaces_are_closed_as_orphans(
     bindings: CmuxSurfaceBindings,
 ) -> None:
     port = FakeWorkspacePort()
-    orphan = port.seed_workspace("Orchestrator [hermes-orch:orch]")
+    orphan = port.seed_workspace(f"Orchestrator {MARKER}")
     unrelated = port.seed_workspace("Sol lead [hermes:intent-9]")
     owner = lifecycle(port, bindings)
 
@@ -1766,3 +1778,217 @@ def test_fence_transfers_deterministically_after_release(
             acquire_workspace_fence(tmp_path / "state")
     finally:
         second.release()
+
+
+# ---------------------------------------------------------------------------
+# Sol packet 21a9edaf: namespaced ownership tokens — an isolated state
+# directory can never claim or close another directory's workspaces.
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle_for(
+    port: FakeWorkspacePort,
+    database: Database,
+    state_dir: Path,
+    name: str = "orchestrator",
+) -> tuple[OrchestratorWorkspaceLifecycle, CmuxSurfaceBindings]:
+    bindings_for = CmuxSurfaceBindings(
+        database=database, events=EventStore(database)
+    )
+    return (
+        OrchestratorWorkspaceLifecycle(
+            port=port,
+            bindings=bindings_for,
+            repo_root=REPO_ROOT,
+            state_dir=state_dir,
+            name=name,
+            lineage=port,
+        ),
+        bindings_for,
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_default_smoke_leaves_production_untouched(
+    tmp_path: Path,
+) -> None:
+    # Sol's defect scenario, all defaults: production and the isolated
+    # smoke share one cmux and both use --name orchestrator. The
+    # namespace (canonical state dir digest) keeps the production
+    # workspace and binding invisible to the smoke.
+    port = FakeWorkspacePort()
+    production_db = Database.open(tmp_path / "production.db")
+    isolated_db = Database.open(tmp_path / "isolated.db")
+    try:
+        production, production_bindings = _lifecycle_for(
+            port, production_db, tmp_path / "production-state"
+        )
+        production_state = await production.ensure()
+
+        isolated, _ = _lifecycle_for(
+            port, isolated_db, tmp_path / "isolated-state"
+        )
+        evidence = await run_smoke(OrchestratorWorkspaceOwner(isolated))
+
+        assert evidence["passed"] is True
+        assert production_state.workspace_uuid in port.workspaces
+        binding = production_bindings.active_orchestrator()
+        assert binding is not None
+        assert binding.workspace_uuid == production_state.workspace_uuid
+        assert binding.state == "active"
+        assert production_state.workspace_uuid not in port.closed
+        assert (
+            production_state.workspace_uuid
+            in evidence["preexisting"]["workspaces"]
+        )
+        assert evidence["preexisting"]["survived_untouched"] is True
+    finally:
+        production_db.close()
+        isolated_db.close()
+
+
+@pytest.mark.asyncio
+async def test_two_state_dirs_same_name_touch_only_their_own_workspaces(
+    tmp_path: Path,
+) -> None:
+    port = FakeWorkspacePort()
+    db_a = Database.open(tmp_path / "a.db")
+    db_b = Database.open(tmp_path / "b.db")
+    try:
+        side_a, _ = _lifecycle_for(port, db_a, tmp_path / "state-a", "orch")
+        side_b, _ = _lifecycle_for(port, db_b, tmp_path / "state-b", "orch")
+        state_a = await side_a.ensure()
+        state_b = await side_b.ensure()
+        assert state_a.workspace_uuid != state_b.workspace_uuid
+        assert len(port.workspaces) == 2
+
+        # A recovers only its own pane; B's workspace is untouched.
+        port.kill_process(state_a.lower.surface_uuid)
+        recovered = await side_a.ensure()
+        assert recovered.outcome == "recovered"
+        assert recovered.workspace_uuid == state_a.workspace_uuid
+        adopted_b = await side_b.ensure()
+        assert adopted_b.outcome == "adopted"
+
+        # B tears down only its own exact workspace.
+        closed = await side_b.close()
+        assert closed == (state_b.workspace_uuid,)
+        assert state_a.workspace_uuid in port.workspaces
+        assert state_b.workspace_uuid not in port.workspaces
+    finally:
+        db_a.close()
+        db_b.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_cleanup_ignores_foreign_namespace_markers(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    foreign = port.seed_workspace(
+        "Orchestrator [hermes-orch:abababababab:orch]"
+    )
+    own_orphan = port.seed_workspace(f"Orchestrator {MARKER}")
+    owner = lifecycle(port, bindings)
+
+    state = await owner.ensure()
+
+    assert own_orphan in port.closed
+    assert foreign not in port.closed
+    assert foreign in port.workspaces
+    assert state.outcome == "created"
+
+
+@pytest.mark.asyncio
+async def test_legacy_binding_migrates_and_foreign_legacy_is_refused(
+    tmp_path: Path,
+) -> None:
+    port = FakeWorkspacePort()
+    owning_db = Database.open(tmp_path / "owning.db")
+    isolated_db = Database.open(tmp_path / "isolated.db")
+    try:
+        # A legacy production workspace, bound in ITS OWN database.
+        upper, _lower = await port.create_two_pane_workspace(
+            title=f"Orchestrator {LEGACY_MARKER}",
+            cwd=REPO_ROOT,
+            upper_command=(
+                "uv run hermes-orchestrator --repo-root /repo/orchestrator "
+                f"--state-dir {tmp_path}/owning-state dashboard "
+                "--interval 30"
+            ),
+            lower_command=HERMES_COMMAND,
+        )
+        owning, owning_bindings = _lifecycle_for(
+            port, owning_db, tmp_path / "owning-state", "orch"
+        )
+        legacy_binding = owning_bindings.bind_orchestrator(upper)
+
+        # An isolated database sees the legacy marker but does not own
+        # it: refused for adoption AND cleanup, visibly, never closed.
+        isolated, _ = _lifecycle_for(
+            port, isolated_db, tmp_path / "isolated-state", "orch"
+        )
+        isolated_state = await isolated.ensure()
+        assert upper.workspace_uuid in isolated_state.ignored_legacy
+        assert upper.workspace_uuid not in port.closed
+        assert isolated_state.workspace_uuid != upper.workspace_uuid
+
+        # The owning database migrates deterministically: renamed to
+        # the namespaced token, journaled through replace(), adopted.
+        migrated = await owning.ensure()
+        assert migrated.workspace_uuid == upper.workspace_uuid
+        assert migrated.outcome == "adopted"
+        assert migrated.generation == legacy_binding.generation + 1
+        assert port.workspaces[upper.workspace_uuid].title == (
+            f"Orchestrator {owning.marker}"
+        )
+        assert owning_bindings.get(legacy_binding.binding_id).state == (
+            "stale"
+        )
+        assert migrated.ignored_legacy == ()
+        # Idempotent: the next ensure has nothing legacy left to do.
+        again = await owning.ensure()
+        assert again.outcome == "adopted"
+        assert again.generation == migrated.generation
+    finally:
+        owning_db.close()
+        isolated_db.close()
+
+
+@pytest.mark.asyncio
+async def test_smoke_evidence_proves_preexisting_workspaces_survive(
+    tmp_path: Path,
+) -> None:
+    # Sol test 5's receipt schema: the evidence records the identities
+    # that pre-existed on the shared cmux and that isolated teardown
+    # left every one of them alive.
+    port = FakeWorkspacePort()
+    production = port.seed_workspace("Orchestrator")
+    legacy = port.seed_workspace(f"Old seat {LEGACY_MARKER}")
+    smoke_db = Database.open(tmp_path / "smoke.db")
+    try:
+        smoke_lifecycle, _ = _lifecycle_for(
+            port, smoke_db, tmp_path / "smoke-state", "orch"
+        )
+        evidence = await run_smoke(
+            OrchestratorWorkspaceOwner(smoke_lifecycle)
+        )
+    finally:
+        smoke_db.close()
+
+    assert evidence["passed"] is True
+    pre = evidence["preexisting"]
+    assert production in pre["workspaces"]
+    assert legacy in pre["workspaces"]
+    assert pre["legacy_marker_workspaces"] == [legacy]
+    assert pre["survived_untouched"] is True
+    assert production in port.workspaces
+    assert legacy in port.workspaces
+
+    # The clause is mandatory: a receipt claiming a disturbed
+    # pre-existing workspace fails the smoke.
+    import copy
+
+    broken = copy.deepcopy(evidence)
+    broken["preexisting"]["survived_untouched"] = False
+    assert smoke_passed(broken) is False

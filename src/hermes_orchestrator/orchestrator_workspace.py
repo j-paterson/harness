@@ -169,8 +169,56 @@ def hermes_pane_command(session_name: str) -> str:
     return f"hermes chat --continue {session_name} --create-if-missing"
 
 
-def workspace_marker(name: str) -> str:
-    """The exact-token title marker correlating workspace to lifecycle."""
+def state_namespace(state_dir: Path) -> str:
+    """The stable ownership namespace for one canonical state directory.
+
+    Sol packet 21a9edaf: ownership tokens were name-only, so an
+    isolated-state smoke sharing the production cmux could discover
+    and close the production workspace. The namespace is a short
+    stable digest (12 hex of sha256) of the CANONICAL resolved state
+    directory path: two different state directories can never produce
+    the same ownership token for the same human label, and only the
+    database that owns a state directory can address its workspaces.
+    """
+
+    canonical = str(state_dir.expanduser().resolve(strict=False))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+_NAMESPACE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def workspace_marker(name: str, *, namespace: str) -> str:
+    """The exact ownership token correlating workspace to lifecycle.
+
+    ``[hermes-orch:<namespace>:<name>]`` — the namespace binds the
+    token to one canonical state directory, the name stays the
+    cosmetic human label (the visible title carries both, separately:
+    ``<title> <marker>``). ALL discovery, adoption, and orphan
+    cleanup match only this full token; a marker-compatible workspace
+    with a foreign or missing namespace is invisible to them.
+    """
+
+    if _NAME.fullmatch(name) is None:
+        raise WorkspaceRefused(
+            "an orchestrator workspace name must be one bounded token"
+        )
+    if _NAMESPACE.fullmatch(namespace) is None:
+        raise WorkspaceRefused(
+            "an ownership namespace must be 12 lowercase hex digits"
+        )
+    return f"[hermes-orch:{namespace}:{name}]"
+
+
+def legacy_workspace_marker(name: str) -> str:
+    """The retired unnamespaced token, recognized only for migration.
+
+    A workspace carrying this token is adopted or cleaned up by
+    NOBODY: the one exception is deterministic migration — when its
+    workspace is the one bound in THIS state directory's own database,
+    it is renamed to the namespaced token; any other bearer is ignored
+    entirely, visibly, and never closed.
+    """
 
     if _NAME.fullmatch(name) is None:
         raise WorkspaceRefused(
@@ -510,6 +558,10 @@ class OrchestratorWorkspacePort(Protocol):
         self, *, title_marker: str
     ) -> frozenset[str]: ...
 
+    async def rename_workspace(
+        self, workspace_uuid: str, title: str
+    ) -> None: ...
+
     async def respawn_surface(
         self, ref: CmuxSurfaceRef, command: str
     ) -> None: ...
@@ -536,6 +588,10 @@ class OrchestratorWorkspaceState:
     generation: int
     outcome: str  # "created" | "adopted" | "recovered"
     respawned: tuple[str, ...]
+    #: Legacy unnamespaced marker bearers this ensure refused to touch
+    #: (not bound in this database): visible in owner state, never
+    #: adopted, never closed.
+    ignored_legacy: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -546,6 +602,7 @@ class OrchestratorWorkspaceState:
             "generation": self.generation,
             "outcome": self.outcome,
             "respawned": list(self.respawned),
+            "ignored_legacy": list(self.ignored_legacy),
         }
 
 
@@ -577,7 +634,22 @@ class OrchestratorWorkspaceLifecycle:
             repo_root=repo_root, state_dir=state_dir, interval=interval
         )
         self._hermes_command = hermes_pane_command(session_name or name)
-        self._marker = workspace_marker(name)
+        self._namespace = state_namespace(state_dir)
+        self._marker = workspace_marker(name, namespace=self._namespace)
+        self._legacy_marker = legacy_workspace_marker(name)
+        self._last_ignored_legacy: tuple[str, ...] = ()
+
+    @property
+    def namespace(self) -> str:
+        return self._namespace
+
+    @property
+    def legacy_marker(self) -> str:
+        return self._legacy_marker
+
+    @property
+    def last_ignored_legacy(self) -> tuple[str, ...]:
+        return self._last_ignored_legacy
 
     @property
     def marker(self) -> str:
@@ -695,6 +767,7 @@ class OrchestratorWorkspaceLifecycle:
 
         self._refuse_if_marked()
         binding = self._bindings.active_orchestrator()
+        binding = await self._reconcile_legacy(binding)
         await self._close_orphans(binding)
         if binding is None:
             return await self._create(replacing=None)
@@ -705,6 +778,44 @@ class OrchestratorWorkspaceLifecycle:
         if _contains(live, binding.workspace_uuid):
             await self._port.close_workspace(binding.workspace_uuid)
         return await self._create(replacing=binding)
+
+    async def _reconcile_legacy(
+        self, binding: CmuxBinding | None
+    ) -> CmuxBinding | None:
+        """Deterministic handling of retired unnamespaced markers.
+
+        A legacy bearer whose workspace is the one bound in THIS state
+        directory's own database migrates: its title is renamed to the
+        namespaced token and the migration is journaled through
+        ``replace()`` (same surfaces, successor generation). Every
+        other legacy bearer — production seen from an isolated
+        database included — is ignored entirely: refused for adoption
+        AND for cleanup, recorded visibly on the returned state.
+        """
+
+        legacy = await self._port.find_workspace_uuids(
+            title_marker=self._legacy_marker
+        )
+        ignored: list[str] = []
+        migrated = binding
+        for workspace_uuid in sorted(legacy):
+            if (
+                binding is not None
+                and workspace_uuid.lower()
+                == binding.workspace_uuid.lower()
+            ):
+                await self._port.rename_workspace(
+                    workspace_uuid, f"{self._title} {self._marker}"
+                )
+                migrated = self._bindings.replace(
+                    binding.binding_id,
+                    binding.ref,
+                    reason="orchestrator_marker_namespace_migrated",
+                )
+            else:
+                ignored.append(workspace_uuid)
+        self._last_ignored_legacy = tuple(ignored)
+        return migrated
 
     def _refuse_if_marked(self) -> None:
         if self._inside_marked_pane:
@@ -823,6 +934,7 @@ class OrchestratorWorkspaceLifecycle:
             generation=binding.generation,
             outcome="recovered" if respawned else "adopted",
             respawned=tuple(respawned),
+            ignored_legacy=self._last_ignored_legacy,
         )
 
     async def _create(
@@ -856,6 +968,7 @@ class OrchestratorWorkspaceLifecycle:
             generation=binding.generation,
             outcome="created",
             respawned=(),
+            ignored_legacy=self._last_ignored_legacy,
         )
 
     async def _close_orphans(self, binding: CmuxBinding | None) -> None:
@@ -957,6 +1070,22 @@ async def run_smoke(
 
     lifecycle = owner.lifecycle
     port = lifecycle.port
+    # Sol packet 21a9edaf, test 5: record every workspace that already
+    # lives on the shared cmux before this smoke touches anything —
+    # the production Orchestrator included — so the receipt itself can
+    # prove isolated teardown removed only the smoke workspace.
+    preexisting_live = await port.live_workspace_uuids()
+    preexisting_legacy = await port.find_workspace_uuids(
+        title_marker=lifecycle.legacy_marker
+    )
+    preexisting_own_marker = await port.find_workspace_uuids(
+        title_marker=lifecycle.marker
+    )
+    foreign_preexisting = sorted(
+        workspace_uuid
+        for workspace_uuid in preexisting_live
+        if not _contains(preexisting_own_marker, workspace_uuid)
+    )
     first = await owner.start()
     if first is None:
         raise WorkspaceRefused(
@@ -983,6 +1112,11 @@ async def run_smoke(
 
     closed = await owner.teardown()
     remaining = await port.live_workspace_uuids()
+    survivors = {found.lower() for found in remaining}
+    preexisting_untouched = all(
+        workspace_uuid.lower() in survivors
+        for workspace_uuid in foreign_preexisting
+    )
     evidence: dict[str, Any] = {
         "marker": lifecycle.marker,
         "stack_direction": STACK_DIRECTION,
@@ -1012,6 +1146,11 @@ async def run_smoke(
                 remaining, second.workspace_uuid
             ),
         },
+        "preexisting": {
+            "workspaces": foreign_preexisting,
+            "legacy_marker_workspaces": sorted(preexisting_legacy),
+            "survived_untouched": preexisting_untouched,
+        },
     }
     evidence["passed"] = smoke_passed(evidence)
     return evidence
@@ -1023,9 +1162,13 @@ def smoke_passed(evidence: dict[str, Any]) -> bool:
     Every clause is mandatory: both stacked panes with both role
     identities proven on the first ensure AND after restart recovery,
     stable identities across inspections, an actual workspace
-    replacement with an advanced binding generation, and a confirmed
-    teardown. A smoke that adopts instead of rebuilding, or proves
-    processes without their role identities, fails.
+    replacement with an advanced binding generation, a confirmed
+    teardown, AND every pre-existing foreign workspace on the shared
+    cmux surviving untouched (Sol 21a9edaf: an isolated smoke that
+    disturbs anything it does not own — the production Orchestrator
+    workspace included — fails). A smoke that adopts instead of
+    rebuilding, or proves processes without their role identities,
+    fails.
     """
 
     inspection = evidence["inspection"]
@@ -1039,6 +1182,7 @@ def smoke_passed(evidence: dict[str, Any]) -> bool:
         and recovery["workspace_replaced"]
         and recovery["generation_advanced"]
         and not evidence["teardown"]["workspace_remains"]
+        and evidence["preexisting"]["survived_untouched"]
     )
 
 
