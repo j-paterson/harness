@@ -39,7 +39,7 @@ STATE_DIR = Path("/state/orchestrator")
 
 DASHBOARD_COMMAND = (
     "uv run hermes-orchestrator --repo-root /repo/orchestrator "
-    "--state-dir /state/orchestrator dashboard --interval 30"
+    "--state-dir /state/orchestrator dashboard --interval 10"
 )
 UPPER_MARKER = DASHBOARD_COMMAND.removeprefix("uv run ")
 LOWER_WRAPPED = (
@@ -339,11 +339,24 @@ def test_upper_command_is_the_lock_free_dashboard_entry() -> None:
     # against the same state directory loses the exclusive lock and
     # respawn-loops. The upper entry is the read-only dashboard.
     command = dashboard_pane_command(
-        repo_root=REPO_ROOT, state_dir=STATE_DIR, interval=30
+        repo_root=REPO_ROOT, state_dir=STATE_DIR, interval=10
     )
     assert command == DASHBOARD_COMMAND
     assert " dashboard " in f"{command} "
     assert " daemon" not in command
+
+
+def test_lifecycle_defaults_to_a_ten_second_dashboard_interval(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    # INFRA-209: the daemon-owned lifecycle ticks the left status pane
+    # every 10s by default (down from 30s) when the caller (runtime.py)
+    # composes it without an explicit interval.
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+
+    assert owner.dashboard_command == DASHBOARD_COMMAND
+    assert "--interval 10" in owner.dashboard_command
 
 
 @pytest.mark.parametrize(
@@ -387,7 +400,7 @@ def test_hermes_session_name_is_grammar_bound(name: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_builds_two_stacked_panes_and_binds_durably(
+async def test_create_builds_two_side_by_side_panes_and_binds_durably(
     bindings: CmuxSurfaceBindings,
 ) -> None:
     port = FakeWorkspacePort()
@@ -525,7 +538,7 @@ async def test_partial_workspace_is_closed_and_rebuilt(
 
 
 @pytest.mark.asyncio
-async def test_tabbed_single_pane_layout_is_not_two_stacked_panes(
+async def test_tabbed_single_pane_layout_is_not_two_side_by_side_panes(
     bindings: CmuxSurfaceBindings,
 ) -> None:
     port = FakeWorkspacePort()
@@ -702,12 +715,12 @@ def test_cli_ensure_dispatches_and_reports_identities(
     assert payload["upper_surface_uuid"] != payload["lower_surface_uuid"]
 
 
-def test_cli_smoke_proves_two_real_stacked_panes_with_stable_identities(
+def test_cli_smoke_proves_two_real_side_by_side_panes_with_stable_identities(
     configured_repo: tuple[Path, Path], cli_port: FakeWorkspacePort
 ) -> None:
     # Sol correction f28e8484: CLI-level proof of exactly two real
-    # panes in one workspace, vertically stacked, with stable
-    # identities across inspection calls — and teardown.
+    # panes in one workspace, side by side, with stable identities
+    # across inspection calls — and teardown.
     exit_code, output = invoke(
         cli_arguments(
             configured_repo,
@@ -722,7 +735,7 @@ def test_cli_smoke_proves_two_real_stacked_panes_with_stable_identities(
     assert exit_code == 0
     evidence = json.loads(output)
     assert evidence["passed"] is True
-    assert evidence["stack_direction"] == "vertical"
+    assert evidence["stack_direction"] == "horizontal"
     assert evidence["inspection"]["pane_count"] == 2
     assert evidence["inspection"]["distinct_panes"] == 2
     assert evidence["stable_identities"] is True
@@ -1296,7 +1309,7 @@ def test_lineage_rejects_non_executable_occurrences(line: str) -> None:
         DASHBOARD_COMMAND.replace(
             "/state/orchestrator", "/state/other"
         ),
-        DASHBOARD_COMMAND.replace("--interval 30", "--interval 31"),
+        DASHBOARD_COMMAND.replace("--interval 10", "--interval 11"),
         # uv without the literal run token.
         DASHBOARD_COMMAND.replace("uv run ", "uv "),
     ],
@@ -1914,7 +1927,7 @@ async def test_legacy_binding_migrates_and_foreign_legacy_is_refused(
             upper_command=(
                 "uv run hermes-orchestrator --repo-root /repo/orchestrator "
                 f"--state-dir {tmp_path}/owning-state dashboard "
-                "--interval 30"
+                "--interval 10"
             ),
             lower_command=HERMES_COMMAND,
         )

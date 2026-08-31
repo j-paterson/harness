@@ -9,10 +9,17 @@ import pytest
 
 from hermes_orchestrator.codex_rpc import CodexRateLimits
 from hermes_orchestrator.dashboard_sources import (
+    CapacityProvider,
+    ClaudeUsageCacheProvider,
     CodexStatusProvider,
+    ControlAttentionProvider,
     DashboardSources,
     ProfileUsage,
+    ResourceProvider,
+    TaskProvider,
+    TransitionProvider,
     UsageAggregator,
+    WorkerProvider,
 )
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
@@ -220,4 +227,778 @@ async def test_collect_reports_all_profiles_leases_and_codex(
     )
     assert snapshot.codex.available is False
     assert snapshot.codex.unavailable_since == now.isoformat()
+    database.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-209 (requirements reread): Work/Capacity/System/Attention providers.
+# ---------------------------------------------------------------------------
+
+
+def _insert_issue(
+    connection,
+    *,
+    issue_id: str,
+    project_key: str,
+    priority: int,
+    state: str,
+    updated_at: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO admitted_issues("
+        "issue_id, project_key, priority, state, admitted_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?)",
+        (issue_id, project_key, priority, state, updated_at, updated_at),
+    )
+
+
+def _insert_cell(
+    connection,
+    *,
+    cell_id: str,
+    project_key: str,
+    state: str,
+    profile_alias: str | None,
+    session_id: str | None,
+) -> None:
+    connection.execute(
+        "INSERT INTO project_cells("
+        "cell_id, project_key, state, profile_alias, session_id, "
+        "created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            cell_id,
+            project_key,
+            state,
+            profile_alias,
+            session_id,
+            "2026-08-30T00:00:00+00:00",
+            "2026-08-30T00:00:00+00:00",
+        ),
+    )
+
+
+def _insert_review(
+    connection,
+    *,
+    review_id: str,
+    issue_id: str,
+    pr_number: int,
+    state: str,
+    created_at: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO reviews("
+        "review_id, project_key, issue_id, event_id, repository, branch, "
+        "pr_number, reviewed_sha, state, created_at, updated_at"
+        ") VALUES (?, 'proj', ?, ?, 'org/repo', 'feature', ?, 'sha', "
+        "?, ?, ?)",
+        (review_id, issue_id, review_id, pr_number, state, created_at, created_at),
+    )
+
+
+def _insert_settlement(
+    connection,
+    *,
+    settlement_id: str,
+    issue_id: str,
+    state: str,
+    created_at: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO merge_settlements("
+        "settlement_id, project_key, issue_id, event_id, repository, "
+        "branch, pr_number, base_sha, candidate_sha, thread_id, "
+        "thread_generation, manifest_version, path, state, created_at, "
+        "updated_at"
+        ") VALUES (?, 'proj', ?, ?, 'org/repo', 'feature', 1, 'base', "
+        "'candidate', 'thread', 1, 1, 'guarded', ?, ?, ?)",
+        (settlement_id, issue_id, settlement_id, state, created_at, created_at),
+    )
+
+
+def _insert_child(
+    connection, *, session_id: str, child_id: str, state: str
+) -> None:
+    connection.execute(
+        "INSERT INTO lead_children(session_id, child_id, state, started_at) "
+        "VALUES (?, ?, ?, '2026-08-30T00:00:00+00:00')",
+        (session_id, child_id, state),
+    )
+
+
+def test_work_states_are_mapped_and_ranked(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-1",
+            project_key="proj-a",
+            priority=2,
+            state="queued",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-2",
+            project_key="proj-b",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T11:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-3",
+            project_key="proj-c",
+            priority=3,
+            state="review",
+            updated_at="2026-08-30T09:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-4",
+            project_key="proj-d",
+            priority=1,
+            state="paused",
+            updated_at="2026-08-30T08:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-5",
+            project_key="proj-e",
+            priority=1,
+            state="failed",
+            updated_at="2026-08-30T08:00:00+00:00",
+        )
+
+    tasks = TaskProvider(database).tasks()
+
+    assert [(task.issue_id, task.operator_state) for task in tasks] == [
+        ("INFRA-2", "Working"),
+        ("INFRA-3", "Review"),
+        ("INFRA-1", "Queued"),
+        ("INFRA-4", "Paused"),
+        ("INFRA-5", "Blocked"),
+    ]
+    database.close()
+
+
+def test_done_issue_is_omitted_unless_it_is_the_projects_only_issue(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        # proj-a has an in-flight issue: its done issue must be omitted.
+        _insert_issue(
+            connection,
+            issue_id="INFRA-10",
+            project_key="proj-a",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T11:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-9",
+            project_key="proj-a",
+            priority=1,
+            state="done",
+            updated_at="2026-08-30T09:00:00+00:00",
+        )
+        # proj-b has only done issues: the most recently updated survives.
+        _insert_issue(
+            connection,
+            issue_id="INFRA-20",
+            project_key="proj-b",
+            priority=1,
+            state="done",
+            updated_at="2026-08-30T08:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-21",
+            project_key="proj-b",
+            priority=1,
+            state="done",
+            updated_at="2026-08-30T12:00:00+00:00",
+        )
+
+    tasks = TaskProvider(database).tasks()
+
+    assert {task.issue_id for task in tasks} == {"INFRA-10", "INFRA-21"}
+    survivor = next(task for task in tasks if task.issue_id == "INFRA-21")
+    assert survivor.operator_state == "Done"
+    database.close()
+
+
+def test_tasks_join_lead_children_pr_and_settlement(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-30",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_cell(
+            connection,
+            cell_id="cell-old",
+            project_key="proj",
+            state="completed",
+            profile_alias="max-z",
+            session_id="stale-session",
+        )
+        _insert_cell(
+            connection,
+            cell_id="cell-active",
+            project_key="proj",
+            state="active",
+            profile_alias="max-c",
+            session_id="session-live",
+        )
+        _insert_child(
+            connection,
+            session_id="session-live",
+            child_id="child-1",
+            state="completed",
+        )
+        _insert_child(
+            connection,
+            session_id="session-live",
+            child_id="child-2",
+            state="started",
+        )
+        _insert_child(
+            connection,
+            session_id="stale-session",
+            child_id="child-x",
+            state="completed",
+        )
+        _insert_review(
+            connection,
+            review_id="rev-1",
+            issue_id="INFRA-30",
+            pr_number=35,
+            state="corrections_required",
+            created_at="2026-08-30T09:00:00+00:00",
+        )
+        _insert_review(
+            connection,
+            review_id="rev-2",
+            issue_id="INFRA-30",
+            pr_number=37,
+            state="merged",
+            created_at="2026-08-30T11:00:00+00:00",
+        )
+        _insert_settlement(
+            connection,
+            settlement_id="settle-1",
+            issue_id="INFRA-30",
+            state="settled",
+            created_at="2026-08-30T11:30:00+00:00",
+        )
+
+    [task] = TaskProvider(database).tasks()
+
+    assert task.lead_profile == "max-c"
+    assert task.children_completed == 1
+    assert task.children_total == 2
+    # The latest review (by created_at) wins, not insertion order.
+    assert task.pr_number == 37
+    assert task.review_state == "merged"
+    assert task.settlement_state == "settled"
+    database.close()
+
+
+def test_tasks_observed_at_is_the_latest_updated_at_or_none(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    assert TaskProvider(database).observed_at() is None
+
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-11",
+            project_key="proj",
+            priority=1,
+            state="queued",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-12",
+            project_key="proj",
+            priority=1,
+            state="done",
+            updated_at="2026-08-30T12:00:00+00:00",
+        )
+
+    assert TaskProvider(database).observed_at() == "2026-08-30T12:00:00+00:00"
+    database.close()
+
+
+def test_capacity_provider_returns_latest_per_alias_and_none_when_absent(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES (?, 'fable', 'capped', 'provider_limit', ?, ?)",
+            ("max-a", "2026-08-30T06:00:00+00:00", "2026-08-31T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES (?, 'fable', 'available', 'operator_attestation', ?, NULL)",
+            ("max-a", "2026-08-30T09:00:00+00:00"),
+        )
+        # A non-fable observation must never shadow the fable row.
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES (?, 'other-model', 'capped', 'provider_limit', ?, NULL)",
+            ("max-a", "2026-08-30T10:00:00+00:00"),
+        )
+
+    capacity = CapacityProvider(database, _registry(tmp_path)).capacity()
+
+    assert tuple(fact.profile_alias for fact in capacity) == _ALIASES
+    max_a = capacity[0]
+    assert max_a.state == "available"
+    assert max_a.source == "operator_attestation"
+    assert max_a.observed_at == "2026-08-30T09:00:00+00:00"
+    assert max_a.resets_at is None
+
+    max_b = capacity[1]
+    assert max_b.state is None
+    assert max_b.source is None
+    assert max_b.observed_at is None
+    assert max_b.resets_at is None
+    database.close()
+
+
+def test_resource_provider_returns_the_latest_sample_and_min_disk_free(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    assert ResourceProvider(database).resource() is None
+
+    with database.transaction() as connection:
+        for sample_id, sampled_at, disk_json in (
+            ("sample-1", "2026-08-30T10:00:00+00:00", "{}"),
+            (
+                "sample-2",
+                "2026-08-30T11:00:00+00:00",
+                '{"root": 500, "data": 137}',
+            ),
+        ):
+            connection.execute(
+                "INSERT INTO resource_samples("
+                "sample_id, sampled_at, pressure, available_memory_bytes, "
+                "total_memory_bytes, swap_used_bytes, load_one, "
+                "logical_cpus, disk_json, managed_rss_bytes"
+                ") VALUES (?, ?, 'green', 1000, 2000, 0, 0.5, 8, ?, 500)",
+                (sample_id, sampled_at, disk_json),
+            )
+
+    resource = ResourceProvider(database).resource()
+
+    assert resource is not None
+    assert resource.sampled_at == "2026-08-30T11:00:00+00:00"
+    assert resource.pressure == "green"
+    assert resource.available_memory_bytes == 1000
+    assert resource.total_memory_bytes == 2000
+    assert resource.logical_cpus == 8
+    assert resource.managed_rss_bytes == 500
+    assert resource.min_disk_free_bytes == 137
+    database.close()
+
+
+def test_resource_provider_none_disk_free_when_disk_json_is_empty(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO resource_samples("
+            "sample_id, sampled_at, pressure, available_memory_bytes, "
+            "total_memory_bytes, swap_used_bytes, load_one, "
+            "logical_cpus, disk_json, managed_rss_bytes"
+            ") VALUES ('s', '2026-08-30T10:00:00+00:00', 'green', 1, 2, "
+            "0, 0.1, 1, '{}', 1)",
+        )
+
+    resource = ResourceProvider(database).resource()
+
+    assert resource is not None
+    assert resource.min_disk_free_bytes is None
+    database.close()
+
+
+def test_worker_provider_counts_active_leases_by_kind(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        for lease_id, kind, state in (
+            ("w-1", "claude_subagent", "active"),
+            ("w-2", "claude_subagent", "active"),
+            ("w-3", "resource_sampler", "active"),
+            ("w-4", "claude_subagent", "expired"),
+        ):
+            connection.execute(
+                "INSERT INTO worker_leases("
+                "lease_id, worker_id, project_key, kind, state, acquired_at"
+                ") VALUES (?, ?, 'proj', ?, ?, '2026-08-30T00:00:00+00:00')",
+                (lease_id, lease_id, kind, state),
+            )
+
+    workers = WorkerProvider(database).workers()
+
+    assert workers.active_total == 3
+    assert dict(workers.active_by_kind) == {
+        "claude_subagent": 2,
+        "resource_sampler": 1,
+    }
+    database.close()
+
+
+def test_transition_provider_tracks_the_latest_whitelisted_event_per_project(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    events = EventStore(database)
+    provider = TransitionProvider(database)
+
+    def _append(event_type: str, payload: dict, aggregate_id: str = "x") -> None:
+        with database.transaction() as connection:
+            events.append(
+                connection,
+                EventInput(
+                    event_type=event_type,
+                    aggregate_type="project_cell",
+                    aggregate_id=aggregate_id,
+                    payload=payload,
+                ),
+            )
+
+    _append(
+        "review.recorded",
+        {"project_key": "proj-a", "state": "approved"},
+    )
+    _append(
+        "project_cell.rotated",
+        {
+            "project_key": "proj-b",
+            "previous_profile_alias": "max-b",
+            "profile_alias": "max-c",
+        },
+    )
+    _append(
+        "lead_correction.queued",
+        {"project_key": "proj-a", "reason": "Important"},
+    )
+    # Not on the whitelist: must never surface as a transition.
+    _append("stream.assistant", {"project_key": "proj-a"})
+    # A control op event of an unlisted kind must be ignored too.
+    _append(
+        "control_operation.published",
+        {"project_key": "proj-c", "kind": "housekeeping.noop"},
+    )
+
+    provider.advance()
+    transitions = {t.project_key: t.phrase for t in provider.transitions()}
+
+    assert transitions["proj-a"] == "correction queued (Important)"
+    assert transitions["proj-b"] == "rotated max-b→max-c"
+    assert "proj-c" not in transitions
+
+    # A second advance with no new rows must not change anything.
+    provider.advance()
+    assert {t.project_key: t.phrase for t in provider.transitions()} == transitions
+    database.close()
+
+
+def test_control_attention_provider_finds_the_latest_whitelisted_published_op(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, state, created_at, "
+            "updated_at"
+            ") VALUES ('op-1', 1, 'lead.launch_failed', 'proj-a', 'cell-1', "
+            "'sess-1', 'dedup-1', '{}', 'published', "
+            "'2026-08-30T09:00:00+00:00', '2026-08-30T09:00:00+00:00')",
+        )
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, state, created_at, "
+            "updated_at"
+            ") VALUES ('op-2', 1, 'channel.approval_required', 'proj-b', "
+            "'cell-2', 'sess-2', 'dedup-2', '{}', 'published', "
+            "'2026-08-30T10:00:00+00:00', '2026-08-30T10:00:00+00:00')",
+        )
+        # A superseded row and an unlisted kind must never win.
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, state, created_at, "
+            "updated_at"
+            ") VALUES ('op-3', 1, 'channel.approval_required', 'proj-c', "
+            "'cell-3', 'sess-3', 'dedup-3', '{}', 'superseded', "
+            "'2026-08-30T11:00:00+00:00', '2026-08-30T11:00:00+00:00')",
+        )
+
+    fact = ControlAttentionProvider(database).latest()
+
+    assert fact is not None
+    assert fact.project_key == "proj-b"
+    assert fact.kind == "channel.approval_required"
+    database.close()
+
+
+@pytest.mark.asyncio
+async def test_collect_fills_work_capacity_system_and_attention_facts(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-20",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES ('max-a', 'fable', 'available', "
+            "'operator_attestation', ?, NULL)",
+            ("2026-08-30T09:00:00+00:00",),
+        )
+        connection.execute(
+            "INSERT INTO resource_samples("
+            "sample_id, sampled_at, pressure, available_memory_bytes, "
+            "total_memory_bytes, swap_used_bytes, load_one, "
+            "logical_cpus, disk_json, managed_rss_bytes"
+            ") VALUES ('sample-1', ?, 'green', 1000, 2000, 0, 0.5, 8, "
+            "'{}', 500)",
+            ("2026-08-30T11:30:00+00:00",),
+        )
+        connection.execute(
+            "INSERT INTO worker_leases("
+            "lease_id, worker_id, project_key, kind, state, acquired_at"
+            ") VALUES ('w-1', 'w-1', 'proj', 'claude_subagent', 'active', "
+            "'2026-08-30T00:00:00+00:00')",
+        )
+
+    sources = DashboardSources(database=database, registry=_registry(tmp_path))
+    now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+    snapshot = await sources.collect(now)
+
+    assert len(snapshot.tasks) == 1
+    assert snapshot.tasks[0].issue_id == "INFRA-20"
+    assert snapshot.tasks_observed_at == "2026-08-30T10:00:00+00:00"
+    assert len(snapshot.capacity) == len(_ALIASES)
+    assert snapshot.capacity[0].state == "available"
+    assert snapshot.resource is not None
+    assert snapshot.resource.sampled_at == "2026-08-30T11:30:00+00:00"
+    assert snapshot.workers.active_total == 1
+    assert snapshot.transitions == ()
+    assert snapshot.attention_control is None
+    database.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-209 addendum: the local Claude usage-percentage cache.
+# ---------------------------------------------------------------------------
+
+_FABLE_LIMIT = {
+    "kind": "weekly_scoped",
+    "scope": {"model": {"display_name": "Fable"}},
+    "percent": 12,
+    "resets_at": "2026-09-01T00:00:00+00:00",
+    "severity": "normal",
+    "is_active": True,
+}
+
+_CACHE_DOCUMENT = {
+    "cachedUsageUtilization": {
+        "fetchedAtMs": 1798700400000,  # 2026-12-31T05:00:00Z-ish; any int works
+        "utilization": {
+            "five_hour": {
+                "utilization": 41,
+                "resets_at": "2026-08-30T14:00:00+00:00",
+            },
+            "seven_day": {
+                "utilization": 63,
+                "resets_at": "2026-09-01T00:00:00+00:00",
+            },
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "scope": {"model": {"display_name": "Codex"}},
+                    "percent": 90,
+                },
+                _FABLE_LIMIT,
+            ],
+        },
+    }
+}
+
+
+def _fake_reader(documents: dict):
+    import json as _json
+
+    def _read(path) -> str:
+        key = str(path)
+        if key not in documents:
+            raise FileNotFoundError(key)
+        return _json.dumps(documents[key])
+
+    return _read
+
+
+def test_claude_usage_cache_parses_five_hour_seven_day_and_fable_window(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    path = str(registry.get("max-a").config_dir / ".claude.json")
+    provider = ClaudeUsageCacheProvider(
+        registry, read_text=_fake_reader({path: _CACHE_DOCUMENT})
+    )
+
+    windows = dict(provider.windows())
+
+    max_a = windows["max-a"]
+    assert max_a.five_hour_used == 41
+    assert max_a.five_hour_resets_at == "2026-08-30T14:00:00+00:00"
+    assert max_a.seven_day_used == 63
+    assert max_a.fable_used == 12
+    assert max_a.fable_resets_at == "2026-09-01T00:00:00+00:00"
+    assert max_a.fable_severity == "normal"
+    assert max_a.fable_active is True
+    assert max_a.fetched_at is not None
+
+    # No file at all for the other aliases.
+    assert windows["max-b"].fetched_at is None
+    assert windows["max-b"].fable_used is None
+
+
+def test_claude_usage_cache_absent_or_malformed_is_never_a_raise(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+
+    def _raising(_path) -> str:
+        raise PermissionError("no access")
+
+    windows = dict(ClaudeUsageCacheProvider(registry, read_text=_raising).windows())
+    assert windows["max-a"].fetched_at is None
+
+    def _malformed(_path) -> str:
+        return "{not valid json"
+
+    windows = dict(ClaudeUsageCacheProvider(registry, read_text=_malformed).windows())
+    assert windows["max-a"].fetched_at is None
+
+    def _missing_key(_path) -> str:
+        return "{}"
+
+    windows = dict(
+        ClaudeUsageCacheProvider(registry, read_text=_missing_key).windows()
+    )
+    assert windows["max-a"].fetched_at is None
+
+
+def test_capacity_provider_merges_windows_by_alias(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    from hermes_orchestrator.dashboard_sources import _EMPTY_WINDOWS, UsageWindows
+
+    windows_by_alias = {
+        "max-a": UsageWindows(
+            fetched_at="2026-08-30T11:00:00+00:00",
+            five_hour_used=10,
+            five_hour_resets_at=None,
+            seven_day_used=20,
+            seven_day_resets_at=None,
+            fable_used=30,
+            fable_resets_at=None,
+            fable_severity="normal",
+            fable_active=True,
+        ),
+    }
+    facts = CapacityProvider(_database(tmp_path), registry).capacity(
+        windows_by_alias
+    )
+    assert facts[0].windows.fable_used == 30
+    assert facts[1].windows == _EMPTY_WINDOWS
+
+
+@pytest.mark.asyncio
+async def test_cache_change_between_ticks_updates_only_that_profile(
+    tmp_path: Path,
+) -> None:
+    # Acceptance (b): the same action/sources instance re-reads the cache
+    # every tick, and a change to one profile's file must never disturb
+    # any other profile's row.
+    registry = _registry(tmp_path)
+    documents: dict[str, dict] = {}
+    path_a = str(registry.get("max-a").config_dir / ".claude.json")
+    path_b = str(registry.get("max-b").config_dir / ".claude.json")
+    documents[path_a] = _CACHE_DOCUMENT
+
+    def _read(path) -> str:
+        import json as _json
+
+        key = str(path)
+        if key not in documents:
+            raise FileNotFoundError(key)
+        return _json.dumps(documents[key])
+
+    database = _database(tmp_path)
+    sources = DashboardSources(
+        database=database, registry=registry, claude_usage_read_text=_read
+    )
+    now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+
+    first = await sources.collect(now)
+    first_by_alias = {fact.profile_alias: fact for fact in first.capacity}
+    assert first_by_alias["max-a"].windows.fable_used == 12
+    assert first_by_alias["max-b"].windows.fetched_at is None
+
+    documents[path_b] = {
+        "cachedUsageUtilization": {
+            "fetchedAtMs": 1798700400000,
+            "utilization": {
+                "five_hour": {"utilization": 5, "resets_at": None},
+                "seven_day": {"utilization": 9, "resets_at": None},
+                "limits": [
+                    {
+                        "kind": "weekly_scoped",
+                        "scope": {"model": {"display_name": "Fable"}},
+                        "percent": 3,
+                        "resets_at": None,
+                        "severity": "normal",
+                        "is_active": True,
+                    }
+                ],
+            },
+        }
+    }
+    second = await sources.collect(now)
+    second_by_alias = {fact.profile_alias: fact for fact in second.capacity}
+
+    # max-b now has fresh windows; max-a's are unchanged.
+    assert second_by_alias["max-b"].windows.fable_used == 3
+    assert second_by_alias["max-a"].windows.fable_used == 12
     database.close()

@@ -953,7 +953,7 @@ async def test_channel_launch_is_the_primary_classic_seat_path(
 # INFRA-191 W3: the two-pane create / respawn / process-metadata vocabulary
 # for the real two-pane Orchestrator workspace. respawn-pane and top join
 # the closed vocabulary as bounded validated methods, the layout form of
-# new-workspace creates both stacked panes eagerly, and every input
+# new-workspace creates both side-by-side panes eagerly, and every input
 # command and screen read stays structurally rejected.
 # ---------------------------------------------------------------------------
 
@@ -1028,7 +1028,7 @@ def _pane_snapshot(*surface_processes: tuple[str, str, list[str]]) -> bytes:
 
 
 @pytest.mark.asyncio
-async def test_two_pane_create_builds_the_fixed_vertical_layout() -> None:
+async def test_two_pane_create_builds_the_fixed_horizontal_layout() -> None:
     import json as json_module
 
     factory = FakeFactory(
@@ -1066,7 +1066,8 @@ async def test_two_pane_create_builds_the_fixed_vertical_layout() -> None:
     focus_at = create_argv.index("--focus")
     assert create_argv[focus_at + 1] == "false"
     layout = json_module.loads(create_argv[create_argv.index("--layout") + 1])
-    assert layout["direction"] == "vertical"
+    assert layout["direction"] == "horizontal"
+    assert layout["split"] == 0.38
     children = layout["children"]
     assert [
         child["pane"]["surfaces"][0]["type"] for child in children
@@ -1167,7 +1168,7 @@ async def test_two_pane_create_fails_closed_without_two_distinct_panes() -> (
     cmux_module._PANE_POLL_DELAY_SECONDS = 0.0
     try:
         with pytest.raises(
-            CmuxProtocolError, match="two stacked panes"
+            CmuxProtocolError, match="two side-by-side panes"
         ):
             await port.create_two_pane_workspace(
                 title="Orchestrator",

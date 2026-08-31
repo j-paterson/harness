@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -45,6 +46,7 @@ from hermes_orchestrator.cmux_surfaces import (
 from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.context import ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
+from hermes_orchestrator.dashboard_pane import FramePane
 from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
@@ -182,6 +184,15 @@ def _parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--once", action="store_true")
     dashboard.add_argument("--interval", type=_watch_interval, default=30)
     dashboard.add_argument("--json", action="store_true")
+    dashboard.add_argument(
+        "--detail",
+        action="store_true",
+        help=(
+            "show the Detail section: local fable/overall token "
+            "accumulation and raw per-window usage percentages "
+            "(hidden by default per the operator capacity correction)"
+        ),
+    )
 
     cmux_focus = commands.add_parser(
         "cmux-focus",
@@ -2711,6 +2722,12 @@ def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
         action = DashboardRefreshAction(
             database=_ReadOnlyDashboardDatabase(connection),
             registry=ProfileRegistry.load(profiles_path),
+            pane=FramePane(),
+            frame=True,
+            width=lambda: shutil.get_terminal_size().columns,
+            height=lambda: shutil.get_terminal_size().lines,
+            color=sys.stdout.isatty(),
+            detail=args.detail,
         )
 
         async def _loop() -> int:

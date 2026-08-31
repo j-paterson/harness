@@ -171,3 +171,99 @@ async def test_default_wiring_is_one_constructor_call(tmp_path: Path) -> None:
 def test_construction_requires_sources_or_database() -> None:
     with pytest.raises(ValueError):
         DashboardRefreshAction()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-209: frame=True renders via render_frame with live callable
+# width/height, resolved fresh every tick (a live terminal-size read).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_frame_true_renders_via_render_frame_with_exact_size() -> None:
+    pane = _RecordingPane()
+    action = DashboardRefreshAction(
+        sources=_ScriptedSources(failures=0),
+        pane=pane,
+        now=_clock,
+        frame=True,
+        width=lambda: 44,
+        height=lambda: 12,
+    )
+    await action.tick()
+    assert len(pane.frames) == 1
+    frame = pane.frames[0]
+    assert len(frame) == 12
+    assert all(len(line) == 44 for line in frame)
+    assert any("HERMES" in line for line in frame)
+    assert any("Attention" in line for line in frame)
+
+
+@pytest.mark.asyncio
+async def test_frame_true_resolves_width_and_height_callables_every_tick() -> None:
+    pane = _RecordingPane()
+    sizes = [(40, 10), (60, 16)]
+    index = {"value": 0}
+    action = DashboardRefreshAction(
+        sources=_ScriptedSources(failures=0),
+        pane=pane,
+        now=_clock,
+        frame=True,
+        width=lambda: sizes[index["value"]][0],
+        height=lambda: sizes[index["value"]][1],
+    )
+    await action.tick()
+    first = pane.frames[0]
+    assert len(first) == 10
+    assert all(len(line) == 40 for line in first)
+
+    index["value"] = 1
+    await action.tick()
+    second = pane.frames[1]
+    assert len(second) == 16
+    assert all(len(line) == 60 for line in second)
+
+
+@pytest.mark.asyncio
+async def test_frame_true_color_flag_reaches_render_frame() -> None:
+    pane = _RecordingPane()
+    action = DashboardRefreshAction(
+        sources=_ScriptedSources(failures=0),
+        pane=pane,
+        now=_clock,
+        frame=True,
+        width=44,
+        height=14,
+        color=True,
+    )
+    await action.tick()
+    frame = pane.frames[0]
+    assert any("\x1b[" in line for line in frame)
+
+
+@pytest.mark.asyncio
+async def test_frame_true_detail_flag_adds_the_detail_section() -> None:
+    pane = _RecordingPane()
+    without_detail = DashboardRefreshAction(
+        sources=_ScriptedSources(failures=0),
+        pane=pane,
+        now=_clock,
+        frame=True,
+        width=90,
+        height=24,
+        detail=False,
+    )
+    await without_detail.tick()
+    assert not any("Detail" in line for line in pane.frames[0])
+
+    with_detail = DashboardRefreshAction(
+        sources=_ScriptedSources(failures=0),
+        pane=pane,
+        now=_clock,
+        frame=True,
+        width=90,
+        height=24,
+        detail=True,
+    )
+    await with_detail.tick()
+    assert any("Detail" in line for line in pane.frames[1])

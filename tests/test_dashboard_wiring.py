@@ -7,6 +7,7 @@ that wiring end to end over a tmp database. Nothing here calls a model.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ import pytest
 
 from hermes_orchestrator.cli import _run_daemon
 from hermes_orchestrator.config import load_settings
-from hermes_orchestrator.dashboard_pane import DashboardPane
+from hermes_orchestrator.dashboard_pane import DashboardPane, FramePane
 from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.dashboard_sources import (
     CodexFact,
@@ -718,3 +719,263 @@ def test_readonly_wrapper_exposes_exactly_the_query_surface(
             )
     finally:
         connection.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-209 (requirements reread): the frame=True FramePane composition —
+# header/Work/Capacity/System/Attention, no-flicker redraws, and the
+# event-driven acceptance sequence.
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_composition_writes_a_full_frame_with_no_newline(
+    tmp_path: Path,
+) -> None:
+    # _dashboard's real composition: a read-only wrapper over one
+    # long-lived mode=ro connection, feeding a frame=True action that
+    # draws through FramePane. The readonly wrapper surface stays
+    # exactly `execute` (test_readonly_wrapper_exposes_exactly_the_query_
+    # surface above pins that independently).
+    _repo_root, state_dir = active_repo(tmp_path)
+    Database.open(state_dir / "state.db").close()
+    connection = sqlite3.connect(
+        f"file:{state_dir / 'state.db'}?mode=ro", uri=True
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        stream = _TtyStream()
+        action = DashboardRefreshAction(
+            database=_ReadOnlyDashboardDatabase(connection),
+            registry=_registry(tmp_path),
+            pane=FramePane(stream),
+            frame=True,
+            width=48,
+            height=16,
+            now=_clock,
+        )
+        asyncio.run(action.tick())
+        output = stream.getvalue()
+        assert "\n" not in output
+        assert "HERMES" in output
+        assert "Attention" in output
+    finally:
+        connection.close()
+
+
+def test_repeated_identical_frame_ticks_add_zero_bytes_beyond_a_cursor_park(
+    tmp_path: Path,
+) -> None:
+    database = _seeded_database(tmp_path)
+    try:
+        stream = _TtyStream()
+        action = DashboardRefreshAction(
+            database=database,
+            registry=_registry(tmp_path),
+            pane=FramePane(stream),
+            frame=True,
+            width=48,
+            height=16,
+            now=_clock,
+        )
+        asyncio.run(action.tick())
+        first_len = len(stream.getvalue())
+        stream.truncate(0)
+        stream.seek(0)
+
+        asyncio.run(action.tick())
+        asyncio.run(action.tick())
+        output = stream.getvalue()
+        # Two more identical ticks: only a cursor-park each time, never
+        # a re-clear or a rewrite of unchanged rows.
+        assert "\x1b[2J" not in output
+        assert output == "\x1b[17;1H" * 2
+        assert first_len > 0
+    finally:
+        database.close()
+
+
+def _append_event(
+    database: Database, *, event_type: str, aggregate_id: str, payload: dict
+) -> None:
+    events = EventStore(database)
+    with database.transaction() as connection:
+        events.append(
+            connection,
+            EventInput(
+                event_type=event_type,
+                aggregate_type="project_cell",
+                aggregate_id=aggregate_id,
+                payload=payload,
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_assignment_child_review_merge_sequence_updates_the_same_frame(
+    tmp_path: Path,
+) -> None:
+    # Acceptance: assignment -> child start -> review -> merge updates
+    # the SAME action/pane instance's rendered Work rows and `last:`
+    # phrases at each step, and the pane output never contains a "\n".
+    database = Database.open(tmp_path / "state.db")
+    stream = _TtyStream()
+    action = DashboardRefreshAction(
+        database=database,
+        registry=_registry(tmp_path),
+        pane=FramePane(stream),
+        frame=True,
+        width=70,
+        height=24,
+        now=_clock,
+    )
+    try:
+        await action.tick()
+        assert "\n" not in stream.getvalue()
+        assert "no in-flight work" in stream.getvalue()
+
+        # 1. Assignment published: the issue and project cell appear.
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, admitted_at, "
+                "updated_at"
+                ") VALUES ('INFRA-1', 'proj', 1, 'in_development', "
+                "'2026-08-30T09:00:00+00:00', '2026-08-30T09:00:00+00:00')",
+            )
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at"
+                ") VALUES ('cell-1', 'proj', 'active', 'max-a', "
+                "'session-1', '2026-08-30T09:00:00+00:00', "
+                "'2026-08-30T09:00:00+00:00')",
+            )
+        _append_event(
+            database,
+            event_type="assignment.published",
+            aggregate_id="cell-1",
+            payload={"project_key": "proj", "issue_id": "INFRA-1"},
+        )
+        await action.tick()
+        after_assignment = stream.getvalue()
+        assert "\n" not in after_assignment
+        assert "INFRA-1" in after_assignment
+        assert "assignment published" in after_assignment
+
+        # 2. A child lane starts.
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO lead_children("
+                "session_id, child_id, state, started_at"
+                ") VALUES ('session-1', 'child-1', 'started', "
+                "'2026-08-30T09:05:00+00:00')",
+            )
+        await action.tick()
+        after_child = stream.getvalue()
+        assert "\n" not in after_child
+        assert "kids 0/1" in after_child
+
+        # 3. Sol requests corrections.
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reviews("
+                "review_id, project_key, issue_id, event_id, repository, "
+                "branch, pr_number, reviewed_sha, state, created_at, "
+                "updated_at"
+                ") VALUES ('rev-1', 'proj', 'INFRA-1', 'rev-1', "
+                "'org/repo', 'feature', 12, 'sha-1', "
+                "'corrections_required', '2026-08-30T09:10:00+00:00', "
+                "'2026-08-30T09:10:00+00:00')",
+            )
+        _append_event(
+            database,
+            event_type="review.corrections",
+            aggregate_id="cell-1",
+            payload={"project_key": "proj", "reason": "lint"},
+        )
+        await action.tick()
+        after_corrections = stream.getvalue()
+        assert "\n" not in after_corrections
+        assert "PR#12 corrections" in after_corrections
+        assert "correction queued (lint)" in after_corrections
+
+        # 4. Sol merges and the settlement lands; the issue is done.
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reviews("
+                "review_id, project_key, issue_id, event_id, repository, "
+                "branch, pr_number, reviewed_sha, state, created_at, "
+                "updated_at"
+                ") VALUES ('rev-2', 'proj', 'INFRA-1', 'rev-2', "
+                "'org/repo', 'feature', 12, 'sha-2', 'merged', "
+                "'2026-08-30T09:20:00+00:00', '2026-08-30T09:20:00+00:00')",
+            )
+            connection.execute(
+                "INSERT INTO merge_settlements("
+                "settlement_id, project_key, issue_id, event_id, "
+                "repository, branch, pr_number, base_sha, candidate_sha, "
+                "thread_id, thread_generation, manifest_version, path, "
+                "state, created_at, updated_at"
+                ") VALUES ('settle-1', 'proj', 'INFRA-1', 'settle-1', "
+                "'org/repo', 'feature', 12, 'base', 'candidate', "
+                "'thread', 1, 1, 'guarded', 'settled', "
+                "'2026-08-30T09:21:00+00:00', '2026-08-30T09:21:00+00:00')",
+            )
+            connection.execute(
+                "UPDATE admitted_issues SET state = 'done', "
+                "updated_at = '2026-08-30T09:22:00+00:00' "
+                "WHERE issue_id = 'INFRA-1'",
+            )
+        _append_event(
+            database,
+            event_type="issue.transitioned",
+            aggregate_id="cell-1",
+            payload={"project_key": "proj", "issue_id": "INFRA-1", "state": "done"},
+        )
+        await action.tick()
+        after_merge = stream.getvalue()
+        assert "\n" not in after_merge
+        assert "PR#12 merged settled" in after_merge
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_a_new_capacity_observation_changes_only_that_profiles_row(
+    tmp_path: Path,
+) -> None:
+    database = Database.open(tmp_path / "state.db")
+    stream = _TtyStream()
+    action = DashboardRefreshAction(
+        database=database,
+        registry=_registry(tmp_path),
+        pane=FramePane(stream),
+        frame=True,
+        width=70,
+        height=24,
+        now=_clock,
+    )
+    try:
+        await action.tick()
+        stream.truncate(0)
+        stream.seek(0)
+
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO profile_capacity_observations("
+                "profile_alias, model, state, source, observed_at, "
+                "resets_at"
+                ") VALUES ('max-b', 'fable', 'capped', 'provider_limit', "
+                "'2026-08-30T11:59:00+00:00', '2026-08-31T00:00:00+00:00')",
+            )
+        await action.tick()
+        output = stream.getvalue()
+        assert "\n" not in output
+        # Only max-b's row is rewritten: max-a/max-c/max-d never
+        # appear in the diffed output at all.
+        assert "max-b" in output
+        assert "max-a" not in output
+        assert "max-c" not in output
+        assert "max-d" not in output
+    finally:
+        database.close()

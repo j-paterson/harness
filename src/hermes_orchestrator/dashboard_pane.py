@@ -79,3 +79,85 @@ class DashboardPane:
     def _write(self, text: str) -> None:
         self._stream.write(text)
         self._stream.flush()
+
+
+_HIDE_CURSOR = "\x1b[?25l"
+_SHOW_CURSOR = "\x1b[?25h"
+_CLEAR_SCREEN = "\x1b[2J"
+_CLEAR_BELOW = "\x1b[J"
+_RESET_ATTRIBUTES = "\x1b[0m"
+
+
+class FramePane:
+    """Redraw ONE full frame in place; nothing ever scrolls or appends.
+
+    INFRA-209: unlike `DashboardPane`'s scroll region (which shares the
+    surface with a second, independently scrolling region), this pane
+    owns the whole stream. The first draw, and any draw whose line
+    count changed, clears the screen and repaints every row. A same-
+    height draw instead diffs against the last drawn lines and
+    rewrites only the rows whose text actually changed — a run of
+    identical frames (the common case between events) writes nothing
+    but a cursor-park, so nothing ever flickers or grows terminal
+    output. When stdout is not a TTY every operation is a strict
+    no-op, and a fresh writer over the same stream re-establishes
+    idempotently — the crash-recovery story is identical to
+    `DashboardPane`.
+    """
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream if stream is not None else sys.stdout
+        self._established_height: int | None = None
+        self._last_lines: tuple[str, ...] | None = None
+
+    def draw(self, lines: Sequence[str]) -> None:
+        """Redraw only the rows of the frame that changed."""
+
+        if not self._is_tty():
+            return
+        lines = tuple(lines)
+        height = len(lines)
+        if self._established_height != height:
+            parts = [f"{_CLEAR_SCREEN}{_HIDE_CURSOR}"]
+            for index, line in enumerate(lines):
+                parts.append(f"\x1b[{index + 1};1H{line}{_CLEAR_TO_EOL}")
+            parts.append(_CLEAR_BELOW)
+            self._established_height = height
+            self._last_lines = lines
+            self._write("".join(parts))
+            return
+
+        assert self._last_lines is not None  # height unchanged => was set
+        parts = [
+            f"\x1b[{index + 1};1H{line}{_CLEAR_TO_EOL}"
+            for index, (previous, line) in enumerate(
+                zip(self._last_lines, lines, strict=True)
+            )
+            if previous != line
+        ]
+        self._last_lines = lines
+        if parts:
+            self._write("".join(parts))
+        else:
+            # No row changed: park the cursor below the frame so it
+            # never blinks inside it, without rewriting anything.
+            self._write(f"\x1b[{height + 1};1H")
+
+    def restore(self) -> None:
+        """Show the cursor and clear the screen; forget drawn state."""
+
+        if not self._is_tty():
+            return
+        self._established_height = None
+        self._last_lines = None
+        self._write(f"{_SHOW_CURSOR}{_RESET_ATTRIBUTES}{_CLEAR_SCREEN}")
+
+    def _is_tty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except Exception:
+            return False
+
+    def _write(self, text: str) -> None:
+        self._stream.write(text)
+        self._stream.flush()
