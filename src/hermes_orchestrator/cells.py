@@ -22,7 +22,11 @@ from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
-from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.linear import (
+    ExternalEffectStore,
+    LinearProjection,
+    projection_request,
+)
 from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
 from hermes_orchestrator.queue import QueueService
@@ -221,6 +225,41 @@ _OCCUPYING_ISSUE_STATES = (
 )
 
 
+def admission_priority_ceiling(
+    executor: object, *, now: datetime, freshness_minutes: int
+) -> int | None:
+    """The highest issue priority the freshest resource sample
+    authorizes right now, or ``None`` when nothing may be admitted.
+
+    THE one shared freshness/priority guard body (Sol ec0ed7fe gap 3):
+    the Stop-hook idle dispatcher (``cli._idle_admission_priority``)
+    and the daemon dispatch path
+    (:meth:`ProjectCellService._activate_issue`'s transaction-local
+    guard) both run exactly this function — first on a plain database
+    snapshot for candidate selection where applicable, then again on
+    the activation transaction's own connection — so the two paths can
+    never diverge on what capacity evidence admits.
+
+    A missing, malformed, implausibly future-dated, or stale sample
+    (INFRA-199 Finding 2) all fail closed here exactly like an explicit
+    red/unknown pressure reading does — refuse admission, never guess.
+    """
+
+    from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
+    from hermes_orchestrator.resources import read_fresh_sample
+
+    reading = read_fresh_sample(
+        executor,  # type: ignore[arg-type]
+        now=now,
+        max_age=timedelta(minutes=freshness_minutes),
+    )
+    if reading is None:
+        return None
+    return {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
+        reading.pressure
+    )
+
+
 def _in_development_effect_id(issue_id: str) -> str:
     """The one stable Linear ``In Development`` projection effect id.
 
@@ -244,15 +283,22 @@ async def _project_in_development(linear: LinearProjector, issue_id: str) -> Non
 
     Linear is an eventually consistent workflow projection, never an
     authority over Hermes' durable local lifecycle. Any failure here —
-    a network error, an unreachable or deleted issue, a disallowed
+    composing the live client itself (the idle path composes its
+    Keychain/config-backed router lazily, inside this very call), a
+    network error, an unreachable or deleted issue, a disallowed
     status transition — is swallowed: it must never roll back, retry-
     loop, or duplicate the local work that already committed.
 
-    The durable trace is not lost, though: the real
-    ``LinearClient.project`` (``linear.py``) journals a ``pending``
-    row in ``external_effects`` via ``ExternalEffectStore.begin``
-    BEFORE it ever attempts the network mutation, so a failure here
-    leaves exactly that row behind — never nothing. Startup/periodic
+    The durable trace is not lost, though: the activation transaction
+    that this projection follows already journaled the stable
+    TARGET-ONLY ``pending`` row in ``external_effects``
+    (``ExternalEffectStore.begin_in`` inside
+    :func:`_activate_issue_transaction`, no live client required), and
+    the real ``LinearClient.project`` (``linear.py``) ADOPTS that
+    exact row — same effect id, byte-identical request — before its
+    first network operation, so ANY failure class here (router
+    composition, the initial issue read, validation, the update)
+    leaves exactly that one row behind — never nothing. Startup/periodic
     reconciliation (``ReconcileService._stage_linear`` /
     ``_project_pending_linear_effect`` in ``reconcile.py``) already
     reads every ``pending`` Linear effect and surfaces it as a durable
@@ -312,8 +358,13 @@ def _activate_issue_transaction(
     re-proven inside this transaction, and any failure aborts with
     ZERO writes:
 
-    - ``guard``, when supplied, runs first on the same connection
-      (resource-sample freshness for the idle path);
+    - ``guard``, when supplied, runs first on the same connection for
+      any FRESH activation (resource-sample freshness plus the
+      priority ceiling — the idle path and the armed daemon path both
+      supply the identical :func:`admission_priority_ceiling` check);
+      a replay of an already-``in_development`` issue is exempt: it
+      resumes work this same guard already authorized, it never
+      admits new work;
     - the issue's source state must be one of the exact runnable
       states (queued/blocked) and the CAS is ``WHERE state = ?`` with
       that observed value — never merely ``!= done``;
@@ -335,8 +386,6 @@ def _activate_issue_transaction(
     stamp = now().isoformat()
     assignment: LeadAssignment | None = None
     with database.transaction() as connection:
-        if guard is not None and not guard(connection):
-            return False, None
         issue_row = connection.execute(
             "SELECT state, instruction_id, project_key, dependency_ready "
             "FROM admitted_issues WHERE issue_id = ?",
@@ -347,6 +396,8 @@ def _activate_issue_transaction(
         prior_state = str(issue_row["state"])
         replaying = prior_state == IssueState.IN_DEVELOPMENT.value
         if not replaying:
+            if guard is not None and not guard(connection):
+                return False, None
             if prior_state not in _RUNNABLE_ISSUE_STATES:
                 return False, None
             if not int(issue_row["dependency_ready"]):
@@ -415,6 +466,29 @@ def _activate_issue_transaction(
                     f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
                 ),
             )
+        # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
+        # projection record becomes durable in this very commit, BEFORE
+        # any fallible Linear operation can run — no live client is
+        # required to write it. ``LinearClient.project`` later ADOPTS
+        # this exact row (same effect id, byte-identical
+        # ``projection_request`` payload) instead of double-beginning,
+        # so every post-commit failure class — router composition, the
+        # initial issue read, team/mapping/transition validation, the
+        # update itself — leaves exactly ONE pending row for
+        # reconciliation (``reconcile._project_pending_linear_effect``).
+        # On a replay the row already exists (pending or completed) and
+        # is adopted untouched, keeping the journal at exactly one row.
+        ExternalEffectStore.begin_in(
+            connection,
+            _in_development_effect_id(issue_id),
+            target=issue_id,
+            request=projection_request(
+                issue_id,
+                LinearProjection(
+                    status="In Development", assignee_alias="operator"
+                ),
+            ),
+        )
     return True, assignment
 
 
@@ -506,6 +580,7 @@ class ProjectCellService:
         decisions: OperatorDecisions | None = None,
         assignments: LeadAssignments | None = None,
         packets: SubagentPackets | None = None,
+        dispatch_freshness_minutes: int | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -530,8 +605,26 @@ class ProjectCellService:
         self._decisions = decisions
         self._assignments = assignments
         self._packets = packets
+        self._dispatch_freshness_minutes = dispatch_freshness_minutes
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
+
+    def require_dispatch_capacity_guard(self, freshness_minutes: int) -> None:
+        """Arm the daemon dispatch path's transaction-local capacity guard.
+
+        Sol ec0ed7fe gap 3: the live daemon (``cli``'s ``daemon``
+        command) arms this with the same
+        ``policy.resource_sample_freshness_minutes`` bound the idle
+        dispatcher reads, so every FRESH activation through
+        :meth:`dispatch` re-proves — inside the activation transaction,
+        on its own connection — that the newest resource sample is
+        fresh enough and its pressure admits the issue's priority
+        (:func:`admission_priority_ceiling`, the identical check the
+        idle path runs). Unarmed (unit composition, one-shot rotation)
+        the dispatch path keeps its historical behavior.
+        """
+
+        self._dispatch_freshness_minutes = int(freshness_minutes)
 
     def active_projects(self) -> frozenset[str]:
         """Return projects that already own a live logical lead cell."""
@@ -1589,6 +1682,15 @@ class ProjectCellService:
         Delegates to the shared :func:`_activate_issue_transaction` — the
         same activation state machine the idle dispatcher's
         :func:`activate_admitted_issue` runs. Never consults Linear.
+
+        When the dispatch capacity guard is armed
+        (:meth:`require_dispatch_capacity_guard` — the live daemon), the
+        transaction runs the IDENTICAL transaction-local guard the idle
+        path supplies: :func:`admission_priority_ceiling` on the
+        activation transaction's own connection, so a sample that went
+        stale — or was superseded by a red one — between scheduler
+        planning and this commit fails the activation closed instead of
+        authorizing it (Sol ec0ed7fe gap 3).
         """
 
         return _activate_issue_transaction(
@@ -1603,7 +1705,31 @@ class ProjectCellService:
                 self._assignments if self._classic_seats else None
             ),
             now=self._aware_now,
+            guard=self._capacity_guard(issue_id),
         )
+
+    def _capacity_guard(
+        self, issue_id: str
+    ) -> Callable[[sqlite3.Connection], bool] | None:
+        """The armed daemon path's transaction-local freshness/priority
+        guard — the same predicate ``cli._dispatch_idle_lead`` builds
+        for the idle path, over the same shared
+        :func:`admission_priority_ceiling`. ``None`` while unarmed."""
+
+        if self._dispatch_freshness_minutes is None:
+            return None
+        freshness_minutes = self._dispatch_freshness_minutes
+        priority = self._queue.get(issue_id).linear_priority
+
+        def guard(connection: sqlite3.Connection) -> bool:
+            ceiling = admission_priority_ceiling(
+                connection,
+                now=self._aware_now(),
+                freshness_minutes=freshness_minutes,
+            )
+            return ceiling is not None and priority <= ceiling
+
+        return guard
 
     def _worker_key(self, cell: ProjectCell) -> str:
         return f"{cell.cell_id}:{cell.session_id}"

@@ -17,7 +17,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -954,22 +954,53 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
 def _open_idle_linear_router(
     settings: Settings, *, database: Database, queue: Any
 ) -> Any:
-    """Compose the live Linear router the idle dispatcher validates and
-    projects through — Keychain + settings, exactly the way
-    ``_open_merge_flow`` composes it for the merge flow (INFRA-199
-    Finding 1).
+    """Compose the live Linear router the idle dispatcher projects
+    through — Keychain + settings, exactly the way ``_open_merge_flow``
+    composes it for the merge flow (INFRA-199 Finding 1).
 
     Raises on any composition failure (missing ``config/linear.yaml``,
-    an unreadable Keychain credential, an unregistered project). The
-    Stop-hook idle path (``_dispatch_idle_lead``) is always invoked
-    under the hook's own ``suppress(Exception)``, so letting a
-    composition failure raise here fails the whole idle dispatch
-    closed — no dispatch, no crash, and never a bypass of Linear.
+    an unreadable Keychain credential, an unregistered project). Sol
+    ec0ed7fe gap 1: the Stop-hook idle path never calls this before its
+    local activation commits — ``_LazyIdleLinearProjector`` defers the
+    composition into the post-commit projection attempt, where
+    ``cells._project_in_development`` swallows a raise here like any
+    other Linear failure. Router composition can therefore never block
+    local work, and never bypasses Linear either: the pending
+    ``external_effects`` row journaled with the activation commit is
+    the durable trace reconciliation resolves.
     """
 
     return build_linear_router(
         settings, database=database, queue=queue, keychain=Keychain()
     )
+
+
+class _LazyIdleLinearProjector:
+    """Compose the Keychain/config-backed Linear router only at
+    projection time — strictly AFTER the local activation transaction
+    committed (Sol ec0ed7fe gap 1).
+
+    Satisfies ``cells.LinearProjector`` without touching the Keychain,
+    ``config/linear.yaml``, or the network at construction time, so an
+    eligible local activation commits without ever constructing the
+    live Linear client. The first (and only) composition happens inside
+    ``cells._project_in_development``'s suppressed projection attempt.
+    """
+
+    def __init__(
+        self, settings: Settings, *, database: Database, queue: Any
+    ) -> None:
+        self._settings = settings
+        self._database = database
+        self._queue = queue
+
+    async def project(
+        self, issue_id: str, target: Any, effect_id: str
+    ) -> Any:
+        router = _open_idle_linear_router(
+            self._settings, database=self._database, queue=self._queue
+        )
+        return await router.project(issue_id, target, effect_id)
 
 
 ROTATION_REGISTRATION_WAIT_SECONDS = 60.0
@@ -2378,23 +2409,20 @@ def _idle_admission_priority(
     """The highest issue priority the freshest resource sample
     authorizes right now, or ``None`` when nothing may be admitted.
 
-    A missing, malformed, implausibly future-dated, or stale sample
-    (INFRA-199 Finding 2) all fail closed here exactly like an explicit
-    red/unknown pressure reading does — refuse admission, never guess.
+    Delegates to :func:`hermes_orchestrator.cells.admission_priority_ceiling`
+    — the ONE shared freshness/priority ceiling the daemon dispatch
+    path's armed transaction-local guard also runs (Sol ec0ed7fe gap
+    3), so the idle and daemon paths can never diverge on what capacity
+    evidence admits. A missing, malformed, implausibly future-dated, or
+    stale sample (INFRA-199 Finding 2) all fail closed exactly like an
+    explicit red/unknown pressure reading does — refuse admission,
+    never guess.
     """
 
-    from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
-    from hermes_orchestrator.resources import read_fresh_sample
+    from hermes_orchestrator.cells import admission_priority_ceiling
 
-    reading = read_fresh_sample(
-        executor,
-        now=now,
-        max_age=timedelta(minutes=freshness_minutes),
-    )
-    if reading is None:
-        return None
-    return {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
-        reading.pressure
+    return admission_priority_ceiling(
+        executor, now=now, freshness_minutes=freshness_minutes
     )
 
 
@@ -2474,11 +2502,17 @@ def _dispatch_idle_lead(
     if candidate is None:
         return
 
-    # Composition failure (no config/linear.yaml, an unreadable Keychain
-    # credential, an unregistered project) raises here and is caught by
-    # this hook's own suppress(Exception) at the call site: fail closed,
-    # no dispatch, no crash, before any local write is even attempted.
-    linear = _open_idle_linear_router(settings, database=database, queue=queue)
+    # Sol ec0ed7fe gap 1: the live Keychain/config-backed Linear router
+    # is NOT composed here any more. An eligible local activation must
+    # commit without ever constructing the live Linear client, so the
+    # lazy projector composes it only inside the post-commit projection
+    # attempt, where a composition failure (no config/linear.yaml, an
+    # unreadable Keychain credential, an unregistered project) is
+    # swallowed by ``cells._project_in_development`` exactly like any
+    # other Linear failure — it can never block or undo the local work,
+    # and the stable pending ``external_effects`` row journaled with the
+    # activation commit remains as the durable trace for reconciliation.
+    linear = _LazyIdleLinearProjector(settings, database=database, queue=queue)
     assignments = LeadAssignments(database, events=events)
 
     def _still_eligible(connection: sqlite3.Connection) -> bool:
@@ -3821,6 +3855,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     checkout_root=_code_checkout_root(),
                     binary_path=Path(sys.argv[0]).resolve(),
                     pid=os.getpid(),
+                )
+            if runtime.cells is not None:
+                # Sol ec0ed7fe gap 3: the daemon's dispatch path runs
+                # the IDENTICAL transaction-local freshness/priority
+                # guard the idle dispatcher supplies
+                # (cells.admission_priority_ceiling on the activation
+                # transaction's own connection), armed with the same
+                # policy freshness bound the idle path reads, so
+                # capacity evidence that went stale — or was superseded
+                # by a red sample — between scheduler planning and the
+                # activation commit fails closed.
+                runtime.cells.require_dispatch_capacity_guard(
+                    settings.policy.resource_sample_freshness_minutes
                 )
             supervisor = asyncio.run(
                 _run_daemon(

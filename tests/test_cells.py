@@ -4036,6 +4036,386 @@ async def test_activate_admitted_issue_refuses_a_stale_profile_lease(
     assert linear.targets == []
 
 
+def _pending_projection_rows(database: Database) -> list[tuple[str, dict]]:
+    """Pending Linear effects, read EXACTLY the way reconciliation's
+    ``_stage_linear`` / ``_project_pending_linear_effect`` read them."""
+
+    rows = database.execute(
+        "SELECT effect_id, target, request_json FROM external_effects "
+        "WHERE adapter = 'linear' AND state = 'pending'"
+    ).fetchall()
+    return [
+        (str(row["effect_id"]), json.loads(row["request_json"]))
+        for row in rows
+    ]
+
+
+_IN_DEV_REQUEST = {
+    "issue_id": "ENG-9",
+    "target": {"status": "In Development", "assignee_alias": "operator"},
+}
+
+
+@pytest.mark.asyncio
+async def test_activation_commit_journals_the_stable_pending_projection_row(
+    database: Database, queue: QueueService
+) -> None:
+    """Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
+    projection record is journaled by the local activation transaction
+    itself — no live Linear client involved — so it exists even when
+    the projector is a fake that never touches the effect store. A
+    transactional refusal journals nothing."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    linear = RecordingLinear()
+
+    refused, _ = await _activate(database, linear, guard=lambda connection: False)
+    assert refused is False
+    assert (
+        int(database.scalar("SELECT count(*) FROM external_effects")) == 0
+    )
+
+    activated, _ = await _activate(database, linear)
+
+    assert activated is True
+    assert _pending_projection_rows(database) == [
+        ("linear:ENG-9:in-development:v2", _IN_DEV_REQUEST)
+    ]
+    # The fake projector ran after the commit but never completed the
+    # journal entry — exactly the durable trace reconciliation reads.
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+
+    # Replay adopts the existing row: still exactly one.
+    replayed, _ = await _activate(database, linear)
+    assert replayed is True
+    assert _pending_projection_rows(database) == [
+        ("linear:ENG-9:in-development:v2", _IN_DEV_REQUEST)
+    ]
+
+
+class _ReadOutageTransport:
+    """A fake ``LinearTransport`` whose ``Issue`` read fails while
+    ``fail_reads`` is True — the early-failure class that used to leave
+    NO pending row at all — and otherwise behaves like a healthy
+    Todo-state issue that accepts updates."""
+
+    def __init__(self) -> None:
+        self.fail_reads = True
+        self.update_calls = 0
+        self._state_id = "state-todo"
+        self._assignee_id: str | None = None
+
+    async def execute(
+        self, operation: str, query: str, variables: dict[str, object]
+    ) -> dict[str, object]:
+        if operation == "Issue":
+            if self.fail_reads:
+                raise TimeoutError("Linear is unreachable")
+            return {
+                "issue": {
+                    "id": "issue-uuid-1",
+                    "identifier": variables["id"],
+                    "updatedAt": "2026-08-30T00:00:00.000Z",
+                    "state": {
+                        "id": self._state_id,
+                        "name": _LINEAR_STATE_NAMES[self._state_id],
+                    },
+                    "assignee": (
+                        {"id": self._assignee_id}
+                        if self._assignee_id is not None
+                        else None
+                    ),
+                    "team": {"id": "team-1"},
+                }
+            }
+        assert operation == "IssueUpdate"
+        self.update_calls += 1
+        update = variables["input"]
+        if "stateId" in update:
+            self._state_id = update["stateId"]
+        if "assigneeId" in update:
+            self._assignee_id = update["assigneeId"]
+        return {
+            "issueUpdate": {
+                "success": True,
+                "issue": {
+                    "id": "issue-uuid-1",
+                    "updatedAt": "2026-08-30T00:00:01.000Z",
+                },
+            }
+        }
+
+
+@pytest.mark.asyncio
+async def test_initial_read_failure_leaves_the_pending_effect_for_reconciliation(
+    database: Database, queue: QueueService
+) -> None:
+    """Sol ec0ed7fe gap 2: an outage on the projection's very FIRST
+    Linear read — before this correction, the one failure class that
+    left no ``external_effects`` row at all, invisible to
+    ``reconcile._project_pending_linear_effect`` — now leaves exactly
+    the stable pending row the activation transaction journaled. Once
+    Linear recovers, a replay (real ``LinearClient`` over the fake
+    transport) ADOPTS that same row and completes the effect exactly
+    once, with no second ``issue.started`` and no second assignment."""
+
+    from hermes_orchestrator.linear import ExternalEffectStore, LinearClient
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+    assignments = LeadAssignments(database, events=events)
+    effects = ExternalEffectStore(database)
+    transport = _ReadOutageTransport()
+    linear = LinearClient(
+        transport=transport,
+        effects=effects,
+        status_ids={"Todo": "state-todo", "In Development": "state-in-dev"},
+        assignee_ids={"operator": "assignee-op", "ryan": "assignee-ryan"},
+        expected_team_id="team-1",
+    )
+    effect_id = "linear:ENG-9:in-development:v2"
+
+    def _activate_via_client() -> object:
+        return activate_admitted_issue(
+            database=database,
+            events=events,
+            linear=linear,
+            assignments=assignments,
+            cell_id="cell-demo",
+            project_key="demo",
+            profile_alias="max-a",
+            session_id=str(SESSION_ID),
+            issue_id="ENG-9",
+        )
+
+    activated, assignment = await _activate_via_client()
+
+    # Local activation stands; the failed initial read left the stable
+    # pending record — visible to reconciliation — not nothing.
+    assert activated is True
+    assert assignment is not None
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert transport.update_calls == 0
+    assert _pending_projection_rows(database) == [(effect_id, _IN_DEV_REQUEST)]
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+
+    # Linear recovers: the replay adopts and completes the SAME effect
+    # exactly once — one mutation, no second issue.started/assignment.
+    transport.fail_reads = False
+    recovered, recovered_assignment = await _activate_via_client()
+    assert recovered is True
+    assert recovered_assignment is None
+    assert effects.get(effect_id).state == "completed"
+    assert transport.update_calls == 1
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+    assert (
+        int(
+            database.scalar(
+                "SELECT count(*) FROM external_effects WHERE effect_id = ?",
+                (effect_id,),
+            )
+        )
+        == 1
+    )
+
+
+# --- Sol ec0ed7fe gap 3: the daemon dispatch capacity guard ----------------
+
+
+_GUARD_NOW = datetime(2026, 8, 26, tzinfo=UTC)
+
+
+def _insert_resource_sample(
+    database: Database,
+    *,
+    pressure: str,
+    sampled_at: datetime,
+    sample_id: str = "sample-1",
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO resource_samples("
+            "sample_id, sampled_at, pressure, available_memory_bytes, "
+            "total_memory_bytes, swap_used_bytes, load_one, logical_cpus, "
+            "disk_json, managed_rss_bytes"
+            ") VALUES (?, ?, ?, 1, 2, 0, 0.1, 1, '{}', 1)",
+            (sample_id, sampled_at.isoformat(), pressure),
+        )
+
+
+@pytest.mark.parametrize(
+    "pressure, sample_age, priority, expect_active",
+    [
+        pytest.param("green", timedelta(0), 1, True, id="fresh-green"),
+        pytest.param("green", timedelta(minutes=6), 1, False, id="stale-green"),
+        pytest.param("red", timedelta(0), 1, False, id="fresh-red"),
+        pytest.param("yellow", timedelta(0), 1, True, id="fresh-yellow-p1"),
+        pytest.param(
+            "yellow", timedelta(0), 2, False, id="yellow-priority-too-high"
+        ),
+        pytest.param(None, timedelta(0), 1, False, id="no-sample"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_armed_daemon_dispatch_reproves_capacity_inside_the_transaction(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+    linear: RecordingLinear,
+    pressure: str | None,
+    sample_age: timedelta,
+    priority: int,
+    expect_active: bool,
+) -> None:
+    """Sol ec0ed7fe gap 3: with the capacity guard armed (the live
+    daemon), the shared activation transaction re-proves the IDENTICAL
+    freshness/priority predicate the idle path supplies — on its own
+    connection — so a missing, stale, red, or priority-refusing sample
+    fails a fresh activation closed with zero issue writes and zero
+    Linear traffic."""
+
+    cell_service.require_dispatch_capacity_guard(5)
+    queue.admit(
+        AdmissionRequest(
+            issue_id="ENG-9",
+            project_key="demo",
+            linear_priority=priority,
+            admitted_by="operator",
+            instruction_id="chat-ENG-9",
+        )
+    )
+    if pressure is not None:
+        _insert_resource_sample(
+            database, pressure=pressure, sampled_at=_GUARD_NOW - sample_age
+        )
+
+    result = await cell_service.dispatch("ENG-9")
+
+    if expect_active:
+        assert result.status == "working"
+        assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+        assert _issue_started_count(database) == 1
+        assert linear.targets == [("ENG-9", "In Development", "operator")]
+    else:
+        assert result.status == "start_unconfirmed"
+        assert queue.get("ENG-9").state == IssueState.QUEUED
+        assert _issue_started_count(database) == 0
+        assert linear.targets == []
+        assert _pending_projection_rows(database) == []
+
+
+@pytest.mark.asyncio
+async def test_armed_daemon_dispatch_fails_closed_on_a_superseding_red_sample(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+    linear: RecordingLinear,
+) -> None:
+    """A green sample authorized planning, but a NEWER red sample landed
+    before the activation commit: the transaction-local guard reads the
+    newest sample and refuses — delayed capacity evidence never
+    authorizes activation."""
+
+    cell_service.require_dispatch_capacity_guard(5)
+    admit(queue, "ENG-9")
+    _insert_resource_sample(
+        database,
+        pressure="green",
+        sampled_at=_GUARD_NOW - timedelta(minutes=2),
+        sample_id="sample-green",
+    )
+    _insert_resource_sample(
+        database,
+        pressure="red",
+        sampled_at=_GUARD_NOW + timedelta(seconds=30),
+        sample_id="sample-red",
+    )
+
+    result = await cell_service.dispatch("ENG-9")
+
+    assert result.status == "start_unconfirmed"
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
+    assert linear.targets == []
+
+
+@pytest.mark.asyncio
+async def test_armed_guard_never_blocks_the_replay_of_in_flight_work(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+    runner: RecordingRunner,
+) -> None:
+    """The guard admits NEW work only: an issue already
+    ``in_development`` (a resume after restart, when no fresh sample
+    may exist yet) replays through the same transaction untouched by
+    the capacity guard — recovery is not a new admission."""
+
+    _insert_resource_sample(database, pressure="green", sampled_at=_GUARD_NOW)
+    admit(queue, "ENG-9")
+    first = await cell_service.dispatch("ENG-9")
+    assert first.status == "working"
+
+    # The sample goes stale; the armed service resumes the in-flight
+    # issue anyway.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE resource_samples SET sampled_at = ?",
+            ((_GUARD_NOW - timedelta(minutes=10)).isoformat(),),
+        )
+    cell_service.require_dispatch_capacity_guard(5)
+
+    resumed = await cell_service.dispatch("ENG-9")
+
+    assert resumed.status == "working"
+    assert runner.resume_count == 1
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert _issue_started_count(database) == 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_and_idle_racing_activate_at_most_one_issue(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+) -> None:
+    """Concurrent daemon dispatch and idle activation for the same
+    project: the existing project-wide lock, ``BEGIN IMMEDIATE``
+    transaction, and occupancy CAS still admit at most one issue —
+    exactly one ``issue.started``, one issue ``in_development``."""
+
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+    _seed_active_cell(database)
+    idle_linear = RecordingLinear()
+
+    await asyncio.gather(
+        cell_service.dispatch("ENG-9"),
+        _activate(database, idle_linear, issue_id="ENG-10"),
+    )
+
+    activated = [
+        issue_id
+        for issue_id in ("ENG-9", "ENG-10")
+        if queue.get(issue_id).state is IssueState.IN_DEVELOPMENT
+    ]
+    assert len(activated) == 1
+    assert _issue_started_count(database) == 1
+    assert (
+        int(
+            database.scalar(
+                "SELECT count(*) FROM admitted_issues "
+                "WHERE state = 'in_development'"
+            )
+        )
+        == 1
+    )
+
+
 @pytest.mark.asyncio
 async def test_paused_issue_is_never_touched_by_a_dispatch_of_a_different_issue(
     cell_service: ProjectCellService,

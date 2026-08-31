@@ -3125,25 +3125,29 @@ def test_intake_poll_idle_dispatch_rechecks_freshness_at_commit_time(
     _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
 
-    import hermes_orchestrator.cli as cli_module
+    import hermes_orchestrator.cells as cells_module
 
     linear = _IdleLinear()
-    compositions = {"count": 0}
+    _patch_idle_linear(monkeypatch, linear)
+    real_activate = cells_module.activate_admitted_issue
+    degrade = {"armed": True}
 
-    def _open(settings: object, *, database: object, queue: object) -> object:
-        compositions["count"] += 1
-        if compositions["count"] == 1:
-            # Degrade the sample the instant Linear is composed — well
-            # before the activation transaction's guard re-reads it —
-            # to model a sampler tick landing mid-dispatch.
-            stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-            with database.transaction() as connection:  # type: ignore[attr-defined]
-                connection.execute(
-                    "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
-                )
-        return linear
+    async def _degrade_then_activate(**kwargs: object) -> object:
+        if degrade["armed"]:
+            # Degrade the sample after candidate selection but before
+            # the shared activation transaction opens — well before its
+            # guard re-reads the sample on the transaction's own
+            # connection — to model a sampler tick landing mid-dispatch.
+            degrade["armed"] = False
+            _set_idle_sample_age(
+                state_dir,
+                (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+            )
+        return await real_activate(**kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open)
+    monkeypatch.setattr(
+        cells_module, "activate_admitted_issue", _degrade_then_activate
+    )
 
     first = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
@@ -3194,21 +3198,48 @@ def test_intake_poll_idle_dispatch_local_activation_survives_a_linear_failure(
     assert issue_state == "in_development"
 
 
-def test_intake_poll_idle_dispatch_fails_closed_when_linear_composition_fails(
+def _pending_projection_rows(state_dir: Path) -> list[tuple[str, dict]]:
+    """Pending Linear effects, read EXACTLY the way reconciliation's
+    ``_stage_linear`` reads them."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        rows = database.execute(
+            "SELECT effect_id, target, request_json FROM external_effects "
+            "WHERE adapter = 'linear' AND state = 'pending'"
+        ).fetchall()
+        return [
+            (str(row["effect_id"]), json.loads(row["request_json"]))
+            for row in rows
+        ]
+    finally:
+        database.close()
+
+
+def test_intake_poll_idle_dispatch_survives_a_linear_composition_failure(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A Keychain/settings composition failure (INFRA-199 Finding 1)
-    must never crash the hook and must never fall back to bypassing
-    Linear: no dispatch, no crash, zero local writes."""
+    """Sol ec0ed7fe gap 1 (flipped router-before-activation test): a
+    Keychain/settings composition failure must never crash the hook AND
+    must never block the eligible LOCAL activation — the router is only
+    composed lazily, after the local commit. Exactly one local start
+    and assignment land, and the stable target-only pending projection
+    row journaled with that same commit is the durable Linear trace
+    reconciliation resolves."""
 
     _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
 
     import hermes_orchestrator.cli as cli_module
 
+    compositions = {"count": 0}
+
     def _broken_composition(
         settings: object, *, database: object, queue: object
     ) -> object:
+        compositions["count"] += 1
         raise RuntimeError("Keychain credential unavailable")
 
     monkeypatch.setattr(cli_module, "_open_idle_linear_router", _broken_composition)
@@ -3216,9 +3247,24 @@ def test_intake_poll_idle_dispatch_fails_closed_when_linear_composition_fails(
     result = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
     assert result.exit_code == 0
+    # The composition failure happened — but only AFTER the local
+    # activation had already committed.
+    assert compositions["count"] == 1
     started, assigned, issue_state = _idle_dispatch_counts(state_dir)
-    assert (started, assigned) == (0, 0)
-    assert issue_state == "queued"
+    assert (started, assigned) == (1, 1)
+    assert issue_state == "in_development"
+    assert _pending_projection_rows(state_dir) == [
+        (
+            "linear:INFRA-9:in-development:v2",
+            {
+                "issue_id": "INFRA-9",
+                "target": {
+                    "status": "In Development",
+                    "assignee_alias": "operator",
+                },
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize(
