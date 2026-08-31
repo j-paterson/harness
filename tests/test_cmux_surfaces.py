@@ -54,6 +54,8 @@ THIRD = CmuxSurfaceRef(
 )
 
 SESSION = "99999999-9999-4999-8999-999999999999"
+# The replacement session a managed rotation seats.
+SESSION_2 = "88888888-8888-4888-8888-888888888888"
 
 
 @pytest.fixture
@@ -1827,15 +1829,17 @@ def trust_confirmer(
     *,
     control: ControlOperations,
     wait_seconds: int = 90,
+    argv: list[str] | None = None,
 ) -> ChannelTrustConfirmer:
     ticks = iter(float(tick) for tick in range(10_000))
+    live = list(CHANNEL_ARGV) if argv is None else list(argv)
     return ChannelTrustConfirmer(
         database=database,
         events=EventStore(database),
         control=control,
         port=port,
         entry_resolver=lambda: entry,
-        live_argv=lambda _session: list(CHANNEL_ARGV),
+        live_argv=lambda _session: list(live),
         wait_seconds=wait_seconds,
         clock=lambda: next(ticks),
         sleep=_no_sleep,
@@ -2141,6 +2145,132 @@ class TestChannelTrustLifecycle:
             "channel_trust_anchor.captured"
         ]
         assert "channel.rebind_refused" not in control_operation_kinds(database)
+
+    @pytest.mark.asyncio
+    async def test_managed_rotation_to_the_selected_profile_rebinds_and_confirms(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """Sol correction 531484d2: the realistic managed account
+        rotation. Trust was proven on profile max-a (session SESSION,
+        surface THIRD). Hermes selects a different healthy profile
+        max-b and seats the replacement exactly as production does —
+        write-ahead intent naming (SESSION_2, max-b), bound to the new
+        workspace as a residual row, promoted to the cell's active lead
+        binding — and the replacement launches with the same shared
+        command shape, differing only at the session slots. The seat
+        trigger carries the anchor forward to max-b/SESSION_2/LEAD and
+        the gate presses the one Enter: zero manual dialog clicks."""
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        predecessor = capture_trust_anchor(
+            database, entry, surface_uuid=THIRD.surface_uuid
+        )
+        intent = bindings.record_intent(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id=SESSION_2,
+            profile_alias="max-b",
+        )
+        residual = bindings.bind_intent(intent.intent_id, ref=LEAD)
+        binding = bindings.activate_residual(residual.binding_id)
+        rotated_argv = [token.replace(SESSION, SESSION_2) for token in CHANNEL_ARGV]
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        confirmer = trust_confirmer(
+            database, port, entry, control=control, argv=rotated_argv
+        )
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == [LEAD]
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        successor = anchors.active_for_cell("cell-demo")
+        assert successor is not None
+        assert successor.anchor_id != predecessor.anchor_id
+        assert successor.profile_alias == "max-b"
+        assert successor.session_id == SESSION_2
+        assert successor.surface_uuid == LEAD.surface_uuid
+        assert successor.workspace_uuid == LEAD.workspace_uuid
+        # Content, prompt evidence, and the trusted launch template are
+        # the predecessor's — only the seat identity moved.
+        assert successor.prompt_pattern == predecessor.prompt_pattern
+        assert successor.launch_argv_template == tuple(CHANNEL_ARGV)
+        assert anchors.get(predecessor.anchor_id).state == "retired"
+        rebound = database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'channel_trust_anchor.rebound'"
+        ).fetchone()
+        payload = json.loads(str(rebound["payload_json"]))
+        assert payload["predecessor_anchor_id"] == predecessor.anchor_id
+        assert payload["predecessor_profile_alias"] == "max-a"
+        assert payload["selected_binding_id"] == binding.binding_id
+        assert payload["selected_intent_id"] == intent.intent_id
+
+    @pytest.mark.asyncio
+    async def test_a_profile_no_durable_selection_names_sends_zero_keys(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """The seat claims a different profile than the anchor's, but
+        it was minted outside Hermes's write-ahead intent path — there
+        is no durable selection proving max-b was chosen for this
+        session. The rebind refuses (recorded as
+        ``channel.rebind_refused``), the anchor is untouched, and the
+        gate's own approval-required path follows with zero keys."""
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        predecessor = capture_trust_anchor(
+            database, entry, surface_uuid=THIRD.surface_uuid
+        )
+        binding = bindings.bind_lead(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id=SESSION_2,
+            profile_alias="max-b",
+            ref=LEAD,
+        )
+        rotated_argv = [token.replace(SESSION, SESSION_2) for token in CHANNEL_ARGV]
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        confirmer = trust_confirmer(
+            database, port, entry, control=control, argv=rotated_argv
+        )
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert control_operation_kinds(database) == [
+            "channel.rebind_refused",
+            "channel.approval_required",
+        ]
+        row = database.execute(
+            "SELECT result_json FROM control_operations "
+            "WHERE kind = 'channel.rebind_refused'"
+        ).fetchone()
+        assert "Hermes-selected replacement binding" in json.loads(
+            str(row["result_json"])
+        )["error"]
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        active = anchors.active_for_cell("cell-demo")
+        assert active is not None
+        assert active.anchor_id == predecessor.anchor_id
+        assert active.profile_alias == "max-a"
+        assert active.surface_uuid == THIRD.surface_uuid
 
     @pytest.mark.asyncio
     async def test_watcher_timeout_sends_zero_keys_and_no_receipt(

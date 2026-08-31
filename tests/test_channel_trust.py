@@ -25,6 +25,8 @@ from hermes_orchestrator.channel_trust import (
     ChannelTrustGate,
     TrustRefused,
 )
+from hermes_orchestrator.cmux import CmuxSurfaceRef
+from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
@@ -613,6 +615,51 @@ def test_rebind_is_idempotent_for_an_already_matching_active_anchor(
 SESSION_3 = "88888888-8888-4888-8888-888888888888"
 CONFIG_PATH_3 = f"/state/mcp/{SESSION_3}.mcp.json"
 
+# The different healthy profile a managed account rotation selects
+# (Sol correction 531484d2) — never equal to the anchor's own.
+SELECTED_PROFILE = "max-b"
+assert SELECTED_PROFILE != PROFILE
+
+
+def _seat_replacement(
+    database: Database,
+    *,
+    session_id: str = SESSION_2,
+    profile_alias: str = SELECTED_PROFILE,
+    workspace_uuid: str = WORKSPACE_2,
+    surface_uuid: str = SURFACE_2,
+    via_intent: bool = True,
+    activate: bool = True,
+    cell_id: str = CELL,
+):
+    """Seat a replacement lead the way Hermes does: a write-ahead
+    activation intent naming the selected session/profile, bound to
+    the returned workspace as a residual row, then promoted to the
+    cell's single active binding. ``via_intent=False`` mints a bare
+    binding outside the intent path; ``activate=False`` leaves the
+    bound row residual."""
+
+    bindings = CmuxSurfaceBindings(database=database, events=EventStore(database))
+    ref = CmuxSurfaceRef(workspace_uuid=workspace_uuid, surface_uuid=surface_uuid)
+    if not via_intent:
+        return bindings.bind_lead(
+            project_key="demo",
+            cell_id=cell_id,
+            session_id=session_id,
+            profile_alias=profile_alias,
+            ref=ref,
+        )
+    intent = bindings.record_intent(
+        project_key="demo",
+        cell_id=cell_id,
+        session_id=session_id,
+        profile_alias=profile_alias,
+    )
+    bound = bindings.bind_intent(intent.intent_id, ref=ref)
+    if not activate:
+        return bound
+    return bindings.activate_residual(bound.binding_id)
+
 
 def _anchor_rows(database: Database) -> list[tuple[str, str, str, str]]:
     rows = database.execute(
@@ -671,15 +718,16 @@ def test_rebind_refuses_a_profile_mismatch_with_zero_mutation(
     tmp_path: Path,
 ) -> None:
     """Byte-identical content at the new path, a well-formed rotated
-    argv — but a different profile alias. The operator trusted ONE
-    profile; a rotation may not silently re-home trust to another."""
+    argv — but a different profile alias that no durable Hermes
+    replacement selection names. The operator trusted ONE profile; a
+    caller argument alone may not re-home trust to another."""
 
     package_root, entry_path = package
     predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
     rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
     before = _anchor_rows(database)
 
-    with pytest.raises(TrustRefused, match="trusted profile"):
+    with pytest.raises(TrustRefused, match="Hermes-selected replacement binding"):
         _rebind_rotated(
             anchors,
             package_root=rotated_root,
@@ -796,7 +844,7 @@ def test_rebind_refuses_drift_before_the_idempotent_no_op(
     anchor = _capture(anchors, package_root=package_root, entry_path=entry_path)
     before = _anchor_rows(database)
 
-    with pytest.raises(TrustRefused, match="trusted profile"):
+    with pytest.raises(TrustRefused, match="Hermes-selected replacement binding"):
         anchors.rebind(
             cell_id=CELL,
             profile_alias="max-z",
@@ -823,6 +871,195 @@ def test_rebind_refuses_drift_before_the_idempotent_no_op(
 
     assert _anchor_rows(database) == before
     assert anchors.active_for_cell(CELL) == anchor
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+def test_rebind_carries_trust_to_the_hermes_selected_replacement_profile(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+    tmp_path: Path,
+) -> None:
+    """Sol correction 531484d2: a realistic managed account rotation —
+    the anchor was trusted on profile A, Hermes selected a different
+    healthy profile B for the replacement and durably seated it (write-
+    ahead intent → bound residual → active lead binding), and the
+    replacement's argv matches the trusted template under the bounded
+    session substitutions. The rebind honors B because the durable seat
+    proves it was Hermes's selection, carries content + prompt +
+    template forward unchanged, and the gate then auto-confirms the
+    rotated seat under B with exactly one Enter."""
+
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+    seat = _seat_replacement(database)
+
+    successor = _rebind_rotated(
+        anchors,
+        package_root=rotated_root,
+        entry_path=rotated_entry,
+        profile_alias=SELECTED_PROFILE,
+    )
+
+    assert successor.profile_alias == SELECTED_PROFILE
+    assert successor.session_id == SESSION_2
+    assert successor.surface_uuid == SURFACE_2
+    assert successor.workspace_uuid == WORKSPACE_2
+    assert successor.launch_argv_template == predecessor.launch_argv_template
+    assert successor.prompt_pattern == predecessor.prompt_pattern
+    assert successor.entry_sha256 == predecessor.entry_sha256
+    assert anchors.get(predecessor.anchor_id).state == "retired"
+    assert anchors.active_for_cell(CELL) == successor
+
+    rows = database.execute(
+        "SELECT event_type, payload_json FROM events "
+        "WHERE aggregate_type = 'channel_trust_anchor' ORDER BY sequence"
+    ).fetchall()
+    assert [str(row["event_type"]) for row in rows] == [
+        "channel_trust_anchor.captured",
+        "channel_trust_anchor.retired",
+        "channel_trust_anchor.rebound",
+    ]
+    payload = json.loads(str(rows[2]["payload_json"]))
+    assert payload["profile_alias"] == SELECTED_PROFILE
+    assert payload["predecessor_profile_alias"] == PROFILE
+    assert payload["selected_binding_id"] == seat.binding_id
+    intent_row = database.execute(
+        "SELECT intent_id FROM cmux_activation_intents WHERE binding_id = ?",
+        (seat.binding_id,),
+    ).fetchone()
+    assert payload["selected_intent_id"] == str(intent_row["intent_id"])
+
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
+    result = _evaluate(
+        gate,
+        entry_path=rotated_entry,
+        package_root=rotated_root,
+        session_id=SESSION_2,
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        profile_alias=SELECTED_PROFILE,
+        argv=_argv(SESSION_2, CONFIG_PATH_2),
+        screen_text=screen_text,
+    )
+    assert result.confirmed is True
+    assert result.anchor_id == successor.anchor_id
+    assert confirm.calls == 1
+
+
+def test_rebind_to_the_same_profile_needs_no_seat_binding(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    """A same-profile restart or rotation carries the operator-trusted
+    profile itself — no durable selection proof is consulted, exactly
+    as before correction 531484d2 (no seat rows exist here at all)."""
+
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+
+    successor = _rebind_rotated(
+        anchors, package_root=rotated_root, entry_path=rotated_entry
+    )
+
+    assert successor.profile_alias == PROFILE == predecessor.profile_alias
+    assert anchors.get(predecessor.anchor_id).state == "retired"
+    rows = database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'channel_trust_anchor.rebound'"
+    ).fetchall()
+    payload = json.loads(str(rows[0]["payload_json"]))
+    assert payload["selected_binding_id"] is None
+    assert payload["selected_intent_id"] is None
+
+
+def _tamper_intent_profile(database: Database, binding_id: str) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE cmux_activation_intents SET profile_alias = 'max-q' "
+            "WHERE binding_id = ?",
+            (binding_id,),
+        )
+
+
+@pytest.mark.parametrize(
+    "seat",
+    [
+        pytest.param(
+            lambda database: None,
+            id="no-seat-binding-at-all",
+        ),
+        pytest.param(
+            lambda database: _seat_replacement(database, via_intent=False),
+            id="binding-minted-outside-the-intent-path",
+        ),
+        pytest.param(
+            lambda database: _seat_replacement(database, activate=False),
+            id="binding-still-residual",
+        ),
+        pytest.param(
+            lambda database: _seat_replacement(database, profile_alias="max-q"),
+            id="seat-selected-another-profile",
+        ),
+        pytest.param(
+            lambda database: _seat_replacement(database, session_id=SESSION_3),
+            id="seat-selected-another-session",
+        ),
+        pytest.param(
+            lambda database: _seat_replacement(database, surface_uuid=SURFACE),
+            id="seat-on-another-surface",
+        ),
+        pytest.param(
+            lambda database: _seat_replacement(database, workspace_uuid=WORKSPACE),
+            id="seat-in-another-workspace",
+        ),
+        pytest.param(
+            lambda database: _tamper_intent_profile(
+                database, _seat_replacement(database).binding_id
+            ),
+            id="intent-disagrees-with-its-binding",
+        ),
+    ],
+)
+def test_rebind_refuses_a_profile_the_durable_seat_did_not_select(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+    seat,
+) -> None:
+    """The caller asks to carry trust to profile B, but Hermes's durable
+    seat evidence does not prove B was selected for exactly this
+    session/surface: refused before anything is measured or retired,
+    with the predecessor still active and no row or event moved."""
+
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+    seat(database)
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="Hermes-selected replacement binding"):
+        _rebind_rotated(
+            anchors,
+            package_root=rotated_root,
+            entry_path=rotated_entry,
+            profile_alias=SELECTED_PROFILE,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.get(predecessor.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == predecessor
     assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
 
 

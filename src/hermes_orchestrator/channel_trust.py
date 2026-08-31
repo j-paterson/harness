@@ -260,6 +260,16 @@ def _is_uuid(token: str) -> bool:
     return True
 
 
+def _canonical_uuid(value: object) -> str | None:
+    """The canonical text of ``value`` when it parses as a UUID, else
+    ``None`` — so a malformed durable row can never compare equal."""
+
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError:
+        return None
+
+
 def _channel_entry_appears_once(argv: Sequence[str]) -> bool:
     """Exactly one channel-loading flag, and it is the fixed dev-channel
     extension carrying :data:`CHANNEL_ENTRY` exactly once."""
@@ -506,17 +516,31 @@ class ChannelTrustAnchors:
         ``build_mtime`` are taken from this fresh measurement, never
         the predecessor's.
 
-        The operator-trusted profile and launch composition are CONTENT
-        facts too (Sol correction f7f6471c): ``profile_alias`` must
-        equal the predecessor's, and ``launch_argv_template`` — the
+        The operator-trusted launch composition is a CONTENT fact too
+        (Sol correction f7f6471c): ``launch_argv_template`` — the
         replacement seat's live argv — must match the predecessor's
         trusted template under exactly the two bounded substitutions
         the gate itself permits (the session-UUID slot and the
         session-scoped MCP config-path slot, both for ``session_id``).
         The successor persists the PREDECESSOR's template verbatim, so
         the trusted launch baseline never drifts across any number of
-        rotations; any other profile or argv difference is refused
-        with zero database mutation and the predecessor stays active.
+        rotations; any other argv difference is refused with zero
+        database mutation and the predecessor stays active.
+
+        A managed account rotation legitimately moves the cell to a
+        different healthy profile (Sol correction 531484d2), so
+        ``profile_alias`` is not required to equal the predecessor's.
+        A different profile is honored only when it is provably
+        Hermes's own durable selection for this exact seat: the cell's
+        single active lead binding — the seat boundary — must name
+        exactly this session, profile, workspace, and surface, and its
+        bound write-ahead activation intent — the selection Hermes
+        committed before any external create — must name the same
+        session and profile. No binding, a stale or residual one, a
+        binding for another session or surface, a binding minted
+        outside the intent path, or an intent that never selected this
+        profile is arbitrary profile drift: refused with zero database
+        mutation, and the predecessor stays active.
 
         Idempotent no-op: when the active anchor already binds this
         exact session/surface/workspace/path, it is returned unchanged
@@ -553,18 +577,24 @@ class ChannelTrustAnchors:
             )
 
         # Sol correction f7f6471c: profile and launch composition are
-        # never rebound from caller input. The replacement must run
-        # under the predecessor's trusted profile, and its argv must
+        # never rebound from caller input. The replacement's argv must
         # equal the predecessor's trusted template token for token
         # except at the existing bounded session-UUID and session-
         # scoped MCP config-path slots — otherwise drift would become
-        # the trusted baseline the gate below compares against.
+        # the trusted baseline the gate below compares against. Sol
+        # correction 531484d2: a different profile is honored only as
+        # Hermes's own durable selection for this exact seat, proven
+        # against the active lead binding and its bound activation
+        # intent — never against the caller's argument alone.
+        selected_binding_id: str | None = None
+        selected_intent_id: str | None = None
         if profile_alias != predecessor.profile_alias:
-            raise TrustRefused(
-                f"profile_alias {profile_alias!r} does not match the "
-                f"retiring anchor {predecessor.anchor_id!r}'s trusted "
-                "profile; this is a new trust decision, not a rotation "
-                "carry-forward"
+            selected_binding_id, selected_intent_id = self._selected_replacement(
+                cell_id,
+                session_id=canonical_session,
+                profile_alias=profile_alias,
+                workspace_uuid=workspace_uuid,
+                surface_uuid=surface_uuid,
             )
         replacement_argv = tuple(str(token) for token in launch_argv_template)
         if not _argv_matches_template(
@@ -689,10 +719,78 @@ class ChannelTrustAnchors:
                         "canonical_entry_path": str(entry_path),
                         "session_id": canonical_session,
                         "predecessor_anchor_id": predecessor.anchor_id,
+                        "predecessor_profile_alias": predecessor.profile_alias,
+                        "selected_binding_id": selected_binding_id,
+                        "selected_intent_id": selected_intent_id,
                     },
                 ),
             )
         return self.get(anchor_id)
+
+    def _selected_replacement(
+        self,
+        cell_id: str,
+        *,
+        session_id: str,
+        profile_alias: str,
+        workspace_uuid: str,
+        surface_uuid: str,
+    ) -> tuple[str, str]:
+        """Prove ``profile_alias`` is Hermes's durable replacement
+        selection for exactly this seat (Sol correction 531484d2).
+
+        Two Hermes-owned rows must agree, neither of which the caller
+        supplies: the cell's single active lead binding (the seat
+        boundary) naming exactly this session, profile, workspace, and
+        surface, and the bound write-ahead activation intent that
+        produced it (the selection committed before any external
+        create) naming the same session and profile. Returns their ids
+        as rebind evidence; any absence or disagreement refuses.
+        """
+
+        refusal = (
+            f"profile_alias {profile_alias!r} differs from the retiring "
+            "anchor's trusted profile and is not the Hermes-selected "
+            f"replacement binding for cell {cell_id!r}"
+        )
+        binding = self._database.execute(
+            "SELECT binding_id, session_id, profile_alias, workspace_uuid, "
+            "surface_uuid FROM cmux_surface_bindings "
+            "WHERE role = 'lead' AND cell_id = ? AND state = 'active'",
+            (cell_id,),
+        ).fetchone()
+        if binding is None:
+            raise TrustRefused(f"{refusal}: no active lead seat binding")
+        if (
+            _canonical_uuid(binding["session_id"]) != session_id
+            or str(binding["profile_alias"]) != profile_alias
+            or str(binding["workspace_uuid"]) != workspace_uuid
+            or str(binding["surface_uuid"]) != surface_uuid
+        ):
+            raise TrustRefused(
+                f"{refusal}: the active lead seat binding names a different "
+                "session, profile, workspace, or surface"
+            )
+        binding_id = str(binding["binding_id"])
+        intent = self._database.execute(
+            "SELECT intent_id, session_id, profile_alias "
+            "FROM cmux_activation_intents "
+            "WHERE state = 'bound' AND binding_id = ? AND cell_id = ?",
+            (binding_id, cell_id),
+        ).fetchone()
+        if intent is None:
+            raise TrustRefused(
+                f"{refusal}: the seat binding has no bound activation intent"
+            )
+        if (
+            _canonical_uuid(intent["session_id"]) != session_id
+            or str(intent["profile_alias"]) != profile_alias
+        ):
+            raise TrustRefused(
+                f"{refusal}: the bound activation intent selected a different "
+                "session or profile"
+            )
+        return binding_id, str(intent["intent_id"])
 
     def retire(self, anchor_id: str) -> ChannelTrustAnchor:
         stamp = self._now().isoformat()
