@@ -73,6 +73,9 @@ from hermes_orchestrator.operator_decisions import (
     DecisionRefused,
     OperatorDecisions,
 )
+from hermes_orchestrator.orchestrator_workspace import (
+    OrchestratorWorkspaceOwner,
+)
 from hermes_orchestrator.packet_admission import PacketAdmission
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -202,6 +205,15 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="cmux CLI path when config/cmux.yaml is absent",
+    )
+    orchestrator_ws.add_argument(
+        "--evidence-file",
+        type=Path,
+        default=None,
+        help=(
+            "smoke: write a sha256-digest-sealed evidence document "
+            "(source sha, exact invocation, full evidence) to this path"
+        ),
     )
     orchestrator_ws.add_argument("--json", action="store_true")
 
@@ -692,10 +704,16 @@ async def _run_daemon(
     fakechat_router: FakechatWakeRouter | None = None,
     activation: object | None = None,
     dashboard_refresh: DashboardRefreshAction | None = None,
+    orchestrator_workspace: OrchestratorWorkspaceOwner | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
+        if orchestrator_workspace is not None:
+            # The bounded reconciliation cadence for the two-pane
+            # Orchestrator workspace: the owner absorbs cmux failures
+            # and seated refusals itself, so the tick never raises.
+            await orchestrator_workspace.tick()
         if dashboard_refresh is not None:
             # tick() contains its own failures and the pane no-ops off
             # a TTY, so the dashboard refresh rides the maintenance
@@ -731,6 +749,7 @@ async def _run_daemon(
                 and lead_intake is None
                 and channel_hub is None
                 and dashboard_refresh is None
+                and orchestrator_workspace is None
             )
             else _maintenance
         ),
@@ -777,6 +796,13 @@ async def _run_daemon(
         # Deliver any envelope a crash separated from its published
         # packet before the first supervised tick.
         await lead_intake.tick()
+    if orchestrator_workspace is not None:
+        # The daemon ensures its two-pane Orchestrator workspace
+        # autonomously the moment it starts: create it, adopt a healthy
+        # survivor exactly once, or recover it — no manual CLI step.
+        # start() absorbs cmux failures, so visibility never blocks
+        # orchestration.
+        await orchestrator_workspace.start()
     if dashboard_refresh is not None:
         # Establish the dashboard pane the moment the daemon starts (and
         # after any restart): the pane's idempotent fresh-writer
@@ -1496,6 +1522,28 @@ def _snapshot_payload(snapshot: ResourceSnapshot) -> dict[str, Any]:
         "disk_free_bytes": snapshot.disk_free_bytes,
         "managed_rss_bytes": snapshot.managed_rss_bytes,
     }
+
+
+def _git_head_sha(repo_root: Path) -> str:
+    """The exact source revision a smoke run executed from.
+
+    Falls back to ``unknown`` when the repo root is not a git checkout
+    (unit fixtures): the evidence document still validates, and a live
+    run always records the real candidate sha.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    sha = completed.stdout.strip()
+    return sha if completed.returncode == 0 and sha else "unknown"
 
 
 def _print(payload: Any, *, json_output: bool, human: str) -> None:
@@ -3082,11 +3130,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
         if args.command == "orchestrator-workspace":
             from hermes_orchestrator.orchestrator_workspace import (
+                SEAT_ENV,
                 OrchestratorWorkspaceLifecycle,
                 WorkspaceRefused,
+                evidence_document,
                 run_smoke,
             )
 
+            seated = bool(os.environ.get(SEAT_ENV))
+            if seated and args.action == "smoke":
+                # The smoke's restart-recovery leg must close and
+                # rebuild its workspace; a seated supervisor may never
+                # do either, so the smoke runs only from outside.
+                _print(
+                    {"error": "smoke refused from a seated supervisor"},
+                    json_output=args.json,
+                    human=(
+                        "run the smoke outside a seated supervisor pane "
+                        f"(unset {SEAT_ENV})."
+                    ),
+                )
+                return 1
             cmux_cli = (
                 [str(args.cmux_cli)]
                 if args.cmux_cli is not None
@@ -3117,6 +3181,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     title=args.title,
                     interval=args.interval,
                     session_name=args.session,
+                    seated=seated,
                 )
                 if args.action == "ensure":
                     state = asyncio.run(lifecycle.ensure())
@@ -3141,6 +3206,33 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     human=f"orchestrator workspace failed: {error}",
                 )
                 return 1
+            if args.evidence_file is not None:
+                # Digest-sealed receipt of this exact run: source sha,
+                # exact invocation, complete evidence. Revalidate with
+                # verify_evidence_document().
+                document = evidence_document(
+                    evidence,
+                    source_sha=_git_head_sha(settings.repo_root),
+                    invocation=[
+                        "hermes-orchestrator",
+                        *(
+                            list(arguments)
+                            if arguments is not None
+                            else sys.argv[1:]
+                        ),
+                    ],
+                    captured_at=datetime.now(UTC).isoformat(),
+                )
+                evidence_path = args.evidence_file.expanduser()
+                evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                evidence_path.write_text(
+                    json.dumps(document, indent=1, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                evidence = dict(evidence)
+                evidence["evidence_file"] = str(evidence_path)
+                evidence["self_digest"] = document["self_digest"]
+                evidence["source_sha"] = document["source_sha"]
             _print(
                 evidence,
                 json_output=args.json,
@@ -3297,6 +3389,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     channel_hub=runtime.channel_hub,
                     control_operations=runtime.control_operations,
                     dashboard_refresh=runtime.dashboard_refresh,
+                    orchestrator_workspace=runtime.orchestrator_workspace,
                     fakechat_router=runtime.fakechat_router,
                 )
             )

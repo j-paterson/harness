@@ -231,3 +231,173 @@ async def test_tick_exception_is_contained_and_surfaces_next_render(
     output = stream.getvalue()
     assert "failed at 2026-08-30T12:00:00+00:00" in output
     assert "TimeoutError" in output
+
+
+# ---------------------------------------------------------------------------
+# INFRA-191 (Sol packet 575fe76c #1): the daemon owns the two-pane
+# Orchestrator workspace autonomously — composed in runtime.py, ensured
+# at startup, reconciled from the bounded maintenance slot.
+# ---------------------------------------------------------------------------
+
+from hermes_orchestrator.cmux_surfaces import (  # noqa: E402
+    CmuxSurfaceBindings,
+)
+from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
+    SEAT_ENV,
+    OrchestratorWorkspaceLifecycle,
+    OrchestratorWorkspaceOwner,
+)
+from tests.test_orchestrator_workspace import (  # noqa: E402
+    FakeWorkspacePort,
+)
+
+
+def _cmux_configured(repo_root: Path) -> None:
+    (repo_root / "config" / "cmux.yaml").write_text(
+        "cli:\n  - /apps/cmux\n", encoding="utf-8"
+    )
+
+
+def test_open_runtime_composes_the_workspace_owner_unseated(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    _cmux_configured(repo_root)
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        owner = runtime.orchestrator_workspace
+        assert isinstance(owner, OrchestratorWorkspaceOwner)
+        assert owner.lifecycle.seated is False
+    finally:
+        runtime.close()
+
+
+def test_open_runtime_composes_a_seated_owner_from_the_env_marker(
+    tmp_path: Path,
+) -> None:
+    # Recursion guard: the daemon launched inside the upper pane sees
+    # the marker its own creation stamped on the workspace env and
+    # composes a seated lifecycle — adopt-in-place, never a second
+    # workspace/supervisor.
+    repo_root, state_dir = active_repo(tmp_path)
+    _cmux_configured(repo_root)
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={SEAT_ENV: "orchestrator"},
+    )
+    try:
+        owner = runtime.orchestrator_workspace
+        assert isinstance(owner, OrchestratorWorkspaceOwner)
+        assert owner.lifecycle.seated is True
+    finally:
+        runtime.close()
+
+
+def test_open_runtime_without_cmux_composes_no_owner(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        assert runtime.orchestrator_workspace is None
+    finally:
+        runtime.close()
+
+
+def _owner_over(tmp_path: Path, port: FakeWorkspacePort):
+    database = Database.open(tmp_path / "owner-state.db")
+    bindings = CmuxSurfaceBindings(
+        database=database, events=EventStore(database)
+    )
+    owner = OrchestratorWorkspaceOwner(
+        OrchestratorWorkspaceLifecycle(
+            port=port,
+            bindings=bindings,
+            repo_root=Path("/repo/orchestrator"),
+            state_dir=Path("/state/orchestrator"),
+            name="daemonized",
+        )
+    )
+    return database, owner
+
+
+@pytest.mark.asyncio
+async def test_daemon_startup_autonomously_ensures_the_workspace(
+    tmp_path: Path,
+) -> None:
+    port = FakeWorkspacePort()
+    database, owner = _owner_over(tmp_path, port)
+    try:
+        service = FakeService()
+
+        await _run_daemon(
+            service, once=True, interval=60, orchestrator_workspace=owner
+        )
+
+        # No manual CLI step: the startup hook created the two-pane
+        # workspace and the maintenance tick adopted it unchanged.
+        assert service.ticks == 1
+        assert len(port.created) == 1
+        [workspace] = port.workspaces.values()
+        assert len(workspace.panes) == 2
+        assert owner.ensures == 2
+        assert owner.last_state is not None
+        assert owner.last_state.outcome == "adopted"
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_daemon_restart_adopts_once_and_reconciles_the_lower_pane(
+    tmp_path: Path,
+) -> None:
+    port = FakeWorkspacePort()
+    database, first_owner = _owner_over(tmp_path, port)
+    try:
+        await _run_daemon(
+            FakeService(),
+            once=True,
+            interval=60,
+            orchestrator_workspace=first_owner,
+        )
+        started = first_owner.last_state
+        assert started is not None
+        port.kill_process(started.lower.surface_uuid)
+
+        # A daemon restart composes a fresh owner over the same durable
+        # bindings: it adopts the surviving workspace exactly once and
+        # respawns the dead Hermes session in place — no second
+        # workspace, no second daemon.
+        second_owner = OrchestratorWorkspaceOwner(first_owner.lifecycle)
+        await _run_daemon(
+            FakeService(),
+            once=True,
+            interval=60,
+            orchestrator_workspace=second_owner,
+        )
+
+        assert len(port.created) == 1
+        assert len(port.workspaces) == 1
+        assert port.respawns[-1][0].surface_uuid == (
+            started.lower.surface_uuid
+        )
+    finally:
+        database.close()

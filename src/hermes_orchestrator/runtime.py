@@ -75,6 +75,12 @@ from hermes_orchestrator.merge_flow import (
     build_merge_flow,
 )
 from hermes_orchestrator.operator_decisions import OperatorDecisions
+from hermes_orchestrator.orchestrator_workspace import (
+    SEAT_ENV,
+    OrchestratorWorkspaceLifecycle,
+    OrchestratorWorkspaceOwner,
+    WorkspaceRefused,
+)
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -180,6 +186,7 @@ class Runtime:
     cmux_bindings: CmuxSurfaceBindings | None = None
     cmux_reconciler: CmuxSurfaceReconciler | None = None
     cmux_hibernation: CmuxHibernationDriver | None = None
+    orchestrator_workspace: OrchestratorWorkspaceOwner | None = None
     lead_intake: LeadIntakeRouter | None = None
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
@@ -443,6 +450,7 @@ def open_runtime(
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
+        orchestrator_workspace: OrchestratorWorkspaceOwner | None = None
         lead_intake: LeadIntakeRouter | None = None
         channel_hub: ChannelHub | None = None
         channel_capabilities: ChannelCapabilities | None = None
@@ -626,6 +634,25 @@ def open_runtime(
                         port=cmux_port,
                     ),
                 )
+                # INFRA-191: the daemon owns the two-pane Orchestrator
+                # workspace autonomously. A daemon launched with the
+                # seat marker its own creation stamped runs seated —
+                # adopt-in-place only, never a second workspace or
+                # supervisor. An unconfigurable repo/state path refuses
+                # composition instead of crashing live startup: cmux
+                # visibility stays optional.
+                try:
+                    orchestrator_workspace = OrchestratorWorkspaceOwner(
+                        OrchestratorWorkspaceLifecycle(
+                            port=cmux_port,
+                            bindings=cmux_bindings,
+                            repo_root=settings.repo_root,
+                            state_dir=settings.state_dir,
+                            seated=bool(environment.get(SEAT_ENV)),
+                        )
+                    )
+                except WorkspaceRefused:
+                    orchestrator_workspace = None
 
             cells = ProjectCellService(
                 database=database,
@@ -705,6 +732,7 @@ def open_runtime(
             cmux_bindings=cmux_bindings,
             cmux_reconciler=cmux_reconciler,
             cmux_hibernation=cmux_hibernation,
+            orchestrator_workspace=orchestrator_workspace,
             lead_intake=lead_intake,
             channel_hub=channel_hub,
             channel_capabilities=channel_capabilities,

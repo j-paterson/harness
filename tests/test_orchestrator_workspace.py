@@ -88,6 +88,9 @@ class FakeWorkspacePort:
     def kill_process(self, surface_uuid: str) -> None:
         self._pane(surface_uuid).processes = ["zsh"]
 
+    def set_processes(self, surface_uuid: str, names: list[str]) -> None:
+        self._pane(surface_uuid).processes = list(names)
+
     def drop_pane(self, workspace_uuid: str, surface_uuid: str) -> None:
         workspace = self.workspaces[workspace_uuid]
         workspace.panes = [
@@ -135,6 +138,7 @@ class FakeWorkspacePort:
                 "cwd": cwd,
                 "upper_command": upper_command,
                 "lower_command": lower_command,
+                "env": dict(env or {}),  # type: ignore[arg-type]
                 "resolve_marker": resolve_marker,
             }
         )
@@ -319,7 +323,7 @@ async def test_upper_pane_runs_the_actual_supervisor_dashboard_lifecycle(
         for row in inspection["surfaces"]
         if row["role"] == UPPER_ROLE
     )
-    assert upper["process_live"]
+    assert upper["role_proven"]
     assert "uv" in upper["process_names"]
 
 
@@ -495,7 +499,7 @@ async def test_smoke_produces_complete_two_pane_evidence(
     assert inspection["pane_count"] == 2
     assert inspection["distinct_panes"] == 2
     assert inspection["both_panes_present"] is True
-    assert inspection["both_processes_live"] is True
+    assert inspection["both_roles_proven"] is True
     assert {row["role"] for row in inspection["surfaces"]} == {
         UPPER_ROLE,
         LOWER_ROLE,
@@ -506,7 +510,7 @@ async def test_smoke_produces_complete_two_pane_evidence(
     recovery = evidence["restart_recovery"]
     assert recovery["workspace_replaced"] is True
     assert recovery["generation_advanced"] is True
-    assert recovery["inspection"]["both_processes_live"] is True
+    assert recovery["inspection"]["both_roles_proven"] is True
     assert evidence["teardown"]["workspace_remains"] is False
     assert port.workspaces == {}
 
@@ -630,3 +634,459 @@ def test_cli_refuses_without_cmux_configuration(
 
     assert exit_code == 1
     assert "cmux is not configured" in json.loads(output)["error"]
+
+
+# ---------------------------------------------------------------------------
+# Sol packet 2 (575fe76c): role-specific process identity from typed
+# metadata — never screen content.
+# ---------------------------------------------------------------------------
+
+from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
+    SEAT_ENV,
+    OrchestratorWorkspaceOwner,
+    evidence_document,
+    hermes_process_identity,
+    smoke_passed,
+    supervisor_process_identity,
+    verify_evidence_document,
+)
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["Python", "sleep", "uv", "zsh", "zsh"],
+        ["zsh", "uv", "python3.13"],
+        ["hermes-orchestrator"],
+    ],
+)
+def test_supervisor_identity_accepts_expected_trees_with_wrappers(
+    names: list[str],
+) -> None:
+    assert supervisor_process_identity(names)
+    assert not hermes_process_identity(names)
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["python3.11", "sleep", "zsh", "zsh"],
+        ["zsh", "hermes", "node"],
+        ["Python"],
+    ],
+)
+def test_hermes_identity_accepts_expected_trees_with_wrappers(
+    names: list[str],
+) -> None:
+    assert hermes_process_identity(names)
+    assert not supervisor_process_identity(names)
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["zsh"],
+        [],
+        ["zsh", "vim"],
+        ["zsh", "uv", "vim"],
+        ["zsh", "python3.11", "ssh"],
+    ],
+)
+def test_neither_role_accepts_unrelated_or_empty_trees(
+    names: list[str],
+) -> None:
+    assert not supervisor_process_identity(names)
+    assert not hermes_process_identity(names)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_process_in_a_pane_is_not_adopted(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    port.set_processes(first.lower.surface_uuid, ["zsh", "vim"])
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
+    assert len(port.created) == 1
+    assert len(port.workspaces[first.workspace_uuid].panes) == 2
+
+
+@pytest.mark.asyncio
+async def test_wrong_role_trees_are_recovered_without_new_resources(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    # Swapped identities: a bare python (Hermes-shaped) upper, a
+    # uv-launched (supervisor-shaped) lower.
+    port.set_processes(first.upper.surface_uuid, ["zsh", "python3.11"])
+    port.set_processes(first.lower.surface_uuid, ["zsh", "uv", "Python"])
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert set(recovered.respawned) == {UPPER_ROLE, LOWER_ROLE}
+    respawned = {ref.surface_uuid: command for ref, command in port.respawns}
+    assert respawned[first.upper.surface_uuid] == SUPERVISOR_COMMAND
+    assert respawned[first.lower.surface_uuid] == HERMES_COMMAND
+    assert len(port.created) == 1
+    assert len(port.workspaces[first.workspace_uuid].panes) == 2
+
+
+class StubbornRolePort(FakeWorkspacePort):
+    """Respawns are recorded but never restore role identity."""
+
+    async def respawn_surface(
+        self, ref: CmuxSurfaceRef, command: str
+    ) -> None:
+        self.respawns.append((ref, command))
+
+    async def create_two_pane_workspace(self, **kwargs: object):
+        upper, lower = await super().create_two_pane_workspace(**kwargs)
+        self.set_processes(lower.surface_uuid, ["zsh", "vim"])
+        return upper, lower
+
+
+@pytest.mark.asyncio
+async def test_smoke_fails_unless_both_role_identities_are_proven(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = StubbornRolePort()
+    owner = lifecycle(port, bindings)
+
+    evidence = await run_smoke(owner, port)
+
+    assert evidence["passed"] is False
+    assert evidence["inspection"]["both_roles_proven"] is False
+
+
+# ---------------------------------------------------------------------------
+# Sol packet 1 (575fe76c): seated recursion guard and the stable owner.
+# ---------------------------------------------------------------------------
+
+
+def seated_lifecycle(
+    port: FakeWorkspacePort, bindings: CmuxSurfaceBindings
+) -> OrchestratorWorkspaceLifecycle:
+    return OrchestratorWorkspaceLifecycle(
+        port=port,
+        bindings=bindings,
+        repo_root=REPO_ROOT,
+        state_dir=STATE_DIR,
+        name="orch",
+        title="Orchestrator",
+        seated=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_created_workspace_carries_the_seat_marker_env(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    await lifecycle(port, bindings).ensure()
+
+    [created] = port.created
+    assert created["env"] == {SEAT_ENV: "orch"}
+
+
+@pytest.mark.asyncio
+async def test_seated_supervisor_adopts_and_reconciles_lower_only(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    first = await lifecycle(port, bindings).ensure()
+    seated = seated_lifecycle(port, bindings)
+
+    adopted = await seated.ensure()
+    assert adopted.outcome == "adopted"
+    assert adopted.workspace_uuid == first.workspace_uuid
+
+    port.kill_process(first.lower.surface_uuid)
+    recovered = await seated.ensure()
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
+    assert len(port.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_seated_supervisor_never_respawns_its_own_upper_pane(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    first = await lifecycle(port, bindings).ensure()
+    port.set_processes(first.upper.surface_uuid, ["zsh"])
+
+    adopted = await seated_lifecycle(port, bindings).ensure()
+
+    assert adopted.outcome == "adopted"
+    assert all(
+        ref.surface_uuid != first.upper.surface_uuid
+        for ref, _ in port.respawns
+    )
+
+
+@pytest.mark.asyncio
+async def test_seated_supervisor_never_creates_or_closes_workspaces(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    seated = seated_lifecycle(port, bindings)
+
+    # No durable seat: refuse, create nothing.
+    with pytest.raises(WorkspaceRefused, match="never creates"):
+        await seated.ensure()
+    assert port.created == []
+
+    # A partial workspace: refuse to rebuild, close nothing.
+    first = await lifecycle(port, bindings).ensure()
+    port.drop_pane(first.workspace_uuid, first.lower.surface_uuid)
+    with pytest.raises(WorkspaceRefused, match="cannot rebuild"):
+        await seated.ensure()
+    assert port.closed == []
+    assert len(port.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_start_ensures_and_ticks_adopt_idempotently(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+
+    started = await owner.start()
+    assert started is not None and started.outcome == "created"
+
+    ticked = await owner.tick()
+    assert ticked is not None and ticked.outcome == "adopted"
+    assert ticked.workspace_uuid == started.workspace_uuid
+    assert owner.ensures == 2
+    assert len(port.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_tick_respawns_dead_lower_session_in_place(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    started = await owner.start()
+    port.kill_process(started.lower.surface_uuid)
+
+    ticked = await owner.tick()
+
+    assert ticked is not None and ticked.outcome == "recovered"
+    assert port.respawns[-1] == (started.lower, HERMES_COMMAND)
+    assert len(port.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_tick_rebuilds_dead_workspace_generation_advancing(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    started = await owner.start()
+    await port.close_workspace(started.workspace_uuid)
+
+    rebuilt = await owner.tick()
+
+    assert rebuilt is not None and rebuilt.outcome == "created"
+    assert rebuilt.generation == started.generation + 1
+
+    port.drop_pane(rebuilt.workspace_uuid, rebuilt.lower.surface_uuid)
+    repaired = await owner.tick()
+    assert repaired is not None and repaired.outcome == "created"
+    assert repaired.generation == rebuilt.generation + 1
+
+
+@pytest.mark.asyncio
+async def test_restarted_owner_adopts_exactly_once_without_duplicates(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    first_owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    started = await first_owner.start()
+
+    # An owner restart composes a fresh owner over the same durable
+    # bindings and the same live cmux: it adopts, never re-creates.
+    second_owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    adopted = await second_owner.start()
+
+    assert adopted is not None and adopted.outcome == "adopted"
+    assert adopted.workspace_uuid == started.workspace_uuid
+    assert len(port.created) == 1
+    assert len(port.workspaces) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_teardown_stops_reconciliation_deterministically(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    started = await owner.start()
+
+    closed = await owner.teardown()
+
+    assert closed == (started.workspace_uuid,)
+    assert owner.stopped is True
+    assert await owner.tick() is None
+    assert len(port.created) == 1
+    assert port.workspaces == {}
+    assert bindings.active_orchestrator() is None
+
+
+@pytest.mark.asyncio
+async def test_owner_absorbs_refusals_and_records_them(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceOwner(seated_lifecycle(port, bindings))
+
+    assert await owner.start() is None
+    assert owner.last_error is not None
+    assert "WorkspaceRefused" in owner.last_error
+    assert port.created == []
+
+
+# ---------------------------------------------------------------------------
+# Sol packet 3 (575fe76c): mandatory replacement/generation clauses and
+# the digest-sealed evidence document.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_smoke_pass_condition_requires_every_clause(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    evidence = await run_smoke(lifecycle(port, bindings), port)
+    assert smoke_passed(evidence) is True
+
+    import copy
+
+    def mutated(apply) -> dict:
+        clone = copy.deepcopy(evidence)
+        apply(clone)
+        return clone
+
+    failures = [
+        mutated(
+            lambda e: e["restart_recovery"].__setitem__(
+                "workspace_replaced", False
+            )
+        ),
+        mutated(
+            lambda e: e["restart_recovery"].__setitem__(
+                "generation_advanced", False
+            )
+        ),
+        mutated(
+            lambda e: e["inspection"].__setitem__(
+                "both_roles_proven", False
+            )
+        ),
+        mutated(
+            lambda e: e["restart_recovery"]["inspection"].__setitem__(
+                "both_roles_proven", False
+            )
+        ),
+        mutated(
+            lambda e: e.__setitem__("stable_identities", False)
+        ),
+        mutated(
+            lambda e: e["teardown"].__setitem__("workspace_remains", True)
+        ),
+    ]
+    for broken in failures:
+        assert smoke_passed(broken) is False
+
+
+class NonClosingPort(FakeWorkspacePort):
+    """close-workspace acks but the workspace survives (a stuck close)."""
+
+    async def close_workspace(self, workspace_uuid: str) -> None:
+        self.closed.append(workspace_uuid)
+
+
+@pytest.mark.asyncio
+async def test_smoke_fails_when_the_workspace_is_not_replaced(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = NonClosingPort()
+    evidence = await run_smoke(lifecycle(port, bindings), port)
+
+    assert evidence["restart_recovery"]["workspace_replaced"] is False
+    assert evidence["restart_recovery"]["generation_advanced"] is False
+    assert evidence["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_evidence_document_binds_the_run_and_revalidates(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    evidence = await run_smoke(lifecycle(port, bindings), port)
+    document = evidence_document(
+        evidence,
+        source_sha="52cd59dcafe",
+        invocation=["hermes-orchestrator", "orchestrator-workspace", "smoke"],
+        captured_at="2026-08-30T20:00:00+00:00",
+    )
+
+    assert document["schema"] == "infra-191-live-smoke/v1"
+    assert document["source_sha"] == "52cd59dcafe"
+    assert document["invocation"][1] == "orchestrator-workspace"
+    body = document["evidence"]
+    assert body["first_ensure"]["generation"] == 1
+    assert body["restart_recovery"]["ensure"]["generation"] == 2
+    assert body["inspection"]["surfaces"][0]["process_names"]
+    assert body["teardown"]["workspace_remains"] is False
+    assert verify_evidence_document(document) is True
+
+    tampered = json.loads(json.dumps(document))
+    tampered["evidence"]["passed"] = False
+    assert verify_evidence_document(tampered) is False
+    reforged = json.loads(json.dumps(document))
+    reforged["self_digest"] = "0" * 64
+    assert verify_evidence_document(reforged) is False
+
+
+def test_cli_smoke_writes_a_digest_sealed_evidence_file(
+    configured_repo: tuple[Path, Path],
+    cli_port: FakeWorkspacePort,
+    tmp_path: Path,
+) -> None:
+    evidence_file = tmp_path / "receipts" / "live-smoke.json"
+    exit_code, output = invoke(
+        cli_arguments(
+            configured_repo,
+            "smoke",
+            "--name",
+            "cli-evidence",
+            "--settle-seconds",
+            "0",
+            "--evidence-file",
+            str(evidence_file),
+        )
+    )
+
+    assert exit_code == 0
+    printed = json.loads(output)
+    assert printed["evidence_file"] == str(evidence_file)
+    document = json.loads(evidence_file.read_text(encoding="utf-8"))
+    assert verify_evidence_document(document) is True
+    assert printed["self_digest"] == document["self_digest"]
+    assert document["invocation"][0] == "hermes-orchestrator"
+    assert "smoke" in document["invocation"]
+    assert isinstance(document["source_sha"], str)
+    assert document["evidence"]["passed"] is True
