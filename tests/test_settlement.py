@@ -1143,7 +1143,7 @@ class TestDirectExactHeadMerge:
 
 PARENT_SHA = "7" * 40
 ADVANCED_PATHS = ("A\tsrc/new.py", "M\tsrc/app.py")
-STABLE_DELTA_DIGEST = "8" * 40
+STABLE_APPLIED_TREE = "8" * 40
 
 
 def _wire_patch_equivalence(
@@ -1156,14 +1156,15 @@ def _wire_patch_equivalence(
 
     acceptance.git.ancestor[(merge_sha, "origin/main")] = True
     acceptance.git.ancestor[(candidate, merge_sha)] = False
-    acceptance.git.trees[merge_sha] = "unrelated-tree-" + merge_sha
+    acceptance.git.trees[merge_sha] = STABLE_APPLIED_TREE
     acceptance.git.trees[candidate] = "tree-" + candidate
     acceptance.git.ancestor[(base, PARENT_SHA)] = True
     acceptance.git.parents[merge_sha] = PARENT_SHA
     acceptance.git.paths[(base, candidate)] = ADVANCED_PATHS
     acceptance.git.paths[(PARENT_SHA, merge_sha)] = ADVANCED_PATHS
-    acceptance.git.delta_digests[(base, candidate)] = STABLE_DELTA_DIGEST
-    acceptance.git.delta_digests[(PARENT_SHA, merge_sha)] = STABLE_DELTA_DIGEST
+    acceptance.git.applied_trees[(base, candidate, PARENT_SHA)] = (
+        STABLE_APPLIED_TREE
+    )
 
 
 def _manifest_for(acceptance: Any, event: Any) -> Any:

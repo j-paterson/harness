@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,37 +15,6 @@ _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 # Conservative allowlist for remotes, branches, and qualified refs: no
 # option-like leading dash, no whitespace or control bytes, no ".." ranges.
 _REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-# Only hunk location metadata is normalized before digesting a delta: the
-# leading "@@ -l,s +l,s @@" marker, never any trailing context text after
-# it, and never any other line (whitespace, mode lines, blob ids, binary
-# literals, additions/deletions, or paths all stay byte-for-byte).
-_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
-# The pre-/post-image blob ids on an ``index`` line are file-identity
-# metadata, not content: the same patch applied over an advanced base that
-# touched the file elsewhere necessarily yields different blob ids while
-# every hunk stays byte-identical (live PR #39: README.md and cli.py).
-# Content is fully carried by the hunks (and by ``--binary`` literals for
-# binary files) and mode by the mode lines and the index line's trailing
-# mode token, which is kept verbatim.
-_INDEX_LINE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+")
-
-
-def _normalize_delta(text: str) -> str:
-    """Normalize only location and identity metadata in a diff.
-
-    Each hunk's location numbers become a bare ``@@`` marker and each
-    ``index <blob>..<blob>`` prefix becomes ``index`` (its trailing mode
-    token stays). Every other byte -- whitespace, old/new mode lines,
-    ``GIT binary patch`` literals, ``\\ No newline at end of file``,
-    additions/deletions, and paths -- is preserved verbatim.
-    """
-
-    normalized: list[str] = []
-    for line in text.splitlines(keepends=True):
-        line = _HUNK_HEADER.sub("@@", line, count=1)
-        line = _INDEX_LINE.sub("index", line, count=1)
-        normalized.append(line)
-    return "".join(normalized)
 
 
 class GitError(RuntimeError):
@@ -64,7 +34,12 @@ class GitRunner(Protocol):
     """Execution boundary: one argv vector, one repository, no shell."""
 
     def run(
-        self, args: tuple[str, ...], cwd: Path, *, input: str | None = None
+        self,
+        args: tuple[str, ...],
+        cwd: Path,
+        *,
+        input: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> GitResult: ...
 
 
@@ -81,13 +56,21 @@ class SubprocessGitRunner:
         self._timeout = timeout
 
     def run(
-        self, args: tuple[str, ...], cwd: Path, *, input: str | None = None
+        self,
+        args: tuple[str, ...],
+        cwd: Path,
+        *,
+        input: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> GitResult:
+        call_env = self._env
+        if env is not None:
+            call_env = {**(self._env or {}), **env}
         try:
             completed = subprocess.run(
                 args,
                 cwd=cwd,
-                env=self._env,
+                env=call_env,
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
@@ -196,38 +179,95 @@ class GitVerifier:
         lines = [line for line in result.stdout.splitlines() if line]
         return tuple(sorted(lines))
 
-    def delta_digest(self, repo_path: Path, base: str, head: str) -> str:
-        """Return a canonical sha256 digest of the diff between two commits.
+    def apply_to_tree(self, repo_path: Path, base: str, head: str, parent: str) -> str:
+        """Prove patch equivalence by isolated Git application, not a digest.
 
-        Built from ``git diff --full-index --binary --no-renames <base>
-        <head>``: every byte is kept verbatim -- whitespace, old/new mode
-        lines, binary patch literals, additions/deletions, and paths --
-        except each hunk's location numbers (``@@ -l,s +l,s @@``) and the
-        ``index`` line's pre-/post-image blob ids, which are normalized so
-        the same patch applied over an advanced base still digests equal.
-        Unlike ``git patch-id --stable``, this digest
-        is sensitive to whitespace-only changes (indentation), file mode
-        changes, and binary content drift. An empty delta is never proof
-        and fails closed.
+        Generates the reviewed patch with ``git diff --full-index --binary
+        --no-renames --no-textconv --no-ext-diff <base> <head>`` (an empty
+        diff is never proof and fails closed), then -- inside a fresh
+        temporary index that is never the user's worktree or real index --
+        reads ``parent`` as the starting tree, applies that exact patch with
+        ``git apply --cached --binary --whitespace=nowarn`` (any rejected
+        hunk, conflict, or malformed patch fails closed; no ``--3way``, no
+        ``--reject``, no fuzz), and writes the resulting tree. The caller
+        compares the returned tree id to the merge commit's own tree: equal
+        trees are the only proof that the reviewed delta, applied exactly
+        as reviewed, reproduces what actually landed. Because ``--no-
+        textconv --no-ext-diff`` are always passed, a repository-configured
+        lossy diff driver can never hide a real content difference from
+        this proof.
         """
 
         _require_sha(base)
         _require_sha(head)
-        result = self._runner.run(
-            ("git", "diff", "--full-index", "--binary", "--no-renames", base, head),
+        _require_sha(parent)
+        diff_result = self._runner.run(
+            (
+                "git",
+                "diff",
+                "--full-index",
+                "--binary",
+                "--no-renames",
+                "--no-textconv",
+                "--no-ext-diff",
+                base,
+                head,
+            ),
             repo_path,
         )
-        if result.returncode != 0:
+        if diff_result.returncode != 0:
             raise GitError(
                 "git diff --full-index --binary failed with exit code "
-                f"{result.returncode}"
+                f"{diff_result.returncode}"
             )
-        if not result.stdout:
+        patch = diff_result.stdout
+        if not patch:
             raise GitError("empty delta")
-        normalized = _normalize_delta(result.stdout)
-        return hashlib.sha256(
-            normalized.encode("utf-8", "surrogateescape")
-        ).hexdigest()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            tmp_index = str(Path(tmpdir) / "index")
+            env = {"GIT_INDEX_FILE": tmp_index}
+            read_tree_result = self._runner.run(
+                ("git", "read-tree", parent), repo_path, env=env
+            )
+            if read_tree_result.returncode != 0:
+                raise GitError(
+                    "git read-tree failed with exit code "
+                    f"{read_tree_result.returncode}"
+                )
+            apply_result = self._runner.run(
+                (
+                    "git",
+                    "apply",
+                    "--cached",
+                    "--binary",
+                    "--whitespace=nowarn",
+                ),
+                repo_path,
+                input=patch,
+                env=env,
+            )
+            if apply_result.returncode != 0:
+                raise GitError(
+                    "git apply failed with exit code "
+                    f"{apply_result.returncode}"
+                )
+            write_tree_result = self._runner.run(
+                ("git", "write-tree"), repo_path, env=env
+            )
+            if write_tree_result.returncode != 0:
+                raise GitError(
+                    "git write-tree failed with exit code "
+                    f"{write_tree_result.returncode}"
+                )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        tree = write_tree_result.stdout.strip()
+        if _SHA_PATTERN.match(tree) is None:
+            raise GitError("git write-tree returned an invalid tree identity")
+        return tree
 
 
 @dataclass(frozen=True, slots=True)

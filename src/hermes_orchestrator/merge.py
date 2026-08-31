@@ -78,7 +78,9 @@ class AncestryVerifier(Protocol):
         self, repo_path: Path, base: str, head: str
     ) -> tuple[str, ...]: ...
 
-    def delta_digest(self, repo_path: Path, base: str, head: str) -> str: ...
+    def apply_to_tree(
+        self, repo_path: Path, base: str, head: str, parent: str
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,9 +91,10 @@ class ProvenMerge:
     commit: ``merge_commit_is_candidate`` (fast-forward), ``candidate_reachable``
     (merge commit), ``reviewed_tree_equivalent`` (squash or rebase whose
     final tree is byte-identical to the reviewed tree), or
-    ``patch_equivalent`` (squash or rebase onto an advanced base whose diff
-    from the recorded candidate base is identical, by changed paths and a
-    canonical delta digest, to the merge's diff from its first parent).
+    ``patch_equivalent`` (squash or rebase onto an advanced base, proven by
+    isolated Git application: the recorded candidate's exact reviewed patch,
+    applied to the merge's first parent in a throwaway index, reproduces
+    the merge commit's own tree byte-for-byte -- never a digest comparison).
     This object is the only permit for a Linear Done projection.
     """
 
@@ -105,7 +108,8 @@ class ProvenMerge:
     relation: str
     base_sha: str | None = None
     merge_parent_sha: str | None = None
-    delta_digest: str | None = None
+    applied_tree_sha: str | None = None
+    merge_tree_sha: str | None = None
     changed_paths: tuple[str, ...] = ()
 
 
@@ -121,7 +125,8 @@ class _Proof:
     relation: str
     base_sha: str | None = None
     merge_parent_sha: str | None = None
-    delta_digest: str | None = None
+    applied_tree_sha: str | None = None
+    merge_tree_sha: str | None = None
     changed_paths: tuple[str, ...] = ()
 
 
@@ -196,7 +201,8 @@ class IntegrationMerge:
             relation=proof.relation,
             base_sha=proof.base_sha,
             merge_parent_sha=proof.merge_parent_sha,
-            delta_digest=proof.delta_digest,
+            applied_tree_sha=proof.applied_tree_sha,
+            merge_tree_sha=proof.merge_tree_sha,
             changed_paths=proof.changed_paths,
         )
 
@@ -238,7 +244,8 @@ class IntegrationMerge:
             relation=proof.relation,
             base_sha=proof.base_sha,
             merge_parent_sha=proof.merge_parent_sha,
-            delta_digest=proof.delta_digest,
+            applied_tree_sha=proof.applied_tree_sha,
+            merge_tree_sha=proof.merge_tree_sha,
             changed_paths=proof.changed_paths,
         )
 
@@ -259,7 +266,12 @@ class IntegrationMerge:
         identity carrying the reviewed tree. When those three relations all
         fail, merge_method is squash or rebase, and the recorded candidate
         base is supplied, a fourth relation — patch equivalence against an
-        advanced base — is tried before giving up.
+        advanced base — is tried before giving up. That fourth relation is
+        never a digest comparison: it is an isolated Git application, in a
+        throwaway index that never touches the user's worktree or real
+        index, of the exact reviewed patch onto the merge's first parent,
+        accepted only when the resulting tree is byte-identical to the
+        merge commit's own tree.
         """
 
         integration_ref = f"origin/{project.integration_branch}"
@@ -304,21 +316,21 @@ class IntegrationMerge:
                     raise ReconciliationRequired(
                         "merge changed paths differ from the reviewed candidate"
                     )
-                candidate_digest = self._git.delta_digest(
-                    project.repo_path, base_sha, candidate_sha
+                applied = self._git.apply_to_tree(
+                    project.repo_path, base_sha, candidate_sha, parent
                 )
-                merge_digest = self._git.delta_digest(
-                    project.repo_path, parent, merge_sha
-                )
-                if candidate_digest != merge_digest:
+                merge_tree = self._git.tree_of(project.repo_path, merge_sha)
+                if applied != merge_tree:
                     raise ReconciliationRequired(
-                        "merge content differs from the reviewed candidate"
+                        "applying the reviewed candidate delta to the merge "
+                        "parent does not reproduce the merge tree"
                     )
                 return _Proof(
                     relation="patch_equivalent",
                     base_sha=base_sha,
                     merge_parent_sha=parent,
-                    delta_digest=merge_digest,
+                    applied_tree_sha=applied,
+                    merge_tree_sha=merge_tree,
                     changed_paths=merge_paths,
                 )
         except GitError as error:
