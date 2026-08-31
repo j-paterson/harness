@@ -1024,3 +1024,36 @@ async def test_mismatched_or_multiple_open_prs_still_reject_settlement(
         "the candidate is not the head of the sole open pull request"
         in outcome_c.reason
     )
+
+
+@pytest.mark.asyncio
+async def test_has_pending_submission_true_only_while_a_submitted_row_exists(
+    flow: ProductionShapedFlow,
+) -> None:
+    """INFRA-198 P1: the read-only helper MergerSession.review_active uses.
+
+    True only for a project with a durable submitted_verdicts row still in
+    state 'submitted'; false with no row, for a different project, and
+    once the row is settled.
+    """
+
+    assert flow.turns.has_pending_submission("demo") is False
+
+    now = flow.clock.isoformat()
+    flow.database.execute(
+        "INSERT INTO submitted_verdicts(event_id, project_key, issue_id, "
+        "candidate_sha, reviewed_thread_id, reviewed_generation, "
+        "verdict_json, state, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ?)",
+        ("evt-pending-1", "demo", "ENG-1", SHA_A, "thr", 1, "{}", now, now),
+    )
+
+    assert flow.turns.has_pending_submission("demo") is True
+    assert flow.turns.has_pending_submission("other-project") is False
+
+    flow.database.execute(
+        "UPDATE submitted_verdicts SET state = 'settled' WHERE event_id = ?",
+        ("evt-pending-1",),
+    )
+
+    assert flow.turns.has_pending_submission("demo") is False

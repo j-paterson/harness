@@ -1,0 +1,420 @@
+"""Verify MergerSession's event-scoped Codex App Server ownership.
+
+INFRA-198 P1 (Sol correction 9a512ed7, Critical, live): before
+``MergerSession`` existed the daemon started the merge flow's App Server
+at process startup and held its process-group lease for the daemon's
+whole lifetime, so the bound Sol thread showed "open in another app"
+while idle. These tests pin the fix: the session opens only while
+durable SQLite state shows review work active, and releases (freeing the
+lease) the instant nothing is outstanding — at startup recovery, on a
+maintenance-style ``reconcile``, and from its own listener's
+terminal-idle hook without a self-cancellation deadlock.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_orchestrator.codex_rpc import CodexRpcClient, RpcNotification
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.merger_session import MergerSession
+from hermes_orchestrator.processes import ProcessRegistry
+
+_CLOSED = object()
+
+
+class FakeRpc:
+    """Records start/close counts; ``notifications()`` ends on close."""
+
+    def __init__(self, *, fail_start: bool = False) -> None:
+        self.fail_start = fail_start
+        self.start_calls = 0
+        self.close_calls = 0
+        self._queue: asyncio.Queue[object] = asyncio.Queue()
+
+    async def start(self) -> None:
+        if self.fail_start:
+            raise RuntimeError("codex app-server did not start")
+        self.start_calls += 1
+        self._queue = asyncio.Queue()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        await self._queue.put(_CLOSED)
+
+    async def notifications(self):
+        while True:
+            item = await self._queue.get()
+            if item is _CLOSED:
+                return
+            yield item
+
+    async def push(self, notification: RpcNotification) -> None:
+        await self._queue.put(notification)
+
+
+class FakeMerger:
+    def __init__(self, *, fail_projects: frozenset[str] = frozenset()) -> None:
+        self.ensure_calls: list[str] = []
+        self._fail = fail_projects
+
+    async def ensure_thread(self, project_key: str) -> None:
+        self.ensure_calls.append(project_key)
+        if project_key in self._fail:
+            raise RuntimeError("merger channel unavailable")
+
+
+class FakeTurns:
+    def __init__(self) -> None:
+        self.outstanding: dict[str, object | None] = {}
+        self.pending: dict[str, bool] = {}
+        self.recover_calls: list[tuple[str, ...]] = []
+        self.settle_calls: list[tuple[tuple[str, ...], str]] = []
+        self.on_settle_idle: Callable[[str], None] | None = None
+
+    def outstanding_wake(self, project_key: str) -> object | None:
+        return self.outstanding.get(project_key)
+
+    def has_pending_submission(self, project_key: str) -> bool:
+        return self.pending.get(project_key, False)
+
+    async def recover_outstanding(
+        self, projects: Sequence[str]
+    ) -> tuple[object, ...]:
+        self.recover_calls.append(tuple(projects))
+        return ()
+
+    async def settle_idle_thread(
+        self, projects: Sequence[str], thread_id: str
+    ) -> None:
+        self.settle_calls.append((tuple(projects), thread_id))
+        if self.on_settle_idle is not None:
+            self.on_settle_idle(thread_id)
+
+    async def on_notification(self, notification: RpcNotification) -> None:
+        return None
+
+
+class FakeReviews:
+    def __init__(self) -> None:
+        self.resume_calls = 0
+
+    async def resume_settlements(self) -> tuple[object, ...]:
+        self.resume_calls += 1
+        return ()
+
+
+def _flow(
+    *, rpc: FakeRpc, merger: FakeMerger, turns: FakeTurns, reviews: FakeReviews
+) -> SimpleNamespace:
+    return SimpleNamespace(rpc=rpc, merger=merger, turns=turns, reviews=reviews)
+
+
+def _event_kinds(events: EventStore) -> list[str]:
+    return [record.event_type for record in events.list_after(0)]
+
+
+async def _wait_until(
+    predicate: Callable[[], bool], *, timeout: float = 2.0
+) -> None:
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(poll(), timeout=timeout)
+
+
+@pytest.fixture
+def database(tmp_path: Path):
+    value = Database.open(tmp_path / "state.db")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_with_no_work_opens_recovers_and_releases_once(
+    database: Database,
+) -> None:
+    events = EventStore(database)
+    rpc = FakeRpc()
+    merger = FakeMerger()
+    turns = FakeTurns()
+    reviews = FakeReviews()
+    session = MergerSession(
+        _flow(rpc=rpc, merger=merger, turns=turns, reviews=reviews),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+
+    await session.startup()
+
+    assert rpc.start_calls == 1
+    assert reviews.resume_calls == 1
+    assert turns.recover_calls == [("demo",)]
+    assert rpc.close_calls == 1
+    assert session.is_open is False
+    assert merger.ensure_calls == ["demo"]
+    assert _event_kinds(events) == [
+        "merger.session_opened",
+        "merger.session_released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_opens_on_a_delivered_wake_and_is_idempotent(
+    database: Database,
+) -> None:
+    events = EventStore(database)
+    rpc = FakeRpc()
+    turns = FakeTurns()
+    session = MergerSession(
+        _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+    await session.startup()
+    assert (rpc.start_calls, rpc.close_calls) == (1, 1)
+
+    turns.outstanding["demo"] = ("evt-1", "delivered")
+    await session.reconcile("wake_delivered")
+
+    assert rpc.start_calls == 2
+    assert session.is_open is True
+
+    # Idempotent: the same reconcile call again opens nothing new.
+    await session.reconcile("wake_delivered_again")
+    assert rpc.start_calls == 2
+    assert session.is_open is True
+
+    await session.release("test_teardown")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_releases_once_work_settles(database: Database) -> None:
+    events = EventStore(database)
+    rpc = FakeRpc()
+    turns = FakeTurns()
+    session = MergerSession(
+        _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+    turns.outstanding["demo"] = ("evt-1", "delivered")
+    await session.reconcile("wake_delivered")
+    assert (rpc.start_calls, session.is_open) == (1, True)
+
+    turns.outstanding["demo"] = None
+    await session.reconcile("settled")
+
+    assert rpc.close_calls == 1
+    assert session.is_open is False
+    assert _event_kinds(events) == [
+        "merger.session_opened",
+        "merger.session_released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_idle_notification_releases_without_deadlock(
+    database: Database,
+) -> None:
+    events = EventStore(database)
+    rpc = FakeRpc()
+    turns = FakeTurns()
+    turns.outstanding["demo"] = ("evt-1", "delivered")
+
+    def settle(thread_id: str) -> None:
+        # The durable submission settled: nothing is outstanding anymore.
+        turns.outstanding["demo"] = None
+
+    turns.on_settle_idle = settle
+    session = MergerSession(
+        _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+
+    opened = await session.open("wake_delivered")
+    assert opened is True
+    assert session.is_open is True
+
+    await rpc.push(
+        RpcNotification(
+            method="thread/status/changed",
+            params={"status": {"type": "idle"}, "threadId": "thr-1"},
+        )
+    )
+
+    # If reconcile()/release() deadlocked trying to cancel+await its own
+    # listener task, this would hang until the test framework's timeout;
+    # instead the listener task detects it is running the release itself
+    # and skips self-cancellation, so this resolves promptly.
+    await _wait_until(lambda: not session.is_open)
+
+    assert rpc.close_calls == 1
+    assert turns.settle_calls == [(("demo",), "thr-1")]
+    assert _event_kinds(events) == [
+        "merger.session_opened",
+        "merger.session_released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restart_over_the_same_rows_repeats_startup_with_no_duplicate_open(
+    database: Database,
+) -> None:
+    events = EventStore(database)
+
+    first_rpc = FakeRpc()
+    first_session = MergerSession(
+        _flow(
+            rpc=first_rpc,
+            merger=FakeMerger(),
+            turns=FakeTurns(),
+            reviews=FakeReviews(),
+        ),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+    await first_session.startup()
+    assert (first_rpc.start_calls, first_rpc.close_calls) == (1, 1)
+
+    # A fresh process, a fresh MergerSession — but the same durable rows
+    # (still nothing outstanding), so restart repeats exactly one
+    # open->recover->release cycle, never a duplicate open.
+    second_rpc = FakeRpc()
+    second_session = MergerSession(
+        _flow(
+            rpc=second_rpc,
+            merger=FakeMerger(),
+            turns=FakeTurns(),
+            reviews=FakeReviews(),
+        ),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+    await second_session.startup()
+
+    assert (second_rpc.start_calls, second_rpc.close_calls) == (1, 1)
+    assert second_session.is_open is False
+    assert _event_kinds(events) == [
+        "merger.session_opened",
+        "merger.session_released",
+        "merger.session_opened",
+        "merger.session_released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_open_returns_false_and_journals_nothing_on_rpc_start_failure(
+    database: Database,
+) -> None:
+    events = EventStore(database)
+    rpc = FakeRpc(fail_start=True)
+    session = MergerSession(
+        _flow(
+            rpc=rpc, merger=FakeMerger(), turns=FakeTurns(), reviews=FakeReviews()
+        ),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+
+    opened = await session.open("wake_delivered")
+
+    assert opened is False
+    assert session.is_open is False
+    assert rpc.close_calls == 0
+    assert _event_kinds(events) == []
+
+
+@pytest.mark.asyncio
+async def test_review_active_is_true_for_a_pending_submission_alone(
+    database: Database,
+) -> None:
+    turns = FakeTurns()
+    turns.pending["demo"] = True
+    session = MergerSession(
+        _flow(
+            rpc=FakeRpc(), merger=FakeMerger(), turns=turns, reviews=FakeReviews()
+        ),
+        ("demo",),
+    )
+
+    assert session.review_active() is True
+
+
+@pytest.mark.asyncio
+async def test_is_review_active_override_replaces_the_default_check(
+    database: Database,
+) -> None:
+    session = MergerSession(
+        _flow(
+            rpc=FakeRpc(),
+            merger=FakeMerger(),
+            turns=FakeTurns(),
+            reviews=FakeReviews(),
+        ),
+        ("demo",),
+        is_review_active=lambda: True,
+    )
+
+    # No project has any outstanding wake or pending submission, yet the
+    # override wins.
+    assert session.review_active() is True
+
+
+@pytest.mark.asyncio
+async def test_release_frees_the_real_codex_app_server_process_lease(
+    tmp_path: Path, database: Database
+) -> None:
+    """(g): a real CodexRpcClient's process lease clears on release.
+
+    Reuses the scripted App Server child from tests/test_codex_rpc.py so
+    the handshake completes over real stdio pipes, and a real
+    ProcessRegistry so the lease lifecycle is genuine, not simulated.
+    """
+
+    from tests.test_codex_rpc import FakeCodexServer
+
+    processes = ProcessRegistry(database, EventStore(database), grace_seconds=1.0)
+    server = FakeCodexServer(tmp_path)
+    rpc = CodexRpcClient(
+        server.command,
+        base_env={},
+        handshake_timeout=5.0,
+        termination_timeout=2.0,
+        processes=processes,
+        project_key="merger",
+    )
+    session = MergerSession(
+        _flow(
+            rpc=rpc, merger=FakeMerger(), turns=FakeTurns(), reviews=FakeReviews()
+        ),
+        ("demo",),
+    )
+
+    opened = await session.open("live_wake")
+
+    assert opened is True
+    leases = processes.active("merger")
+    assert len(leases) == 1
+    assert leases[0].kind == "codex_app_server"
+
+    await session.release("live_release")
+
+    assert processes.active("merger") == ()

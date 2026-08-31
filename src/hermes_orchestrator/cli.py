@@ -65,6 +65,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.merger_session import MergerSession
 from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
 from hermes_orchestrator.migration_gate import (
     MigrationGate,
@@ -659,9 +660,22 @@ async def _settle_idle_merger_thread(
 
 
 async def _listen_for_merger_turns(
-    flow: MergeFlow, projects: Sequence[str] = ()
+    flow: MergeFlow,
+    projects: Sequence[str] = (),
+    *,
+    session: MergerSession | None = None,
 ) -> None:
-    """Settle Merger turns as the App Server reports them; never poll."""
+    """Settle Merger turns as the App Server reports them; never poll.
+
+    INFRA-198 P1: when a ``session`` is given, an idle status also
+    reconciles it — the terminal-idle hook that releases the App Server
+    process lease the instant nothing is left outstanding. Reconciling
+    from inside this same listener task never deadlocks:
+    ``MergerSession.release`` recognizes it is running inside its own
+    listener task and skips the self-cancellation, only closing the RPC
+    inline, which is what lets this loop's own ``notifications()``
+    iteration end and return on its own right after.
+    """
 
     async for notification in flow.rpc.notifications():
         if notification.method == "thread/status/changed":
@@ -685,6 +699,8 @@ async def _listen_for_merger_turns(
                 )
                 if outcome is not None:
                     _print_merger_turn(outcome)
+                if session is not None:
+                    await session.reconcile("terminal_idle")
             continue
         outcome = await flow.turns.on_notification(notification)
         if outcome is not None:
@@ -719,6 +735,7 @@ async def _run_daemon(
     shutdown_event: asyncio.Event | None = None,
     merge_flow: MergeFlow | None = None,
     projects: Sequence[str] = (),
+    database: Database | None = None,
     request_checkpoint: Callable[[str, str], Awaitable[object]] | None = None,
     checkpoint_dispatcher: CheckpointDispatcher | None = None,
     wake_delivery: LeadWakeDelivery | None = None,
@@ -733,9 +750,20 @@ async def _run_daemon(
     dashboard_refresh: DashboardRefreshAction | None = None,
     orchestrator_workspace: OrchestratorWorkspaceOwner | None = None,
 ) -> Supervisor:
+    # INFRA-198 P1: bound to the merge flow's lifetime once merge_flow is
+    # created below (only in the non-``once`` path); the maintenance
+    # closure reads this by reference at tick time, never at definition
+    # time, so it always observes the current session.
+    session: MergerSession | None = None
+
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
+        if session is not None:
+            # Event-scoped App Server ownership: open when review work
+            # is active and the session is closed, release when it is
+            # open and nothing is outstanding. Never raises.
+            await session.reconcile("maintenance")
         if orchestrator_workspace is not None:
             # The bounded reconciliation cadence for the two-pane
             # Orchestrator workspace: the owner absorbs cmux failures
@@ -777,6 +805,7 @@ async def _run_daemon(
                 and channel_hub is None
                 and dashboard_refresh is None
                 and orchestrator_workspace is None
+                and merge_flow is None
             )
             else _maintenance
         ),
@@ -843,20 +872,28 @@ async def _run_daemon(
             if channel_hub is not None:
                 await channel_hub.stop()
         return supervisor
-    listener: asyncio.Task[None] | None = None
-    if merge_flow is not None and await _start_merge_flow(merge_flow, projects):
-        # Startup settlement recovery: an approved review whose merge
-        # was separated from its verdict by a crash, a full window, or
-        # a lost completion event is re-driven from its durable
-        # settlement row before any new turn is listened for.
-        await merge_flow.reviews.resume_settlements()
-        # Then recover any completed review whose turn notification
-        # was lost: the delivered wake and the thread report are
-        # durable, so one boundary pass settles them exactly once.
-        await merge_flow.turns.recover_outstanding(tuple(projects))
-        listener = asyncio.create_task(
-            _listen_for_merger_turns(merge_flow, tuple(projects))
+    if merge_flow is not None:
+        # INFRA-198 P1: the session owns the App Server connection's
+        # whole lifecycle — startup recovery (open, resume_settlements,
+        # recover_outstanding, then release unless work is still
+        # outstanding), the maintenance-tick open/release above, the
+        # listener's own terminal-idle release, and daemon shutdown
+        # below — so the process lease is held only while review work is
+        # actually active.
+        session = MergerSession(
+            merge_flow,
+            tuple(projects),
+            events=(EventStore(database) if database is not None else None),
+            database=database,
+            listener_factory=(
+                lambda flow, session_projects, active_session: (
+                    _listen_for_merger_turns(
+                        flow, session_projects, session=active_session
+                    )
+                )
+            ),
         )
+        await session.startup()
     stop = shutdown_event or asyncio.Event()
     registered_signals: list[signal.Signals] = []
     if shutdown_event is None:
@@ -876,12 +913,8 @@ async def _run_daemon(
             for shutdown_signal in registered_signals:
                 loop.remove_signal_handler(shutdown_signal)
         await supervisor.shutdown()
-        if listener is not None:
-            listener.cancel()
-            with suppress(asyncio.CancelledError):
-                await listener
-        if merge_flow is not None:
-            await merge_flow.rpc.close()
+        if session is not None:
+            await session.shutdown()
         if channel_hub is not None:
             await channel_hub.stop()
     return supervisor
@@ -3586,6 +3619,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     dispatch=runtime.dispatch,
                     merge_flow=runtime.merge_flow,
                     projects=tuple(settings.projects),
+                    database=runtime.database,
                     request_checkpoint=(
                         None
                         if runtime.cells is None
