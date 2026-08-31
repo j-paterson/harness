@@ -167,6 +167,18 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument("--interval", type=_watch_interval, default=30)
     daemon.add_argument("--json", action="store_true")
 
+    dashboard = commands.add_parser(
+        "dashboard",
+        help=(
+            "render the Orchestrator dashboard in this terminal: "
+            "token-free, read-only, no daemon lock (the upper-pane "
+            "entry; the daemon stays the sole supervisor)"
+        ),
+    )
+    dashboard.add_argument("--once", action="store_true")
+    dashboard.add_argument("--interval", type=_watch_interval, default=30)
+    dashboard.add_argument("--json", action="store_true")
+
     cmux_focus = commands.add_parser(
         "cmux-focus",
         help="focus the cmux surface bound to a project's lead "
@@ -192,7 +204,7 @@ def _parser() -> argparse.ArgumentParser:
         help="Hermes durable session name (default: the workspace name)",
     )
     orchestrator_ws.add_argument(
-        "--interval", type=_watch_interval, default=300
+        "--interval", type=_watch_interval, default=30
     )
     orchestrator_ws.add_argument(
         "--settle-seconds",
@@ -2553,6 +2565,118 @@ def _migration_env(
     return 0 if report.completed else 1
 
 
+def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
+    """Run the lock-free read-only dashboard loop (the upper pane).
+
+    Sol K1: this entry is deliberately NOT the daemon — it takes no
+    daemon lock and cannot collide with the one lock-holding
+    supervisor. It is token-free (no Keychain, no Linear) and
+    read-only over the durable database: because ``Database.open``
+    always applies pending migrations, it first compares the runtime's
+    migration generation to the database's applied schema through a
+    ``mode=ro`` SQLite connection and refuses on any mismatch — so
+    the open that follows is provably a migration no-op, and a stale
+    or newer checkout can never mutate the daemon's state. It ticks
+    the existing dashboard sources/renderer/pane machinery unchanged.
+    """
+
+    import sqlite3
+
+    from hermes_orchestrator import db as db_module
+    from hermes_orchestrator.profiles import ProfileRegistry
+
+    state_db = settings.state_dir / "state.db"
+    if not state_db.exists():
+        _print(
+            {"error": "state database does not exist"},
+            json_output=args.json,
+            human=f"no state database at {state_db}.",
+        )
+        return 1
+    migrations_dir = Path(db_module.__file__).with_name("migrations")
+    runtime_generation = max(
+        (
+            int(found.name.split("_", maxsplit=1)[0])
+            for found in migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql")
+        ),
+        default=0,
+    )
+    try:
+        readonly = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+        try:
+            applied = readonly.execute(
+                "SELECT coalesce(max(version), 0) FROM schema_migrations"
+            ).fetchone()[0]
+        finally:
+            readonly.close()
+    except sqlite3.Error as error:
+        _print(
+            {"error": f"schema probe failed: {type(error).__name__}"},
+            json_output=args.json,
+            human="the state database could not be probed read-only.",
+        )
+        return 1
+    if int(applied) != runtime_generation:
+        _print(
+            {
+                "error": "schema generation mismatch",
+                "runtime_generation": runtime_generation,
+                "database_schema": int(applied),
+            },
+            json_output=args.json,
+            human=(
+                "refusing: this checkout's migration generation "
+                f"({runtime_generation}) does not match the database "
+                f"schema ({applied}); the dashboard never migrates."
+            ),
+        )
+        return 1
+    profiles_path = settings.repo_root / "config" / "profiles.yaml"
+    if not profiles_path.exists():
+        _print(
+            {"error": "config/profiles.yaml is required"},
+            json_output=args.json,
+            human="the dashboard requires config/profiles.yaml.",
+        )
+        return 1
+    database = Database.open(state_db)  # no-op by the guard above
+    try:
+        action = DashboardRefreshAction(
+            database=database,
+            registry=ProfileRegistry.load(profiles_path),
+        )
+
+        async def _loop() -> int:
+            await action.tick()
+            if args.once:
+                return 1
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with suppress(NotImplementedError, ValueError):
+                    loop.add_signal_handler(signum, stop.set)
+            ticks = 1
+            while not stop.is_set():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=args.interval
+                    )
+                    break
+                await action.tick()
+                ticks += 1
+            return ticks
+
+        ticks = asyncio.run(_loop())
+    finally:
+        database.close()
+    _print(
+        {"ticks": ticks, "read_only": True, "daemon_lock": False},
+        json_output=args.json,
+        human=f"dashboard stopped after {ticks} tick(s).",
+    )
+    return 0
+
+
 def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
     """Serve the operations console over the durable state database.
 
@@ -2637,6 +2761,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if args.command == "runtime-exec":
         return _runtime_exec(args)
     settings = load_settings(args.repo_root, args.state_dir)
+    if args.command == "dashboard":
+        return _dashboard(args, settings)
     if args.command == "serve-console":
         return _serve_console(args, settings)
     if args.command == "hooks-install":
@@ -3134,23 +3260,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 OrchestratorWorkspaceLifecycle,
                 WorkspaceRefused,
                 evidence_document,
+                file_sha256,
                 run_smoke,
             )
 
-            seated = bool(os.environ.get(SEAT_ENV))
-            if seated and args.action == "smoke":
-                # The smoke's restart-recovery leg must close and
-                # rebuild its workspace; a seated supervisor may never
-                # do either, so the smoke runs only from outside.
-                _print(
-                    {"error": "smoke refused from a seated supervisor"},
-                    json_output=args.json,
-                    human=(
-                        "run the smoke outside a seated supervisor pane "
-                        f"(unset {SEAT_ENV})."
-                    ),
-                )
-                return 1
+            inside_marked_pane = bool(os.environ.get(SEAT_ENV))
             cmux_cli = (
                 [str(args.cmux_cli)]
                 if args.cmux_cli is not None
@@ -3181,7 +3295,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     title=args.title,
                     interval=args.interval,
                     session_name=args.session,
-                    seated=seated,
+                    inside_marked_pane=inside_marked_pane,
                 )
                 if args.action == "ensure":
                     state = asyncio.run(lifecycle.ensure())
@@ -3192,10 +3306,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     )
                     _print(payload, json_output=args.json, human=human)
                     return 0
+                # The smoke drives the production ownership topology:
+                # the same owner start/tick reconciliation the daemon
+                # runs — never a standalone lifecycle path (Sol K1).
+                owner = OrchestratorWorkspaceOwner(lifecycle)
                 evidence = asyncio.run(
                     run_smoke(
-                        lifecycle,
-                        port,
+                        owner,
                         settle_seconds=args.settle_seconds,
                     )
                 )
@@ -3231,7 +3348,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 )
                 evidence = dict(evidence)
                 evidence["evidence_file"] = str(evidence_path)
+                # Both digests, distinguished (Sol K3): the canonical
+                # payload seal inside the receipt, and the byte hash
+                # of the written file (which cannot contain itself).
                 evidence["self_digest"] = document["self_digest"]
+                evidence["self_digest_kind"] = document["self_digest_kind"]
+                evidence["file_sha256"] = file_sha256(evidence_path)
                 evidence["source_sha"] = document["source_sha"]
             _print(
                 evidence,

@@ -24,20 +24,27 @@ from hermes_orchestrator.orchestrator_workspace import (
     UPPER_ROLE,
     OrchestratorWorkspaceLifecycle,
     WorkspaceRefused,
+    dashboard_pane_command,
     hermes_pane_command,
     inspect_workspace,
     run_smoke,
-    supervisor_pane_command,
     workspace_marker,
 )
 
 REPO_ROOT = Path("/repo/orchestrator")
 STATE_DIR = Path("/state/orchestrator")
 
-SUPERVISOR_COMMAND = (
+DASHBOARD_COMMAND = (
     "uv run hermes-orchestrator --repo-root /repo/orchestrator "
-    "--state-dir /state/orchestrator daemon --interval 300 --json"
+    "--state-dir /state/orchestrator dashboard --interval 30"
 )
+UPPER_MARKER = DASHBOARD_COMMAND.removeprefix("uv run ")
+LOWER_WRAPPED = (
+    "/Users/x/.hermes/hermes-agent/venv/bin/python "
+    "/Users/x/.hermes/hermes-agent/hermes chat --continue orch "
+    "--create-if-missing"
+)
+UPPER_WRAPPED = f"/repo/orchestrator/.venv/bin/python3 /x/bin/{UPPER_MARKER}"
 HERMES_COMMAND = "hermes chat --continue orch --create-if-missing"
 
 
@@ -46,6 +53,7 @@ class FakePane:
     pane_uuid: str
     surface_uuid: str
     processes: list[str]
+    command: str | None = None
 
 
 @dataclass
@@ -86,10 +94,30 @@ class FakeWorkspacePort:
         return workspace_uuid
 
     def kill_process(self, surface_uuid: str) -> None:
-        self._pane(surface_uuid).processes = ["zsh"]
+        pane = self._pane(surface_uuid)
+        pane.processes = ["zsh"]
+        pane.command = None
 
-    def set_processes(self, surface_uuid: str, names: list[str]) -> None:
-        self._pane(surface_uuid).processes = list(names)
+    def set_processes(
+        self,
+        surface_uuid: str,
+        names: list[str],
+        command: str | None = None,
+    ) -> None:
+        pane = self._pane(surface_uuid)
+        pane.processes = list(names)
+        pane.command = command
+
+    def running_commands(self) -> tuple[str, ...]:
+        """The fake doubles as the ProcessLineage source: each live
+        pane's launched command line, as local ps would report it."""
+
+        return tuple(
+            pane.command
+            for workspace in self.workspaces.values()
+            for pane in workspace.panes
+            if pane.command
+        )
 
     def drop_pane(self, workspace_uuid: str, surface_uuid: str) -> None:
         workspace = self.workspaces[workspace_uuid]
@@ -122,11 +150,13 @@ class FakeWorkspacePort:
             self._next("pane"),
             self._next("surf"),
             ["zsh", upper_command.split()[0]],
+            command=upper_command,
         )
         lower = FakePane(
             self._next("pane"),
             self._next("surf"),
             ["zsh", lower_command.split()[0]],
+            command=lower_command,
         )
         self.workspaces[workspace_uuid] = FakeWorkspace(
             title=title, panes=[upper, lower]
@@ -169,7 +199,9 @@ class FakeWorkspacePort:
         self, ref: CmuxSurfaceRef, command: str
     ) -> None:
         self.respawns.append((ref, command))
-        self._pane(ref.surface_uuid).processes = ["zsh", command.split()[0]]
+        pane = self._pane(ref.surface_uuid)
+        pane.processes = ["zsh", command.split()[0]]
+        pane.command = command
 
     async def workspace_processes(
         self, workspace_uuid: str
@@ -221,6 +253,7 @@ def lifecycle(
         state_dir=STATE_DIR,
         name="orch",
         title="Orchestrator",
+        lineage=port,
     )
 
 
@@ -229,13 +262,16 @@ def lifecycle(
 # ---------------------------------------------------------------------------
 
 
-def test_supervisor_command_is_the_actual_daemon_entry() -> None:
-    assert (
-        supervisor_pane_command(
-            repo_root=REPO_ROOT, state_dir=STATE_DIR, interval=300
-        )
-        == SUPERVISOR_COMMAND
+def test_upper_command_is_the_lock_free_dashboard_entry() -> None:
+    # Sol K1: the upper pane never runs the daemon — a second daemon
+    # against the same state directory loses the exclusive lock and
+    # respawn-loops. The upper entry is the read-only dashboard.
+    command = dashboard_pane_command(
+        repo_root=REPO_ROOT, state_dir=STATE_DIR, interval=30
     )
+    assert command == DASHBOARD_COMMAND
+    assert " dashboard " in f"{command} "
+    assert " daemon" not in command
 
 
 @pytest.mark.parametrize(
@@ -252,7 +288,7 @@ def test_supervisor_command_grammar_refuses_unsafe_input(
     root: Path, state: Path, interval: int
 ) -> None:
     with pytest.raises(WorkspaceRefused):
-        supervisor_pane_command(
+        dashboard_pane_command(
             repo_root=root, state_dir=state, interval=interval
         )
 
@@ -290,7 +326,7 @@ async def test_create_builds_two_stacked_panes_and_binds_durably(
     assert created["title"] == "Orchestrator [hermes-orch:orch]"
     assert created["resolve_marker"] == "[hermes-orch:orch]"
     assert created["cwd"] == REPO_ROOT
-    assert created["upper_command"] == SUPERVISOR_COMMAND
+    assert created["upper_command"] == DASHBOARD_COMMAND
     assert created["lower_command"] == HERMES_COMMAND
     assert port.respawns == []
     workspace = port.workspaces[state.workspace_uuid]
@@ -303,27 +339,29 @@ async def test_create_builds_two_stacked_panes_and_binds_durably(
 
 
 @pytest.mark.asyncio
-async def test_upper_pane_runs_the_actual_supervisor_dashboard_lifecycle(
+async def test_upper_pane_runs_the_dashboard_with_lineage_proof(
     bindings: CmuxSurfaceBindings,
 ) -> None:
-    # Sol correction f28e8484: the upper pane runs the real
-    # supervisor/dashboard process lifecycle — the daemon entry whose
-    # maintenance loop owns the dashboard renderer — not a placeholder
-    # shell.
+    # The upper pane runs the real dashboard renderer entry (reusing
+    # the existing sources/pane machinery), proven by shape AND exact
+    # command lineage — never a bare interpreter name (Sol K2).
     port = FakeWorkspacePort()
     owner = lifecycle(port, bindings)
 
     state = await owner.ensure()
 
     [created] = port.created
-    assert created["upper_command"] == SUPERVISOR_COMMAND
-    inspection = await inspect_workspace(port, state)
+    assert created["upper_command"] == DASHBOARD_COMMAND
+    inspection = await inspect_workspace(owner, state)
     upper = next(
         row
         for row in inspection["surfaces"]
         if row["role"] == UPPER_ROLE
     )
     assert upper["role_proven"]
+    assert upper["shape_ok"]
+    assert upper["expected_lineage"] == UPPER_MARKER
+    assert upper["lineage_matches"] == [DASHBOARD_COMMAND]
     assert "uv" in upper["process_names"]
 
 
@@ -388,7 +426,7 @@ async def test_dead_upper_supervisor_is_respawned_in_place(
 
     assert recovered.outcome == "recovered"
     assert recovered.respawned == (UPPER_ROLE,)
-    assert port.respawns[-1] == (first.upper, SUPERVISOR_COMMAND)
+    assert port.respawns[-1] == (first.upper, DASHBOARD_COMMAND)
     assert len(port.created) == 1
 
 
@@ -489,12 +527,17 @@ async def test_smoke_produces_complete_two_pane_evidence(
     port = FakeWorkspacePort()
     owner = lifecycle(port, bindings)
 
-    evidence = await run_smoke(owner, port)
+    evidence = await run_smoke(OrchestratorWorkspaceOwner(owner))
 
     assert evidence["passed"] is True
     assert evidence["stack_direction"] == STACK_DIRECTION
-    assert evidence["supervisor_command"] == SUPERVISOR_COMMAND
+    assert evidence["topology"] == "owner-driven"
+    assert evidence["dashboard_command"] == DASHBOARD_COMMAND
     assert evidence["hermes_command"] == HERMES_COMMAND
+    assert evidence["role_expectations"] == {
+        UPPER_ROLE: UPPER_MARKER,
+        LOWER_ROLE: HERMES_COMMAND,
+    }
     inspection = evidence["inspection"]
     assert inspection["pane_count"] == 2
     assert inspection["distinct_panes"] == 2
@@ -542,6 +585,13 @@ def cli_port(monkeypatch: pytest.MonkeyPatch) -> FakeWorkspacePort:
 
     monkeypatch.setattr(
         "hermes_orchestrator.cli.CmuxCliAdapter", build_adapter
+    )
+    # The CLI composes the default ps-backed lineage source; the fake
+    # port doubles as that source so role proof observes the fake's
+    # pane command lines instead of the host's real processes.
+    monkeypatch.setattr(
+        "hermes_orchestrator.orchestrator_workspace.PsProcessLineage",
+        lambda: port,
     )
     return port
 
@@ -644,10 +694,10 @@ def test_cli_refuses_without_cmux_configuration(
 from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
     SEAT_ENV,
     OrchestratorWorkspaceOwner,
+    dashboard_process_shape,
     evidence_document,
-    hermes_process_identity,
+    hermes_process_shape,
     smoke_passed,
-    supervisor_process_identity,
     verify_evidence_document,
 )
 
@@ -663,8 +713,8 @@ from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
 def test_supervisor_identity_accepts_expected_trees_with_wrappers(
     names: list[str],
 ) -> None:
-    assert supervisor_process_identity(names)
-    assert not hermes_process_identity(names)
+    assert dashboard_process_shape(names)
+    assert not hermes_process_shape(names)
 
 
 @pytest.mark.parametrize(
@@ -678,8 +728,8 @@ def test_supervisor_identity_accepts_expected_trees_with_wrappers(
 def test_hermes_identity_accepts_expected_trees_with_wrappers(
     names: list[str],
 ) -> None:
-    assert hermes_process_identity(names)
-    assert not supervisor_process_identity(names)
+    assert hermes_process_shape(names)
+    assert not dashboard_process_shape(names)
 
 
 @pytest.mark.parametrize(
@@ -695,8 +745,8 @@ def test_hermes_identity_accepts_expected_trees_with_wrappers(
 def test_neither_role_accepts_unrelated_or_empty_trees(
     names: list[str],
 ) -> None:
-    assert not supervisor_process_identity(names)
-    assert not hermes_process_identity(names)
+    assert not dashboard_process_shape(names)
+    assert not hermes_process_shape(names)
 
 
 @pytest.mark.asyncio
@@ -734,14 +784,18 @@ async def test_wrong_role_trees_are_recovered_without_new_resources(
     assert recovered.outcome == "recovered"
     assert set(recovered.respawned) == {UPPER_ROLE, LOWER_ROLE}
     respawned = {ref.surface_uuid: command for ref, command in port.respawns}
-    assert respawned[first.upper.surface_uuid] == SUPERVISOR_COMMAND
+    assert respawned[first.upper.surface_uuid] == DASHBOARD_COMMAND
     assert respawned[first.lower.surface_uuid] == HERMES_COMMAND
     assert len(port.created) == 1
     assert len(port.workspaces[first.workspace_uuid].panes) == 2
 
 
 class StubbornRolePort(FakeWorkspacePort):
-    """Respawns are recorded but never restore role identity."""
+    """The lower pane always runs the WRONG durable session: its cmux
+    name shape looks right (a python interpreter), but the observed
+    argv lineage never carries the expected session name — and
+    respawns are recorded without fixing it. Only command-specific
+    proof (Sol K2) can catch this."""
 
     async def respawn_surface(
         self, ref: CmuxSurfaceRef, command: str
@@ -750,7 +804,11 @@ class StubbornRolePort(FakeWorkspacePort):
 
     async def create_two_pane_workspace(self, **kwargs: object):
         upper, lower = await super().create_two_pane_workspace(**kwargs)
-        self.set_processes(lower.surface_uuid, ["zsh", "vim"])
+        self.set_processes(
+            lower.surface_uuid,
+            ["zsh", "python3.11"],
+            command="hermes chat --continue wrong-session --create-if-missing",
+        )
         return upper, lower
 
 
@@ -761,10 +819,19 @@ async def test_smoke_fails_unless_both_role_identities_are_proven(
     port = StubbornRolePort()
     owner = lifecycle(port, bindings)
 
-    evidence = await run_smoke(owner, port)
+    evidence = await run_smoke(OrchestratorWorkspaceOwner(owner))
 
     assert evidence["passed"] is False
     assert evidence["inspection"]["both_roles_proven"] is False
+    lower = next(
+        row
+        for row in evidence["inspection"]["surfaces"]
+        if row["role"] == LOWER_ROLE
+    )
+    # The shape looked right; only the command-specific lineage failed.
+    assert lower["shape_ok"] is True
+    assert lower["lineage_matches"] == []
+    assert lower["role_proven"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +849,8 @@ def seated_lifecycle(
         state_dir=STATE_DIR,
         name="orch",
         title="Orchestrator",
-        seated=True,
+        lineage=port,
+        inside_marked_pane=True,
     )
 
 
@@ -798,61 +866,29 @@ async def test_created_workspace_carries_the_seat_marker_env(
 
 
 @pytest.mark.asyncio
-async def test_seated_supervisor_adopts_and_reconciles_lower_only(
+async def test_marked_pane_lifecycle_refuses_every_operation(
     bindings: CmuxSurfaceBindings,
 ) -> None:
+    # Sol K1: the seated-adopt branch is retired — the one supervising
+    # daemon is never inside a pane. A lifecycle told it runs inside a
+    # marked pane is an operator error and fails closed outright: no
+    # adopt, no create, no close, before and after a workspace exists.
     port = FakeWorkspacePort()
-    first = await lifecycle(port, bindings).ensure()
-    seated = seated_lifecycle(port, bindings)
+    marked = seated_lifecycle(port, bindings)
 
-    adopted = await seated.ensure()
-    assert adopted.outcome == "adopted"
-    assert adopted.workspace_uuid == first.workspace_uuid
-
-    port.kill_process(first.lower.surface_uuid)
-    recovered = await seated.ensure()
-    assert recovered.outcome == "recovered"
-    assert recovered.respawned == (LOWER_ROLE,)
-    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
-    assert len(port.created) == 1
-
-
-@pytest.mark.asyncio
-async def test_seated_supervisor_never_respawns_its_own_upper_pane(
-    bindings: CmuxSurfaceBindings,
-) -> None:
-    port = FakeWorkspacePort()
-    first = await lifecycle(port, bindings).ensure()
-    port.set_processes(first.upper.surface_uuid, ["zsh"])
-
-    adopted = await seated_lifecycle(port, bindings).ensure()
-
-    assert adopted.outcome == "adopted"
-    assert all(
-        ref.surface_uuid != first.upper.surface_uuid
-        for ref, _ in port.respawns
-    )
-
-
-@pytest.mark.asyncio
-async def test_seated_supervisor_never_creates_or_closes_workspaces(
-    bindings: CmuxSurfaceBindings,
-) -> None:
-    port = FakeWorkspacePort()
-    seated = seated_lifecycle(port, bindings)
-
-    # No durable seat: refuse, create nothing.
-    with pytest.raises(WorkspaceRefused, match="never creates"):
-        await seated.ensure()
+    with pytest.raises(WorkspaceRefused, match="marked Orchestrator pane"):
+        await marked.ensure()
     assert port.created == []
 
-    # A partial workspace: refuse to rebuild, close nothing.
     first = await lifecycle(port, bindings).ensure()
-    port.drop_pane(first.workspace_uuid, first.lower.surface_uuid)
-    with pytest.raises(WorkspaceRefused, match="cannot rebuild"):
-        await seated.ensure()
+    with pytest.raises(WorkspaceRefused, match="marked Orchestrator pane"):
+        await marked.ensure()
+    with pytest.raises(WorkspaceRefused, match="marked Orchestrator pane"):
+        await marked.close()
     assert port.closed == []
+    assert port.respawns == []
     assert len(port.created) == 1
+    assert first.workspace_uuid in port.workspaces
 
 
 @pytest.mark.asyncio
@@ -969,7 +1005,7 @@ async def test_smoke_pass_condition_requires_every_clause(
     bindings: CmuxSurfaceBindings,
 ) -> None:
     port = FakeWorkspacePort()
-    evidence = await run_smoke(lifecycle(port, bindings), port)
+    evidence = await run_smoke(OrchestratorWorkspaceOwner(lifecycle(port, bindings)))
     assert smoke_passed(evidence) is True
 
     import copy
@@ -1023,7 +1059,7 @@ async def test_smoke_fails_when_the_workspace_is_not_replaced(
     bindings: CmuxSurfaceBindings,
 ) -> None:
     port = NonClosingPort()
-    evidence = await run_smoke(lifecycle(port, bindings), port)
+    evidence = await run_smoke(OrchestratorWorkspaceOwner(lifecycle(port, bindings)))
 
     assert evidence["restart_recovery"]["workspace_replaced"] is False
     assert evidence["restart_recovery"]["generation_advanced"] is False
@@ -1035,7 +1071,7 @@ async def test_evidence_document_binds_the_run_and_revalidates(
     bindings: CmuxSurfaceBindings,
 ) -> None:
     port = FakeWorkspacePort()
-    evidence = await run_smoke(lifecycle(port, bindings), port)
+    evidence = await run_smoke(OrchestratorWorkspaceOwner(lifecycle(port, bindings)))
     document = evidence_document(
         evidence,
         source_sha="52cd59dcafe",
@@ -1090,3 +1126,226 @@ def test_cli_smoke_writes_a_digest_sealed_evidence_file(
     assert "smoke" in document["invocation"]
     assert isinstance(document["source_sha"], str)
     assert document["evidence"]["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Sol K2 (a6bc7ca2): command-specific lineage discrimination.
+# ---------------------------------------------------------------------------
+
+from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
+    file_sha256,
+    lineage_matches,
+)
+
+
+def test_lineage_matches_through_legitimate_wrappers() -> None:
+    # The bash launcher execs the hermes venv python with the script
+    # path; the console script runs under the project venv python; uv
+    # keeps the typed argv. All carry the exact expected command.
+    assert lineage_matches([LOWER_WRAPPED], HERMES_COMMAND) == (
+        LOWER_WRAPPED,
+    )
+    assert lineage_matches([UPPER_WRAPPED], UPPER_MARKER) == (
+        UPPER_WRAPPED,
+    )
+    assert lineage_matches([DASHBOARD_COMMAND], UPPER_MARKER) == (
+        DASHBOARD_COMMAND,
+    )
+
+
+def test_lineage_rejects_wrong_and_superstring_sessions() -> None:
+    wrong = "hermes chat --continue other-session --create-if-missing"
+    superstring = (
+        "/x/venv/bin/python /x/hermes chat --continue orch2 "
+        "--create-if-missing"
+    )
+    prefixed = "notreallyhermes chat --continue orch --create-if-missing"
+    assert lineage_matches([wrong], HERMES_COMMAND) == ()
+    assert lineage_matches([superstring], HERMES_COMMAND) == ()
+    assert lineage_matches([prefixed], HERMES_COMMAND) == ()
+    assert (
+        lineage_matches(["uv run some-other-tool serve --json"], UPPER_MARKER)
+        == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrong_session_name_is_rejected_and_recovered(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    # Shape looks perfectly healthy — a python interpreter — but the
+    # observed argv carries the WRONG durable session name.
+    port.set_processes(
+        first.lower.surface_uuid,
+        ["zsh", "python3.11"],
+        command="hermes chat --continue impostor --create-if-missing",
+    )
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
+    assert len(port.created) == 1
+    assert len(port.workspaces[first.workspace_uuid].panes) == 2
+
+
+@pytest.mark.asyncio
+async def test_unrelated_uv_python_is_rejected_for_the_upper_role(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    # An unrelated uv+python tree: right shape, wrong command.
+    port.set_processes(
+        first.upper.surface_uuid,
+        ["zsh", "uv", "Python"],
+        command="uv run some-other-tool serve --json",
+    )
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (UPPER_ROLE,)
+    assert port.respawns[-1] == (first.upper, DASHBOARD_COMMAND)
+    assert len(port.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_bare_interpreter_name_alone_is_not_role_proof(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    # cmux still reports a plausible python tree, but no observed argv
+    # lineage matches the expected command any more.
+    port.set_processes(
+        first.lower.surface_uuid, ["zsh", "python3.11"], command=None
+    )
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+
+
+# ---------------------------------------------------------------------------
+# Sol K3 (a6bc7ca2): candidate-bound verification and dual digests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_verification_refuses_a_mismatched_candidate_sha(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    evidence = await run_smoke(
+        OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    )
+    document = evidence_document(
+        evidence,
+        source_sha="cafe0191beef",
+        invocation=["hermes-orchestrator", "orchestrator-workspace", "smoke"],
+        captured_at="2026-08-31T00:00:00+00:00",
+    )
+
+    assert verify_evidence_document(document) is True
+    assert (
+        verify_evidence_document(
+            document, expected_source_sha="cafe0191beef"
+        )
+        is True
+    )
+    # The wrong candidate never validates, even with an intact seal.
+    assert (
+        verify_evidence_document(
+            document, expected_source_sha="0000000000"
+        )
+        is False
+    )
+    # And an intact expected sha never rescues a tampered seal.
+    tampered = json.loads(json.dumps(document))
+    tampered["evidence"]["passed"] = False
+    assert (
+        verify_evidence_document(
+            tampered, expected_source_sha="cafe0191beef"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_receipt_declares_and_distinguishes_both_digests(
+    bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    port = FakeWorkspacePort()
+    evidence = await run_smoke(
+        OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    )
+    document = evidence_document(
+        evidence,
+        source_sha="cafe0191beef",
+        invocation=["hermes-orchestrator", "orchestrator-workspace", "smoke"],
+        captured_at="2026-08-31T00:00:00+00:00",
+    )
+    assert document["self_digest_kind"] == "sha256-of-canonical-json"
+
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(
+        json.dumps(document, indent=1, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    import hashlib
+
+    byte_digest = file_sha256(receipt)
+    assert byte_digest == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    # Two digests, two kinds, never interchangeable: the canonical
+    # payload seal is formatting-independent, the file hash is not.
+    assert byte_digest != document["self_digest"]
+    pretty = tmp_path / "pretty.json"
+    pretty.write_text(
+        json.dumps(document, indent=4, sort_keys=True), encoding="utf-8"
+    )
+    assert file_sha256(pretty) != byte_digest
+    assert verify_evidence_document(
+        json.loads(pretty.read_text(encoding="utf-8"))
+    )
+
+
+def test_cli_smoke_reports_both_digests_and_candidate_sha(
+    configured_repo: tuple[Path, Path],
+    cli_port: FakeWorkspacePort,
+    tmp_path: Path,
+) -> None:
+    evidence_file = tmp_path / "receipts" / "k3.json"
+    exit_code, output = invoke(
+        cli_arguments(
+            configured_repo,
+            "smoke",
+            "--name",
+            "cli-k3",
+            "--settle-seconds",
+            "0",
+            "--evidence-file",
+            str(evidence_file),
+        )
+    )
+
+    assert exit_code == 0
+    printed = json.loads(output)
+    assert printed["self_digest_kind"] == "sha256-of-canonical-json"
+    assert printed["file_sha256"] == file_sha256(evidence_file)
+    assert printed["file_sha256"] != printed["self_digest"]
+    document = json.loads(evidence_file.read_text(encoding="utf-8"))
+    assert (
+        verify_evidence_document(
+            document, expected_source_sha=printed["source_sha"]
+        )
+        is True
+    )
+    assert document["evidence"]["topology"] == "owner-driven"

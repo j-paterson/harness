@@ -258,7 +258,7 @@ def _cmux_configured(repo_root: Path) -> None:
     )
 
 
-def test_open_runtime_composes_the_workspace_owner_unseated(
+def test_open_runtime_composes_the_workspace_owner_outside_panes(
     tmp_path: Path,
 ) -> None:
     repo_root, state_dir = active_repo(tmp_path)
@@ -274,18 +274,17 @@ def test_open_runtime_composes_the_workspace_owner_unseated(
     try:
         owner = runtime.orchestrator_workspace
         assert isinstance(owner, OrchestratorWorkspaceOwner)
-        assert owner.lifecycle.seated is False
+        assert owner.lifecycle.inside_marked_pane is False
     finally:
         runtime.close()
 
 
-def test_open_runtime_composes_a_seated_owner_from_the_env_marker(
+def test_open_runtime_marks_a_daemon_inside_a_pane_as_fail_closed(
     tmp_path: Path,
 ) -> None:
-    # Recursion guard: the daemon launched inside the upper pane sees
-    # the marker its own creation stamped on the workspace env and
-    # composes a seated lifecycle — adopt-in-place, never a second
-    # workspace/supervisor.
+    # Sol K1: no daemon may run inside a pane. One launched with the
+    # pane marker composes a lifecycle that refuses every operation —
+    # never a second workspace or supervisor, fail closed.
     repo_root, state_dir = active_repo(tmp_path)
     _cmux_configured(repo_root)
     settings = load_settings(repo_root, state_dir)
@@ -299,7 +298,7 @@ def test_open_runtime_composes_a_seated_owner_from_the_env_marker(
     try:
         owner = runtime.orchestrator_workspace
         assert isinstance(owner, OrchestratorWorkspaceOwner)
-        assert owner.lifecycle.seated is True
+        assert owner.lifecycle.inside_marked_pane is True
     finally:
         runtime.close()
 
@@ -334,6 +333,7 @@ def _owner_over(tmp_path: Path, port: FakeWorkspacePort):
             repo_root=Path("/repo/orchestrator"),
             state_dir=Path("/state/orchestrator"),
             name="daemonized",
+            lineage=port,
         )
     )
     return database, owner
@@ -400,4 +400,127 @@ async def test_daemon_restart_adopts_once_and_reconciles_the_lower_pane(
             started.lower.surface_uuid
         )
     finally:
+        database.close()
+
+
+# ---------------------------------------------------------------------------
+# Sol K1 (a6bc7ca2): the upper pane is the lock-free read-only dashboard
+# entry; the one daemon keeps the exclusive state lock; no
+# DaemonAlreadyRunning, no respawn loop.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+from contextlib import redirect_stderr, redirect_stdout  # noqa: E402
+from io import StringIO  # noqa: E402
+
+from hermes_orchestrator.cli import main  # noqa: E402
+from hermes_orchestrator.runtime import _DaemonLock  # noqa: E402
+
+
+def _invoke(arguments: list[str]) -> tuple[int, str]:
+    stdout = StringIO()
+    stderr = StringIO()
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(arguments)
+    except SystemExit as error:
+        exit_code = int(error.code)
+    return exit_code, stdout.getvalue() + stderr.getvalue()
+
+
+def test_dashboard_entry_runs_readonly_while_the_daemon_holds_the_lock(
+    tmp_path: Path,
+) -> None:
+    # The production topology: the one daemon owns the exclusive state
+    # lock the entire time; the upper-pane dashboard entry still works
+    # because it never takes the lock and never migrates.
+    repo_root, state_dir = active_repo(tmp_path)
+    Database.open(state_dir / "state.db").close()
+    lock = _DaemonLock(state_dir / "daemon.lock")
+    lock.acquire()
+    try:
+        exit_code, output = _invoke(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--state-dir",
+                str(state_dir),
+                "dashboard",
+                "--once",
+                "--json",
+            ]
+        )
+    finally:
+        lock.release()
+
+    assert exit_code == 0
+    payload = json.loads(output)
+    assert payload["ticks"] == 1
+    assert payload["read_only"] is True
+    assert payload["daemon_lock"] is False
+
+
+def test_dashboard_refuses_any_schema_generation_mismatch(
+    tmp_path: Path,
+) -> None:
+    # Database.open always applies pending migrations, so the
+    # dashboard proves the open is a no-op first — a checkout ahead of
+    # or behind the database refuses instead of mutating daemon state.
+    repo_root, state_dir = active_repo(tmp_path)
+    Database.open(state_dir / "state.db").close()
+    connection = sqlite3.connect(state_dir / "state.db")
+    try:
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) "
+            "VALUES (9999, '2026-08-31T00:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    exit_code, output = _invoke(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--state-dir",
+            str(state_dir),
+            "dashboard",
+            "--once",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 1
+    payload = json.loads(output)
+    assert payload["error"] == "schema generation mismatch"
+    assert payload["database_schema"] == 9999
+
+
+@pytest.mark.asyncio
+async def test_upper_pane_stays_live_across_maintenance_intervals(
+    tmp_path: Path,
+) -> None:
+    # With the daemon holding the REAL exclusive lock for the entire
+    # run, the dashboard-topology upper pane keeps proving its role
+    # tick after tick: exactly one daemon owns the state, and the
+    # DaemonAlreadyRunning respawn loop Sol evidenced cannot exist —
+    # zero respawns across multiple maintenance intervals.
+    port = FakeWorkspacePort()
+    database, owner = _owner_over(tmp_path, port)
+    lock = _DaemonLock(tmp_path / "owner-state-daemon.lock")
+    lock.acquire()
+    try:
+        started = await owner.start()
+        assert started is not None and started.outcome == "created"
+        assert " dashboard " in f'{port.created[0]["upper_command"]} '
+        assert " daemon" not in str(port.created[0]["upper_command"])
+        for _ in range(3):
+            ticked = await owner.tick()
+            assert ticked is not None and ticked.outcome == "adopted"
+        assert port.respawns == []
+        assert len(port.created) == 1
+        assert len(port.workspaces) == 1
+    finally:
+        lock.release()
         database.close()

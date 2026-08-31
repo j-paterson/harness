@@ -1,15 +1,25 @@
 """Recoverable two-pane Orchestrator workspace lifecycle.
 
-INFRA-191 W3 (Hermes directive channel.blocked 2833d6d0, Sol correction
-f28e8484): the Orchestrator becomes one real cmux workspace with two
-stacked normal terminal panes — an upper pane running the actual
-supervisor/dashboard lifecycle (the ``hermes-orchestrator daemon``
-entry, whose maintenance loop carries the existing dashboard renderer
-and durable sources unchanged) and a lower pane running the installed
-Nous Hermes classic durable session (``hermes chat --continue <name>
---create-if-missing``: the same named session is reattached on every
-recovery, never duplicated). The stale single-surface ANSI-region
-design in ``dashboard_pane.py`` is not touched.
+INFRA-191 W3 (Hermes directive channel.blocked 2833d6d0, Sol packets
+575fe76c and a6bc7ca2): the Orchestrator becomes one real cmux
+workspace with two stacked normal terminal panes.
+
+Ownership topology (Sol K1, explicit): production has exactly one
+effective supervisor of the durable state — the single lock-holding
+``hermes-orchestrator daemon`` process (launchd), which is never
+inside a pane. It composes the one
+:class:`OrchestratorWorkspaceOwner` and drives this lifecycle from
+startup and its bounded maintenance slot. The upper pane runs the
+distinct, deliberately non-supervising ``hermes-orchestrator
+dashboard`` entry: token-free, read-only over the same durable
+database, no daemon lock — so it can never collide with the daemon's
+exclusive state-directory lock (the DaemonAlreadyRunning respawn loop
+Sol evidenced is structurally impossible). The lower pane runs the
+installed Nous Hermes classic durable session (``hermes chat
+--continue <name> --create-if-missing``: the same named session is
+reattached on every recovery, never duplicated). The stale
+single-surface ANSI-region design in ``dashboard_pane.py`` is not
+touched; the dashboard entry reuses its renderer unchanged.
 
 Durable recovery identity needs no schema change: the workspace and
 its upper (supervisor) surface are journaled through the existing
@@ -23,15 +33,22 @@ never stored: with the two-pane invariant it is always "the one
 surface that is not the bound upper", so the durable row can never
 disagree with the live layout about it.
 
-``ensure`` is idempotent: a live workspace with both panes and both
-processes is adopted unchanged; a dead pane process is respawned into
-the exact same surface (no duplication); a dead or partial workspace
-is closed and rebuilt under the binding's successor generation.
-Liveness comes only from cmux's typed process metadata
-(``workspace_processes``) — never from screen content: a pane is live
-when its process tree holds anything beyond a login shell, which in an
-orchestrator-owned workspace is by construction the process this
-lifecycle launched there.
+``ensure`` is idempotent: a live workspace with both roles proven is
+adopted unchanged; a dead or wrong pane process is respawned into the
+exact same surface (no duplication); a dead or partial workspace is
+closed and rebuilt under the binding's successor generation.
+
+Role proof (Sol K2) combines two typed observations and no screen
+content: the pane's cmux process-name tree must have the role's
+expected interpreter/wrapper shape, AND the exact expected command
+lineage must be observed running via local process argv (``ps``),
+which carries the full command line through legitimate wrappers —
+``…/hermes-agent/venv/bin/python …/hermes-agent/hermes chat
+--continue <session> --create-if-missing`` for the lower role and
+``uv run hermes-orchestrator --repo-root … --state-dir … dashboard``
+(plus its console-script child) for the upper. A bare interpreter
+name proves nothing; a wrong session name or an unrelated
+python/uv+python fails the role and fails closed.
 """
 
 from __future__ import annotations
@@ -56,14 +73,16 @@ from hermes_orchestrator.cmux_surfaces import CmuxBinding, CmuxSurfaceBindings
 #: normal terminal panes — supervisor above, Hermes below.
 STACK_DIRECTION = "vertical"
 
-UPPER_ROLE = "supervisor"
+UPPER_ROLE = "dashboard"
 LOWER_ROLE = "hermes"
 
-#: Recursion guard (Sol packet 1): every workspace this lifecycle
-#: creates carries this environment marker, so the supervisor daemon
-#: running in the upper pane recognizes its own seat. A seated daemon
-#: adopts-in-place and reconciles the lower session, but never creates
-#: a workspace whose upper pane would launch another supervisor.
+#: Pane marker (Sol K1 repurposed the former seated-adopt marker):
+#: every workspace this lifecycle creates stamps this environment
+#: variable on both panes. No daemon behavior branches on it any more
+#: — the supervising daemon is never inside a pane — it survives as a
+#: fail-closed operator-error guard: a lifecycle told it is running
+#: inside a marked pane refuses every operation outright, because the
+#: only process that may own this lifecycle is the outside daemon.
 SEAT_ENV = "HERMES_ORCH_SEAT"
 
 #: Version tag of the live-smoke evidence document schema.
@@ -92,15 +111,18 @@ class WorkspaceRefused(RuntimeError):
     """The lifecycle refused an invalid or unsafe composition."""
 
 
-def supervisor_pane_command(
+def dashboard_pane_command(
     *, repo_root: Path, state_dir: Path, interval: int
 ) -> str:
-    """The exact upper-pane command: the real supervisor lifecycle.
+    """The exact upper-pane command: the non-daemon dashboard entry.
 
-    This is the daemon entry the Orchestrator terminal runs today
-    (``uv run hermes-orchestrator … daemon``), whose maintenance loop
-    owns the existing dashboard renderer and durable dashboard sources
-    — not a placeholder shell. Both paths must be absolute and
+    Sol K1: the upper pane deliberately does NOT run the daemon — a
+    second full daemon against the same state directory loses the
+    exclusive daemon lock, exits ``DaemonAlreadyRunning``, and puts
+    the outer maintenance loop into a respawn loop. Instead it runs
+    ``hermes-orchestrator dashboard``: token-free, read-only over the
+    durable database, lock-free, ticking the existing dashboard
+    sources/renderer/pane machinery. Both paths must be absolute and
     metacharacter-free and the interval bounded, so exactly this
     command shape and nothing else can be composed.
     """
@@ -109,21 +131,21 @@ def supervisor_pane_command(
     state = str(state_dir)
     if _SAFE_PATH.fullmatch(root) is None:
         raise WorkspaceRefused(
-            "the supervisor repo root must be an absolute "
+            "the dashboard repo root must be an absolute "
             "metacharacter-free path"
         )
     if _SAFE_PATH.fullmatch(state) is None:
         raise WorkspaceRefused(
-            "the supervisor state dir must be an absolute "
+            "the dashboard state dir must be an absolute "
             "metacharacter-free path"
         )
     if not 5 <= int(interval) <= 86400:
         raise WorkspaceRefused(
-            "the supervisor interval must be between 5 and 86400 seconds"
+            "the dashboard interval must be between 5 and 86400 seconds"
         )
     return (
         f"uv run hermes-orchestrator --repo-root {root} "
-        f"--state-dir {state} daemon --interval {int(interval)} --json"
+        f"--state-dir {state} dashboard --interval {int(interval)}"
     )
 
 
@@ -170,15 +192,15 @@ def _is_python(name: str) -> bool:
     return name.lower().startswith("python")
 
 
-def supervisor_process_identity(processes: Sequence[str]) -> bool:
-    """The upper pane proves the supervisor role, from typed metadata.
+def dashboard_process_shape(processes: Sequence[str]) -> bool:
+    """The upper pane's cmux name-tree shape for the dashboard role.
 
-    Expected launch identity, characterized live: the daemon starts as
-    ``uv run hermes-orchestrator … daemon``, so the tree carries ``uv``
-    (or the console entry itself) with python interpreters beneath it,
-    plus wrappers. Any other non-wrapper process — or none at all —
-    is not the supervisor, and the pane fails closed. Screen content
-    plays no part (Sol packet 2)."""
+    Shape only — necessary, never sufficient (Sol K2: a bare
+    interpreter name is not role proof). Characterized live: ``uv run
+    hermes-orchestrator … dashboard`` shows ``uv`` (or the console
+    entry) with python interpreters beneath it, plus wrappers. Any
+    other non-wrapper process fails the shape.
+    """
 
     meaningful = _meaningful(processes)
     signature = any(
@@ -190,14 +212,14 @@ def supervisor_process_identity(processes: Sequence[str]) -> bool:
     )
 
 
-def hermes_process_identity(processes: Sequence[str]) -> bool:
-    """The lower pane proves the Nous Hermes role, from typed metadata.
+def hermes_process_shape(processes: Sequence[str]) -> bool:
+    """The lower pane's cmux name-tree shape for the Hermes role.
 
-    Expected launch identity, characterized live: the installed
-    ``hermes`` entry is a python script, so the tree shows a python
-    interpreter (or a ``hermes`` binary name), optionally with ``node``
-    tool children, plus wrappers. ``uv`` or any other non-wrapper
-    process is not the Hermes session, and the pane fails closed."""
+    Shape only — necessary, never sufficient. Characterized live: the
+    installed ``hermes`` entry is a python script, so the tree shows a
+    python interpreter (or a ``hermes`` binary name), optionally with
+    ``node`` tool children, plus wrappers.
+    """
 
     meaningful = _meaningful(processes)
     signature = any(
@@ -209,10 +231,72 @@ def hermes_process_identity(processes: Sequence[str]) -> bool:
     )
 
 
-ROLE_IDENTITIES = {
-    UPPER_ROLE: supervisor_process_identity,
-    LOWER_ROLE: hermes_process_identity,
+ROLE_SHAPES = {
+    UPPER_ROLE: dashboard_process_shape,
+    LOWER_ROLE: hermes_process_shape,
 }
+
+
+class ProcessLineage(Protocol):
+    """Local observed process command lines (argv), for role proof."""
+
+    def running_commands(self) -> tuple[str, ...]: ...
+
+
+class PsProcessLineage:
+    """Production lineage source: local ``ps`` argv, no cmux, no screen.
+
+    cmux panes are local processes on the daemon's own host (the cmux
+    CLI and socket are local by construction), so ``ps -axo command=``
+    exposes each pane process's full argv — including the session name
+    inside ``… hermes chat --continue <session> --create-if-missing``
+    and the exact ``… hermes-orchestrator … dashboard`` line — through
+    every legitimate wrapper (the shell, ``uv``, the bash launcher
+    that execs the hermes venv python). This is typed OS process
+    metadata, never terminal screen content.
+    """
+
+    def running_commands(self) -> tuple[str, ...]:
+        import subprocess
+
+        try:
+            completed = subprocess.run(
+                ["ps", "-axo", "command="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ()
+        if completed.returncode != 0:
+            return ()
+        return tuple(
+            line.strip()
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        )
+
+
+def lineage_matches(
+    commands: Sequence[str], expected_marker: str
+) -> tuple[str, ...]:
+    """The observed command lines carrying the exact expected lineage.
+
+    The marker must appear as a whole token run — preceded by nothing,
+    whitespace, or a path separator (the hermes launcher execs
+    ``…/hermes-agent/hermes chat …``, the console script runs as
+    ``…/bin/hermes-orchestrator …``) and followed by nothing or
+    whitespace — so ``--continue other-session`` or a superstring
+    session name can never satisfy it.
+    """
+
+    pattern = re.compile(
+        r"(?:^|[\s/])" + re.escape(expected_marker) + r"(?:$|\s)"
+    )
+    return tuple(
+        command for command in commands if pattern.search(command)
+    )
 
 
 class OrchestratorWorkspacePort(Protocol):
@@ -286,17 +370,19 @@ class OrchestratorWorkspaceLifecycle:
         state_dir: Path,
         name: str = "orchestrator",
         title: str = "Orchestrator",
-        interval: int = 300,
+        interval: int = 30,
         session_name: str | None = None,
-        seated: bool = False,
+        lineage: ProcessLineage | None = None,
+        inside_marked_pane: bool = False,
     ) -> None:
         self._port = port
         self._bindings = bindings
         self._repo_root = repo_root
         self._name = name
         self._title = title
-        self._seated = bool(seated)
-        self._supervisor_command = supervisor_pane_command(
+        self._lineage = lineage if lineage is not None else PsProcessLineage()
+        self._inside_marked_pane = bool(inside_marked_pane)
+        self._dashboard_command = dashboard_pane_command(
             repo_root=repo_root, state_dir=state_dir, interval=interval
         )
         self._hermes_command = hermes_pane_command(session_name or name)
@@ -307,26 +393,68 @@ class OrchestratorWorkspaceLifecycle:
         return self._marker
 
     @property
-    def seated(self) -> bool:
-        """Whether this lifecycle runs inside its own upper pane.
-
-        A seated lifecycle (the daemon launched with the ``SEAT_ENV``
-        marker its own creation stamped on the workspace) may adopt
-        and reconcile the lower Hermes session, but never create a
-        workspace, close its own, or respawn the upper pane — each of
-        those would duplicate or kill the very supervisor doing the
-        reconciling.
-        """
-
-        return self._seated
+    def port(self) -> OrchestratorWorkspacePort:
+        return self._port
 
     @property
-    def supervisor_command(self) -> str:
-        return self._supervisor_command
+    def inside_marked_pane(self) -> bool:
+        """Whether this process was told it runs inside a marked pane.
+
+        The former seated-adopt branch is retired (Sol K1): the one
+        supervising daemon is never inside a pane, so a lifecycle
+        constructed inside a marked pane can only be an operator error
+        — it refuses every operation, fail closed, instead of
+        adopting, creating, or closing anything.
+        """
+
+        return self._inside_marked_pane
+
+    @property
+    def dashboard_command(self) -> str:
+        return self._dashboard_command
 
     @property
     def hermes_command(self) -> str:
         return self._hermes_command
+
+    @property
+    def upper_lineage_marker(self) -> str:
+        """The exact upper-role command lineage the role proof demands."""
+
+        return self._dashboard_command.removeprefix("uv run ")
+
+    @property
+    def lower_lineage_marker(self) -> str:
+        """The exact lower-role command lineage the role proof demands."""
+
+        return self._hermes_command
+
+    def observed_lineage(self) -> tuple[str, ...]:
+        return self._lineage.running_commands()
+
+    def role_proof(
+        self, role: str, names: Sequence[str], commands: Sequence[str]
+    ) -> dict[str, Any]:
+        """One role's complete proof over typed shape plus argv lineage."""
+
+        shape = ROLE_SHAPES.get(role)
+        marker = (
+            self.upper_lineage_marker
+            if role == UPPER_ROLE
+            else self.lower_lineage_marker
+            if role == LOWER_ROLE
+            else None
+        )
+        shape_ok = shape is not None and shape(names)
+        matched = (
+            lineage_matches(commands, marker) if marker is not None else ()
+        )
+        return {
+            "shape_ok": shape_ok,
+            "expected_lineage": marker,
+            "lineage_matches": [line[:200] for line in matched],
+            "role_proven": shape_ok and bool(matched),
+        }
 
     async def ensure(self) -> OrchestratorWorkspaceState:
         """Create, adopt, or recover the one two-pane workspace.
@@ -340,26 +468,8 @@ class OrchestratorWorkspaceLifecycle:
         workspace can survive an ensure.
         """
 
+        self._refuse_if_marked()
         binding = self._bindings.active_orchestrator()
-        if self._seated:
-            # Recursion guard: a seated supervisor reconciles in place
-            # only. It closes no workspaces (an orphan sweep could take
-            # down its own seat under a fresh database) and creates
-            # none (the created upper pane would launch a second
-            # supervisor). Anything it cannot adopt is left for an
-            # unseated owner, deterministically, by refusing.
-            if binding is None:
-                raise WorkspaceRefused(
-                    "a seated supervisor has no durable seat to adopt "
-                    "and never creates one"
-                )
-            adopted = await self._adopt(binding)
-            if adopted is None:
-                raise WorkspaceRefused(
-                    "a seated supervisor cannot rebuild its own "
-                    "workspace; an unseated owner must recreate it"
-                )
-            return adopted
         await self._close_orphans(binding)
         if binding is None:
             return await self._create(replacing=None)
@@ -371,9 +481,18 @@ class OrchestratorWorkspaceLifecycle:
             await self._port.close_workspace(binding.workspace_uuid)
         return await self._create(replacing=binding)
 
+    def _refuse_if_marked(self) -> None:
+        if self._inside_marked_pane:
+            raise WorkspaceRefused(
+                "this process runs inside a marked Orchestrator pane; "
+                "only the outside lock-holding daemon may own the "
+                "workspace lifecycle"
+            )
+
     async def close(self) -> tuple[str, ...]:
         """Tear down the workspace and retire its durable binding."""
 
+        self._refuse_if_marked()
         binding = self._bindings.active_orchestrator()
         marked = await self._port.find_workspace_uuids(
             title_marker=self._marker
@@ -436,19 +555,21 @@ class OrchestratorWorkspaceLifecycle:
             workspace_uuid=binding.workspace_uuid,
             surface_uuid=lower.surface_uuid,
         )
-        # A tree that does not prove the supervisor identity — dead, or
-        # occupied by something else — fails closed: the exact expected
-        # command is respawned into the exact surface. A seated
-        # supervisor skips this (the upper pane is itself) and leaves
-        # the mismatch for an unseated owner.
-        if not self._seated and not supervisor_process_identity(
-            upper.process_names
-        ):
+        # A pane that does not prove its role — dead, wrong session,
+        # or occupied by something else (Sol K2: shape plus exact argv
+        # lineage, both mandatory) — fails closed: the exact expected
+        # command is respawned into the exact surface.
+        commands = self.observed_lineage()
+        if not self.role_proof(
+            UPPER_ROLE, upper.process_names, commands
+        )["role_proven"]:
             await self._port.respawn_surface(
-                upper_ref, self._supervisor_command
+                upper_ref, self._dashboard_command
             )
             respawned.append(UPPER_ROLE)
-        if not hermes_process_identity(lower.process_names):
+        if not self.role_proof(
+            LOWER_ROLE, lower.process_names, commands
+        )["role_proven"]:
             await self._port.respawn_surface(
                 lower_ref, self._hermes_command
             )
@@ -469,12 +590,12 @@ class OrchestratorWorkspaceLifecycle:
         upper, lower = await self._port.create_two_pane_workspace(
             title=f"{self._title} {self._marker}",
             cwd=self._repo_root,
-            upper_command=self._supervisor_command,
+            upper_command=self._dashboard_command,
             lower_command=self._hermes_command,
-            # Recursion guard: the workspace-level marker tells the
-            # upper-pane daemon it is the seated supervisor, so its own
-            # lifecycle adopts-in-place and never creates a second
-            # workspace (and with it a second daemon).
+            # Pane marker: no daemon branches on it (the supervisor is
+            # never inside a pane); it identifies pane processes as
+            # lifecycle-owned and arms the fail-closed operator-error
+            # guard (inside_marked_pane).
             env={SEAT_ENV: self._name},
             resolve_marker=self._marker,
         )
@@ -508,11 +629,19 @@ class OrchestratorWorkspaceLifecycle:
 
 
 async def inspect_workspace(
-    port: OrchestratorWorkspacePort, state: OrchestratorWorkspaceState
+    lifecycle: OrchestratorWorkspaceLifecycle,
+    state: OrchestratorWorkspaceState,
 ) -> dict[str, Any]:
-    """One structural inspection: panes, identities, process evidence."""
+    """One structural inspection: panes, identities, per-role proof.
 
+    Each row carries the role's complete command-specific evidence:
+    the cmux name-tree shape verdict, the exact expected argv lineage,
+    and the observed command lines that matched it (Sol K2).
+    """
+
+    port = lifecycle.port
     surfaces = await port.workspace_processes(state.workspace_uuid)
+    commands = lifecycle.observed_lineage()
     rows = []
     for surface in surfaces:
         key = surface.surface_uuid.lower()
@@ -522,17 +651,14 @@ async def inspect_workspace(
             role = LOWER_ROLE
         else:
             role = "unexpected"
-        matcher = ROLE_IDENTITIES.get(role)
+        proof = lifecycle.role_proof(role, surface.process_names, commands)
         rows.append(
             {
                 "role": role,
                 "pane_uuid": surface.pane_uuid,
                 "surface_uuid": surface.surface_uuid,
                 "process_names": list(surface.process_names),
-                "role_proven": (
-                    matcher is not None
-                    and matcher(surface.process_names)
-                ),
+                **proof,
             }
         )
     pane_uuids = {surface.pane_uuid.lower() for surface in surfaces}
@@ -569,44 +695,61 @@ async def _screen_evidence(
 
 
 async def run_smoke(
-    lifecycle: OrchestratorWorkspaceLifecycle,
-    port: OrchestratorWorkspacePort,
+    owner: OrchestratorWorkspaceOwner,
     *,
     settle_seconds: float = 0.0,
     screen_lines: int = 40,
 ) -> dict[str, Any]:
-    """Drive the full lifecycle and return a JSON-able evidence summary.
+    """Drive the production ownership topology and return evidence.
 
-    ensure → verify both stacked panes and both processes (typed
-    process metadata twice for identity stability, plus read-only
+    Sol K1: the smoke exercises the exact path production runs — the
+    owner's ``start()``/``tick()`` reconciliation, not a standalone
+    lifecycle call — so the evidence proves the owner-driven topology:
+    start → verify both stacked panes with command-specific role proof
+    (typed metadata twice for identity stability, plus read-only
     screen evidence) → restart-recovery (close the workspace
-    externally, ensure again, verify) → teardown — entirely
-    non-interactive, with no staged operator TTY action.
+    externally, tick again) → teardown through the owner. An owner
+    that absorbs a failure fails the smoke loudly here instead.
     """
 
-    first = await lifecycle.ensure()
+    lifecycle = owner.lifecycle
+    port = lifecycle.port
+    first = await owner.start()
+    if first is None:
+        raise WorkspaceRefused(
+            f"the owner could not ensure the workspace: {owner.last_error}"
+        )
     if settle_seconds > 0:
         await asyncio.sleep(settle_seconds)
-    inspection = await inspect_workspace(port, first)
-    inspection_again = await inspect_workspace(port, first)
+    inspection = await inspect_workspace(lifecycle, first)
+    inspection_again = await inspect_workspace(lifecycle, first)
     stable_identities = _identities(inspection) == _identities(
         inspection_again
     )
     screens = await _screen_evidence(port, first, lines=screen_lines)
 
     await port.close_workspace(first.workspace_uuid)
-    second = await lifecycle.ensure()
+    second = await owner.tick()
+    if second is None:
+        raise WorkspaceRefused(
+            f"the owner could not recover the workspace: {owner.last_error}"
+        )
     if settle_seconds > 0:
         await asyncio.sleep(settle_seconds)
-    recovery_inspection = await inspect_workspace(port, second)
+    recovery_inspection = await inspect_workspace(lifecycle, second)
 
-    closed = await lifecycle.close()
+    closed = await owner.teardown()
     remaining = await port.live_workspace_uuids()
     evidence: dict[str, Any] = {
         "marker": lifecycle.marker,
         "stack_direction": STACK_DIRECTION,
-        "supervisor_command": lifecycle.supervisor_command,
+        "topology": "owner-driven",
+        "dashboard_command": lifecycle.dashboard_command,
         "hermes_command": lifecycle.hermes_command,
+        "role_expectations": {
+            UPPER_ROLE: lifecycle.upper_lineage_marker,
+            LOWER_ROLE: lifecycle.lower_lineage_marker,
+        },
         "first_ensure": first.payload(),
         "inspection": inspection,
         "stable_identities": stable_identities,
@@ -688,13 +831,15 @@ class OrchestratorWorkspaceOwner:
     bounded reconciliation cadence. Every reconciliation is one
     ``ensure()``: adopt a healthy workspace unchanged, respawn a dead
     or wrong-role pane process in place, rebuild a dead or partial
-    workspace under the successor generation. The recursion guard
-    lives in the lifecycle's ``seated`` mode; the owner adds
-    determinism at the edges: cmux failures and seated refusals are
-    absorbed and recorded (the daemon never crashes over terminal
-    visibility), and :meth:`stop` / :meth:`teardown` end
-    reconciliation permanently so a stopping daemon cannot recreate
-    what it just tore down.
+    workspace under the successor generation. Ownership is singular by
+    construction (Sol K1): the owner lives only inside the one
+    lock-holding daemon, the upper pane runs the lock-free read-only
+    dashboard entry, and a lifecycle marked as running inside a pane
+    refuses everything. The owner adds determinism at the edges: cmux
+    failures and refusals are absorbed and recorded (the daemon never
+    crashes over terminal visibility), and :meth:`stop` /
+    :meth:`teardown` end reconciliation permanently so a stopping
+    daemon cannot recreate what it just tore down.
     """
 
     def __init__(self, lifecycle: OrchestratorWorkspaceLifecycle) -> None:
@@ -777,18 +922,46 @@ def evidence_document(
         "invocation": list(invocation),
         "captured_at": captured_at,
         "evidence": evidence,
+        # Two distinct digests exist for this receipt and a manifest
+        # may reference either unambiguously (Sol K3): ``self_digest``
+        # (kind declared here) seals the canonical JSON payload and
+        # lives inside the document; the file-byte sha256 of the
+        # written receipt is computed over the file with
+        # :func:`file_sha256` and reported alongside — it cannot live
+        # inside the file it hashes.
+        "self_digest_kind": "sha256-of-canonical-json",
     }
     document["self_digest"] = _canonical_digest(document)
     return document
 
 
-def verify_evidence_document(document: dict[str, Any]) -> bool:
-    """Recompute the canonical digest and compare it to the seal."""
+def verify_evidence_document(
+    document: dict[str, Any], *, expected_source_sha: str | None = None
+) -> bool:
+    """Recompute the canonical digest and validate the binding.
+
+    Verification refuses (returns False) when the seal does not match
+    — any tampering with evidence, invocation, or sha — and, when the
+    caller supplies the candidate sha it expects, when the document's
+    ``source_sha`` is any other revision (Sol K3): a receipt from the
+    wrong candidate never validates against this one.
+    """
 
     recorded = document.get("self_digest")
-    return isinstance(recorded, str) and recorded == _canonical_digest(
-        document
-    )
+    if not (
+        isinstance(recorded, str)
+        and recorded == _canonical_digest(document)
+    ):
+        return False
+    if expected_source_sha is not None:
+        return document.get("source_sha") == expected_source_sha
+    return True
+
+
+def file_sha256(path: Path) -> str:
+    """The written receipt's file-byte sha256 (kind: sha256-of-file)."""
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _canonical_digest(document: dict[str, Any]) -> str:

@@ -634,13 +634,15 @@ def open_runtime(
                         port=cmux_port,
                     ),
                 )
-                # INFRA-191: the daemon owns the two-pane Orchestrator
-                # workspace autonomously. A daemon launched with the
-                # seat marker its own creation stamped runs seated —
-                # adopt-in-place only, never a second workspace or
-                # supervisor. An unconfigurable repo/state path refuses
-                # composition instead of crashing live startup: cmux
-                # visibility stays optional.
+                # INFRA-191 (Sol K1): the one lock-holding daemon owns
+                # the two-pane Orchestrator workspace autonomously;
+                # the upper pane runs the lock-free read-only
+                # `dashboard` entry, never a second daemon. A daemon
+                # somehow launched inside a marked pane composes a
+                # lifecycle that refuses everything, fail closed. An
+                # unconfigurable repo/state path refuses composition
+                # instead of crashing live startup: cmux visibility
+                # stays optional.
                 try:
                     orchestrator_workspace = OrchestratorWorkspaceOwner(
                         OrchestratorWorkspaceLifecycle(
@@ -648,7 +650,9 @@ def open_runtime(
                             bindings=cmux_bindings,
                             repo_root=settings.repo_root,
                             state_dir=settings.state_dir,
-                            seated=bool(environment.get(SEAT_ENV)),
+                            inside_marked_pane=bool(
+                                environment.get(SEAT_ENV)
+                            ),
                         )
                     )
                 except WorkspaceRefused:
