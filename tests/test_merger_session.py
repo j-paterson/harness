@@ -418,3 +418,29 @@ async def test_release_frees_the_real_codex_app_server_process_lease(
     await session.release("live_release")
 
     assert processes.active("merger") == ()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reopens_after_the_connection_ended_on_its_own() -> None:
+    """A dead App Server connection must not leave the session stuck open:
+    the listener has finished on its own, so reconcile releases (freeing
+    the lease) and, with review work still active, reopens a fresh
+    connection instead of waiting on a dead one forever."""
+
+    rpc = FakeRpc()
+    flow = _flow(rpc=rpc, merger=FakeMerger(), turns=FakeTurns(), reviews=FakeReviews())
+    session = MergerSession(flow, ("demo",), is_review_active=lambda: True)
+    assert await session.open("test")
+    assert session.is_open
+    # The child dies: the notification stream ends without any close()
+    # call, so the listener task completes while _open stays True.
+    await rpc._queue.put(_CLOSED)
+    await _wait_until(
+        lambda: session._listener is not None and session._listener.done()
+    )
+
+    await session.reconcile("maintenance")
+
+    assert session.is_open
+    assert rpc.close_calls == 1
+    assert rpc.start_calls == 2

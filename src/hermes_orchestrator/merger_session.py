@@ -158,6 +158,18 @@ class MergerSession:
             print(f"merger session review check failed: {error}", file=sys.stderr)
             return
         try:
+            if (
+                self._open
+                and self._listener is not None
+                and self._listener.done()
+                and self._listener is not asyncio.current_task()
+            ):
+                # The App Server connection ended on its own (child exit
+                # or protocol failure): the listener finished while the
+                # session still believed it was open. Release first so a
+                # still-active review reopens a fresh connection below
+                # instead of staying stuck on a dead one.
+                await self.release("connection_ended")
             if active and not self._open:
                 await self.open(reason)
             elif self._open and not active:
