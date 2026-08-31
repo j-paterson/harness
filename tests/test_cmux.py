@@ -1333,6 +1333,10 @@ async def test_workspace_processes_returns_typed_metadata_only() -> None:
         (UPPER_PANE, SURFACE, ("zsh", "uv", "python3.13")),
         (LOWER_PANE, LOWER_SURFACE, ("zsh", "hermes")),
     ]
+    # Sol L1: the adapter exposes the PIDs the top tree already
+    # carries, parallel to the names, so lineage can be correlated to
+    # exactly this surface's processes and their descendants.
+    assert [row.process_ids for row in rows] == [(10, 11, 12), (20, 21)]
 
 
 @pytest.mark.asyncio

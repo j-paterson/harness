@@ -237,31 +237,43 @@ ROLE_SHAPES = {
 }
 
 
-class ProcessLineage(Protocol):
-    """Local observed process command lines (argv), for role proof."""
+@dataclass(frozen=True, slots=True)
+class ProcessRecord:
+    """One host process observation: pid, parent pid, full argv line."""
 
-    def running_commands(self) -> tuple[str, ...]: ...
+    pid: int
+    ppid: int
+    command: str
+
+
+class ProcessLineage(Protocol):
+    """Local observed process table (pid/ppid/argv), for role proof."""
+
+    def process_table(self) -> tuple[ProcessRecord, ...]: ...
 
 
 class PsProcessLineage:
-    """Production lineage source: local ``ps`` argv, no cmux, no screen.
+    """Production lineage source: local ``ps`` table, no cmux, no screen.
 
     cmux panes are local processes on the daemon's own host (the cmux
-    CLI and socket are local by construction), so ``ps -axo command=``
-    exposes each pane process's full argv — including the session name
-    inside ``… hermes chat --continue <session> --create-if-missing``
-    and the exact ``… hermes-orchestrator … dashboard`` line — through
-    every legitimate wrapper (the shell, ``uv``, the bash launcher
-    that execs the hermes venv python). This is typed OS process
+    CLI and socket are local by construction), so ``ps -axo
+    pid=,ppid=,command=`` exposes each process's identity, parentage,
+    and full argv — including the session name inside ``… hermes chat
+    --continue <session> --create-if-missing`` and the exact ``…
+    hermes-orchestrator … dashboard`` line — through every legitimate
+    wrapper. Sol L1: argv is never consumed host-wide; the lifecycle
+    correlates it strictly through the PIDs cmux attributes to each
+    surface (and their descendants), so a matching command running
+    anywhere else can never prove a pane. This is typed OS process
     metadata, never terminal screen content.
     """
 
-    def running_commands(self) -> tuple[str, ...]:
+    def process_table(self) -> tuple[ProcessRecord, ...]:
         import subprocess
 
         try:
             completed = subprocess.run(
-                ["ps", "-axo", "command="],
+                ["ps", "-axo", "pid=,ppid=,command="],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -271,11 +283,124 @@ class PsProcessLineage:
             return ()
         if completed.returncode != 0:
             return ()
-        return tuple(
-            line.strip()
-            for line in completed.stdout.splitlines()
-            if line.strip()
+        records: list[ProcessRecord] = []
+        for line in completed.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            command = parts[2].strip()
+            if command:
+                records.append(
+                    ProcessRecord(pid=pid, ppid=ppid, command=command)
+                )
+        return tuple(records)
+
+
+class LineageCorrelationUnavailable(WorkspaceRefused):
+    """Surface-to-argv correlation was unavailable or ambiguous.
+
+    Sol L1: when the two typed reads (cmux surface PIDs, ps table)
+    cannot be correlated — every surface process disappeared between
+    the reads, or a surface PID's observed argv no longer matches its
+    reported process name (suspected PID reuse) — the lifecycle fails
+    closed: nothing is adopted, respawned, closed, or created, and the
+    next bounded cadence retries from fresh reads.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceCorrelation:
+    """One surface's correlation outcome and its scoped command lines."""
+
+    status: str  # "ok" | "idle" | "disappeared" | "suspected_pid_reuse"
+    pids: tuple[int, ...]
+    commands: tuple[str, ...]
+
+    @property
+    def failed(self) -> bool:
+        return self.status in ("disappeared", "suspected_pid_reuse")
+
+
+def _argv_name_consistent(name: str, command: str) -> bool:
+    """Whether a surface process name plausibly owns this argv line.
+
+    Guards against PID reuse between the cmux read and the ps read:
+    the executable basename and the cmux-reported name must share a
+    prefix relation (``Python``/``python3.13``, ``zsh``/``-zsh``,
+    ``uv``/``uv``); a pid whose argv now belongs to something else
+    fails, and the correlation fails closed with it.
+    """
+
+    argv0 = command.split()[0] if command.split() else ""
+    base = argv0.rsplit("/", 1)[-1].lstrip("-").lower()
+    expected = name.lstrip("-").lower()
+    if not base or not expected:
+        return False
+    return base.startswith(expected) or expected.startswith(base)
+
+
+def correlate_surface(
+    surface: CmuxSurfaceProcesses, table: Sequence[ProcessRecord]
+) -> SurfaceCorrelation:
+    """Scope observed argv strictly to one surface's process tree.
+
+    The surface's cmux-attributed PIDs anchor the correlation; their
+    ps records plus every ps-walked descendant form the one process
+    tree that shape and lineage are evaluated on. A transient child
+    exiting between the reads is tolerated (dropped), but a surface
+    whose reported processes ALL vanished, or any anchored pid whose
+    argv is inconsistent with its reported name (suspected reuse),
+    yields a failed correlation the caller must treat as
+    fail-closed-and-retry, never as evidence.
+    """
+
+    anchors = [
+        (name, pid)
+        for name, pid in zip(
+            surface.process_names, surface.process_ids, strict=True
         )
+        if pid > 0
+    ]
+    if not anchors:
+        return SurfaceCorrelation(status="idle", pids=(), commands=())
+    by_pid = {record.pid: record for record in table}
+    present = [
+        (name, pid) for name, pid in anchors if pid in by_pid
+    ]
+    if not present:
+        return SurfaceCorrelation(
+            status="disappeared",
+            pids=tuple(pid for _, pid in anchors),
+            commands=(),
+        )
+    for name, pid in present:
+        if not _argv_name_consistent(name, by_pid[pid].command):
+            return SurfaceCorrelation(
+                status="suspected_pid_reuse",
+                pids=tuple(pid for _, pid in anchors),
+                commands=(),
+            )
+    children: dict[int, list[int]] = {}
+    for record in table:
+        children.setdefault(record.ppid, []).append(record.pid)
+    scoped: set[int] = set()
+    stack = [pid for _, pid in present]
+    while stack:
+        pid = stack.pop()
+        if pid in scoped:
+            continue
+        scoped.add(pid)
+        stack.extend(children.get(pid, ()))
+    commands = tuple(
+        record.command for record in table if record.pid in scoped
+    )
+    return SurfaceCorrelation(
+        status="ok", pids=tuple(sorted(scoped)), commands=commands
+    )
 
 
 def lineage_matches(
@@ -429,13 +554,24 @@ class OrchestratorWorkspaceLifecycle:
 
         return self._hermes_command
 
-    def observed_lineage(self) -> tuple[str, ...]:
-        return self._lineage.running_commands()
+    def observed_table(self) -> tuple[ProcessRecord, ...]:
+        return self._lineage.process_table()
 
     def role_proof(
-        self, role: str, names: Sequence[str], commands: Sequence[str]
+        self,
+        role: str,
+        surface: CmuxSurfaceProcesses,
+        table: Sequence[ProcessRecord],
     ) -> dict[str, Any]:
-        """One role's complete proof over typed shape plus argv lineage."""
+        """One role's complete proof, surface-bound (Sol L1).
+
+        Shape and exact command/session lineage are evaluated on the
+        SAME process tree: the surface's cmux-attributed names/PIDs
+        and the ps argv correlated strictly through those PIDs and
+        their descendants. A matching command running anywhere else on
+        the host proves nothing. A failed correlation proves nothing
+        either and is reported for the caller to fail closed on.
+        """
 
         shape = ROLE_SHAPES.get(role)
         marker = (
@@ -445,15 +581,24 @@ class OrchestratorWorkspaceLifecycle:
             if role == LOWER_ROLE
             else None
         )
-        shape_ok = shape is not None and shape(names)
+        shape_ok = shape is not None and shape(surface.process_names)
+        correlation = correlate_surface(surface, table)
         matched = (
-            lineage_matches(commands, marker) if marker is not None else ()
+            lineage_matches(correlation.commands, marker)
+            if marker is not None and correlation.status == "ok"
+            else ()
         )
         return {
             "shape_ok": shape_ok,
             "expected_lineage": marker,
+            "correlation": correlation.status,
+            "surface_pids": list(correlation.pids),
             "lineage_matches": [line[:200] for line in matched],
-            "role_proven": shape_ok and bool(matched),
+            "role_proven": (
+                shape_ok
+                and correlation.status == "ok"
+                and bool(matched)
+            ),
         }
 
     async def ensure(self) -> OrchestratorWorkspaceState:
@@ -556,20 +701,36 @@ class OrchestratorWorkspaceLifecycle:
             surface_uuid=lower.surface_uuid,
         )
         # A pane that does not prove its role — dead, wrong session,
-        # or occupied by something else (Sol K2: shape plus exact argv
-        # lineage, both mandatory) — fails closed: the exact expected
-        # command is respawned into the exact surface.
-        commands = self.observed_lineage()
-        if not self.role_proof(
-            UPPER_ROLE, upper.process_names, commands
-        )["role_proven"]:
+        # or occupied by something else (Sol K2/L1: shape plus exact
+        # argv lineage on the surface's own process tree, both
+        # mandatory) — fails closed: the exact expected command is
+        # respawned into the exact surface. But an UNAVAILABLE or
+        # AMBIGUOUS correlation (processes vanished between the typed
+        # reads, or suspected PID reuse) is not evidence of anything:
+        # respawning on it could kill a live pane, so it refuses the
+        # whole adopt — nothing mutated — and the owner's next bounded
+        # cadence retries from fresh reads.
+        table = self.observed_table()
+        upper_proof = self.role_proof(UPPER_ROLE, upper, table)
+        lower_proof = self.role_proof(LOWER_ROLE, lower, table)
+        for role, proof in (
+            (UPPER_ROLE, upper_proof),
+            (LOWER_ROLE, lower_proof),
+        ):
+            if proof["correlation"] in (
+                "disappeared",
+                "suspected_pid_reuse",
+            ):
+                raise LineageCorrelationUnavailable(
+                    f"the {role} pane's process correlation is "
+                    f"{proof['correlation']}; retrying without adopting"
+                )
+        if not upper_proof["role_proven"]:
             await self._port.respawn_surface(
                 upper_ref, self._dashboard_command
             )
             respawned.append(UPPER_ROLE)
-        if not self.role_proof(
-            LOWER_ROLE, lower.process_names, commands
-        )["role_proven"]:
+        if not lower_proof["role_proven"]:
             await self._port.respawn_surface(
                 lower_ref, self._hermes_command
             )
@@ -634,14 +795,15 @@ async def inspect_workspace(
 ) -> dict[str, Any]:
     """One structural inspection: panes, identities, per-role proof.
 
-    Each row carries the role's complete command-specific evidence:
-    the cmux name-tree shape verdict, the exact expected argv lineage,
-    and the observed command lines that matched it (Sol K2).
+    Each row carries the role's complete surface-bound evidence: the
+    cmux name-tree shape verdict, the surface's correlated PIDs and
+    correlation status, the exact expected argv lineage, and the
+    surface-scoped command lines that matched it (Sol K2/L1).
     """
 
     port = lifecycle.port
     surfaces = await port.workspace_processes(state.workspace_uuid)
-    commands = lifecycle.observed_lineage()
+    table = lifecycle.observed_table()
     rows = []
     for surface in surfaces:
         key = surface.surface_uuid.lower()
@@ -651,13 +813,14 @@ async def inspect_workspace(
             role = LOWER_ROLE
         else:
             role = "unexpected"
-        proof = lifecycle.role_proof(role, surface.process_names, commands)
+        proof = lifecycle.role_proof(role, surface, table)
         rows.append(
             {
                 "role": role,
                 "pane_uuid": surface.pane_uuid,
                 "surface_uuid": surface.surface_uuid,
                 "process_names": list(surface.process_names),
+                "process_ids": list(surface.process_ids),
                 **proof,
             }
         )

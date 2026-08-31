@@ -130,14 +130,21 @@ class CmuxSurfaceRef:
 class CmuxSurfaceProcesses:
     """Process metadata for one surface, from cmux's structured listing.
 
-    ``process_names`` are the surface's attributed process names in
-    tree order (macOS process accounting via ``top --json``) — exact
-    identities and names only, never screen content or command output.
+    ``process_names`` and ``process_ids`` are parallel, in tree order:
+    the surface's attributed process names and their PIDs (macOS
+    process accounting via ``top --json``, whose process nodes carry
+    ``name``/``pid``/``ppid``) — exact identities only, never screen
+    content or command output. The PIDs give every consumer a stable
+    surface-scoped process identity, so argv lineage can be correlated
+    strictly to THIS surface's processes and their descendants instead
+    of anything else on the host (Sol L1). A node cmux reports without
+    a usable pid carries ``0`` and is ignored by correlation.
     """
 
     pane_uuid: str
     surface_uuid: str
     process_names: tuple[str, ...]
+    process_ids: tuple[int, ...]
 
 
 class CmuxControlPort(Protocol):
@@ -546,13 +553,15 @@ class CmuxCliAdapter:
                     continue
                 for pane in workspace.get("panes") or []:
                     for surface in pane.get("surfaces") or []:
+                        names, pids = _process_entries(
+                            surface.get("processes")
+                        )
                         rows.append(
                             CmuxSurfaceProcesses(
                                 pane_uuid=str(pane.get("id", "")),
                                 surface_uuid=str(surface.get("id", "")),
-                                process_names=_process_names(
-                                    surface.get("processes")
-                                ),
+                                process_names=names,
+                                process_ids=pids,
                             )
                         )
         return tuple(rows)
@@ -774,10 +783,18 @@ def _first_uuid(output: str) -> str | None:
     return None if found is None else found.group(0)
 
 
-def _process_names(processes: object) -> tuple[str, ...]:
-    """Flatten a cmux process tree to its names, in tree order."""
+def _process_entries(
+    processes: object,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Flatten a cmux process tree to parallel names and PIDs.
+
+    Tree order is preserved. A node without a name is skipped; a node
+    whose pid is missing or malformed keeps its name with pid ``0`` so
+    the parallel arrays never drift.
+    """
 
     names: list[str] = []
+    pids: list[int] = []
     stack: list[object] = (
         list(reversed(processes)) if isinstance(processes, list) else []
     )
@@ -788,7 +805,9 @@ def _process_names(processes: object) -> tuple[str, ...]:
         name = node.get("name")
         if name:
             names.append(str(name))
+            raw_pid = node.get("pid")
+            pids.append(raw_pid if isinstance(raw_pid, int) else 0)
         children = node.get("children")
         if isinstance(children, list):
             stack.extend(reversed(children))
-    return tuple(names)
+    return tuple(names), tuple(pids)

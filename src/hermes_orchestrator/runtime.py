@@ -142,6 +142,26 @@ class _DaemonLock:
             handle.close()
 
 
+def acquire_workspace_fence(state_dir: Path) -> _DaemonLock:
+    """Take the ONE exclusive ownership fence for this state directory.
+
+    Sol L2: every workspace-mutating entry — the daemon's lifecycle
+    owner and the manual ``orchestrator-workspace ensure``/``smoke``
+    CLI paths — serializes through the same flock the daemon holds
+    (``<state-dir>/daemon.lock``). Non-blocking: if the production
+    daemon (or any other mutator) owns it, :class:`DaemonAlreadyRunning`
+    is raised and the caller must refuse with zero binding/cmux
+    effects. A smoke against its own isolated state directory takes
+    that directory's own fence, so temp-state smokes stay permitted.
+    flock releases on process death, so a crashed owner transfers the
+    fence deterministically to the next acquirer.
+    """
+
+    lock = _DaemonLock(state_dir / "daemon.lock")
+    lock.acquire()
+    return lock
+
+
 class KeychainReader(Protocol):
     """Narrow credential boundary used during live assembly."""
 

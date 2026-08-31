@@ -23,6 +23,7 @@ from hermes_orchestrator.orchestrator_workspace import (
     STACK_DIRECTION,
     UPPER_ROLE,
     OrchestratorWorkspaceLifecycle,
+    ProcessRecord,
     WorkspaceRefused,
     dashboard_pane_command,
     hermes_pane_command,
@@ -53,7 +54,9 @@ class FakePane:
     pane_uuid: str
     surface_uuid: str
     processes: list[str]
+    pids: list[int] = field(default_factory=list)
     command: str | None = None
+    vanished: bool = False
 
 
 @dataclass
@@ -70,11 +73,20 @@ class FakeWorkspacePort:
     created: list[dict[str, object]] = field(default_factory=list)
     respawns: list[tuple[CmuxSurfaceRef, str]] = field(default_factory=list)
     closed: list[str] = field(default_factory=list)
+    host_processes: list[ProcessRecord] = field(default_factory=list)
     counter: int = 0
+    pid_counter: int = 1000
 
     def _next(self, prefix: str) -> str:
         self.counter += 1
         return f"{prefix}-{self.counter}"
+
+    def _next_pid(self) -> int:
+        self.pid_counter += 1
+        return self.pid_counter
+
+    def _assign_pids(self, pane: FakePane) -> None:
+        pane.pids = [self._next_pid() for _ in pane.processes]
 
     def _pane(self, surface_uuid: str) -> FakePane:
         for workspace in self.workspaces.values():
@@ -87,9 +99,10 @@ class FakeWorkspacePort:
         """A marker-titled workspace nothing durable owns (orphan)."""
 
         workspace_uuid = self._next("ws")
+        pane = FakePane(self._next("pane"), self._next("surf"), ["zsh"])
+        self._assign_pids(pane)
         self.workspaces[workspace_uuid] = FakeWorkspace(
-            title=title,
-            panes=[FakePane(self._next("pane"), self._next("surf"), ["zsh"])],
+            title=title, panes=[pane]
         )
         return workspace_uuid
 
@@ -97,6 +110,7 @@ class FakeWorkspacePort:
         pane = self._pane(surface_uuid)
         pane.processes = ["zsh"]
         pane.command = None
+        self._assign_pids(pane)
 
     def set_processes(
         self,
@@ -107,17 +121,60 @@ class FakeWorkspacePort:
         pane = self._pane(surface_uuid)
         pane.processes = list(names)
         pane.command = command
+        pane.vanished = False
+        self._assign_pids(pane)
 
-    def running_commands(self) -> tuple[str, ...]:
-        """The fake doubles as the ProcessLineage source: each live
-        pane's launched command line, as local ps would report it."""
+    def vanish_from_table(self, surface_uuid: str) -> None:
+        """cmux still reports the pane's pids, ps no longer sees them."""
 
-        return tuple(
-            pane.command
-            for workspace in self.workspaces.values()
-            for pane in workspace.panes
-            if pane.command
+        self._pane(surface_uuid).vanished = True
+
+    def add_host_process(self, command: str) -> int:
+        """An unrelated host process outside every pane's tree."""
+
+        pid = self._next_pid()
+        self.host_processes.append(
+            ProcessRecord(pid=pid, ppid=1, command=command)
         )
+        return pid
+
+    def process_table(self) -> tuple[ProcessRecord, ...]:
+        """The fake doubles as the ProcessLineage source: one ps-shaped
+        row per live pane process (shells as '-zsh', the launcher pid
+        carrying the pane's argv, others as their bare name), plus any
+        seeded unrelated host processes."""
+
+        records = list(self.host_processes)
+        shells = {"zsh", "bash", "sh", "fish", "tcsh", "login"}
+        for workspace in self.workspaces.values():
+            for pane in workspace.panes:
+                if pane.vanished:
+                    continue
+                launcher_index = next(
+                    (
+                        index
+                        for index, name in enumerate(pane.processes)
+                        if name.lower() not in shells
+                    ),
+                    None,
+                )
+                parent = pane.pids[0] if pane.pids else 1
+                for index, (name, pid) in enumerate(
+                    zip(pane.processes, pane.pids, strict=True)
+                ):
+                    if name.lower() in shells:
+                        command = f"-{name}"
+                        ppid = 1
+                    elif index == launcher_index and pane.command:
+                        command = pane.command
+                        ppid = parent
+                    else:
+                        command = name
+                        ppid = parent
+                    records.append(
+                        ProcessRecord(pid=pid, ppid=ppid, command=command)
+                    )
+        return tuple(records)
 
     def drop_pane(self, workspace_uuid: str, surface_uuid: str) -> None:
         workspace = self.workspaces[workspace_uuid]
@@ -152,12 +209,14 @@ class FakeWorkspacePort:
             ["zsh", upper_command.split()[0]],
             command=upper_command,
         )
+        self._assign_pids(upper)
         lower = FakePane(
             self._next("pane"),
             self._next("surf"),
             ["zsh", lower_command.split()[0]],
             command=lower_command,
         )
+        self._assign_pids(lower)
         self.workspaces[workspace_uuid] = FakeWorkspace(
             title=title, panes=[upper, lower]
         )
@@ -202,6 +261,8 @@ class FakeWorkspacePort:
         pane = self._pane(ref.surface_uuid)
         pane.processes = ["zsh", command.split()[0]]
         pane.command = command
+        pane.vanished = False
+        self._assign_pids(pane)
 
     async def workspace_processes(
         self, workspace_uuid: str
@@ -214,6 +275,7 @@ class FakeWorkspacePort:
                 pane_uuid=pane.pane_uuid,
                 surface_uuid=pane.surface_uuid,
                 process_names=tuple(pane.processes),
+                process_ids=tuple(pane.pids),
             )
             for pane in workspace.panes
         )
@@ -807,7 +869,10 @@ class StubbornRolePort(FakeWorkspacePort):
         self.set_processes(
             lower.surface_uuid,
             ["zsh", "python3.11"],
-            command="hermes chat --continue wrong-session --create-if-missing",
+            command=(
+                "/x/venv/bin/python /x/hermes chat --continue "
+                "wrong-session --create-if-missing"
+            ),
         )
         return upper, lower
 
@@ -1181,7 +1246,10 @@ async def test_wrong_session_name_is_rejected_and_recovered(
     port.set_processes(
         first.lower.surface_uuid,
         ["zsh", "python3.11"],
-        command="hermes chat --continue impostor --create-if-missing",
+        command=(
+            "/x/venv/bin/python /x/hermes chat --continue impostor "
+            "--create-if-missing"
+        ),
     )
 
     recovered = await owner.ensure()
@@ -1349,3 +1417,291 @@ def test_cli_smoke_reports_both_digests_and_candidate_sha(
         is True
     )
     assert document["evidence"]["topology"] == "owner-driven"
+
+
+# ---------------------------------------------------------------------------
+# Sol L1 (9cbe7613): role proof is surface-bound — argv correlates only
+# through the surface's own PIDs and descendants.
+# ---------------------------------------------------------------------------
+
+from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
+    LineageCorrelationUnavailable,
+    correlate_surface,
+)
+
+
+@pytest.mark.asyncio
+async def test_expected_hermes_command_elsewhere_proves_nothing(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    # Sol reproduced this: an unrelated python in the lower pane used
+    # to become role_proven because the expected Hermes command ran
+    # elsewhere on the host. Now lineage is scoped to the surface's
+    # own pids: the unrelated pane is rejected and recovered.
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    port.add_host_process(LOWER_WRAPPED)  # exact expected cmd, elsewhere
+    port.set_processes(
+        first.lower.surface_uuid,
+        ["zsh", "python3.11"],
+        command="/usr/bin/python3 -m http.server 8080",
+    )
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
+
+
+@pytest.mark.asyncio
+async def test_expected_dashboard_command_elsewhere_proves_nothing(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    port.add_host_process(UPPER_WRAPPED)  # exact expected cmd, elsewhere
+    port.set_processes(
+        first.upper.surface_uuid,
+        ["zsh", "uv", "Python"],
+        command="uv run some-other-tool serve --json",
+    )
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (UPPER_ROLE,)
+    assert port.respawns[-1] == (first.upper, DASHBOARD_COMMAND)
+
+
+@pytest.mark.asyncio
+async def test_stale_expected_session_cannot_suppress_lower_recovery(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    # A stale process running the exact expected session command
+    # OUTSIDE the inspected workspace must not stop the dead lower
+    # pane from being recovered.
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    port.add_host_process(LOWER_WRAPPED)
+    port.kill_process(first.lower.surface_uuid)
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
+
+
+@pytest.mark.asyncio
+async def test_pid_disappearance_fails_closed_and_retries_without_adopting(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    started = await owner.start()
+    assert started is not None
+    port.vanish_from_table(started.lower.surface_uuid)
+
+    # Direct ensure fails closed with zero mutations.
+    with pytest.raises(LineageCorrelationUnavailable):
+        await owner.lifecycle.ensure()
+    assert len(port.created) == 1
+    assert port.closed == []
+    assert len(port.respawns) == 0
+
+    # The owner absorbs it and the next cadence retries; once the
+    # reads agree again, the same workspace is adopted — never rebuilt.
+    assert await owner.tick() is None
+    assert "LineageCorrelationUnavailable" in (owner.last_error or "")
+    port.set_processes(
+        started.lower.surface_uuid,
+        ["zsh", "python3.11"],
+        command=LOWER_WRAPPED,
+    )
+    ticked = await owner.tick()
+    assert ticked is not None and ticked.outcome == "adopted"
+    assert ticked.workspace_uuid == started.workspace_uuid
+
+
+@pytest.mark.asyncio
+async def test_suspected_pid_reuse_fails_closed_without_mutation(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    # cmux says the pid is a python; the observed argv at that pid is
+    # something else entirely: the pid was likely reused between the
+    # two reads. Not evidence — fail closed, mutate nothing.
+    port.set_processes(
+        first.lower.surface_uuid,
+        ["zsh", "python3.11"],
+        command="vim /tmp/notes.txt",
+    )
+
+    with pytest.raises(LineageCorrelationUnavailable, match="pid_reuse"):
+        await owner.ensure()
+    assert port.closed == []
+    assert len(port.respawns) == 0
+    assert len(port.created) == 1
+
+
+def test_correlate_surface_scopes_to_descendants_only() -> None:
+    surface = CmuxSurfaceProcesses(
+        pane_uuid="pane-x",
+        surface_uuid="surf-x",
+        process_names=("zsh", "python3.11"),
+        process_ids=(100, 101),
+    )
+    table = (
+        ProcessRecord(pid=100, ppid=1, command="-zsh"),
+        ProcessRecord(pid=101, ppid=100, command=LOWER_WRAPPED),
+        ProcessRecord(pid=102, ppid=101, command="node tool-child"),
+        ProcessRecord(pid=900, ppid=1, command=LOWER_WRAPPED),  # elsewhere
+    )
+
+    correlation = correlate_surface(surface, table)
+
+    assert correlation.status == "ok"
+    assert correlation.pids == (100, 101, 102)
+    assert LOWER_WRAPPED in correlation.commands
+    assert len(correlation.commands) == 3  # pid 900 never enters
+
+
+@pytest.mark.asyncio
+async def test_smoke_records_surface_scoped_pid_and_argv_lineage(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    port = FakeWorkspacePort()
+    evidence = await run_smoke(
+        OrchestratorWorkspaceOwner(lifecycle(port, bindings))
+    )
+
+    assert evidence["passed"] is True
+    for phase in (
+        evidence["inspection"],
+        evidence["restart_recovery"]["inspection"],
+    ):
+        for row in phase["surfaces"]:
+            assert row["correlation"] == "ok"
+            assert row["process_ids"]
+            assert row["surface_pids"]
+            assert row["lineage_matches"]
+            assert row["role_proven"] is True
+
+
+# ---------------------------------------------------------------------------
+# Sol L2 (9cbe7613): one exclusive ownership fence for every mutator.
+# ---------------------------------------------------------------------------
+
+from hermes_orchestrator.runtime import (  # noqa: E402
+    DaemonAlreadyRunning,
+    acquire_workspace_fence,
+)
+
+
+def test_manual_ensure_refuses_while_the_fence_is_held(
+    configured_repo: tuple[Path, Path], cli_port: FakeWorkspacePort
+) -> None:
+    _, state_dir = configured_repo
+    fence = acquire_workspace_fence(state_dir)
+    try:
+        exit_code, output = invoke(
+            cli_arguments(configured_repo, "ensure", "--name", "fenced")
+        )
+    finally:
+        fence.release()
+
+    assert exit_code == 1
+    payload = json.loads(output)
+    assert payload["error"] == "workspace lifecycle fence is held"
+    # Zero binding/cmux effects on refusal.
+    assert cli_port.created == []
+    assert cli_port.closed == []
+    assert cli_port.respawns == []
+    assert cli_port.workspaces == {}
+
+
+def test_manual_smoke_refuses_while_the_fence_is_held(
+    configured_repo: tuple[Path, Path], cli_port: FakeWorkspacePort
+) -> None:
+    _, state_dir = configured_repo
+    fence = acquire_workspace_fence(state_dir)
+    try:
+        exit_code, output = invoke(
+            cli_arguments(
+                configured_repo,
+                "smoke",
+                "--name",
+                "fenced-smoke",
+                "--settle-seconds",
+                "0",
+            )
+        )
+    finally:
+        fence.release()
+
+    assert exit_code == 1
+    assert (
+        json.loads(output)["error"] == "workspace lifecycle fence is held"
+    )
+    assert cli_port.created == []
+
+
+def test_temp_state_smoke_stays_permitted_under_a_foreign_fence(
+    configured_repo: tuple[Path, Path],
+    cli_port: FakeWorkspacePort,
+    tmp_path: Path,
+) -> None:
+    # The production state dir's fence is held (the daemon runs), but
+    # a smoke against its own isolated state dir takes that isolated
+    # dir's own fence and proceeds: it cannot address production
+    # bindings at all.
+    production_state = tmp_path / "production-state"
+    fence = acquire_workspace_fence(production_state)
+    try:
+        exit_code, output = invoke(
+            cli_arguments(
+                configured_repo,
+                "smoke",
+                "--name",
+                "temp-state",
+                "--settle-seconds",
+                "0",
+            )
+        )
+    finally:
+        fence.release()
+
+    assert exit_code == 0
+    assert json.loads(output)["passed"] is True
+
+
+def test_two_simultaneous_mutators_yield_exactly_one_owner(
+    tmp_path: Path,
+) -> None:
+    first = acquire_workspace_fence(tmp_path / "state")
+    try:
+        with pytest.raises(DaemonAlreadyRunning):
+            acquire_workspace_fence(tmp_path / "state")
+    finally:
+        first.release()
+
+
+def test_fence_transfers_deterministically_after_release(
+    tmp_path: Path,
+) -> None:
+    # flock releases on process death; release() is the in-process
+    # analog. The next acquirer becomes the one owner immediately.
+    first = acquire_workspace_fence(tmp_path / "state")
+    first.release()
+    second = acquire_workspace_fence(tmp_path / "state")
+    try:
+        with pytest.raises(DaemonAlreadyRunning):
+            acquire_workspace_fence(tmp_path / "state")
+    finally:
+        second.release()

@@ -524,3 +524,107 @@ async def test_upper_pane_stays_live_across_maintenance_intervals(
     finally:
         lock.release()
         database.close()
+
+
+# ---------------------------------------------------------------------------
+# Sol L3 (9cbe7613): the dashboard is genuinely read-only — one
+# long-lived mode=ro connection for the schema probe and every read.
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+import stat  # noqa: E402
+
+from hermes_orchestrator.cli import _ReadOnlyDashboardDatabase  # noqa: E402
+
+
+def test_dashboard_works_when_the_filesystem_forbids_writes(
+    tmp_path: Path,
+) -> None:
+    repo_root, state_dir = active_repo(tmp_path)
+    Database.open(state_dir / "state.db").close()
+    read_only = stat.S_IRUSR | stat.S_IXUSR
+    os.chmod(state_dir / "state.db", stat.S_IRUSR)
+    os.chmod(state_dir, read_only)
+    try:
+        exit_code, output = _invoke(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--state-dir",
+                str(state_dir),
+                "dashboard",
+                "--once",
+                "--json",
+            ]
+        )
+    finally:
+        os.chmod(state_dir, stat.S_IRWXU)
+        os.chmod(state_dir / "state.db", stat.S_IRUSR | stat.S_IWUSR)
+
+    assert exit_code == 0
+    assert json.loads(output)["read_only"] is True
+
+
+def test_dashboard_leaves_the_database_and_fence_untouched(
+    tmp_path: Path,
+) -> None:
+    # No migrations, no transactions, no lock file: the database bytes
+    # are identical after a dashboard run and the ownership fence is
+    # never created. (A WAL-journal reader inherently touches the
+    # -shm index; that is SQLite reader behavior, not a write by this
+    # entry, and the main database file never changes.)
+    import hashlib
+
+    repo_root, state_dir = active_repo(tmp_path)
+    Database.open(state_dir / "state.db").close()
+    before = hashlib.sha256((state_dir / "state.db").read_bytes()).hexdigest()
+
+    exit_code, _ = _invoke(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--state-dir",
+            str(state_dir),
+            "dashboard",
+            "--once",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    after = hashlib.sha256((state_dir / "state.db").read_bytes()).hexdigest()
+    assert after == before
+    assert not (state_dir / "daemon.lock").exists()
+
+
+def test_readonly_wrapper_exposes_exactly_the_query_surface(
+    tmp_path: Path,
+) -> None:
+    # One shared mode=ro connection serves the schema probe AND the
+    # sources' reads; the wrapper offers execute() and nothing that
+    # could mutate — no transaction, no scalar, no close-and-reopen.
+    database = Database.open(tmp_path / "state.db")
+    database.close()
+    connection = sqlite3.connect(
+        f"file:{tmp_path / 'state.db'}?mode=ro", uri=True
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        wrapper = _ReadOnlyDashboardDatabase(connection)
+        applied = wrapper.execute(
+            "SELECT coalesce(max(version), 0) FROM schema_migrations"
+        ).fetchone()[0]
+        assert applied > 0
+        rows = wrapper.execute(
+            "SELECT profile_alias FROM profile_leases", ()
+        ).fetchall()
+        assert rows == []
+        assert not hasattr(wrapper, "transaction")
+        assert not hasattr(wrapper, "scalar")
+        with pytest.raises(sqlite3.OperationalError):
+            wrapper.execute(
+                "INSERT INTO schema_migrations(version, applied_at) "
+                "VALUES (12345, 'never')"
+            )
+    finally:
+        connection.close()
