@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -121,9 +120,18 @@ class LeadSeatEnsurer(Protocol):
 
 
 class LinearProjector(Protocol):
-    """Approved Linear projection boundary used by project cells."""
+    """Approved Linear projection boundary used by project cells.
 
-    async def validate(self, project_key: str, issue_id: str) -> object: ...
+    INFRA-199 v2: Linear never authorizes activation, so this contract
+    is projection-only. There is deliberately no ``validate`` method
+    here any more — the removed pre-commit team/routing check that
+    used to gate whether a candidate could even start is gone (see
+    ``ProjectCellService._dispatch_locked`` and
+    :func:`activate_admitted_issue`); team/routing correctness is
+    proven, post-commit, by ``project``'s own internal
+    ``validate_issue`` call (``LinearClient.project`` in ``linear.py``)
+    the one time Linear is ever consulted in this path.
+    """
 
     async def project(
         self,
@@ -191,10 +199,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-ACTIVATION_INTENDED_EVENT = "issue.activation_intended"
-ACTIVATION_COMPLETED_EVENT = "issue.activation_completed"
-ACTIVATION_COMPENSATED_EVENT = "issue.activation_compensated"
-
 # The only source states an activation may CAS out of: the exact
 # runnable states ranked dispatch selects from. Anything else — done,
 # paused, review, qa, in_development — refuses at commit time.
@@ -203,377 +207,70 @@ _RUNNABLE_ISSUE_STATES = (
     IssueState.BLOCKED.value,
 )
 
-_OPEN_INTENT_GUARD = (
-    "NOT EXISTS ("
-    "SELECT 1 FROM events c WHERE c.correlation_id = e.event_id "
-    "AND c.event_type IN (?, ?)"
-    ")"
+# Project occupancy (INFRA-199 v2 / INFRA-211): a project is "busy" —
+# refusing a DIFFERENT issue's activation — while it has an issue in
+# EITHER of these states. ``in_development`` is the obvious case; the
+# INFRA-211 failure reproduction showed a second issue starting while
+# the first had already moved to ``review`` (the lead had handed off,
+# but the project is not yet free — the reviewer/settlement flow still
+# owns it), so review occupies the project exactly like in_development
+# does.
+_OCCUPYING_ISSUE_STATES = (
+    IssueState.IN_DEVELOPMENT.value,
+    IssueState.REVIEW.value,
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ActivationIntent:
-    """One durable, journaled intent to activate an admitted issue.
+def _in_development_effect_id(issue_id: str) -> str:
+    """The one stable Linear ``In Development`` projection effect id.
 
-    Journaled on the issue aggregate BEFORE the Linear ``In
-    Development`` projection, so the external effect is never ahead of
-    any durable local record of why it was made. An intent is *open*
-    until a later ``issue.activation_completed`` or
-    ``issue.activation_compensated`` event carries this intent's event
-    id as its ``correlation_id`` — the events journal is the whole
-    substrate; there is no separate table.
+    Hermes' durable local lifecycle is authoritative (INFRA-199 v2):
+    local activation commits before this projection is ever attempted,
+    and nothing here ever compensates or re-projects under a bumped
+    epoch, so — unlike the removed intent machinery's per-compensation
+    suffix — a single, permanently stable id is correct: at most one
+    legitimate ``In Development`` projection exists per issue's
+    activation, and ``ExternalEffectStore``/``LinearClient`` (see
+    ``linear.py``) make any replay of it idempotent for free.
     """
 
-    intent_id: str
-    issue_id: str
-    project_key: str
-    cell_id: str
-    session_id: str
-    profile_alias: str
-    effect_id: str
-
-    @property
-    def compensation_effect_id(self) -> str:
-        """Distinct idempotent effect identity for this intent's
-        compensation projection: one intent compensates at most once,
-        across any number of retries or restarts."""
-
-        return f"linear:{self.issue_id}:activation-compensation:{self.intent_id}"
+    return f"linear:{issue_id}:in-development:v2"
 
 
-def _activation_effect_id(database: Database, issue_id: str) -> str:
-    """The Linear ``In Development`` effect id for the issue's CURRENT
-    activation epoch.
+async def _project_in_development(linear: LinearProjector, issue_id: str) -> None:
+    """Best-effort, idempotent ``In Development`` projection attempted
+    ONLY after the local activation transaction already committed
+    (INFRA-199 v2: local-first activation).
 
-    The historical convention ``linear:{issue}:in-development:v2`` is
-    kept for the first epoch. Every compensation closes an epoch, and a
-    later, legitimate re-activation must re-project (the compensation
-    released the assignee), so the effect id is suffixed with the
-    number of prior compensations — deterministic from the journal, so
-    every process derives the identical id.
+    Linear is an eventually consistent workflow projection, never an
+    authority over Hermes' durable local lifecycle. Any failure here —
+    a network error, an unreachable or deleted issue, a disallowed
+    status transition — is swallowed: it must never roll back, retry-
+    loop, or duplicate the local work that already committed.
+
+    The durable trace is not lost, though: the real
+    ``LinearClient.project`` (``linear.py``) journals a ``pending``
+    row in ``external_effects`` via ``ExternalEffectStore.begin``
+    BEFORE it ever attempts the network mutation, so a failure here
+    leaves exactly that row behind — never nothing. Startup/periodic
+    reconciliation (``ReconcileService._stage_linear`` /
+    ``_project_pending_linear_effect`` in ``reconcile.py``) already
+    reads every ``pending`` Linear effect and surfaces it as a durable
+    finding; that existing, read-only mechanism — not a retry loop
+    here — is what an operator or a later reconciliation pass resolves
+    it through. A later legitimate replay of this same stable effect
+    id (the issue's project cell resuming after a restart, say) is
+    naturally idempotent through that same store, so it converges the
+    pending row forward on its own without any bespoke convergence
+    protocol.
     """
 
-    compensations = int(
-        database.scalar(
-            "SELECT count(*) FROM events WHERE aggregate_type = 'issue' "
-            "AND aggregate_id = ? AND event_type = ?",
-            (issue_id, ACTIVATION_COMPENSATED_EVENT),
-        )
-    )
-    base = f"linear:{issue_id}:in-development:v2"
-    return base if compensations == 0 else f"{base}:r{compensations}"
-
-
-def _intent_from_row(event_id: str, payload_json: str) -> ActivationIntent:
-    payload = json.loads(payload_json)
-    return ActivationIntent(
-        intent_id=event_id,
-        issue_id=str(payload["issue_id"]),
-        project_key=str(payload["project_key"]),
-        cell_id=str(payload["cell_id"]),
-        session_id=str(payload["session_id"]),
-        profile_alias=str(payload["profile_alias"]),
-        effect_id=str(payload["effect_id"]),
-    )
-
-
-def open_activation_intent(
-    database: Database, issue_id: str
-) -> ActivationIntent | None:
-    """The issue's open (uncompleted, uncompensated) activation intent."""
-
-    row = database.execute(
-        "SELECT e.event_id, e.payload_json FROM events e "
-        "WHERE e.aggregate_type = 'issue' AND e.aggregate_id = ? "
-        f"AND e.event_type = ? AND {_OPEN_INTENT_GUARD} "
-        "ORDER BY e.sequence DESC LIMIT 1",
-        (
-            issue_id,
-            ACTIVATION_INTENDED_EVENT,
-            ACTIVATION_COMPLETED_EVENT,
-            ACTIVATION_COMPENSATED_EVENT,
-        ),
-    ).fetchone()
-    if row is None:
-        return None
-    return _intent_from_row(str(row["event_id"]), str(row["payload_json"]))
-
-
-def open_activation_intents(
-    database: Database, project_key: str
-) -> tuple[ActivationIntent, ...]:
-    """Every open activation intent journaled for the project's issues."""
-
-    rows = database.execute(
-        "SELECT e.event_id, e.payload_json FROM events e "
-        "WHERE e.aggregate_type = 'issue' AND e.event_type = ? "
-        "AND json_extract(e.payload_json, '$.project_key') = ? "
-        f"AND {_OPEN_INTENT_GUARD} ORDER BY e.sequence ASC",
-        (
-            ACTIVATION_INTENDED_EVENT,
-            project_key,
-            ACTIVATION_COMPLETED_EVENT,
-            ACTIVATION_COMPENSATED_EVENT,
-        ),
-    ).fetchall()
-    return tuple(
-        _intent_from_row(str(row["event_id"]), str(row["payload_json"]))
-        for row in rows
-    )
-
-
-def _journal_activation_intent(
-    database: Database,
-    events: EventStore,
-    *,
-    issue_id: str,
-    project_key: str,
-    cell_id: str,
-    session_id: str,
-    profile_alias: str,
-) -> ActivationIntent:
-    effect_id = _activation_effect_id(database, issue_id)
-    event = EventInput(
-        event_type=ACTIVATION_INTENDED_EVENT,
-        aggregate_type="issue",
-        aggregate_id=issue_id,
-        payload={
-            "issue_id": issue_id,
-            "project_key": project_key,
-            "cell_id": cell_id,
-            "session_id": session_id,
-            "profile_alias": profile_alias,
-            "effect_id": effect_id,
-        },
-    )
-    with database.transaction() as connection:
-        events.append(connection, event)
-    return ActivationIntent(
-        intent_id=event.event_id,
-        issue_id=issue_id,
-        project_key=project_key,
-        cell_id=cell_id,
-        session_id=session_id,
-        profile_alias=profile_alias,
-        effect_id=effect_id,
-    )
-
-
-def _ensure_activation_intent(
-    database: Database,
-    events: EventStore,
-    *,
-    issue_id: str,
-    project_key: str,
-    cell_id: str,
-    session_id: str,
-    profile_alias: str,
-) -> ActivationIntent | None:
-    """Reuse the issue's open intent, or journal a fresh one for a
-    runnable issue. A non-runnable issue (already in development —
-    resume/replay — or terminal) gets no new intent: there is nothing
-    left to converge for it."""
-
-    existing = open_activation_intent(database, issue_id)
-    if existing is not None:
-        return existing
-    row = database.execute(
-        "SELECT state FROM admitted_issues WHERE issue_id = ?",
-        (issue_id,),
-    ).fetchone()
-    if row is None or str(row["state"]) not in _RUNNABLE_ISSUE_STATES:
-        return None
-    return _journal_activation_intent(
-        database,
-        events,
-        issue_id=issue_id,
-        project_key=project_key,
-        cell_id=cell_id,
-        session_id=session_id,
-        profile_alias=profile_alias,
-    )
-
-
-def _close_activation_intent(
-    database: Database,
-    events: EventStore,
-    intent: ActivationIntent,
-    *,
-    event_type: str,
-    payload: dict[str, object],
-) -> bool:
-    """Journal exactly one closure event for an open intent.
-
-    Returns False — journaling nothing — when the intent is already
-    closed, so repeated convergence passes are strict no-ops.
-    """
-
-    with database.transaction() as connection:
-        still_open = connection.execute(
-            "SELECT 1 FROM events e WHERE e.event_id = ? "
-            f"AND {_OPEN_INTENT_GUARD}",
-            (
-                intent.intent_id,
-                ACTIVATION_COMPLETED_EVENT,
-                ACTIVATION_COMPENSATED_EVENT,
-            ),
-        ).fetchone()
-        if still_open is None:
-            return False
-        events.append(
-            connection,
-            EventInput(
-                event_type=event_type,
-                aggregate_type="issue",
-                aggregate_id=intent.issue_id,
-                correlation_id=intent.intent_id,
-                payload=dict(payload),
-            ),
-        )
-    return True
-
-
-def _intent_ineligibility_reason(
-    database: Database, intent: ActivationIntent
-) -> str | None:
-    """Why the intent's issue can no longer activate where it stands,
-    or None while it is still a runnable, dispatchable candidate."""
-
-    row = database.execute(
-        "SELECT state, dependency_ready FROM admitted_issues "
-        "WHERE issue_id = ?",
-        (intent.issue_id,),
-    ).fetchone()
-    if row is None:
-        return "issue_no_longer_admitted"
-    state = str(row["state"])
-    if state not in _RUNNABLE_ISSUE_STATES:
-        return f"issue_{state}"
-    if not int(row["dependency_ready"]):
-        return "dependency_not_ready"
-    pending = database.execute(
-        "SELECT 1 FROM operator_decisions WHERE issue_id = ? "
-        "AND status = 'pending' LIMIT 1",
-        (intent.issue_id,),
-    ).fetchone()
-    if pending is not None:
-        return "operator_decision_pending"
-    return None
-
-
-async def converge_activation_intents(
-    *,
-    database: Database,
-    events: EventStore,
-    linear: LinearProjector,
-    project_key: str,
-) -> tuple[tuple[str, str], ...]:
-    """Drive every open activation intent of the project to closure or
-    forward progress; returns ``(issue_id, outcome)`` pairs.
-
-    The complete convergence argument (INFRA-199, Sol 0453ff62):
-
-    - An intent is journaled BEFORE the Linear ``In Development``
-      projection, so a crash or a commit-time refusal after the
-      projection always leaves a durable open intent — divergence is
-      never silent.
-    - The driver is the normal dispatch surface, not another Stop
-      event: ``ProjectCellService.dispatch`` runs this sweep on every
-      pass (the daemon dispatches ranked issues each scheduler tick),
-      and the idle-boundary dispatcher runs the identical sweep. Any
-      dispatch activity for the project converges ALL of its open
-      intents.
-    - Per open intent, exactly one of three things happens:
-
-      1. The issue is already ``in_development`` — the activation
-         committed under another pass or another intent — so the
-         intent is closed as completed with zero external work.
-      2. The issue is still a runnable candidate (queued/blocked,
-         dependency-ready, no pending operator decision): the intent
-         stays open and is REUSED by that issue's own dispatch, whose
-         idempotent effect id makes re-projection safe; the activation
-         transaction journals the completion atomically with the
-         activation itself. The issue remains ranked, so the
-         scheduler keeps producing dispatch passes for it — the open
-         window is bounded by the issue's own forward progress, never
-         indefinite.
-      3. The issue is no longer eligible there (paused, decision-held,
-         dependency no longer ready, moved to a non-runnable state, or
-         gone): the intent is COMPENSATED — see below — and closed.
-
-    - Compensation transition legality: ``_ALLOWED_STATUS_TRANSITIONS``
-      in ``linear.py`` (not editable here) permits from ``In
-      Development`` only ``-> Review``; no reverse pair to ``Todo``
-      exists, so a status rollback of a completed projection is not
-      representable. The compliant compensation the transition table
-      allows is therefore the assignee release:
-      ``LinearProjection(status=None, assignee_alias="ryan")`` —
-      a pure assignee projection consults no status pair at all (and
-      is a legal no-op even when the crash preceded the actual Linear
-      mutation), handing the issue visibly back to the human operator.
-      The residual ``In Development`` status carries no false claim
-      once Hermes' assignee is released, and it converges forward the
-      next time the issue legitimately activates: the compensation
-      bumps the activation effect id (``_activation_effect_id``), so
-      the re-activation re-projects — restoring the operator assignee
-      — instead of replaying a completed effect.
-    - Exactly-once: the compensation projection uses the intent-scoped
-      ``compensation_effect_id`` (idempotent through the external
-      effect journal), and ``_close_activation_intent`` refuses a
-      second closure of the same intent, so repeated sweeps after
-      completion or compensation journal and project nothing further.
-
-    Together: no supported interleaving leaves Linear claiming Hermes
-    development while Hermes remains queued indefinitely — a still-
-    eligible issue converges forward on its own ranked dispatch, and
-    an ineligible one is compensated by the very next dispatch pass
-    anywhere in the project (daemon tick or idle boundary).
-    """
-
-    outcomes: list[tuple[str, str]] = []
-    for intent in open_activation_intents(database, project_key):
-        row = database.execute(
-            "SELECT state FROM admitted_issues WHERE issue_id = ?",
-            (intent.issue_id,),
-        ).fetchone()
-        if (
-            row is not None
-            and str(row["state"]) == IssueState.IN_DEVELOPMENT.value
-        ):
-            if _close_activation_intent(
-                database,
-                events,
-                intent,
-                event_type=ACTIVATION_COMPLETED_EVENT,
-                payload={
-                    "intent_id": intent.intent_id,
-                    "reason": "issue_already_in_development",
-                },
-            ):
-                outcomes.append((intent.issue_id, "completed"))
-            continue
-        reason = _intent_ineligibility_reason(database, intent)
-        if reason is None:
-            outcomes.append((intent.issue_id, "open"))
-            continue
+    with suppress(Exception):
         await linear.project(
-            intent.issue_id,
-            LinearProjection(status=None, assignee_alias="ryan"),
-            effect_id=intent.compensation_effect_id,
+            issue_id,
+            LinearProjection(status="In Development", assignee_alias="operator"),
+            effect_id=_in_development_effect_id(issue_id),
         )
-        if _close_activation_intent(
-            database,
-            events,
-            intent,
-            event_type=ACTIVATION_COMPENSATED_EVENT,
-            payload={
-                "intent_id": intent.intent_id,
-                "reason": reason,
-                "compensation_effect_id": intent.compensation_effect_id,
-            },
-        ):
-            outcomes.append((intent.issue_id, "compensated"))
-    return tuple(outcomes)
 
 
 def _activate_issue_transaction(
@@ -588,25 +285,30 @@ def _activate_issue_transaction(
     assignments: LeadAssignments | None,
     now: Callable[[], datetime],
     guard: Callable[[sqlite3.Connection], bool] | None = None,
-    intent: ActivationIntent | None = None,
 ) -> tuple[bool, LeadAssignment | None]:
-    """The one durable activation transaction every dispatch path shares:
-    the full commit-time eligibility recheck, the ``project_cells``
-    active-lease guard, the ``admitted_issues`` CAS into
-    ``in_development``, the journaled ``issue.started`` event, the
-    intent completion, and (when ``assignments`` is supplied) the
-    durable assignment packet — all in one exclusive write transaction
-    (``Database.transaction`` opens ``BEGIN IMMEDIATE``), so a queue
-    transition can never again outrun its assignment and no predicate
-    can change between its recheck and the commit.
+    """The one durable, LOCAL-ONLY activation transaction every dispatch
+    path shares: the full commit-time eligibility recheck, the
+    ``project_cells`` active-lease guard, the ``admitted_issues`` CAS
+    into ``in_development``, the journaled ``issue.started`` event, and
+    (when ``assignments`` is supplied) the durable assignment packet —
+    all in one exclusive write transaction (``Database.transaction``
+    opens ``BEGIN IMMEDIATE``), so a queue transition can never again
+    outrun its assignment and no predicate can change between its
+    recheck and the commit.
+
+    INFRA-199 v2: this transaction never consults Linear. Hermes'
+    durable local lifecycle is authoritative; Linear is an eventually
+    consistent workflow projection attempted only AFTER this commits
+    (see :func:`_project_in_development`, called by both callers below
+    once this returns ``True``).
 
     Both :meth:`ProjectCellService._activate_issue` (explicit dispatch)
     and :func:`activate_admitted_issue` (the Stop-hook idle dispatcher,
     ``cli.py``'s ``_dispatch_idle_lead``) call this exact function;
     neither reimplements the state machine.
 
-    Commit-time eligibility (INFRA-199, Sol 0453ff62 Finding 2) — every
-    mutable predicate observed before the awaited Linear work is
+    Commit-time eligibility (INFRA-199 Finding 2) — every mutable
+    predicate observed before dispatch selected this candidate is
     re-proven inside this transaction, and any failure aborts with
     ZERO writes:
 
@@ -616,7 +318,9 @@ def _activate_issue_transaction(
       states (queued/blocked) and the CAS is ``WHERE state = ?`` with
       that observed value — never merely ``!= done``;
     - ``dependency_ready`` must still hold;
-    - no OTHER issue of the project may be ``in_development``;
+    - no OTHER issue of the project may occupy it — ``in_development``
+      OR ``review`` (INFRA-211: a lead that already handed off to
+      review still owns the project until settlement clears it);
     - no pending operator decision may exist for the issue;
     - the cell must still be live and its profile lease active
       (the ``project_cells`` CAS with the ``profile_leases`` guard).
@@ -626,11 +330,6 @@ def _activate_issue_transaction(
     (idempotently) ensured, but no second ``issue.started`` is ever
     journaled and no queue transition happens — full replay
     idempotence across effect, transition, event, and assignment.
-
-    ``intent``, when supplied, is this activation's durable open
-    intent: its ``issue.activation_completed`` closure is journaled in
-    this very transaction, so an intent without a completion is
-    exactly the signature of a projection that outran its activation.
     """
 
     stamp = now().isoformat()
@@ -654,10 +353,10 @@ def _activate_issue_transaction(
                 return False, None
             busy = connection.execute(
                 "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-                "AND state = ? AND issue_id != ? LIMIT 1",
+                "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
                 (
                     str(issue_row["project_key"]),
-                    IssueState.IN_DEVELOPMENT.value,
+                    *_OCCUPYING_ISSUE_STATES,
                     issue_id,
                 ),
             ).fetchone()
@@ -703,21 +402,6 @@ def _activate_issue_transaction(
                     payload={"cell_id": cell_id},
                 ),
             )
-        if intent is not None:
-            events.append(
-                connection,
-                EventInput(
-                    event_type=ACTIVATION_COMPLETED_EVENT,
-                    aggregate_type="issue",
-                    aggregate_id=issue_id,
-                    correlation_id=intent.intent_id,
-                    payload={
-                        "intent_id": intent.intent_id,
-                        "cell_id": cell_id,
-                        "session_id": session_id,
-                    },
-                ),
-            )
         if assignments is not None:
             assignment = assignments.publish_in(
                 connection,
@@ -750,58 +434,32 @@ async def activate_admitted_issue(
 ) -> tuple[bool, LeadAssignment | None]:
     """Dispatch one already-admitted issue onto a live cell durably.
 
-    INFRA-199 Finding 1: the Stop-hook idle dispatcher (``cli.py``'s
-    ``_dispatch_idle_lead``) calls this instead of reimplementing any
-    part of dispatch's Linear-then-activate sequence. It performs the
-    exact same steps, in the exact same order, as
-    ``ProjectCellService._dispatch_locked``'s own inline validate +
-    project + :meth:`ProjectCellService._activate_issue` sequence —
-    and the final step delegates to the very same
+    INFRA-199 v2 (local-first activation): the Stop-hook idle
+    dispatcher (``cli.py``'s ``_dispatch_idle_lead``) calls this
+    instead of reimplementing any part of dispatch's activation
+    sequence. It delegates to the very same
     :func:`_activate_issue_transaction` that backs
-    ``_activate_issue`` — so the idle path can never again bypass
-    Linear or diverge from the activation state machine.
+    :meth:`ProjectCellService._activate_issue`, so the idle path can
+    never diverge from the activation state machine.
 
-    Convergent ordering (Sol 0453ff62): (1) journal — or reuse — the
-    durable activation INTENT on the issue aggregate, BEFORE any
-    external effect, so a crash or commit-time refusal from here on
-    always leaves a durable open intent for the next dispatch pass to
-    converge (see :func:`converge_activation_intents` for the complete
-    convergence argument); (2) validate the exact issue/project
-    against Linear exactly the way ``ProjectCellService.dispatch``
-    does; (3) complete (or idempotently replay) its ``In Development``
-    projection through the intent's effect id — the same convention
-    dispatch uses, so a projection begun by one path is recognized as
-    already-done by the other; (4) only then run the shared activation
-    transaction, which re-proves EVERY mutable eligibility predicate
-    at commit time and journals the intent's completion atomically
-    with the activation itself. A Linear validation or projection
-    failure raises here, before any local queue/event/assignment
-    write — the issue stays exactly as runnable as it was; a
-    commit-time refusal after the projection leaves zero activation
-    writes plus the open intent that guarantees convergence.
+    Ordering: the shared LOCAL activation transaction commits FIRST —
+    it never consults Linear at all (see
+    :func:`_activate_issue_transaction`) — and only once it reports
+    success is the idempotent ``In Development`` projection attempted
+    through :func:`_project_in_development`. Linear never authorizes
+    activation: a deleted/unreachable issue, a disallowed transition,
+    or any other Linear failure cannot block or undo the local work
+    that already committed, and is swallowed rather than retried here
+    (see :func:`_project_in_development` for where that failure's
+    durable trace lives and how it gets resolved).
+
+    A commit-time refusal (occupancy, exact-state CAS, dependency
+    flip, pending decision, stale guard, lease identity) leaves ZERO
+    local writes and Linear is never even attempted — there is nothing
+    to project for a candidate that did not activate.
     """
 
-    intent = _ensure_activation_intent(
-        database,
-        events,
-        issue_id=issue_id,
-        project_key=project_key,
-        cell_id=cell_id,
-        session_id=session_id,
-        profile_alias=profile_alias,
-    )
-    await linear.validate(project_key, issue_id)
-    effect_id = (
-        intent.effect_id
-        if intent is not None
-        else _activation_effect_id(database, issue_id)
-    )
-    await linear.project(
-        issue_id,
-        LinearProjection(status="In Development", assignee_alias="operator"),
-        effect_id=effect_id,
-    )
-    return _activate_issue_transaction(
+    activated, assignment = _activate_issue_transaction(
         database=database,
         events=events,
         cell_id=cell_id,
@@ -812,8 +470,11 @@ async def activate_admitted_issue(
         assignments=assignments,
         now=now,
         guard=guard,
-        intent=intent,
     )
+    if not activated:
+        return False, None
+    await _project_in_development(linear, issue_id)
+    return True, assignment
 
 
 class ProjectCellService:
@@ -884,28 +545,11 @@ class ProjectCellService:
         return frozenset(str(row["project_key"]) for row in rows)
 
     async def dispatch(self, issue_id: str) -> DispatchResult:
-        """Start or resume the issue's project lead after explicit admission.
-
-        Every dispatch pass first converges the project's open
-        activation intents (:func:`converge_activation_intents`): an
-        intent left open by a commit-time refusal or crash after its
-        Linear projection is completed here when its issue meanwhile
-        activated, compensated when its issue is no longer eligible,
-        and otherwise left for this very pass to complete through the
-        idempotent effect machinery — so this ordinary scheduler-tick
-        driver, not another Stop event, is what makes every
-        interleaving converge.
-        """
+        """Start or resume the issue's project lead after explicit admission."""
 
         issue = self._queue.get(issue_id)
         lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
         async with lock:
-            await converge_activation_intents(
-                database=self._database,
-                events=self._events,
-                linear=self._linear,
-                project_key=issue.project_key,
-            )
             if self._decisions is not None:
                 pending = self._decisions.pending_for_issue(issue_id)
                 if pending:
@@ -918,20 +562,36 @@ class ProjectCellService:
         """Dispatch one issue while holding its project-wide in-process lock."""
 
         issue = self._queue.get(issue_id)
-        # One issue in_development per project (INFRA-199, daemon side): a
-        # DIFFERENT queued issue never starts while this project already
-        # has one mid-flight. Dispatching that same in_development issue
-        # itself (resume after restart, reconciliation, handoff) is
-        # untouched — only a distinct issue_id is refused here, and the
-        # refusal is a plain read with zero writes.
+        # Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT queued
+        # issue never starts while this project already has one mid-flight
+        # in EITHER in_development or review. Dispatching that same
+        # in_development issue itself (resume after restart, reconciliation,
+        # handoff) is untouched — only a distinct issue_id is refused here,
+        # and the refusal is a plain read with zero writes. This is a coarse
+        # pre-check only, purely to avoid launching a Claude lead process for
+        # a candidate that cannot activate; the shared activation
+        # transaction (`_activate_issue_transaction`) re-proves the same
+        # occupancy predicate, transactionally, at commit time.
         busy = self._database.execute(
-            "SELECT 1 FROM admitted_issues WHERE project_key = ? AND state = ? "
-            "AND issue_id != ? LIMIT 1",
-            (issue.project_key, IssueState.IN_DEVELOPMENT.value, issue_id),
+            "SELECT 1 FROM admitted_issues WHERE project_key = ? "
+            "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+            (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
         ).fetchone()
         if busy is not None:
             return DispatchResult(status="project_busy", issue_id=issue_id)
-        await self._linear.validate(issue.project_key, issue_id)
+        # INFRA-199 v2: Linear is never consulted before the local commit.
+        # Hermes' durable local lifecycle is authoritative; a pre-commit
+        # `linear.validate` here used to gate whether this candidate could
+        # even start a Claude lead, which meant a deleted/unreachable/
+        # misrouted Linear issue could block a locally-eligible, fully
+        # runnable issue from ever activating. That is exactly the
+        # authority Linear must not hold. Team/project routing is instead
+        # proven, post-commit, by the one Linear call this path still makes
+        # — `_project_and_activate`'s idempotent projection, whose
+        # `LinearClient.project` internally re-validates the team/issue
+        # before mutating anything — so a routing problem surfaces as a
+        # durable pending `external_effects` row for reconciliation, never
+        # as a block on local activation.
         cell = self._find_active_cell(issue.project_key)
         created = False
         if cell is None:
@@ -1898,44 +1558,29 @@ class ProjectCellService:
     async def _project_and_activate(
         self, cell: ProjectCell, issue_id: str
     ) -> tuple[bool, LeadAssignment | None]:
-        """Intent, then projection, then the activation transaction.
+        """Local commit first, then the Linear projection (INFRA-199 v2).
 
         The daemon-side twin of :func:`activate_admitted_issue`'s
-        convergent ordering: the durable activation intent is journaled
-        (or an open one reused) BEFORE the idempotent Linear ``In
-        Development`` projection, and the shared activation transaction
-        both re-proves commit-time eligibility and journals the
-        intent's completion. A refusal or crash after the projection
-        therefore always leaves the durable open intent the next
-        dispatch pass converges.
+        local-first ordering: :meth:`_activate_issue` — the shared
+        activation transaction — commits first and never consults
+        Linear; only once it reports success is the idempotent ``In
+        Development`` projection attempted, through
+        :func:`_project_in_development`, which swallows any Linear
+        failure rather than rolling back or retrying the already-
+        durable local activation (see its docstring for where that
+        failure's durable trace lives).
         """
 
-        intent = _ensure_activation_intent(
-            self._database,
-            self._events,
-            issue_id=issue_id,
-            project_key=cell.project_key,
-            cell_id=cell.cell_id,
-            session_id=str(cell.session_id),
-            profile_alias=cell.profile_alias,
-        )
-        effect_id = (
-            intent.effect_id
-            if intent is not None
-            else _activation_effect_id(self._database, issue_id)
-        )
-        await self._linear.project(
-            issue_id,
-            LinearProjection(status="In Development", assignee_alias="operator"),
-            effect_id=effect_id,
-        )
-        return self._activate_issue(cell, issue_id, intent=intent)
+        activated, assignment = self._activate_issue(cell, issue_id)
+        if not activated:
+            return False, None
+        await _project_in_development(self._linear, issue_id)
+        return True, assignment
 
     def _activate_issue(
         self,
         cell: ProjectCell,
         issue_id: str,
-        intent: ActivationIntent | None = None,
     ) -> tuple[bool, LeadAssignment | None]:
         """Activate the cell and issue; on the classic path, commit the
         durable assignment packet in the very same transaction, so a
@@ -1943,7 +1588,7 @@ class ProjectCellService:
 
         Delegates to the shared :func:`_activate_issue_transaction` — the
         same activation state machine the idle dispatcher's
-        :func:`activate_admitted_issue` runs.
+        :func:`activate_admitted_issue` runs. Never consults Linear.
         """
 
         return _activate_issue_transaction(
@@ -1958,7 +1603,6 @@ class ProjectCellService:
                 self._assignments if self._classic_seats else None
             ),
             now=self._aware_now,
-            intent=intent,
         )
 
     def _worker_key(self, cell: ProjectCell) -> str:

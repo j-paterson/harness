@@ -2811,28 +2811,26 @@ class _IdleLinear:
     ``activate_admitted_issue`` service, composed in place of
     ``cli._open_idle_linear_router`` for these hook-level tests. Models
     the real ``LinearClient``'s per-``effect_id`` idempotence so a
-    replay test can prove no duplicate projection is ever sent."""
+    replay test can prove no duplicate projection is ever sent.
+
+    INFRA-199 v2: ``validate`` is no longer part of the shared
+    ``LinearProjector`` contract (Linear never authorizes activation),
+    so this fake has no ``validate`` method at all — ``project`` is the
+    only Linear operation the idle path ever calls, and only AFTER its
+    local activation transaction already committed.
+    """
 
     def __init__(
         self,
         *,
-        validate_error: Exception | None = None,
         project_error: Exception | None = None,
         on_project: object = None,
     ) -> None:
-        self.validations: list[tuple[str, str]] = []
         self.targets: list[tuple[str, str | None, str]] = []
         self.effect_ids: list[str] = []
-        self._validate_error = validate_error
         self._project_error = project_error
         self._on_project = on_project
         self._completed: dict[str, object] = {}
-
-    async def validate(self, project_key: str, issue_id: str) -> object:
-        self.validations.append((project_key, issue_id))
-        if self._validate_error is not None:
-            raise self._validate_error
-        return object()
 
     async def project(self, issue_id: str, target: object, effect_id: str) -> object:
         if effect_id in self._completed:
@@ -2971,47 +2969,6 @@ def _idle_dispatch_counts(state_dir: Path) -> tuple[int, int, str | None]:
         database.close()
 
 
-def _open_idle_intents(state_dir: Path) -> tuple[object, ...]:
-    from hermes_orchestrator.cells import open_activation_intents
-    from hermes_orchestrator.db import Database
-
-    database = Database.open(state_dir / "state.db")
-    try:
-        return open_activation_intents(database, "demo")
-    finally:
-        database.close()
-
-
-def _idle_event_count(state_dir: Path, event_type: str) -> int:
-    from hermes_orchestrator.db import Database
-
-    database = Database.open(state_dir / "state.db")
-    try:
-        return int(
-            database.scalar(
-                "SELECT count(*) FROM events WHERE event_type = ?",
-                (event_type,),
-            )
-        )
-    finally:
-        database.close()
-
-
-def _set_idle_issue_state(state_dir: Path, state: str) -> None:
-    from hermes_orchestrator.db import Database
-
-    database = Database.open(state_dir / "state.db")
-    try:
-        with database.transaction() as connection:
-            connection.execute(
-                "UPDATE admitted_issues SET state = ? "
-                "WHERE issue_id = 'INFRA-9'",
-                (state,),
-            )
-    finally:
-        database.close()
-
-
 def _set_idle_sample_age(state_dir: Path, sampled_at: str) -> None:
     from hermes_orchestrator.db import Database
 
@@ -3037,29 +2994,28 @@ def test_intake_poll_dispatches_ready_work_at_the_idle_boundary(
     assert first.exit_code == 0
     assert "HERMES_ASSIGNMENT_READY" in json.loads(first.stdout)["reason"]
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
-    # Finding 1: the idle path validates and projects through Linear
-    # exactly once, using the normal effect-id convention, before the
-    # assignment (asserted separately below).
-    assert linear.validations == [("demo", "INFRA-9")]
+    # INFRA-199 v2: local activation commits first; the idle path never
+    # consults Linear before that commit, and only then projects the
+    # normal ``In Development`` effect id exactly once (asserted below).
     assert linear.targets == [("INFRA-9", "In Development", "operator")]
 
     # A repeated Stop at the same (now non-runnable) idle boundary is a
-    # strict no-op: the CAS has already fired, and Linear is not
-    # touched again (the project_busy guard short-circuits first).
+    # strict no-op: the project already has an issue occupying it (this
+    # very one), so the occupancy pre-check short-circuits before Linear
+    # is ever composed again.
     second = _poll_at_idle_boundary(configured_repo, monkeypatch)
     assert second.exit_code == 0
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
-    assert linear.validations == [("demo", "INFRA-9")]
     assert linear.targets == [("INFRA-9", "In Development", "operator")]
 
 
-def test_intake_poll_idle_dispatch_projects_before_assigning(
+def test_intake_poll_idle_dispatch_commits_locally_before_projecting(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The Linear projection must complete BEFORE the local activation
-    transaction: a fake that inspects durable state from inside
-    ``project`` observes zero committed assignments and the issue still
-    queued."""
+    """The local activation transaction must land BEFORE the Linear
+    projection (INFRA-199 v2): a fake that inspects durable state from
+    inside ``project`` observes the issue already ``in_development``
+    and its assignment already committed."""
 
     _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
@@ -3085,7 +3041,7 @@ def test_intake_poll_idle_dispatch_projects_before_assigning(
     result = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
     assert result.exit_code == 0
-    assert observed == {"assignments": 0, "issue_state": "queued"}
+    assert observed == {"assignments": 1, "issue_state": "in_development"}
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
 
 
@@ -3152,7 +3108,6 @@ def test_intake_poll_never_dispatches_a_held_or_ineligible_lane(
         assert issue_state == kwargs.get("issue_state", "queued")
     # None of these ineligible lanes ever reach Linear: capacity/queue
     # eligibility is decided before Linear composition even happens.
-    assert linear.validations == []
     assert linear.targets == []
 
 
@@ -3160,13 +3115,12 @@ def test_intake_poll_idle_dispatch_rechecks_freshness_at_commit_time(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Freshness is proven at TWO points, not just the initial snapshot
-    (INFRA-199 Finding 2), and a commit-time refusal after the
-    completed projection no longer strands the two systems apart (Sol
-    0453ff62): the refusal leaves a DURABLE open activation intent —
-    journaled before the projection — with zero activation writes, and
-    the very next dispatch pass converges it exactly once: the same
-    intent (same idempotent effect id) completes the activation, so
-    Linear and the queue agree afterward."""
+    (INFRA-199 Finding 2). INFRA-199 v2: a commit-time refusal now
+    happens entirely BEFORE Linear is ever consulted — the local
+    activation transaction never even attempts the projection — so the
+    candidate simply stays queued with zero Linear traffic, and the
+    very next idle boundary (once the sample is fresh again) runs the
+    whole sequence from scratch and succeeds exactly once."""
 
     _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
@@ -3179,7 +3133,7 @@ def test_intake_poll_idle_dispatch_rechecks_freshness_at_commit_time(
     def _open(settings: object, *, database: object, queue: object) -> object:
         compositions["count"] += 1
         if compositions["count"] == 1:
-            # Degrade the sample the instant it is composed — well
+            # Degrade the sample the instant Linear is composed — well
             # before the activation transaction's guard re-reads it —
             # to model a sampler tick landing mid-dispatch.
             stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
@@ -3194,125 +3148,37 @@ def test_intake_poll_idle_dispatch_rechecks_freshness_at_commit_time(
     first = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
     assert first.exit_code == 0
-    # The projection itself is not gated by capacity freshness — only
-    # local activation is — so Linear still observed the call, and the
-    # divergence is pinned by a durable open intent, never silence.
-    assert linear.targets == [("INFRA-9", "In Development", "operator")]
-    assert (
-        _idle_dispatch_counts(state_dir) == (0, 0, "queued")
-    )
-    intents = _open_idle_intents(state_dir)
-    assert [intent.issue_id for intent in intents] == ["INFRA-9"]  # type: ignore[attr-defined]
+    # The local activation transaction refused before Linear was ever
+    # attempted: there is nothing to project for a candidate that never
+    # activated.
+    assert linear.targets == []
+    assert _idle_dispatch_counts(state_dir) == (0, 0, "queued")
 
-    # A fresh sample lands before the next idle boundary; the next
-    # dispatch pass completes the SAME intent — no duplicate
-    # projection, one issue.started, one assignment, both sides agree.
+    # A fresh sample lands before the next idle boundary; the whole
+    # sequence runs again from scratch and succeeds exactly once.
     _set_idle_sample_age(state_dir, datetime.now(UTC).isoformat())
     second = _poll_at_idle_boundary(configured_repo, monkeypatch)
     assert second.exit_code == 0
     assert linear.targets == [("INFRA-9", "In Development", "operator")]
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
-    assert _open_idle_intents(state_dir) == ()
-    assert _idle_event_count(state_dir, "issue.activation_completed") == 1
 
-    # Any further pass is a strict no-op: convergence is exactly-once.
+    # Any further pass is a strict no-op: the project is now occupied.
     third = _poll_at_idle_boundary(configured_repo, monkeypatch)
     assert third.exit_code == 0
     assert linear.targets == [("INFRA-9", "In Development", "operator")]
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
-    assert _idle_event_count(state_dir, "issue.activation_completed") == 1
 
 
-def test_intake_poll_compensates_an_open_intent_for_a_held_issue(
+def test_intake_poll_idle_dispatch_local_activation_survives_a_linear_failure(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the issue is no longer eligible after the refusal (paused —
-    an operator hold that removes it from ranking), the next dispatch
-    pass COMPENSATES instead of completing: the transition table
-    permits no In Development -> Todo reverse, so the compliant
-    compensation releases the Linear assignee back to the human
-    ("ryan") under the intent-scoped effect id, closes the intent, and
-    later passes converge nothing further."""
-
-    _repo_root, state_dir = configured_repo
-    _seed_idle_dispatch(state_dir)
-
-    import hermes_orchestrator.cli as cli_module
-
-    linear = _IdleLinear()
-    compositions = {"count": 0}
-
-    def _open(settings: object, *, database: object, queue: object) -> object:
-        compositions["count"] += 1
-        if compositions["count"] == 1:
-            stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-            with database.transaction() as connection:  # type: ignore[attr-defined]
-                connection.execute(
-                    "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
-                )
-        return linear
-
-    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open)
-
-    first = _poll_at_idle_boundary(configured_repo, monkeypatch)
-    assert first.exit_code == 0
-    assert linear.targets == [("INFRA-9", "In Development", "operator")]
-    assert _idle_dispatch_counts(state_dir) == (0, 0, "queued")
-    assert len(_open_idle_intents(state_dir)) == 1
-
-    # The operator pauses the issue before the next idle boundary.
-    _set_idle_issue_state(state_dir, "paused")
-
-    second = _poll_at_idle_boundary(configured_repo, monkeypatch)
-    assert second.exit_code == 0
-    assert linear.targets == [
-        ("INFRA-9", "In Development", "operator"),
-        ("INFRA-9", None, "ryan"),
-    ]
-    assert linear.effect_ids[-1].startswith(
-        "linear:INFRA-9:activation-compensation:"
-    )
-    assert _open_idle_intents(state_dir) == ()
-    assert _idle_event_count(state_dir, "issue.activation_compensated") == 1
-    assert _idle_dispatch_counts(state_dir) == (0, 0, "paused")
-
-    # A further pass finds no open intent: no composition, no
-    # projection, no journal growth — compensation is exactly-once.
-    third = _poll_at_idle_boundary(configured_repo, monkeypatch)
-    assert third.exit_code == 0
-    assert compositions["count"] == 2
-    assert len(linear.targets) == 2
-    assert _idle_event_count(state_dir, "issue.activation_compensated") == 1
-
-
-def test_intake_poll_idle_dispatch_refuses_an_unknown_linear_issue(
-    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A deleted/unknown/project-mismatched Linear issue must refuse the
-    whole idle dispatch — zero queue/event/assignment effects — never a
-    local activation that leaves Linear stale (INFRA-199 Finding 1)."""
-
-    _repo_root, state_dir = configured_repo
-    _seed_idle_dispatch(state_dir)
-    linear = _IdleLinear(validate_error=ValueError("Linear issue not found"))
-    _patch_idle_linear(monkeypatch, linear)
-
-    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
-
-    assert result.exit_code == 0
-    assert linear.validations == [("demo", "INFRA-9")]
-    assert linear.targets == []
-    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
-    assert (started, assigned) == (0, 0)
-    assert issue_state == "queued"
-
-
-def test_intake_poll_idle_dispatch_refuses_on_projection_failure(
-    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A Linear projection failure (network error, disallowed status
-    transition, etc.) must also leave the issue fully runnable — no
-    partial local activation."""
+    """INFRA-199 v2 (flipped O-era test): a deleted/unreachable Linear
+    issue, a network error, a disallowed transition — any Linear
+    projection failure — never blocks or undoes the local activation
+    that already committed. Linear never authorizes activation; the
+    durable pending trace this leaves (exercised at the ``LinearClient``
+    layer in ``tests/test_cells.py``) is reconciliation's job to
+    surface, never a reason to strand the queue."""
 
     _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
@@ -3322,10 +3188,10 @@ def test_intake_poll_idle_dispatch_refuses_on_projection_failure(
     result = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
     assert result.exit_code == 0
-    assert linear.validations == [("demo", "INFRA-9")]
+    assert linear.targets == []  # the fake raised before recording a target
     started, assigned, issue_state = _idle_dispatch_counts(state_dir)
-    assert (started, assigned) == (0, 0)
-    assert issue_state == "queued"
+    assert (started, assigned) == (1, 1)
+    assert issue_state == "in_development"
 
 
 def test_intake_poll_idle_dispatch_fails_closed_when_linear_composition_fails(
@@ -3355,70 +3221,17 @@ def test_intake_poll_idle_dispatch_fails_closed_when_linear_composition_fails(
     assert issue_state == "queued"
 
 
-def test_intake_poll_idle_dispatch_replay_after_completed_projection_is_idempotent(
-    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A replay after the Linear projection already completed (but,
-    say, a prior process crashed before the local commit) must not
-    duplicate the projection, and the eventual successful activation
-    happens exactly once."""
-
-    _repo_root, state_dir = configured_repo
-    _seed_idle_dispatch(state_dir)
-
-    import hermes_orchestrator.cli as cli_module
-    from hermes_orchestrator.db import Database
-
-    linear = _IdleLinear()
-    attempts = {"count": 0}
-
-    def _open(settings: object, *, database: object, queue: object) -> object:
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            # Degrade the resource sample during THIS composition, so
-            # the activation transaction's freshness guard refuses to
-            # commit after the projection completes — modeling a crash
-            # or race between the durable Linear effect and the local
-            # commit, without ever duplicating the projection itself.
-            stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-            with database.transaction() as connection:  # type: ignore[attr-defined]
-                connection.execute(
-                    "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
-                )
-        return linear
-
-    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open)
-
-    first = _poll_at_idle_boundary(configured_repo, monkeypatch)
-    assert first.exit_code == 0
-    assert linear.targets == [("INFRA-9", "In Development", "operator")]
-    assert _idle_dispatch_counts(state_dir) == (0, 0, "queued")
-
-    # A fresh sample lands before the lead's next idle boundary.
-    fresh_at = datetime.now(UTC).isoformat()
-    database = Database.open(state_dir / "state.db")
-    try:
-        with database.transaction() as connection:
-            connection.execute(
-                "UPDATE resource_samples SET sampled_at = ?", (fresh_at,)
-            )
-    finally:
-        database.close()
-
-    second = _poll_at_idle_boundary(configured_repo, monkeypatch)
-    assert second.exit_code == 0
-    # Same effect_id, already completed: no duplicate projection.
-    assert linear.targets == [("INFRA-9", "In Development", "operator")]
-    assert linear.validations == [("demo", "INFRA-9"), ("demo", "INFRA-9")]
-    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
-
-
+@pytest.mark.parametrize(
+    "occupying_state", ["in_development", "review"], ids=["in_development", "review"]
+)
 def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
-    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    configured_repo: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    occupying_state: str,
 ) -> None:
-    """One issue in development per project at a time: a runnable
-    queued lane is refused while another issue in the same project is
-    already ``in_development``."""
+    """Project occupancy (INFRA-199 v2 / INFRA-211): a runnable queued
+    lane is refused while another issue in the same project is already
+    ``in_development`` OR ``review``."""
 
     from hermes_orchestrator.db import Database
 
@@ -3434,9 +3247,9 @@ def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
                 "INSERT INTO admitted_issues("
                 "issue_id, project_key, priority, state, instruction_id, "
                 "dependency_ready, overlap_risk, admitted_at, updated_at"
-                ") VALUES ('INFRA-8', 'demo', 1, 'in_development', "
+                ") VALUES ('INFRA-8', 'demo', 1, ?, "
                 "'instr-8', 1, 0, ?, ?)",
-                (now, now),
+                (occupying_state, now, now),
             )
     finally:
         database.close()
@@ -3447,7 +3260,7 @@ def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
     started, assigned, issue_state = _idle_dispatch_counts(state_dir)
     assert (started, assigned) == (0, 0)
     assert issue_state == "queued"
-    assert linear.validations == []
+    assert linear.targets == []
 
 
 # --- verify / verify-check (INFRA-186 P9: any-agent verifier CLI) ----------

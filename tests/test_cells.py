@@ -13,8 +13,6 @@ from hermes_orchestrator.cells import (
     ProjectCell,
     ProjectCellService,
     activate_admitted_issue,
-    converge_activation_intents,
-    open_activation_intents,
 )
 from hermes_orchestrator.claude import (
     ClaudeEvent,
@@ -106,6 +104,16 @@ class RecordingRunner:
 
 
 class RecordingLinear:
+    """A ``LinearProjector`` test double.
+
+    INFRA-199 v2: Linear is never consulted before the local activation
+    commit, so ``validate`` is no longer part of the shared contract
+    (``cells.LinearProjector``) — this fake keeps the method only so
+    any test that still constructs it directly compiles; nothing in
+    ``cells.py`` calls it any more, so ``validations`` should stay
+    empty across every dispatch path exercised here.
+    """
+
     def __init__(self) -> None:
         self.targets: list[tuple[str, str | None, str]] = []
         self.validations: list[tuple[str, str]] = []
@@ -121,14 +129,10 @@ class RecordingLinear:
         target: LinearProjection,
         effect_id: str,
     ) -> object:
-        # Activation projections keep the historical effect-id convention
-        # (suffixed with a deterministic epoch after a compensation);
-        # compensations carry their own intent-scoped effect id.
-        assert effect_id.startswith(
-            f"linear:{issue_id}:in-development:v2"
-        ) or effect_id.startswith(
-            f"linear:{issue_id}:activation-compensation:"
-        )
+        # One stable, permanent effect id per issue — no epoch suffix:
+        # local activation is authoritative and never re-projects under
+        # a bumped id (the removed compensation machinery used to).
+        assert effect_id == f"linear:{issue_id}:in-development:v2"
         self.effect_ids.append(effect_id)
         self.targets.append((issue_id, target.status, target.assignee_alias))
         return object()
@@ -292,6 +296,34 @@ async def test_second_issue_refused_while_first_in_development(
 
 
 @pytest.mark.asyncio
+async def test_second_issue_refused_while_first_in_review(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-211 failure reproduction: a lead that has already handed
+    off to review still occupies the project — a distinct queued issue
+    must never start or deliver an assignment while the first sits in
+    review."""
+
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+
+    await cell_service.dispatch("ENG-9")
+    queue.transition(
+        "ENG-9", IssueState.REVIEW, actor="lead", reason="handed off"
+    )
+
+    second = await cell_service.dispatch("ENG-10")
+
+    assert second.status == "project_busy"
+    assert second.cell_id is None
+    assert second.session_id is None
+    assert queue.get("ENG-10").state == IssueState.QUEUED
+    assert runner.resume_count == 0
+
+
+@pytest.mark.asyncio
 async def test_second_issue_dispatches_once_first_leaves_in_development(
     cell_service: ProjectCellService,
     queue: QueueService,
@@ -311,17 +343,23 @@ async def test_second_issue_dispatches_once_first_leaves_in_development(
 
 
 @pytest.mark.asyncio
-async def test_linear_team_is_validated_before_claude_starts(
+async def test_dispatch_never_pre_validates_linear_before_claude_starts(
     cell_service: ProjectCellService,
     queue: QueueService,
     runner: RecordingRunner,
     linear: RecordingLinear,
 ) -> None:
+    """INFRA-199 v2 (flipped O-era test): Linear never authorizes
+    activation, so dispatch never consults it before starting the
+    Claude lead — team/routing correctness is proven only by the
+    post-commit projection, once the session and the local activation
+    have already gone through."""
+
     admit(queue, "ENG-9")
 
     await cell_service.dispatch("ENG-9")
 
-    assert linear.validations == [("demo", "ENG-9")]
+    assert linear.validations == []
     assert runner.start_count == 1
 
 
@@ -339,26 +377,27 @@ async def test_working_issue_projects_in_development(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_does_not_resurrect_issue_completed_during_validation(
+async def test_dispatch_does_not_resurrect_an_already_completed_issue(
     database: Database,
     queue: QueueService,
     profiles: ProfilePool,
     runner: RecordingRunner,
     tmp_path: Path,
 ) -> None:
+    """``_create_cell``'s own transactional check refuses to resurrect
+    an issue that completed by any other means before dispatch — e.g.
+    a merge or an operator action recorded between admission and this
+    dispatch pass — never a local activation racing ahead of Linear
+    (INFRA-199 v2: there is no pre-commit Linear call left to race)."""
+
     admit(queue, "ENG-9")
+    queue.complete(
+        "ENG-9",
+        reason="linear_completed",
+        evidence="https://linear.example/ENG-9",
+    )
 
-    class CompletingLinear(RecordingLinear):
-        async def validate(self, project_key: str, issue_id: str) -> object:
-            result = await super().validate(project_key, issue_id)
-            queue.complete(
-                issue_id,
-                reason="linear_completed",
-                evidence="https://linear.example/ENG-9",
-            )
-            return result
-
-    linear = CompletingLinear()
+    linear = RecordingLinear()
     service = ProjectCellService(
         database=database,
         events=EventStore(database),
@@ -513,13 +552,22 @@ async def test_projection_waits_for_session_started(
 
 
 @pytest.mark.asyncio
-async def test_linear_projection_failure_leaves_new_issue_retryable(
+async def test_dispatch_survives_a_linear_projection_failure_after_local_activation(
     database: Database,
     queue: QueueService,
     profiles: ProfilePool,
     runner: RecordingRunner,
     tmp_path: Path,
 ) -> None:
+    """INFRA-199 v2 (flipped O-era test): the Linear projection is
+    attempted only AFTER the shared activation transaction commits, so
+    a failure there never rolls back the newly created cell/session or
+    the issue's transition to ``in_development`` — Linear never
+    authorizes activation. The durable pending trace this leaves in
+    ``external_effects`` (not exercised by this in-memory fake) is
+    reconciliation's job to surface, never a reason to fail the lead
+    start or strand the queue."""
+
     class FailingLinear(RecordingLinear):
         async def project(
             self,
@@ -529,13 +577,14 @@ async def test_linear_projection_failure_leaves_new_issue_retryable(
         ) -> object:
             raise TimeoutError("Linear is unavailable")
 
+    linear = FailingLinear()
     service = ProjectCellService(
         database=database,
         events=EventStore(database),
         queue=queue,
         profiles=profiles,
         runner=runner,
-        linear=FailingLinear(),
+        linear=linear,
         project_paths={"demo": tmp_path},
         session_ids=lambda: SESSION_ID,
         cell_ids=lambda: "cell-demo",
@@ -543,15 +592,19 @@ async def test_linear_projection_failure_leaves_new_issue_retryable(
     )
     admit(queue, "ENG-9")
 
-    with pytest.raises(TimeoutError, match="Linear is unavailable"):
-        await service.dispatch("ENG-9")
+    result = await service.dispatch("ENG-9")
 
-    assert queue.get("ENG-9").state.value == "queued"
+    assert result.status == "working"
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
     assert (
         database.scalar("SELECT state FROM project_cells WHERE cell_id = 'cell-demo'")
-        == "failed"
+        == "active"
     )
-    assert database.scalar("SELECT count(*) FROM profile_leases") == 0
+    assert database.scalar("SELECT count(*) FROM profile_leases") == 1
+    assert _issue_started_count(database) == 1
+    # The fake raised before ever recording a target: the projection
+    # attempt happened, but nothing about it is locally visible.
+    assert linear.targets == []
 
 
 @pytest.mark.asyncio
@@ -2305,30 +2358,25 @@ async def test_issue_completed_during_turn_commits_completed_wake(
     database: Database,
     queue: QueueService,
     profiles: ProfilePool,
-    runner: RecordingRunner,
     tmp_path: Path,
 ) -> None:
+    """An explicit terminal reconciliation wins the race between the
+    lead process starting and dispatch confirming its session — the
+    local activation transaction re-proves the CAS at commit time and
+    refuses, zero writes, exactly as if the candidate had never been
+    runnable (INFRA-199 v2: there is no Linear call left in this path
+    to race against, so the injection point moves to the lead stream
+    itself, ahead of the very first ``session.started`` event)."""
+
     admit(queue, "ENG-9")
 
-    class CompletingProjection(RecordingLinear):
-        async def project(
-            self,
-            issue_id: str,
-            target: LinearProjection,
-            effect_id: str,
-        ) -> object:
-            result = await super().project(issue_id, target, effect_id)
-            # An explicit terminal reconciliation wins the race mid-turn.
-            with database.transaction() as connection:
-                connection.execute(
-                    "UPDATE admitted_issues SET state = 'done' "
-                    "WHERE issue_id = ?",
-                    (issue_id,),
-                )
-            return result
-
     service, sink = sink_cells(
-        database, queue, profiles, runner, CompletingProjection(), tmp_path
+        database,
+        queue,
+        profiles,
+        _CompletingRunner(database),
+        RecordingLinear(),
+        tmp_path,
     )
 
     result = await service.dispatch("ENG-9")
@@ -2339,32 +2387,32 @@ async def test_issue_completed_during_turn_commits_completed_wake(
 
 
 @pytest.mark.asyncio
-async def test_issue_completed_during_validation_commits_no_wake(
+async def test_issue_completed_before_dispatch_commits_no_wake(
     database: Database,
     queue: QueueService,
     profiles: ProfilePool,
     runner: RecordingRunner,
     tmp_path: Path,
 ) -> None:
-    admit(queue, "ENG-9")
+    """INFRA-199 v2 (flipped O-era test): with no pre-commit Linear call
+    left before cell creation, an issue completed by any other means
+    before this dispatch pass is simply already done when
+    ``_create_cell`` makes its own transactional check — no lead turn
+    ever runs, so there is no terminal boundary to wake on."""
 
-    class CompletingLinear(RecordingLinear):
-        async def validate(self, project_key: str, issue_id: str) -> object:
-            result = await super().validate(project_key, issue_id)
-            queue.complete(
-                issue_id,
-                reason="linear_completed",
-                evidence="https://linear.example/ENG-9",
-            )
-            return result
+    admit(queue, "ENG-9")
+    queue.complete(
+        "ENG-9",
+        reason="linear_completed",
+        evidence="https://linear.example/ENG-9",
+    )
 
     service, sink = sink_cells(
-        database, queue, profiles, runner, CompletingLinear(), tmp_path
+        database, queue, profiles, runner, RecordingLinear(), tmp_path
     )
 
     result = await service.dispatch("ENG-9")
 
-    # No lead turn ran, so there is no terminal boundary to wake on.
     assert result.status == "already_completed"
     assert sink.wakes == []
 
@@ -2721,26 +2769,29 @@ async def test_reconcile_never_resurrects_evidence_below_the_floor(
     assert wake_rows(database) == []
 
 
-class _CompletingProjection(RecordingLinear):
-    """Completes the issue mid-turn, after dispatch admitted the lead."""
+class _CompletingRunner(RecordingRunner):
+    """Completes the issue via direct SQL before its ``session.started``
+    is ever observed by dispatch — the local activation transaction's
+    own CAS then refuses cleanly (INFRA-199 v2: there is no Linear call
+    left in the activation path to race against any more, so the
+    injection point is the lead stream itself, ahead of the first
+    event dispatch ever reads)."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, issue_id: str = "ENG-9") -> None:
         super().__init__()
         self._database = database
+        self._issue_id = issue_id
 
-    async def project(
-        self,
-        issue_id: str,
-        target: LinearProjection,
-        effect_id: str,
-    ) -> object:
-        result = await super().project(issue_id, target, effect_id)
+    async def _events(
+        self, request: LeadTurnRequest
+    ) -> AsyncIterator[ClaudeEvent]:
         with self._database.transaction() as connection:
             connection.execute(
                 "UPDATE admitted_issues SET state = 'done' WHERE issue_id = ?",
-                (issue_id,),
+                (self._issue_id,),
             )
-        return result
+        async for event in super()._events(request):
+            yield event
 
 
 def already_completed_evidence_key(database: Database) -> str:
@@ -2768,8 +2819,8 @@ async def test_lost_already_completed_wake_reconstructs_and_pushes_on_restart(
         database,
         queue,
         profiles,
-        runner,
-        _CompletingProjection(database),
+        _CompletingRunner(database),
+        RecordingLinear(),
         tmp_path,
         sink=CrashingSink(),
     )
@@ -2827,8 +2878,8 @@ async def test_direct_already_completed_wake_matches_reconstruction_identity(
         database,
         queue,
         profiles,
-        runner,
-        _CompletingProjection(database),
+        _CompletingRunner(database),
+        RecordingLinear(),
         tmp_path,
         sink=wakes,
     )
@@ -3576,44 +3627,108 @@ def _assignment_count(database: Database) -> int:
     return int(database.scalar("SELECT count(*) FROM lead_assignments"))
 
 
-@pytest.mark.asyncio
-async def test_activate_admitted_issue_validates_projects_and_activates(
-    database: Database, queue: QueueService
-) -> None:
-    admit(queue, "ENG-9")
-    _seed_active_cell(database)
-    linear = RecordingLinear()
-    events = EventStore(database)
-    assignments = LeadAssignments(database, events=events)
+_LINEAR_STATE_NAMES = {"state-todo": "Todo", "state-in-dev": "In Development"}
 
-    activated, assignment = await activate_admitted_issue(
+
+class _ToggleableIssueUpdateTransport:
+    """A fake ``LinearTransport`` (see ``linear.py``) for exercising the
+    REAL ``LinearClient``/``ExternalEffectStore``: ``Issue`` always
+    reads back the current fake state; ``IssueUpdate`` raises while
+    ``fail_updates`` is True and otherwise applies the update, modeling
+    an outage that later recovers without ever losing the durable
+    pending effect row ``ExternalEffectStore.begin`` wrote before the
+    first failed mutation attempt."""
+
+    def __init__(self) -> None:
+        self.fail_updates = True
+        self.update_calls = 0
+        self._state_id = "state-todo"
+        self._assignee_id: str | None = None
+
+    async def execute(
+        self, operation: str, query: str, variables: dict[str, object]
+    ) -> dict[str, object]:
+        if operation == "Issue":
+            return {
+                "issue": {
+                    "id": "issue-uuid-1",
+                    "identifier": variables["id"],
+                    "updatedAt": "2026-08-30T00:00:00.000Z",
+                    "state": {
+                        "id": self._state_id,
+                        "name": _LINEAR_STATE_NAMES[self._state_id],
+                    },
+                    "assignee": (
+                        {"id": self._assignee_id}
+                        if self._assignee_id is not None
+                        else None
+                    ),
+                    "team": {"id": "team-1"},
+                }
+            }
+        assert operation == "IssueUpdate"
+        self.update_calls += 1
+        if self.fail_updates:
+            raise RuntimeError("Linear is unreachable")
+        update = variables["input"]
+        if "stateId" in update:
+            self._state_id = update["stateId"]
+        if "assigneeId" in update:
+            self._assignee_id = update["assigneeId"]
+        return {
+            "issueUpdate": {
+                "success": True,
+                "issue": {
+                    "id": "issue-uuid-1",
+                    "updatedAt": "2026-08-30T00:00:01.000Z",
+                },
+            }
+        }
+
+
+async def _activate(
+    database: Database,
+    linear: RecordingLinear,
+    *,
+    issue_id: str = "ENG-9",
+    guard: object = None,
+) -> tuple[bool, object]:
+    events = EventStore(database)
+    return await activate_admitted_issue(
         database=database,
         events=events,
         linear=linear,
-        assignments=assignments,
+        assignments=LeadAssignments(database, events=events),
         cell_id="cell-demo",
         project_key="demo",
         profile_alias="max-a",
         session_id=str(SESSION_ID),
-        issue_id="ENG-9",
+        issue_id=issue_id,
+        guard=guard,
     )
 
-    assert activated is True
-    assert linear.validations == [("demo", "ENG-9")]
-    assert linear.targets == [("ENG-9", "In Development", "operator")]
-    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
-    assert assignment is not None
-    assert _issue_started_count(database) == 1
-    assert _assignment_count(database) == 1
+
+# --- INFRA-199 v2: local-commit-first activation ---------------------------
+#
+# Hermes' durable local lifecycle is authoritative; Linear is an
+# eventually consistent workflow projection only. ``activate_admitted_issue``
+# commits its LOCAL activation transaction first and never consults Linear
+# before that commit; only once it succeeds is the idempotent "In
+# Development" projection attempted, and a projection failure is swallowed
+# rather than rolling back or retrying the already-durable local work (see
+# ``cells._project_in_development``). The tests below replace the P-era
+# activation-intent/compensation suite this superseded — there is nothing
+# left to converge, since Linear can no longer strand local state.
 
 
 @pytest.mark.asyncio
-async def test_activate_admitted_issue_projects_before_activating(
+async def test_activate_admitted_issue_commits_locally_then_projects(
     database: Database, queue: QueueService
 ) -> None:
-    """The projection must land BEFORE the local activation transaction:
-    a fake that inspects durable state from inside ``project`` sees the
-    issue still queued and zero committed assignments."""
+    """The local activation transaction must land BEFORE the Linear
+    projection: a fake that inspects durable state from inside
+    ``project`` observes the issue already ``in_development`` and its
+    assignment already committed."""
 
     admit(queue, "ENG-9")
     _seed_active_cell(database)
@@ -3648,65 +3763,76 @@ async def test_activate_admitted_issue_projects_before_activating(
     )
 
     assert activated is True
-    assert linear.state_at_projection == IssueState.QUEUED
-    assert linear.assignments_at_projection == 0
+    assert linear.validations == []
+    assert linear.state_at_projection == IssueState.IN_DEVELOPMENT
+    assert linear.assignments_at_projection == 1
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
     assert assignment is not None
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
 
 
 @pytest.mark.asyncio
-async def test_activate_admitted_issue_refuses_a_failed_validation(
+async def test_activate_admitted_issue_refuses_transactionally_without_touching_linear(
     database: Database, queue: QueueService
 ) -> None:
+    """A commit-time refusal (here: the guard) leaves zero local writes
+    AND never even attempts Linear — there is nothing to project for a
+    candidate that did not activate."""
+
     admit(queue, "ENG-9")
     _seed_active_cell(database)
-    events = EventStore(database)
+    linear = RecordingLinear()
 
-    class UnknownIssueLinear(RecordingLinear):
-        async def validate(self, project_key: str, issue_id: str) -> object:
-            raise ValueError("Linear issue not found")
+    refused, assignment = await _activate(
+        database, linear, guard=lambda connection: False
+    )
 
-    linear = UnknownIssueLinear()
-    assignments = LeadAssignments(database, events=events)
-
-    with pytest.raises(ValueError, match="Linear issue not found"):
-        await activate_admitted_issue(
-            database=database,
-            events=events,
-            linear=linear,
-            assignments=assignments,
-            cell_id="cell-demo",
-            project_key="demo",
-            profile_alias="max-a",
-            session_id=str(SESSION_ID),
-            issue_id="ENG-9",
-        )
-
-    # The issue stays exactly as runnable as it was: zero local writes.
+    assert refused is False
+    assert assignment is None
     assert queue.get("ENG-9").state == IssueState.QUEUED
     assert linear.targets == []
+    assert linear.validations == []
     assert _issue_started_count(database) == 0
     assert _assignment_count(database) == 0
 
 
 @pytest.mark.asyncio
-async def test_activate_admitted_issue_refuses_a_failed_projection(
+async def test_activate_admitted_issue_projection_failure_leaves_durable_pending_trace(
     database: Database, queue: QueueService
 ) -> None:
+    """INFRA-199 v2 (flipped O-era test): a Linear projection failure —
+    an unreachable/deleted issue, a network error, a disallowed
+    transition, anything — never blocks or undoes the local activation
+    that already committed. The real ``LinearClient``/
+    ``ExternalEffectStore`` (``linear.py``) leave exactly the durable
+    ``pending`` ``external_effects`` row that reconciliation's
+    ``_project_pending_linear_effect`` already surfaces — never
+    nothing — and a replay of the same issue (its cell's session
+    resuming) retries that SAME effect id rather than minting a new
+    one or duplicating any local work. Once Linear recovers, that same
+    replay completes the pending effect exactly once."""
+
+    from hermes_orchestrator.linear import ExternalEffectStore, LinearClient
+
     admit(queue, "ENG-9")
     _seed_active_cell(database)
     events = EventStore(database)
-
-    class FailingProjectionLinear(RecordingLinear):
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            raise TimeoutError("Linear is unavailable")
-
-    linear = FailingProjectionLinear()
     assignments = LeadAssignments(database, events=events)
+    effects = ExternalEffectStore(database)
+    transport = _ToggleableIssueUpdateTransport()
+    linear = LinearClient(
+        transport=transport,
+        effects=effects,
+        status_ids={"Todo": "state-todo", "In Development": "state-in-dev"},
+        assignee_ids={"operator": "assignee-op", "ryan": "assignee-ryan"},
+        expected_team_id="team-1",
+    )
+    effect_id = "linear:ENG-9:in-development:v2"
 
-    with pytest.raises(TimeoutError, match="Linear is unavailable"):
-        await activate_admitted_issue(
+    def _activate_via_client() -> object:
+        return activate_admitted_issue(
             database=database,
             events=events,
             linear=linear,
@@ -3718,493 +3844,217 @@ async def test_activate_admitted_issue_refuses_a_failed_projection(
             issue_id="ENG-9",
         )
 
-    assert linear.validations == [("demo", "ENG-9")]
-    assert queue.get("ENG-9").state == IssueState.QUEUED
-    assert _issue_started_count(database) == 0
-    assert _assignment_count(database) == 0
+    activated, assignment = await _activate_via_client()
 
-
-@pytest.mark.asyncio
-async def test_activate_admitted_issue_replay_after_completed_projection_is_idempotent(
-    database: Database, queue: QueueService
-) -> None:
-    """A crash (or a guard refusal) between a completed Linear
-    projection and the local activation commit must not re-project on
-    replay (the real ``LinearClient.project`` is exactly-once per
-    ``effect_id`` via ``ExternalEffectStore``; this fake models that
-    same contract), and the eventual successful replay activates and
-    assigns exactly once."""
-
-    admit(queue, "ENG-9")
-    _seed_active_cell(database)
-    events = EventStore(database)
-    assignments = LeadAssignments(database, events=events)
-
-    class IdempotentLinear(RecordingLinear):
-        def __init__(self) -> None:
-            super().__init__()
-            self._completed: dict[str, object] = {}
-
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            if effect_id in self._completed:
-                return self._completed[effect_id]
-            result = await super().project(issue_id, target, effect_id)
-            self._completed[effect_id] = result
-            return result
-
-    linear = IdempotentLinear()
-
-    # First attempt: the projection completes but the guard refuses the
-    # activation transaction (simulating a crash/race after the durable
-    # Linear effect landed but before local activation committed).
-    first_activated, first_assignment = await activate_admitted_issue(
-        database=database,
-        events=events,
-        linear=linear,
-        assignments=assignments,
-        cell_id="cell-demo",
-        project_key="demo",
-        profile_alias="max-a",
-        session_id=str(SESSION_ID),
-        issue_id="ENG-9",
-        guard=lambda connection: False,
-    )
-    assert first_activated is False
-    assert first_assignment is None
-    assert linear.targets == [("ENG-9", "In Development", "operator")]
-    assert queue.get("ENG-9").state == IssueState.QUEUED
-    assert _issue_started_count(database) == 0
-    assert _assignment_count(database) == 0
-
-    # Replay: the projection is idempotently replayed — still exactly
-    # one recorded target, because the same effect_id is already
-    # completed — and activation now succeeds exactly once.
-    second_activated, second_assignment = await activate_admitted_issue(
-        database=database,
-        events=events,
-        linear=linear,
-        assignments=assignments,
-        cell_id="cell-demo",
-        project_key="demo",
-        profile_alias="max-a",
-        session_id=str(SESSION_ID),
-        issue_id="ENG-9",
-    )
-    assert second_activated is True
-    assert second_assignment is not None
-    assert linear.targets == [("ENG-9", "In Development", "operator")]
-    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
-    assert _issue_started_count(database) == 1
-    assert _assignment_count(database) == 1
-
-
-# --- INFRA-199 (Sol 0453ff62): durable activation intents ------------------
-
-
-class _IdempotentRecordingLinear(RecordingLinear):
-    """Models the real ``LinearClient``'s per-``effect_id`` exactly-once
-    contract (``ExternalEffectStore``): a completed effect id replays
-    without a second external call."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._completed: dict[str, object] = {}
-
-    async def project(
-        self, issue_id: str, target: LinearProjection, effect_id: str
-    ) -> object:
-        if effect_id in self._completed:
-            return self._completed[effect_id]
-        result = await super().project(issue_id, target, effect_id)
-        self._completed[effect_id] = result
-        return result
-
-
-async def _activate(
-    database: Database,
-    linear: RecordingLinear,
-    *,
-    issue_id: str = "ENG-9",
-    guard: object = None,
-) -> tuple[bool, object]:
-    events = EventStore(database)
-    return await activate_admitted_issue(
-        database=database,
-        events=events,
-        linear=linear,
-        assignments=LeadAssignments(database, events=events),
-        cell_id="cell-demo",
-        project_key="demo",
-        profile_alias="max-a",
-        session_id=str(SESSION_ID),
-        issue_id=issue_id,
-        guard=guard,
-    )
-
-
-def _event_count(database: Database, event_type: str) -> int:
-    return int(
-        database.scalar(
-            "SELECT count(*) FROM events WHERE event_type = ?",
-            (event_type,),
-        )
-    )
-
-
-@pytest.mark.asyncio
-async def test_commit_time_refusal_leaves_open_intent_then_completes_once(
-    database: Database, queue: QueueService
-) -> None:
-    """A guard refusal AFTER the completed projection leaves a durable
-    open intent — the divergence is never silent — and the next
-    dispatch pass completes the activation exactly once through the
-    same idempotent effect id; further passes are strict no-ops."""
-
-    admit(queue, "ENG-9")
-    _seed_active_cell(database)
-    linear = _IdempotentRecordingLinear()
-
-    refused, _ = await _activate(
-        database, linear, guard=lambda connection: False
-    )
-    assert refused is False
-    intents = open_activation_intents(database, "demo")
-    assert [intent.issue_id for intent in intents] == ["ENG-9"]
-    assert intents[0].effect_id == "linear:ENG-9:in-development:v2"
-    assert intents[0].cell_id == "cell-demo"
-    assert intents[0].session_id == str(SESSION_ID)
-    assert queue.get("ENG-9").state == IssueState.QUEUED
-    assert _issue_started_count(database) == 0
-    assert _assignment_count(database) == 0
-
-    activated, assignment = await _activate(database, linear)
+    # Local activation stands even though the projection failed.
     assert activated is True
     assert assignment is not None
-    # Linear and the queue agree, the intent is closed in the same
-    # transaction as the activation, and nothing was projected twice.
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
-    assert linear.targets == [("ENG-9", "In Development", "operator")]
-    assert open_activation_intents(database, "demo") == ()
-    assert _event_count(database, "issue.activation_completed") == 1
     assert _issue_started_count(database) == 1
     assert _assignment_count(database) == 1
 
-    # Full replay idempotence across effect, transition, event, and
-    # assignment: another pass over the now-active issue changes nothing.
-    replayed, _ = await _activate(database, linear)
+    effect = effects.get(effect_id)
+    assert effect is not None
+    assert effect.state == "pending"
+    assert transport.update_calls == 1
+
+    # A replay (the issue's own project cell resuming) never rolls back
+    # or duplicates the local work, and retries the SAME pending effect.
+    replayed, replayed_assignment = await _activate_via_client()
     assert replayed is True
-    assert linear.targets == [("ENG-9", "In Development", "operator")]
-    assert _event_count(database, "issue.activation_intended") == 1
-    assert _event_count(database, "issue.activation_completed") == 1
+    assert replayed_assignment is None  # unconsumed packet: durable no-op
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+    assert transport.update_calls == 2
+    assert effects.get(effect_id).state == "pending"
+    assert (
+        int(
+            database.scalar(
+                "SELECT count(*) FROM external_effects WHERE effect_id = ?",
+                (effect_id,),
+            )
+        )
+        == 1
+    )
+
+    # Linear recovers: the next replay completes the SAME effect exactly
+    # once — no re-mint, no duplicate local work.
+    transport.fail_updates = False
+    recovered, recovered_assignment = await _activate_via_client()
+    assert recovered is True
+    assert recovered_assignment is None
+    assert effects.get(effect_id).state == "completed"
+    assert transport.update_calls == 3
     assert _issue_started_count(database) == 1
     assert _assignment_count(database) == 1
 
 
+@pytest.mark.parametrize(
+    "occupying_state",
+    [IssueState.IN_DEVELOPMENT, IssueState.REVIEW],
+    ids=["in_development", "review"],
+)
 @pytest.mark.asyncio
-async def test_restart_after_projection_converges_exactly_once(
-    database: Database, queue: QueueService, tmp_path: Path
+async def test_activate_admitted_issue_refuses_when_project_is_occupied(
+    database: Database, queue: QueueService, occupying_state: IssueState
 ) -> None:
-    """A crash between the completed projection and the activation
-    commit (modeled by a refusing guard) followed by a full restart —
-    fresh service objects over the same database file — converges
-    deterministically and exactly once."""
-
-    admit(queue, "ENG-9")
-    _seed_active_cell(database)
-    linear = _IdempotentRecordingLinear()
-
-    refused, _ = await _activate(
-        database, linear, guard=lambda connection: False
-    )
-    assert refused is False
-    assert len(open_activation_intents(database, "demo")) == 1
-
-    restarted = Database.open(tmp_path / "state.db")
-    try:
-        restarted_queue = QueueService(
-            restarted, EventStore(restarted), {"demo"}
-        )
-        activated, assignment = await _activate(restarted, linear)
-        assert activated is True
-        assert assignment is not None
-        assert restarted_queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
-        assert linear.targets == [("ENG-9", "In Development", "operator")]
-        assert open_activation_intents(restarted, "demo") == ()
-        assert _issue_started_count(restarted) == 1
-        assert _assignment_count(restarted) == 1
-    finally:
-        restarted.close()
-
-
-@pytest.mark.asyncio
-async def test_other_issue_entering_development_mid_projection_refuses(
-    database: Database, queue: QueueService
-) -> None:
-    """Project-wide occupancy is re-proven INSIDE the activation
-    transaction: an issue that becomes in_development during the
-    awaited Linear work refuses the candidate with zero local writes;
-    once the project frees up, the open intent completes exactly once."""
+    """Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT issue
+    already in ``in_development`` OR ``review`` refuses this candidate
+    transactionally, with zero local writes and zero Linear traffic."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
     _seed_active_cell(database)
-
-    class InterleavingLinear(_IdempotentRecordingLinear):
-        def __init__(self) -> None:
-            super().__init__()
-            self.interleave = True
-
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            if self.interleave:
-                self.interleave = False
-                with database.transaction() as connection:
-                    connection.execute(
-                        "UPDATE admitted_issues SET state = ? "
-                        "WHERE issue_id = 'ENG-10'",
-                        (IssueState.IN_DEVELOPMENT.value,),
-                    )
-            return await super().project(issue_id, target, effect_id)
-
-    linear = InterleavingLinear()
-
-    refused, assignment = await _activate(database, linear)
-    assert refused is False
-    assert assignment is None
-    # The candidate stays queued with no second start or assignment.
-    assert queue.get("ENG-9").state == IssueState.QUEUED
-    assert _issue_started_count(database) == 0
-    assert _assignment_count(database) == 0
-    assert len(open_activation_intents(database, "demo")) == 1
-
-    # The candidate remains an eligible ranked issue, so convergence is
-    # forward: the sweep leaves its intent open rather than compensating.
-    outcomes = await converge_activation_intents(
-        database=database,
-        events=EventStore(database),
-        linear=linear,
-        project_key="demo",
-    )
-    assert outcomes == (("ENG-9", "open"),)
-
     with database.transaction() as connection:
         connection.execute(
             "UPDATE admitted_issues SET state = ? WHERE issue_id = 'ENG-10'",
-            (IssueState.DONE.value,),
+            (occupying_state.value,),
+        )
+    linear = RecordingLinear()
+
+    refused, assignment = await _activate(database, linear)
+
+    assert refused is False
+    assert assignment is None
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
+    assert _assignment_count(database) == 0
+    assert linear.targets == []
+
+    # The occupying issue clears; the candidate now activates normally.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE admitted_issues SET state = 'done' WHERE issue_id = 'ENG-10'"
         )
     activated, _ = await _activate(database, linear)
     assert activated is True
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
     assert linear.targets == [("ENG-9", "In Development", "operator")]
-    assert open_activation_intents(database, "demo") == ()
-    assert _issue_started_count(database) == 1
-    assert _assignment_count(database) == 1
 
 
 @pytest.mark.asyncio
-async def test_dependency_flip_mid_projection_refuses_then_compensates(
+async def test_activate_admitted_issue_refuses_a_dependency_not_ready_issue(
     database: Database, queue: QueueService
 ) -> None:
-    """dependency_ready re-proven at commit time: a flip to 0 during the
-    awaited Linear work refuses with zero local effects; the next sweep
-    compensates the intent exactly once through the intent-scoped
-    effect id, and a later re-activation re-projects under a fresh
-    epoch id (restoring the operator assignee)."""
-
     admit(queue, "ENG-9")
     _seed_active_cell(database)
-
-    class FlippingLinear(_IdempotentRecordingLinear):
-        def __init__(self) -> None:
-            super().__init__()
-            self.flip = True
-
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            if self.flip:
-                self.flip = False
-                with database.transaction() as connection:
-                    connection.execute(
-                        "UPDATE admitted_issues SET dependency_ready = 0 "
-                        "WHERE issue_id = 'ENG-9'"
-                    )
-            return await super().project(issue_id, target, effect_id)
-
-    linear = FlippingLinear()
-
-    refused, _ = await _activate(database, linear)
-    assert refused is False
-    assert queue.get("ENG-9").state == IssueState.QUEUED
-    assert _issue_started_count(database) == 0
-    assert _assignment_count(database) == 0
-    intent = open_activation_intents(database, "demo")[0]
-
-    events = EventStore(database)
-    outcomes = await converge_activation_intents(
-        database=database, events=events, linear=linear, project_key="demo"
-    )
-    assert outcomes == (("ENG-9", "compensated"),)
-    assert linear.targets[-1] == ("ENG-9", None, "ryan")
-    assert linear.effect_ids[-1] == intent.compensation_effect_id
-    assert open_activation_intents(database, "demo") == ()
-    assert _event_count(database, "issue.activation_compensated") == 1
-
-    # Repeated sweeps after the compensation are strict no-ops.
-    repeat = await converge_activation_intents(
-        database=database, events=events, linear=linear, project_key="demo"
-    )
-    assert repeat == ()
-    assert len(linear.targets) == 2
-    assert _event_count(database, "issue.activation_compensated") == 1
-
-    # Dependency readiness returns: the re-activation runs under a NEW
-    # intent whose bumped effect id re-projects instead of replaying the
-    # pre-compensation effect, so the operator assignee is restored.
     with database.transaction() as connection:
         connection.execute(
-            "UPDATE admitted_issues SET dependency_ready = 1 "
+            "UPDATE admitted_issues SET dependency_ready = 0 "
             "WHERE issue_id = 'ENG-9'"
         )
-    activated, _ = await _activate(database, linear)
-    assert activated is True
-    assert linear.targets[-1] == ("ENG-9", "In Development", "operator")
-    assert linear.effect_ids[-1] == "linear:ENG-9:in-development:v2:r1"
-    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
-    assert _issue_started_count(database) == 1
-    assert _assignment_count(database) == 1
+    linear = RecordingLinear()
 
+    refused, assignment = await _activate(database, linear)
 
-@pytest.mark.asyncio
-async def test_pending_decision_mid_projection_refuses_with_zero_effects(
-    database: Database, queue: QueueService
-) -> None:
-    admit(queue, "ENG-9")
-    _seed_active_cell(database)
-
-    class DecidingLinear(_IdempotentRecordingLinear):
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            with database.transaction() as connection:
-                connection.execute(
-                    "INSERT OR IGNORE INTO operator_decisions("
-                    "decision_id, issue_id, project_key, cell_id, "
-                    "session_id, actor, choice, status, recorded_at"
-                    ") VALUES ('dec-1', 'ENG-9', 'demo', 'cell-demo', ?, "
-                    "'operator', 'hold', 'pending', ?)",
-                    (str(SESSION_ID), datetime.now(UTC).isoformat()),
-                )
-            return await super().project(issue_id, target, effect_id)
-
-    linear = DecidingLinear()
-
-    refused, _ = await _activate(database, linear)
     assert refused is False
+    assert assignment is None
     assert queue.get("ENG-9").state == IssueState.QUEUED
     assert _issue_started_count(database) == 0
     assert _assignment_count(database) == 0
-
-    # Decision-held is not a runnable candidate: the sweep compensates.
-    outcomes = await converge_activation_intents(
-        database=database,
-        events=EventStore(database),
-        linear=linear,
-        project_key="demo",
-    )
-    assert outcomes == (("ENG-9", "compensated"),)
-    assert linear.targets[-1] == ("ENG-9", None, "ryan")
-    assert open_activation_intents(database, "demo") == ()
+    assert linear.targets == []
 
 
 @pytest.mark.asyncio
-async def test_cas_refuses_a_non_runnable_source_state_at_commit_time(
+async def test_activate_admitted_issue_refuses_a_pending_operator_decision(
     database: Database, queue: QueueService
 ) -> None:
-    """The CAS accepts only the exact observed runnable state: an issue
-    moved to review during the awaited Linear work is refused — never
-    silently dragged back into in_development by a ``!= done`` CAS."""
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO operator_decisions("
+            "decision_id, issue_id, project_key, cell_id, session_id, "
+            "actor, choice, status, recorded_at"
+            ") VALUES ('dec-1', 'ENG-9', 'demo', 'cell-demo', ?, "
+            "'operator', 'hold', 'pending', ?)",
+            (str(SESSION_ID), datetime.now(UTC).isoformat()),
+        )
+    linear = RecordingLinear()
+
+    refused, assignment = await _activate(database, linear)
+
+    assert refused is False
+    assert assignment is None
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
+    assert _assignment_count(database) == 0
+    assert linear.targets == []
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_refuses_a_non_runnable_source_state(
+    database: Database, queue: QueueService
+) -> None:
+    """The CAS accepts only the exact observed runnable state
+    (queued/blocked) — never a permissive ``!= done`` check that could
+    silently drag a review/paused issue back into ``in_development``."""
 
     admit(queue, "ENG-9")
     _seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = 'ENG-9'",
+            (IssueState.REVIEW.value,),
+        )
+    linear = RecordingLinear()
 
-    class ReviewingLinear(_IdempotentRecordingLinear):
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            with database.transaction() as connection:
-                connection.execute(
-                    "UPDATE admitted_issues SET state = ? "
-                    "WHERE issue_id = 'ENG-9'",
-                    (IssueState.REVIEW.value,),
-                )
-            return await super().project(issue_id, target, effect_id)
+    refused, assignment = await _activate(database, linear)
 
-    linear = ReviewingLinear()
-
-    refused, _ = await _activate(database, linear)
     assert refused is False
+    assert assignment is None
     assert queue.get("ENG-9").state == IssueState.REVIEW
     assert _issue_started_count(database) == 0
     assert _assignment_count(database) == 0
-    assert len(open_activation_intents(database, "demo")) == 1
+    assert linear.targets == []
 
 
 @pytest.mark.asyncio
-async def test_dispatch_pass_compensates_a_paused_open_intent(
+async def test_activate_admitted_issue_refuses_a_stale_profile_lease(
+    database: Database, queue: QueueService
+) -> None:
+    """The ``project_cells``/``profile_leases`` CAS guard: an active
+    cell whose profile lease is no longer active (released, rotated,
+    capped) refuses activation transactionally."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE profile_leases SET state = 'capped' "
+            "WHERE project_key = 'demo' AND profile_alias = 'max-a'"
+        )
+    linear = RecordingLinear()
+
+    refused, assignment = await _activate(database, linear)
+
+    assert refused is False
+    assert assignment is None
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
+    assert _assignment_count(database) == 0
+    assert linear.targets == []
+
+
+@pytest.mark.asyncio
+async def test_paused_issue_is_never_touched_by_a_dispatch_of_a_different_issue(
     cell_service: ProjectCellService,
-    database: Database,
     queue: QueueService,
     linear: RecordingLinear,
 ) -> None:
-    """The daemon dispatch path is the natural convergence driver: an
-    intent left open when its issue was paused mid-flight is
-    compensated by the very next dispatch pass anywhere in the project
-    — no extra Stop event — exactly once, while the pass's own issue
-    activates normally."""
+    """INFRA-199 v2: there is no convergence sweep any more. A paused
+    issue is simply not ranked (``queue.list_ranked`` only ever returns
+    queued/blocked issues), so dispatch never touches it — no Linear
+    traffic, no local writes — while a distinct ranked issue in the
+    same project dispatches normally."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
-    _seed_active_cell(database)
-
-    class PausingLinear(_IdempotentRecordingLinear):
-        async def project(
-            self, issue_id: str, target: LinearProjection, effect_id: str
-        ) -> object:
-            with database.transaction() as connection:
-                connection.execute(
-                    "UPDATE admitted_issues SET state = ? "
-                    "WHERE issue_id = 'ENG-9'",
-                    (IssueState.PAUSED.value,),
-                )
-            return await super().project(issue_id, target, effect_id)
-
-    refused, _ = await _activate(database, PausingLinear())
-    assert refused is False
-    assert queue.get("ENG-9").state == IssueState.PAUSED
-    assert len(open_activation_intents(database, "demo")) == 1
+    queue.transition("ENG-9", IssueState.PAUSED, actor="operator", reason="hold")
 
     result = await cell_service.dispatch("ENG-10")
 
     assert result.status == "working"
-    assert ("ENG-9", None, "ryan") in linear.targets
-    assert ("ENG-10", "In Development", "operator") in linear.targets
-    assert open_activation_intents(database, "demo") == ()
-    assert _event_count(database, "issue.activation_compensated") == 1
     assert queue.get("ENG-9").state == IssueState.PAUSED
     assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
-    # ENG-9 never started and never received an assignment; the pass's
-    # own issue accounts for the single start.
-    assert _issue_started_count(database) == 1
-
-    # A repeated dispatch pass converges nothing further.
-    compensations = [t for t in linear.targets if t == ("ENG-9", None, "ryan")]
-    assert len(compensations) == 1
-    await cell_service.dispatch("ENG-10")
-    assert _event_count(database, "issue.activation_compensated") == 1
-    assert [t for t in linear.targets if t == ("ENG-9", None, "ryan")] == (
-        compensations
-    )
+    assert all(target[0] != "ENG-9" for target in linear.targets)
