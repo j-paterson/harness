@@ -539,6 +539,31 @@ class Reconciler:
             for lease in self._processes.find_orphans():
                 lease_id = str(lease.lease_id)
                 reported.add(lease_id)
+                if self._expected_applier_lease(lease):
+                    findings.append(
+                        Finding(
+                            kind="expected_applier_lease",
+                            subsystem="process_leases",
+                            severity="info",
+                            aggregate_id=lease_id,
+                            recommended_action=(
+                                "none; this runtime_applier is bound to a "
+                                "live activation intent and is expected to "
+                                "survive the kickstart that spawned this "
+                                "daemon; the post-merge tick reaps its exit "
+                                "by exact identity"
+                            ),
+                            evidence={
+                                "project_key": getattr(
+                                    lease, "project_key", None
+                                ),
+                                "pid": getattr(lease, "pid", None),
+                                "cwd": getattr(lease, "cwd", None),
+                                "worker_id": getattr(lease, "worker_id", None),
+                            },
+                        )
+                    )
+                    continue
                 findings.append(
                     Finding(
                         kind="orphan_process",
@@ -620,6 +645,47 @@ class Reconciler:
                         evidence={"pid": int(pid)},
                     )
                 )
+
+    def _expected_applier_lease(self, lease: Any) -> bool:
+        """A live ``runtime_applier`` lease bound to an open activation.
+
+        Sol correction e716a420: a still-verifying applier survives this
+        daemon's own kickstart-triggered death; without this, a bare
+        ``find_orphans`` would block admission for the applier's entire
+        lifetime and never record its exit. Exactly the intent-bound
+        lease is excused — every other surviving lease, including any
+        other ``runtime_applier``, stays a fail-closed orphan.
+
+        The lease is expected if and only if its ``worker_id`` (the
+        merge sha) has an ``activate:<sha>`` intent still ``intended``,
+        or the applier's own apply row for that same target checkout is
+        ``intended``, ``activated``, or ``restarted`` — anything else
+        (no intent at all, or a terminal outcome already recorded)
+        fails closed.
+        """
+
+        if getattr(lease, "kind", None) != "runtime_applier":
+            return False
+        worker_id = getattr(lease, "worker_id", None)
+        if not worker_id:
+            return False
+        apply_id = f"activate:{worker_id}"
+        intent = self._database.execute(
+            "SELECT state, target_checkout FROM activation_applies "
+            "WHERE apply_id = ?",
+            (apply_id,),
+        ).fetchone()
+        if intent is None:
+            return False
+        if str(intent["state"]) == "intended":
+            return True
+        applier_row = self._database.execute(
+            "SELECT 1 FROM activation_applies WHERE apply_id != ? "
+            "AND target_checkout = ? "
+            "AND state IN ('intended', 'activated', 'restarted')",
+            (apply_id, str(intent["target_checkout"])),
+        ).fetchone()
+        return applier_row is not None
 
     # -- stage 3: worker sessions ------------------------------------------
 

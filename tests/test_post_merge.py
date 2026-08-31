@@ -109,6 +109,22 @@ def _registry(database: Database, events: EventStore) -> ProcessRegistry:
     return ProcessRegistry(database, events, os_port=os_port, info=info)
 
 
+def _registry_with_info(
+    database: Database, events: EventStore
+) -> tuple[ProcessRegistry, FakeInfo]:
+    """Like :func:`_registry`, but exposes the fake liveness evidence so a
+    test can make the leased process vanish without ever calling
+    ``mark_exited`` itself."""
+
+    os_port = FakeOs()
+    info = FakeInfo()
+    os_port.info = info
+    os_port.groups[FAKE_PID] = FAKE_PID
+    info.create_times[FAKE_PID] = 1.0
+    info.running.add(FAKE_PID)
+    return ProcessRegistry(database, events, os_port=os_port, info=info), info
+
+
 def make_advance(
     database: Database,
     events: EventStore,
@@ -209,9 +225,13 @@ def seed_applier_row(
 # -- (i) terminal merge of a self-host project ---------------------------
 
 
-def test_on_merged_records_intent_and_flips_blocked_dependents(
+def test_on_merged_self_host_records_intent_and_defers_dependency_ready(
     database: Database, events: EventStore, tmp_path: Path
 ) -> None:
+    """A self-host merge intends the activation but never itself flips
+    dependency_ready — INFRA-198 P3 / Sol correction e716a420: the
+    successor stays blocked until the activation intent verifies."""
+
     queue = QueueService(database=database, events=events, registered_projects={"demo"})
     queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
     queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
@@ -247,14 +267,23 @@ def test_on_merged_records_intent_and_flips_blocked_dependents(
         )
         == 1
     )
-    assert queue.get("ENG-1").dependency_ready is True
-    assert queue.get("ENG-2").dependency_ready is True
+    # Nothing releases yet: the durable pending marker is recorded but
+    # every dependent, including the two non-paused ones, stays blocked.
+    assert queue.get("ENG-1").dependency_ready is False
+    assert queue.get("ENG-2").dependency_ready is False
     assert queue.get("ENG-3").dependency_ready is False  # paused: never touched
     assert (
         database.scalar(
             "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready'"
         )
-        == 2
+        == 0
+    )
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.successor_pending' "
+            "AND aggregate_id = 'review:demo:evt-1'"
+        )
+        == 1
     )
 
     # Idempotent: calling again records nothing new.
@@ -273,9 +302,129 @@ def test_on_merged_records_intent_and_flips_blocked_dependents(
     )
     assert (
         database.scalar(
-            "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready'"
+            "SELECT count(*) FROM events WHERE event_type = 'merge.successor_pending'"
         )
-        == 2
+        == 1
+    )
+
+
+# -- (ix) self-host successor releases only once the intent verifies -----
+
+
+@pytest.mark.asyncio
+async def test_self_host_successor_releases_when_activation_verifies(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    assert queue.get("ENG-1").dependency_ready is False
+
+    # The active generation now matches this merge's sha: verified.
+    seed_active_generation(
+        database,
+        generation=1,
+        git_sha=MERGE_SHA,
+        activated_at="2026-08-31T11:00:00+00:00",
+    )
+    await advance.tick()
+
+    assert queue.get("ENG-1").dependency_ready is True
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced' "
+            "AND aggregate_id = 'review:demo:evt-1'"
+        )
+        == 1
+    )
+
+    # A restart over the same durable rows releases nothing new.
+    restarted = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    await restarted.tick()
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state", ["refused", "rolled_back", "ambiguous"]
+)
+async def test_self_host_successor_stays_blocked_after_non_verified_terminal(
+    database: Database, events: EventStore, tmp_path: Path, terminal_state: str
+) -> None:
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    seed_applier_row(
+        database,
+        apply_id="applier-uuid-1",
+        target_checkout=str(tmp_path / "state" / "checkouts" / MERGE_SHA),
+        state=terminal_state,
+        created_at="2026-08-31T10:05:00+00:00",
+    )
+
+    await advance.tick()
+    assert queue.get("ENG-1").dependency_ready is False
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 0
+    )
+
+    # Permanently: repeated ticks (including after a restart) never
+    # release it, since the apply row is already terminal and non-verified.
+    restarted = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+    await restarted.tick()
+    await restarted.tick()
+    assert queue.get("ENG-1").dependency_ready is False
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 0
     )
 
 
@@ -306,6 +455,116 @@ def test_on_merged_non_self_host_flips_dependencies_without_intent(
 
     assert database.scalar("SELECT count(*) FROM activation_applies") == 0
     assert queue.get("ENG-9").dependency_ready is True
+
+
+@pytest.mark.asyncio
+async def test_tick_discovers_non_self_host_merge_and_releases_once_across_restarts(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """No fast ``on_merged`` callback ever ran for this merge (a crash,
+    or the accelerator being out of reach); the tick's own discovery
+    must find it, release its successor exactly once, and never repeat
+    that release across restarts — proven by the durable
+    ``merge.advanced`` event on the review."""
+
+    queue = QueueService(
+        database=database, events=events, registered_projects={"plain"}
+    )
+    queue.admit(
+        _request("ENG-9", "chat-9", project_key="plain", dependency_ready=False)
+    )
+    queue.transition("ENG-9", IssueState.BLOCKED, actor="op", reason="dep")
+    seed_merged_review(
+        database,
+        review_id="review:plain:evt-1",
+        project_key="plain",
+        issue_id="ENG-9",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance = make_advance(
+        database, events, projects={"plain": PLAIN}, queue=queue, tmp_path=tmp_path
+    )
+
+    await advance.tick()
+
+    assert queue.get("ENG-9").dependency_ready is True
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced' "
+            "AND aggregate_id = 'review:plain:evt-1'"
+        )
+        == 1
+    )
+
+    # A restart (a fresh PostMergeAdvance over the same durable rows)
+    # releases nothing new and journals nothing new.
+    restarted = make_advance(
+        database, events, projects={"plain": PLAIN}, queue=queue, tmp_path=tmp_path
+    )
+    await restarted.tick()
+    await restarted.tick()
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'merge.advanced'"
+        )
+        == 1
+    )
+
+
+# -- older self-host merges predate the active generation -----------------
+
+
+@pytest.mark.asyncio
+async def test_tick_advances_self_host_merge_predating_active_generation(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A self-host merge with no existing activation intent, older than
+    the currently active generation, is journaled advanced with
+    ``predates_active_generation`` and is never re-activated: no
+    activation intent is ever created for it, and it is never
+    respawned or re-verified."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    queue.admit(_request("ENG-1", "chat-1", dependency_ready=False))
+    queue.transition("ENG-1", IssueState.BLOCKED, actor="op", reason="dep")
+    old_sha = "b" * 40
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-old",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=old_sha,
+        updated_at="2026-08-31T09:00:00+00:00",
+    )
+    seed_active_generation(
+        database,
+        generation=5,
+        git_sha=MERGE_SHA,
+        activated_at="2026-08-31T11:00:00+00:00",
+    )
+    advance = make_advance(
+        database, events, projects={"demo": SELF_HOST}, queue=queue, tmp_path=tmp_path
+    )
+
+    await advance.tick()
+
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    row = database.execute(
+        "SELECT payload_json FROM events WHERE event_type = 'merge.advanced' "
+        "AND aggregate_id = 'review:demo:evt-old'"
+    ).fetchone()
+    assert row is not None
+    assert "predates_active_generation" in row["payload_json"]
+    assert queue.get("ENG-1").dependency_ready is True
+    assert advance.spawn.calls == []  # type: ignore[attr-defined]
+
+    # Never re-activated: another tick creates no intent and spawns
+    # nothing for this old merge.
+    await advance.tick()
+    assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    assert advance.spawn.calls == []  # type: ignore[attr-defined]
 
 
 # -- (ii) tick spawns exactly one registered runtime_applier --------------
@@ -579,6 +838,64 @@ async def test_tick_marks_ambiguous_when_applier_lease_exits_without_a_row(
 
     await advance.tick()
 
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == "ambiguous"
+    assert row["reason"] == "applier exited without a terminal apply record"
+    assert len(spawn.calls) == 1  # never respawned
+
+
+@pytest.mark.asyncio
+async def test_tick_reaps_dead_applier_lease_without_manual_mark_exited(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """The applier process vanishes without anyone ever calling
+    ``mark_exited`` — the tick itself must observe the exit through the
+    registry, reap the exact lease, and only then let the existing rule
+    turn the unproven intent into ``ambiguous``."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry, info = _registry_with_info(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = f"activate:{MERGE_SHA}"
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    await advance.tick()
+    assert len(spawn.calls) == 1
+    lease = registry.active()[0]
+    assert lease.state == "active"
+
+    # The applier process is simply gone — nothing records the exit.
+    info.running.discard(FAKE_PID)
+
+    await advance.tick()
+
+    stopped = registry.get(lease.lease_id)
+    assert (stopped.state, stopped.stop_reason) == ("stopped", "exited")
     row = database.execute(
         "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
         (apply_id,),

@@ -14,7 +14,11 @@ operator-side session, must own this deterministically:
 * Every project's blocked, not-yet-ready dependents flip
   ``dependency_ready`` so the existing ranked dispatch admits the next
   explicitly admitted successor. ``paused`` issues are an operator hold
-  and are never touched.
+  and are never touched. A non-self-host merge releases immediately; a
+  self-host merge records a durable ``merge.successor_pending`` marker
+  instead and stays blocked until its own ``activate:<merge_sha>``
+  intent is durably ``verified`` — refused, rolled back, or ambiguous
+  never releases it (Sol correction e716a420 / INFRA-198 P3).
 * The daemon's 30s :meth:`PostMergeAdvance.tick` discovers any merge the
   fast :meth:`PostMergeAdvance.on_merged` path missed (a crash, or the
   ``ReviewService`` construction site being out of reach for direct
@@ -118,31 +122,49 @@ class PostMergeAdvance:
         Called synchronously as an optional accelerator right after a
         review's ``merged`` transition commits, and again, idempotently,
         whenever :meth:`tick` discovers this exact merge from durable
-        rows after a crash or restart. Records intents only — never
-        spawns or restarts anything itself — and never raises into its
-        caller; a failure here is repaired by the next tick.
+        rows after a crash or restart. Never spawns or restarts
+        anything itself, and never raises into its caller; a failure
+        here is repaired by the next tick.
+
+        A non-self-host merge releases its successor immediately. A
+        self-host merge never does (Sol correction e716a420 / INFRA-198
+        P3): it records the durable ``merge.successor_pending`` marker
+        instead, and its successor stays blocked until
+        ``activate:<merge_sha>`` is durably verified — see
+        :meth:`_advance_verified_successor`.
         """
 
         del issue_id  # not needed here; kept for the documented API shape
+        project = self.projects.get(project_key)
+        if project is not None and project.self_host:
+            try:
+                self._record_self_host_intent(
+                    project_key, review_id=review_id, merge_sha=merge_sha
+                )
+            except Exception as error:
+                print(
+                    "post-merge advance: intent recording failed for "
+                    f"{merge_sha!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+            try:
+                self._record_successor_pending(
+                    review_id, project_key=project_key, merge_sha=merge_sha
+                )
+            except Exception as error:
+                print(
+                    "post-merge advance: successor-pending marker failed "
+                    f"for {review_id!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+            return
         try:
-            self._record_self_host_intent(
-                project_key, review_id=review_id, merge_sha=merge_sha
+            self._advance_successor(
+                project_key, review_id=review_id, reason=f"merge:{review_id}"
             )
         except Exception as error:
             print(
-                "post-merge advance: intent recording failed for "
-                f"{merge_sha!r}: {type(error).__name__}: {error}",
-                file=sys.stderr,
-            )
-        try:
-            self.queue.mark_dependency_ready(
-                project_key,
-                actor="post_merge_advance",
-                reason=f"merge:{review_id}",
-            )
-        except Exception as error:
-            print(
-                "post-merge advance: dependency-ready flip failed for "
+                "post-merge advance: successor advance failed for "
                 f"{project_key!r}: {type(error).__name__}: {error}",
                 file=sys.stderr,
             )
@@ -189,6 +211,94 @@ class PostMergeAdvance:
                 ),
             )
 
+    def _record_successor_pending(
+        self, review_id: str, *, project_key: str, merge_sha: str
+    ) -> None:
+        """Journal that a self-host merge's successor advance is pending.
+
+        Idempotent: a ``merge.successor_pending`` event already recorded
+        for this review means a prior call — this run or a previous
+        life — already marked it, so nothing is appended twice. The
+        successor stays blocked until :meth:`_advance_verified_successor`
+        releases it.
+        """
+
+        existing = self.database.execute(
+            "SELECT 1 FROM events WHERE event_type = 'merge.successor_pending' "
+            "AND aggregate_id = ? LIMIT 1",
+            (review_id,),
+        ).fetchone()
+        if existing is not None:
+            return
+        with self.database.transaction() as connection:
+            self.events.append(
+                connection,
+                EventInput(
+                    event_type="merge.successor_pending",
+                    aggregate_type="review",
+                    aggregate_id=review_id,
+                    payload={"project_key": project_key, "merge_sha": merge_sha},
+                ),
+            )
+
+    def _advance_successor(
+        self, project_key: str, *, review_id: str, reason: str
+    ) -> None:
+        """Release one project's blocked dependents and journal the advance.
+
+        Idempotent across restarts: a ``merge.advanced`` event already
+        recorded for this review means this exact merge already
+        released its successors, so nothing is repeated.
+        ``QueueService.mark_dependency_ready`` is independently
+        idempotent, but the guard here also keeps the durable
+        ``merge.advanced`` event from ever being journaled twice.
+        """
+
+        existing = self.database.execute(
+            "SELECT 1 FROM events WHERE event_type = 'merge.advanced' "
+            "AND aggregate_id = ? LIMIT 1",
+            (review_id,),
+        ).fetchone()
+        if existing is not None:
+            return
+        self.queue.mark_dependency_ready(
+            project_key, actor="post_merge_advance", reason=reason
+        )
+        with self.database.transaction() as connection:
+            self.events.append(
+                connection,
+                EventInput(
+                    event_type="merge.advanced",
+                    aggregate_type="review",
+                    aggregate_id=review_id,
+                    payload={"project_key": project_key, "reason": reason},
+                ),
+            )
+
+    def _advance_verified_successor(self, apply_id: str) -> None:
+        """Release a self-host merge's successor once its activation verifies.
+
+        Refused, rolled back, or ambiguous never call this — only a
+        verified ``activate:<sha>`` ever releases a self-host merge's
+        successor (INFRA-198 P3), and it stays released forever once
+        the idempotent ``merge.advanced`` guard in
+        :meth:`_advance_successor` has fired.
+        """
+
+        merge_sha = apply_id.removeprefix("activate:")
+        row = self.database.execute(
+            "SELECT review_id, project_key FROM reviews WHERE merge_sha = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (merge_sha,),
+        ).fetchone()
+        if row is None:
+            return
+        self._advance_successor(
+            str(row["project_key"]),
+            review_id=str(row["review_id"]),
+            reason=f"activation:{apply_id}",
+        )
+
     # -- tick ---------------------------------------------------------------
 
     async def tick(self) -> None:
@@ -205,6 +315,7 @@ class PostMergeAdvance:
 
     async def _tick(self) -> None:
         self._discover_unadvanced_merges()
+        self._recover_verified_successor_releases()
         current = self._current_activation()
         current_sha = None if current is None else str(current["git_sha"])
         rows = self.database.execute(
@@ -225,52 +336,87 @@ class PostMergeAdvance:
                 )
 
     def _discover_unadvanced_merges(self) -> None:
-        """Discover self-host merges whose activation intent never landed.
+        """Discover every merged review whose successor advance never landed.
 
-        Bounded to reviews updated after the current active activation
-        (or every merged review lacking an intent when none is active
-        yet), so the query stays cheap forever. Reusing :meth:`on_merged`
-        keeps the dependency-ready flip and the intent insert identical
-        to the fast path, and fully idempotent.
+        Every configured project is eligible, not only self-host ones
+        (Sol correction e716a420 / INFRA-198 P3): the durable
+        ``merge.advanced`` event on the review is the sole discovery
+        gate, so this stays correct forever, across every restart. A
+        self-host merge newer than the active activation gates through
+        the ordinary intent path (:meth:`on_merged`); a self-host merge
+        that already predates whatever generation is active is advanced
+        directly, with reason ``predates_active_generation``, and never
+        creates — or re-creates — an activation intent: reactivating an
+        already-superseded checkout would be wrong.
         """
 
-        self_host_projects = tuple(
-            key for key, project in self.projects.items() if project.self_host
-        )
-        if not self_host_projects:
+        if not self.projects:
             return
         current = self._current_activation()
         threshold = None if current is None else str(current["activated_at"])
-        placeholders = ",".join("?" for _ in self_host_projects)
-        if threshold is None:
-            rows = self.database.execute(
-                "SELECT review_id, project_key, issue_id, merge_sha FROM "
-                f"reviews WHERE state = 'merged' AND merge_sha IS NOT NULL "
-                f"AND project_key IN ({placeholders}) ORDER BY updated_at ASC",
-                self_host_projects,
-            ).fetchall()
-        else:
-            rows = self.database.execute(
-                "SELECT review_id, project_key, issue_id, merge_sha FROM "
-                f"reviews WHERE state = 'merged' AND merge_sha IS NOT NULL "
-                f"AND project_key IN ({placeholders}) AND updated_at > ? "
-                "ORDER BY updated_at ASC",
-                (*self_host_projects, threshold),
-            ).fetchall()
+        placeholders = ",".join("?" for _ in self.projects)
+        rows = self.database.execute(
+            "SELECT review_id, project_key, issue_id, merge_sha, updated_at "
+            f"FROM reviews WHERE state = 'merged' AND merge_sha IS NOT NULL "
+            f"AND project_key IN ({placeholders}) AND review_id NOT IN ("
+            "SELECT aggregate_id FROM events "
+            "WHERE event_type = 'merge.advanced') ORDER BY updated_at ASC",
+            tuple(self.projects),
+        ).fetchall()
         for row in rows:
+            project_key = str(row["project_key"])
+            project = self.projects.get(project_key)
+            review_id = str(row["review_id"])
             merge_sha = str(row["merge_sha"])
-            existing = self.database.execute(
-                "SELECT 1 FROM activation_applies WHERE apply_id = ?",
-                (f"activate:{merge_sha}",),
-            ).fetchone()
-            if existing is not None:
-                continue
+            if (
+                project is not None
+                and project.self_host
+                and threshold is not None
+                and str(row["updated_at"]) <= threshold
+            ):
+                # Only a merge with no existing intent at all predates
+                # tracking entirely: the merge that produced the very
+                # activation now active always has an 'activate:<sha>'
+                # row already (created by the original on_merged call),
+                # and that row's own outcome — verified or otherwise —
+                # must keep driving the ordinary path below, never this
+                # one-shot direct advance.
+                existing_intent = self.database.execute(
+                    "SELECT 1 FROM activation_applies WHERE apply_id = ?",
+                    (f"activate:{merge_sha}",),
+                ).fetchone()
+                if existing_intent is None:
+                    self._advance_successor(
+                        project_key,
+                        review_id=review_id,
+                        reason="predates_active_generation",
+                    )
+                    continue
             self.on_merged(
-                project_key=str(row["project_key"]),
+                project_key=project_key,
                 issue_id=str(row["issue_id"]),
-                review_id=str(row["review_id"]),
+                review_id=review_id,
                 merge_sha=merge_sha,
             )
+
+    def _recover_verified_successor_releases(self) -> None:
+        """Recover a verified self-host activation whose release never landed.
+
+        A crash between journaling ``activate:<sha>`` verified and
+        releasing its successor would otherwise strand the successor
+        forever: the apply-row scan below only ever revisits
+        ``intended`` rows. Replaying this over every already-verified
+        row is always safe — :meth:`_advance_successor`'s own
+        ``merge.advanced`` guard makes it a no-op once the release
+        already landed.
+        """
+
+        rows = self.database.execute(
+            "SELECT apply_id FROM activation_applies "
+            "WHERE state = 'verified' AND apply_id LIKE 'activate:%'"
+        ).fetchall()
+        for row in rows:
+            self._advance_verified_successor(str(row["apply_id"]))
 
     async def _advance_intent(
         self, row: sqlite3.Row, *, current_sha: str | None
@@ -376,7 +522,7 @@ class PostMergeAdvance:
                     file=sys.stderr,
                 )
                 return
-        await register_spawned(
+        lease_id = await register_spawned(
             self.registry,
             process,
             project_key=project_key,
@@ -393,7 +539,11 @@ class PostMergeAdvance:
                     event_type="activation.applier_spawned",
                     aggregate_type="activation_apply",
                     aggregate_id=apply_id,
-                    payload={"apply_id": apply_id, "pid": int(process.pid)},
+                    payload={
+                        "apply_id": apply_id,
+                        "pid": int(process.pid),
+                        "lease_id": lease_id,
+                    },
                 ),
             )
 
@@ -422,6 +572,14 @@ class PostMergeAdvance:
             return None
         for lease in self.registry.active():
             if lease.kind == "runtime_applier" and lease.worker_id == merge_sha:
+                if not self.registry.snapshot(lease.lease_id).alive:
+                    # The applier process is gone but nothing recorded its
+                    # exit; reap it here, by exact identity, so the
+                    # ambiguous rule below fires deterministically
+                    # instead of blocking admission on this lease forever
+                    # (Sol correction e716a420).
+                    self.registry.mark_exited(lease.lease_id)
+                    return None
                 return lease
         return None
 
@@ -460,3 +618,5 @@ class PostMergeAdvance:
                     payload={"reason": reason},
                 ),
             )
+        if state == "verified":
+            self._advance_verified_successor(apply_id)
