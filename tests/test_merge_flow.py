@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,12 @@ import pytest
 from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.merge_flow import build_merge_flow, merger_contract_path
+from hermes_orchestrator.git import GitError
+from hermes_orchestrator.merge_flow import (
+    _branch_head,
+    build_merge_flow,
+    merger_contract_path,
+)
 from hermes_orchestrator.queue import QueueService
 
 
@@ -146,3 +152,67 @@ def test_build_merge_flow_wires_no_admission_enforcement_seams(
 
     for seam in ("_packets", "_verifier", "_session_chain", "_grandfather_binding"):
         assert not hasattr(flow.emitter, seam)
+
+
+@dataclass
+class FakeBranchHeadGit:
+    """Recording fake standing in for GitVerifier's fetch/head_of surface."""
+
+    heads: dict[str, str] = field(default_factory=dict)
+    fetch_error: GitError | None = None
+    head_of_error: GitError | None = None
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
+        self.calls.append(("fetch", str(repo_path), remote, branch))
+        if self.fetch_error is not None:
+            raise self.fetch_error
+
+    def head_of(self, repo_path: Path, ref: str) -> str:
+        self.calls.append(("head_of", str(repo_path), ref))
+        if self.head_of_error is not None:
+            raise self.head_of_error
+        return self.heads[ref]
+
+
+def test_branch_head_resolves_the_fetched_origin_branch_sha(
+    tmp_path: Path,
+) -> None:
+    """INFRA-202: admission's branch head comes from git, never from the
+    open-PR list — no GitHub call is made to resolve it."""
+
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    git = FakeBranchHeadGit(heads={"origin/feature/eng-9": "1" * 40})
+
+    head = _branch_head(settings, git)
+
+    assert head("demo", "feature/eng-9") == "1" * 40
+    assert git.calls == [
+        ("fetch", str(repo_root), "origin", "feature/eng-9"),
+        ("head_of", str(repo_root), "origin/feature/eng-9"),
+    ]
+
+
+def test_branch_head_returns_empty_string_on_fetch_failure(
+    tmp_path: Path,
+) -> None:
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    git = FakeBranchHeadGit(fetch_error=GitError("git fetch failed"))
+
+    head = _branch_head(settings, git)
+
+    assert head("demo", "feature/eng-9") == ""
+
+
+def test_branch_head_returns_empty_string_on_resolution_failure(
+    tmp_path: Path,
+) -> None:
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    git = FakeBranchHeadGit(head_of_error=GitError("git rev-parse failed"))
+
+    head = _branch_head(settings, git)
+
+    assert head("demo", "feature/eng-9") == ""

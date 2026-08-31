@@ -18,7 +18,7 @@
   "severity": {"enum": ["Critical", "Important"]},
   "repository": {"type": "string", "minLength": 1},
   "branch": {"type": "string", "minLength": 1},
-  "pr_number": {"type": "integer", "minimum": 1},
+  "pr_number": {"type": "integer", "minimum": 0},
   "reviewed_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
   "evidence": {"type": "string", "minLength": 1},
   "acceptance_criterion": {"type": "string", "minLength": 1},
