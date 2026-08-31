@@ -13,13 +13,14 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
+from hermes_orchestrator.cells import ProjectCellService
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
     hub_socket_path,
@@ -27,13 +28,21 @@ from hermes_orchestrator.channel_hub import (
 from hermes_orchestrator.channel_hub import (
     nudge as nudge_channel,
 )
-from hermes_orchestrator.checkpoints import CheckpointDispatcher
+from hermes_orchestrator.checkpoints import CheckpointDispatcher, CheckpointSafetyStore
+from hermes_orchestrator.claude import (
+    ClaudeRunner,
+    control_launch_failure_recorder,
+)
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
+    CHANNEL_ENTRY,
     CmuxHibernationDriver,
+    CmuxLeadSeater,
     CmuxSurfaceReconciler,
+    RegistryProfileDirectory,
 )
 from hermes_orchestrator.config import Settings, load_settings
+from hermes_orchestrator.context import ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
@@ -41,6 +50,8 @@ from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.fakechat_router import FakechatWakeRouter
+from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
@@ -51,6 +62,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
 from hermes_orchestrator.migration_gate import (
     MigrationGate,
     jo_loans_commands,
@@ -62,6 +74,12 @@ from hermes_orchestrator.operator_decisions import (
     OperatorDecisions,
 )
 from hermes_orchestrator.packet_admission import PacketAdmission
+from hermes_orchestrator.profiles import (
+    ClaudeProfileProbe,
+    ProfileHealth,
+    ProfilePool,
+    ProfileRegistry,
+)
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict
 from hermes_orchestrator.remote.auth import (
@@ -177,6 +195,27 @@ def _parser() -> argparse.ArgumentParser:
     )
     merger_turn.add_argument("--project", required=True)
     merger_turn.add_argument("--json", action="store_true")
+
+    submit_review = commands.add_parser(
+        "submit-review",
+        help=(
+            "submit Sol's explicit final review verdict for the "
+            "outstanding wake and settle it exactly once (operator "
+            "correction ec1f6bdf); the verdict is submitted, never "
+            "inferred from an idle thread"
+        ),
+    )
+    submit_review.add_argument("--project", required=True)
+    submit_review.add_argument("--issue", required=True)
+    submit_review.add_argument("--event", required=True)
+    submit_review.add_argument("--candidate-sha", required=True)
+    submit_review.add_argument("--thread", required=True)
+    submit_review.add_argument("--generation", type=int, required=True)
+    submit_review.add_argument(
+        "--verdict",
+        required=True,
+        help="path to the verdict JSON document, or - to read stdin",
+    )
 
     reviewer_fix = commands.add_parser(
         "reviewer-fix",
@@ -340,6 +379,50 @@ def _parser() -> argparse.ArgumentParser:
     intake_ack.add_argument("--packet", required=True)
     intake_ack.add_argument("--offer", required=True)
 
+    channel_trust_capture = commands.add_parser(
+        "channel-trust-capture",
+        help=(
+            "persist the single manual channel-trust event's measured "
+            "build/binding evidence as the cell's active trust anchor "
+            "(INFRA-197 v5.1); re-measures from disk and refuses on "
+            "any drift from the recorded evidence"
+        ),
+    )
+    channel_trust_capture.add_argument("--evidence", type=Path, required=True)
+    channel_trust_capture.add_argument("--json", action="store_true")
+
+    channel_trust_confirm = commands.add_parser(
+        "channel-trust-confirm",
+        help=(
+            "watch one lead seat for the hermes-control confirmation "
+            "dialog, then either bind the anchor's pending prompt "
+            "evidence from the live screen (no keypress) or evaluate "
+            "the v5.1 trust gate, which presses Enter only on an "
+            "exact-build full match; any mismatch fails closed as "
+            "CHANNEL APPROVAL REQUIRED"
+        ),
+    )
+    channel_trust_confirm.add_argument("--cell", required=True)
+    channel_trust_confirm.add_argument("--wait-seconds", type=int, default=90)
+    channel_trust_confirm.add_argument("--capture-prompt", action="store_true")
+    channel_trust_confirm.add_argument("--json", action="store_true")
+
+    rotate_lead = commands.add_parser(
+        "rotate-lead",
+        help=(
+            "first-class idempotent lead rotation: validates the "
+            "submitted handoff and clean pushed checkpoint, reserves a "
+            "different healthy first-party Max profile, drives exact "
+            "handoff acknowledgment, atomically transfers the cell and "
+            "lease, and seats the replacement through the managed "
+            "classic path; any failure is one actionable message "
+            "(operator directive "
+            "infra-197-first-class-profile-rotation-20260830-v1)"
+        ),
+    )
+    rotate_lead.add_argument("--cell", required=True)
+    rotate_lead.add_argument("--json", action="store_true")
+
     decision_import = commands.add_parser(
         "decision-import",
         help=(
@@ -452,42 +535,88 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _listen_for_merger_turns(flow: MergeFlow) -> None:
+def _print_merger_turn(outcome: TurnOutcome) -> None:
+    print(
+        json.dumps(
+            {
+                "merger_turn": outcome.kind,
+                "project_key": outcome.project_key,
+                "issue_id": outcome.issue_id,
+                "event_id": outcome.event_id,
+                "reason": outcome.reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
+async def _settle_idle_merger_thread(
+    flow: MergeFlow, projects: Sequence[str], thread_id: str
+) -> TurnOutcome | None:
+    """Crash-recovery fallback for an explicitly submitted verdict.
+
+    SR2 (supersedes fast-lane a3aa8cd8's idle-primary design): the
+    verdict is submitted, never inferred. An idle
+    ``thread/status/changed`` for the project's bound reviewer channel
+    resumes settlement ONLY when a durable ``submitted_verdicts`` row in
+    state ``'submitted'`` already exists for the project's outstanding
+    wake — an explicit ``submit-review`` whose settlement a crash cut
+    short. ``handle_turn`` then settles that durable document (it
+    resumes the pending submission before ever pulling the thread), so
+    idle never triggers a thread-pull-and-infer settlement. Without the
+    durable pending submission, idle is a no-op; ``turn/completed``
+    observation keeps its existing behavior.
+    """
+
+    for project_key in projects:
+        channel = flow.merger.read_channel(project_key)
+        if channel is None or channel.thread_id != thread_id:
+            continue
+        outstanding = flow.turns.outstanding_wake(project_key)
+        if outstanding is None:
+            return None
+        event, _state = outstanding
+        # The durable-read guard: MergerTurnService's own pending-
+        # submission read (the same one its resume path settles from).
+        if flow.turns._pending_submission(project_key, event.event_id) is None:
+            return None
+        return await flow.turns.handle_turn(project_key)
+    return None
+
+
+async def _listen_for_merger_turns(
+    flow: MergeFlow, projects: Sequence[str] = ()
+) -> None:
     """Settle Merger turns as the App Server reports them; never poll."""
 
     async for notification in flow.rpc.notifications():
         if notification.method == "thread/status/changed":
             status = notification.params.get("status")
+            status_type = status.get("type") if isinstance(status, dict) else None
+            thread_id = notification.params.get("threadId")
             print(
                 json.dumps(
                     {
-                        "thread_status": (
-                            status.get("type") if isinstance(status, dict) else None
-                        ),
-                        "thread_id": notification.params.get("threadId"),
+                        "thread_status": status_type,
+                        "thread_id": thread_id,
                     },
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
                 flush=True,
             )
+            if status_type == "idle" and isinstance(thread_id, str):
+                outcome = await _settle_idle_merger_thread(
+                    flow, projects, thread_id
+                )
+                if outcome is not None:
+                    _print_merger_turn(outcome)
             continue
         outcome = await flow.turns.on_notification(notification)
         if outcome is not None:
-            print(
-                json.dumps(
-                    {
-                        "merger_turn": outcome.kind,
-                        "project_key": outcome.project_key,
-                        "issue_id": outcome.issue_id,
-                        "event_id": outcome.event_id,
-                        "reason": outcome.reason,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                flush=True,
-            )
+            _print_merger_turn(outcome)
 
 
 async def _start_merge_flow(flow: MergeFlow, projects: Sequence[str]) -> bool:
@@ -527,6 +656,7 @@ async def _run_daemon(
     lead_intake: LeadIntakeRouter | None = None,
     channel_hub: ChannelHub | None = None,
     control_operations: ControlOperations | None = None,
+    fakechat_router: FakechatWakeRouter | None = None,
     activation: object | None = None,
     dashboard_refresh: DashboardRefreshAction | None = None,
 ) -> Supervisor:
@@ -548,6 +678,11 @@ async def _run_daemon(
             # route directly through the in-process router and the
             # nudge op; this sweep recovers whatever those missed.
             await channel_hub.publish_pending()
+        if fakechat_router is not None:
+            # Same recovery shape for the fakechat wake plane: the
+            # commit-time router already signaled fresh envelopes;
+            # this sweep re-wakes whatever stayed announced.
+            fakechat_router.signal_pending()
 
     supervisor = Supervisor(
         service,
@@ -633,7 +768,9 @@ async def _run_daemon(
         # was lost: the delivered wake and the thread report are
         # durable, so one boundary pass settles them exactly once.
         await merge_flow.turns.recover_outstanding(tuple(projects))
-        listener = asyncio.create_task(_listen_for_merger_turns(merge_flow))
+        listener = asyncio.create_task(
+            _listen_for_merger_turns(merge_flow, tuple(projects))
+        )
     stop = shutdown_event or asyncio.Event()
     registered_signals: list[signal.Signals] = []
     if shutdown_event is None:
@@ -683,6 +820,125 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
         base_env=os.environ,
         processes=runtime.processes,
     )
+
+
+class _NoDispatchLinear:
+    """Placeholder Linear projector for one-shot lead rotation.
+
+    ``ProjectCellService.rotate`` never dispatches a fresh issue or
+    projects a Linear status — only ``dispatch`` does that — so
+    ``_open_rotation_collaborators`` builds its cell service without the
+    live Linear router the daemon needs for admission, avoiding a
+    network/Keychain dependency the rotation itself never exercises.
+    Either method being called here would be a programming error, not
+    an operator refusal, so both raise loudly rather than returning
+    anything.
+    """
+
+    async def validate(self, project_key: str, issue_id: str) -> object:
+        raise AssertionError("lead rotation never validates a Linear issue")
+
+    async def project(self, issue_id: str, target: Any, effect_id: str) -> object:
+        raise AssertionError("lead rotation never projects a Linear status")
+
+
+def _open_rotation_collaborators(
+    settings: Settings, runtime: Runtime
+) -> tuple[ProjectCellService, CmuxLeadSeater]:
+    """Compose the project cell service and classic seater rotation needs.
+
+    Neither is exposed on :class:`Runtime`: ``cells`` is only assembled
+    for the live daemon (``enable_live``), and the classic
+    :class:`CmuxLeadSeater` was never stored on the runtime graph at
+    all — ``open_runtime`` builds it as a local variable and hands it
+    straight to ``ProjectCellService`` without keeping a reference. Both
+    are constructed here from the same local, credential-free
+    collaborators ``open_runtime`` uses for them (profile registry, the
+    auth-status probe, the cmux CLI adapter), mirroring
+    ``_open_merge_flow``'s reuse-else-construct idiom. Raises
+    ``ValueError`` with an actionable message when a required local file
+    (``config/profiles.yaml``) is missing; the caller turns that into a
+    clean refusal rather than a traceback.
+    """
+
+    assert settings.cmux is not None
+    assert runtime.cmux_bindings is not None
+    database = runtime.database
+    events = EventStore(database)
+    profile_path = settings.repo_root / "config" / "profiles.yaml"
+    if not profile_path.exists():
+        raise ValueError("the cell service or seater is unavailable")
+    registry = ProfileRegistry.load(profile_path)
+    environment = dict(os.environ)
+    probe = ClaudeProfileProbe(registry, base_env=environment)
+    # Mirrors open_runtime's own startup seeding (runtime.py:453-458): a
+    # freshly built ProfilePool starts every slot ineligible, and only
+    # ``record_health`` ever flips one to eligible, so the pool this
+    # one-shot command hands to ``ProjectCellService`` must be seeded
+    # exactly like the daemon's before ``reserve_replacement`` can ever
+    # find a healthy profile. Unlike the daemon's startup assembly —
+    # which lets a probe failure abort the whole live runtime — this
+    # command probes four profiles for a single rotation, so one
+    # profile's probe failing must not crash the others: it is recorded
+    # as an ineligible, reasoned ``ProfileHealth`` instead of raising
+    # past this builder.
+    pool = ProfilePool(registry)
+    for profile in registry.profiles:
+        try:
+            health = probe.check(profile.alias)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            health = ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=False,
+                reason=f"probe_failed: {error}",
+                last_checked_at=datetime.now(UTC),
+            )
+        pool.record_health(health)
+    project_paths: Mapping[str, Path] = {
+        alias: project.repo_path for alias, project in settings.projects.items()
+    }
+    cmux_port = CmuxCliAdapter(
+        settings.cmux.cli,
+        base_env=environment,
+        password_source=cmux_password_source(Keychain()),
+    )
+    seater = CmuxLeadSeater(
+        bindings=runtime.cmux_bindings,
+        port=cmux_port,
+        project_paths=project_paths,
+        profile_dirs=RegistryProfileDirectory(registry),
+        auth_probe=lambda alias: probe.check(alias).eligible,
+        control=runtime.control_operations,
+    )
+    if runtime.cells is not None:
+        return runtime.cells, seater
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=settings.repo_root / "prompts" / "claude-lead.md",
+        base_env=environment,
+        processes=runtime.processes,
+        freeze_dir=settings.state_dir / "freezes",
+        launch_failure_recorder=(
+            control_launch_failure_recorder(runtime.control_operations)
+            if runtime.control_operations is not None
+            else None
+        ),
+    )
+    cells = ProjectCellService(
+        database=database,
+        events=events,
+        queue=runtime.queue,
+        profiles=pool,
+        runner=runner,
+        linear=_NoDispatchLinear(),
+        project_paths=project_paths,
+        handoffs=HandoffService(database),
+        safety=CheckpointSafetyStore(database, events),
+        checkpoints=runtime.checkpoints,
+        context=ContextMonitor(database, events, policy=settings.policy),
+        surfaces=seater,
+    )
+    return cells, seater
 
 
 async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
@@ -1965,6 +2221,100 @@ def _intake_poll(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class WorktreeState:
+    """One bounded snapshot of a project worktree's git state.
+
+    Structurally matches the rotation gate's own ``WorktreeState``
+    (``branch``, ``head``, ``origin_head``, ``dirty``): the gate reads
+    these fields directly and refuses when ``head != origin_head`` or
+    ``dirty`` is true, so an unknown value here must resolve to
+    something that fails that comparison rather than to ``None``,
+    which the gate never expects.
+    """
+
+    branch: str
+    head: str
+    origin_head: str
+    dirty: bool
+
+
+def _worktree_state(path: Path) -> WorktreeState:
+    """The worktree's branch, HEAD, origin HEAD, and dirtiness.
+
+    Read via a handful of bounded ``git`` subprocess calls so the
+    rotation gate can verify the submitted handoff names a clean,
+    pushed checkpoint before any lead identity moves. Any git failure
+    (missing worktree, detached HEAD with no branch, no upstream, git
+    itself absent) is mapped fail-closed here rather than left for the
+    gate to interpret: a string field that could not be read resolves
+    to ``""`` — never coincidentally equal to another unknown value —
+    and cleanliness that could not be measured resolves to
+    ``dirty=True``; unknown cleanliness must refuse, never pass as
+    clean. The gate remains the boundary that acts on these values, but
+    the probe itself now only ever hands it fail-closed data.
+    """
+
+    def _run(args: list[str]) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip()
+
+    branch = _run(["branch", "--show-current"]) or ""
+    head = _run(["rev-parse", "HEAD"]) or ""
+    origin_head = (_run(["rev-parse", f"origin/{branch}"]) or "") if branch else ""
+    status = _run(["status", "--porcelain"])
+    dirty = status is None or status != ""
+    return WorktreeState(
+        branch=branch,
+        head=head,
+        origin_head=origin_head,
+        dirty=dirty,
+    )
+
+
+def _live_claude_argv(session_id: str) -> list[str]:
+    """The live ``claude`` process argv for one exact session.
+
+    Read from ``ps`` at trust-gate time so the gate compares what is
+    actually running against the anchored launch template. The classic
+    command grammar guarantees metacharacter-free, space-free tokens,
+    so a whitespace split reconstructs the argv exactly. Zero or two
+    matching processes both return an empty argv — the gate then fails
+    closed on the template comparison rather than guessing.
+    """
+
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "args="],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    matches = [
+        line.strip()
+        for line in listing.splitlines()
+        if session_id in line
+        and "claude" in line
+        and (" --resume " in line or " --session-id " in line)
+        and "ps -axo" not in line
+    ]
+    if len(matches) != 1:
+        return []
+    return matches[0].split()
+
+
 def _intake_ack(args: argparse.Namespace) -> int:
     """Record the lead's consumption of one exact offer."""
 
@@ -2282,6 +2632,372 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "channel-trust-capture":
+            from hermes_orchestrator.channel_trust import (
+                ChannelTrustAnchors,
+                TrustRefused,
+            )
+
+            try:
+                evidence = json.loads(args.evidence.read_bytes())
+            except (OSError, ValueError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"evidence unreadable: {error}",
+                )
+                return 1
+            anchors = ChannelTrustAnchors(database, events=EventStore(database))
+            entry_path = Path(str(evidence["canonical_entry_path"]))
+            try:
+                anchor = anchors.capture(
+                    cell_id=str(evidence["cell_id"]),
+                    profile_alias=str(evidence["profile_alias"]),
+                    entry_path=entry_path,
+                    package_root=entry_path.parents[2],
+                    channel_entry=str(evidence["channel_entry"]),
+                    launch_argv_template=list(
+                        evidence["launch_argv_template"]
+                    ),
+                    workspace_uuid=str(evidence["workspace_uuid"]),
+                    surface_uuid=str(evidence["surface_uuid"]),
+                    session_id=str(evidence["session_id"]),
+                    prompt_pattern=evidence.get("prompt_pattern"),
+                )
+            except (TrustRefused, KeyError, OSError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"capture refused: {error}",
+                )
+                return 1
+            # The evidence file records what the manual trust event
+            # measured; a re-measurement that disagrees means the build
+            # drifted between the trust event and this capture, so the
+            # anchor is retired again immediately and the capture
+            # refuses rather than blessing the drifted build.
+            drift = [
+                name
+                for name, recorded, measured in (
+                    ("entry_sha256", evidence.get("entry_sha256"), anchor.entry_sha256),
+                    (
+                        "dist_tree_sha256",
+                        evidence.get("dist_tree_sha256"),
+                        anchor.dist_tree_sha256,
+                    ),
+                    (
+                        "entry_owner_uid",
+                        evidence.get("entry_owner_uid"),
+                        anchor.entry_owner_uid,
+                    ),
+                )
+                if recorded is not None and recorded != measured
+            ]
+            if drift:
+                anchors.retire(anchor.anchor_id)
+                _print(
+                    {"error": "evidence drift", "fields": drift},
+                    json_output=args.json,
+                    human=(
+                        "capture refused: the build drifted from the "
+                        f"recorded trust evidence on {', '.join(drift)}"
+                    ),
+                )
+                return 1
+            _print(
+                {
+                    "anchor_id": anchor.anchor_id,
+                    "prompt_evidence": (
+                        "bound" if anchor.prompt_pattern else "pending"
+                    ),
+                },
+                json_output=args.json,
+                human=(
+                    f"Trust anchor {anchor.anchor_id} captured; prompt "
+                    "evidence "
+                    + ("bound." if anchor.prompt_pattern else "pending.")
+                ),
+            )
+            return 0
+
+        if args.command == "channel-trust-confirm":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            if runtime.control_operations is None:
+                _print(
+                    {"error": "control operations are unavailable"},
+                    json_output=args.json,
+                    human="control operations are unavailable.",
+                )
+                return 1
+            from hermes_orchestrator.channel_trust import (
+                ChannelTrustAnchors,
+                ChannelTrustGate,
+                TrustRefused,
+            )
+            from hermes_orchestrator.runtime import resolve_sidecar_entry
+
+            binding = runtime.cmux_bindings.active_lead(args.cell)
+            if binding is None:
+                _print(
+                    {"error": "no active lead binding for this cell"},
+                    json_output=args.json,
+                    human="no active lead binding for this cell.",
+                )
+                return 1
+            events = EventStore(database)
+            anchors = ChannelTrustAnchors(database, events=events)
+            anchor = anchors.active_for_cell(args.cell)
+            if anchor is None:
+                _print(
+                    {"error": "no active trust anchor for this cell"},
+                    json_output=args.json,
+                    human="no active trust anchor for this cell.",
+                )
+                return 1
+            port = CmuxCliAdapter(
+                settings.cmux.cli,
+                base_env=os.environ,
+                password_source=cmux_password_source(Keychain()),
+            )
+            # Bounded watch: the dialog either appears within the
+            # window or this invocation exits without any durable
+            # trust receipt — a watcher timeout is an absent dialog,
+            # not a trust refusal.
+            deadline = time.monotonic() + max(1, args.wait_seconds)
+            screen = ""
+            dialog_visible = False
+            while time.monotonic() < deadline:
+                try:
+                    screen = asyncio.run(
+                        port.read_screen(binding.ref, lines=200)
+                    )
+                except CmuxError:
+                    screen = ""
+                if (
+                    "Loading development channels" in screen
+                    and "server:hermes-control" in screen
+                ):
+                    dialog_visible = True
+                    break
+                time.sleep(2)
+            if not dialog_visible:
+                _print(
+                    {"error": "dialog not visible within the wait window"},
+                    json_output=args.json,
+                    human=(
+                        "the hermes-control confirmation dialog did not "
+                        "appear within the wait window; nothing recorded."
+                    ),
+                )
+                return 1
+            entry_path = resolve_sidecar_entry(
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            )
+            if args.capture_prompt and (
+                anchor.prompt_pattern is None
+                or anchor.canonical_entry_path != str(entry_path)
+            ):
+                # The one bounded recapture: this launch's manual Enter
+                # IS a full manual trust event (v5.1), so the anchor is
+                # (re)bound to the exact LIVE identity showing the
+                # dialog — never merely patched onto a stale build. The
+                # operator-recorded normalized structure must be present
+                # or this refuses; no key is ever pressed here.
+                markers = (
+                    "Loading development channels",
+                    "server:hermes-control",
+                    "I am using this for local development",
+                    "Enter to confirm",
+                )
+                missing = [m for m in markers if m not in screen]
+                if missing or screen.count("server:hermes-control") != 1:
+                    _print(
+                        {
+                            "error": "live dialog does not match the "
+                            "operator-recorded normalized structure",
+                            "missing": missing,
+                        },
+                        json_output=args.json,
+                        human=(
+                            "prompt capture refused: the live dialog "
+                            "does not match the operator-recorded "
+                            "normalized structure."
+                        ),
+                    )
+                    return 1
+                pattern = r"[\s\S]{0,4000}?".join(
+                    re.escape(marker) for marker in markers
+                )
+                live_argv = _live_claude_argv(str(binding.session_id))
+                if not live_argv:
+                    _print(
+                        {"error": "no unique live claude process argv"},
+                        json_output=args.json,
+                        human=(
+                            "prompt capture refused: no unique live "
+                            "claude process for this session."
+                        ),
+                    )
+                    return 1
+                try:
+                    if anchor.canonical_entry_path != str(entry_path):
+                        anchors.retire(anchor.anchor_id)
+                        anchor = anchors.capture(
+                            cell_id=args.cell,
+                            profile_alias=str(binding.profile_alias),
+                            entry_path=entry_path,
+                            package_root=entry_path.parents[2],
+                            channel_entry=CHANNEL_ENTRY,
+                            launch_argv_template=live_argv,
+                            workspace_uuid=binding.ref.workspace_uuid,
+                            surface_uuid=binding.ref.surface_uuid,
+                            session_id=str(binding.session_id),
+                            prompt_pattern=pattern,
+                        )
+                    else:
+                        anchors.complete_prompt(anchor.anchor_id, pattern)
+                except TrustRefused as error:
+                    _print(
+                        {"error": str(error)},
+                        json_output=args.json,
+                        human=f"trust (re)binding refused: {error}",
+                    )
+                    return 1
+                _print(
+                    {
+                        "anchor_id": anchor.anchor_id,
+                        "prompt_evidence": "bound",
+                        "manual_press_required": True,
+                    },
+                    json_output=args.json,
+                    human=(
+                        "Trust anchor bound to the live launch "
+                        "identity with prompt evidence; this launch "
+                        "still requires the one manual Enter. The "
+                        "next launch auto-confirms."
+                    ),
+                )
+                return 0
+            gate = ChannelTrustGate(
+                database,
+                events=events,
+                anchors=anchors,
+                control=runtime.control_operations,
+                read_screen=lambda: screen,
+                confirm=lambda: asyncio.run(
+                    port.confirm_channel_dialog(binding.ref)
+                ),
+            )
+            verdict = gate.evaluate(
+                cell_id=args.cell,
+                session_id=str(binding.session_id),
+                workspace_uuid=binding.ref.workspace_uuid,
+                surface_uuid=binding.ref.surface_uuid,
+                profile_alias=str(binding.profile_alias),
+                entry_path=entry_path,
+                package_root=entry_path.parents[2],
+                launch_argv=_live_claude_argv(str(binding.session_id)),
+                screen_text=screen,
+            )
+            payload = {
+                "confirmed": verdict.confirmed,
+                "receipt_operation_id": verdict.receipt_operation_id,
+            }
+            if not verdict.confirmed:
+                payload["first_failure"] = verdict.first_failure
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    "Channel confirmed automatically; receipt "
+                    f"{verdict.receipt_operation_id}."
+                    if verdict.confirmed
+                    else "CHANNEL APPROVAL REQUIRED "
+                    f"({verdict.first_failure}); receipt "
+                    f"{verdict.receipt_operation_id}."
+                ),
+            )
+            return 0 if verdict.confirmed else 1
+
+        if args.command == "rotate-lead":
+            if settings.cmux is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human="cmux is not configured (config/cmux.yaml).",
+                )
+                return 1
+            from hermes_orchestrator.lead_rotation import LeadRotation
+
+            binding = runtime.cmux_bindings.active_lead(args.cell)
+            if binding is None or binding.project_key is None:
+                _print(
+                    {"error": "no active lead binding for this cell"},
+                    json_output=args.json,
+                    human="no active lead binding for this cell.",
+                )
+                return 1
+            project = settings.projects.get(binding.project_key)
+            if project is None:
+                _print(
+                    {"error": "the cell's project is not configured"},
+                    json_output=args.json,
+                    human="the cell's project is not configured.",
+                )
+                return 1
+            try:
+                cells, seater = _open_rotation_collaborators(settings, runtime)
+            except (OSError, ValueError) as error:
+                _print(
+                    {"error": str(error)},
+                    json_output=args.json,
+                    human=f"{error}.",
+                )
+                return 1
+            # Leads and candidates work in a dedicated worktree when
+            # the project configures one; ``repo_path`` itself must
+            # stay the stable primary checkout (see the linked-worktree
+            # rejection in ``load_settings``), so the rotation probe
+            # validates the lead's actual candidate tree instead.
+            lead_worktree = project.lead_worktree or project.repo_path
+            rotation = LeadRotation(
+                database=database,
+                handoffs=HandoffService(database),
+                cells=cells,
+                bindings=runtime.cmux_bindings,
+                seater=seater,
+                # The gate calls this with the project key, not the
+                # cell id; the exact worktree path is already resolved
+                # above, so the key itself is accepted but unused.
+                worktree_state=lambda _project_key: _worktree_state(lead_worktree),
+            )
+            report = asyncio.run(rotation.rotate(args.cell))
+            payload = dataclasses.asdict(report)
+            if report.failure:
+                _print(
+                    payload,
+                    json_output=args.json,
+                    human=f"lead rotation refused: {report.failure}",
+                )
+                return 1
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    f"Lead rotated for cell {report.cell_id}: session "
+                    f"{report.replacement_session} seated on "
+                    f"{report.profile} (binding {report.binding_id})."
+                ),
+            )
+            return 0
+
         if args.command == "decision-import":
             try:
                 raw = args.receipt.read_bytes()
@@ -2480,6 +3196,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     channel_hub=runtime.channel_hub,
                     control_operations=runtime.control_operations,
                     dashboard_refresh=runtime.dashboard_refresh,
+                    fakechat_router=runtime.fakechat_router,
                 )
             )
             payload = {
@@ -2725,6 +3442,52 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             if settings.cmux is not None:
                 # A settled Merger turn may have journalled correction
+                # packets; route them to a registered channel now.
+                nudge_channel(hub_socket_path(settings.state_dir))
+            return 0
+
+        if args.command == "submit-review":
+            if re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha) is None:
+                print(
+                    "--candidate-sha must be the full 40-hex candidate SHA",
+                    file=sys.stderr,
+                )
+                return 1
+            if args.verdict == "-":
+                verdict_json = sys.stdin.read()
+            else:
+                try:
+                    verdict_json = Path(args.verdict).read_text(encoding="utf-8")
+                except OSError as error:
+                    print(
+                        f"cannot read verdict document: {error}", file=sys.stderr
+                    )
+                    return 1
+            if not verdict_json.strip():
+                print("verdict document is empty", file=sys.stderr)
+                return 1
+            # Strictly local: the submitted document is settled from
+            # durable state — the thread is never pulled, so the App
+            # Server is not started, watched, or polled.
+            flow = _open_merge_flow(settings, runtime)
+            try:
+                outcome = asyncio.run(
+                    flow.turns.submit_review(
+                        args.project,
+                        issue_id=args.issue,
+                        event_id=args.event,
+                        candidate_sha=args.candidate_sha,
+                        reviewed_thread_id=args.thread,
+                        reviewed_generation=args.generation,
+                        verdict_json=verdict_json,
+                    )
+                )
+            except SubmissionRejected as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print_merger_turn(outcome)
+            if settings.cmux is not None:
+                # A settled submission may have journalled correction
                 # packets; route them to a registered channel now.
                 nudge_channel(hub_socket_path(settings.state_dir))
             return 0

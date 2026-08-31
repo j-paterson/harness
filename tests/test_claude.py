@@ -1127,3 +1127,221 @@ def test_parser_existing_child_error_result_still_stays_stream_result() -> None:
     )
 
     assert event.kind == "stream.result"
+
+
+# --- INFRA-197 C1: durable launch-failure identity ---
+
+
+class FailingLaunchProcessFactory:
+    """A lead that dies before session confirmation with bytes on stderr."""
+
+    def __init__(self, *, stderr_payload: str, returncode: int = 7) -> None:
+        self.stderr_payload = stderr_payload
+        self.returncode = returncode
+        self.call: tuple[tuple[str, ...], dict[str, Any]] | None = None
+        self.process: asyncio.subprocess.Process | None = None
+
+    async def __call__(
+        self,
+        *command: str,
+        **kwargs: Any,
+    ) -> asyncio.subprocess.Process:
+        self.call = (command, kwargs)
+        child_code = (
+            "import sys;"
+            f"sys.stderr.write({self.stderr_payload!r});"
+            "sys.stderr.flush();"
+            f"sys.exit({self.returncode})"
+        )
+        self.process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            child_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        return self.process
+
+
+class SucceedingProcessFactory:
+    """A lead that confirms its session and exits cleanly."""
+
+    async def __call__(
+        self,
+        *command: str,
+        **kwargs: Any,
+    ) -> asyncio.subprocess.Process:
+        del command, kwargs
+        child_code = (
+            "import json;"
+            "print(json.dumps({'type':'system','subtype':'init',"
+            "'session_id':'11111111-1111-4111-8111-111111111111'}),flush=True)"
+        )
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            child_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_records_one_durable_identity_receipt(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.claude import control_launch_failure_recorder
+    from hermes_orchestrator.control_operations import ControlOperations
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(tmp_path / "control-state.db")
+    try:
+        control = ControlOperations(database, events=EventStore(database))
+        factory = FailingLaunchProcessFactory(
+            stderr_payload="claude: unknown option '--frobnicate'\n",
+            returncode=7,
+        )
+        runner = ClaudeRunner(
+            registry,
+            prompt_file=tmp_path / "claude-lead.md",
+            base_env={
+                "PATH": os.environ["PATH"],
+                "AWS_PROFILE": "work",
+                "ANTHROPIC_API_KEY": "sk-secret",
+            },
+            process_factory=factory,
+            launch_failure_recorder=control_launch_failure_recorder(control),
+        )
+
+        with pytest.raises(ClaudeProcessError, match="status 7"):
+            _ = [
+                event async for event in runner.start_lead(new_request(tmp_path))
+            ]
+
+        rows = database.execute(
+            "SELECT operation_id FROM control_operations "
+            "WHERE kind = 'lead.launch_failed'"
+        ).fetchall()
+        assert len(rows) == 1
+        operation = control.get(str(rows[0]["operation_id"]))
+        assert factory.call is not None
+        assert factory.process is not None
+        command, kwargs = factory.call
+        assert kwargs["env"]["CLAUDE_CONFIG_DIR"].endswith(".claude-max-a")
+        session = "11111111-1111-4111-8111-111111111111"
+        assert operation.session_id == session
+        # Content equality: the payload is exactly the launch identity —
+        # never the wider environment, never any scrubbed credential.
+        assert operation.result == {
+            "argv": list(command),
+            "cwd": str(tmp_path),
+            "claude_config_dir": kwargs["env"]["CLAUDE_CONFIG_DIR"],
+            "profile_alias": "max-a",
+            "pid": factory.process.pid,
+            "exit_code": 7,
+            "session_id": session,
+            "stderr_tail": "claude: unknown option '--frobnicate'\n",
+        }
+        serialized = json.dumps(operation.as_dict())
+        assert "sk-secret" not in serialized
+        assert "AWS_PROFILE" not in serialized
+        assert "ANTHROPIC_API_KEY" not in serialized
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_stderr_tail_is_exactly_the_last_8192_bytes(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.claude import control_launch_failure_recorder
+    from hermes_orchestrator.control_operations import ControlOperations
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(tmp_path / "control-state.db")
+    try:
+        control = ControlOperations(database, events=EventStore(database))
+        factory = FailingLaunchProcessFactory(
+            stderr_payload="h" * 1000 + "t" * 8192,
+            returncode=1,
+        )
+        runner = ClaudeRunner(
+            registry,
+            prompt_file=tmp_path / "claude-lead.md",
+            base_env={"PATH": os.environ["PATH"]},
+            process_factory=factory,
+            launch_failure_recorder=control_launch_failure_recorder(control),
+        )
+
+        with pytest.raises(ClaudeProcessError, match="status 1"):
+            _ = [
+                event async for event in runner.start_lead(new_request(tmp_path))
+            ]
+
+        rows = database.execute(
+            "SELECT operation_id FROM control_operations "
+            "WHERE kind = 'lead.launch_failed'"
+        ).fetchall()
+        assert len(rows) == 1
+        operation = control.get(str(rows[0]["operation_id"]))
+        assert operation.result["stderr_tail"] == "t" * 8192
+        assert operation.result["exit_code"] == 1
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_launch_records_no_launch_failure_receipt(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    from hermes_orchestrator.claude import control_launch_failure_recorder
+    from hermes_orchestrator.control_operations import ControlOperations
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(tmp_path / "control-state.db")
+    try:
+        control = ControlOperations(database, events=EventStore(database))
+        runner = ClaudeRunner(
+            registry,
+            prompt_file=tmp_path / "claude-lead.md",
+            base_env={"PATH": os.environ["PATH"]},
+            process_factory=SucceedingProcessFactory(),
+            launch_failure_recorder=control_launch_failure_recorder(control),
+        )
+
+        events = [
+            event async for event in runner.start_lead(new_request(tmp_path))
+        ]
+
+        assert events[0].kind == "session.started"
+        assert database.scalar("SELECT COUNT(*) FROM control_operations") == 0
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_without_recorder_keeps_existing_behavior(
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    factory = FailingLaunchProcessFactory(
+        stderr_payload="boom\n",
+        returncode=7,
+    )
+    runner = ClaudeRunner(
+        registry,
+        prompt_file=tmp_path / "claude-lead.md",
+        base_env={"PATH": os.environ["PATH"]},
+        process_factory=factory,
+    )
+
+    with pytest.raises(ClaudeProcessError, match="status 7"):
+        _ = [event async for event in runner.start_lead(new_request(tmp_path))]

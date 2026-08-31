@@ -38,10 +38,18 @@ from hermes_orchestrator.review_intake import AdmittedCandidate
 from hermes_orchestrator.settlement import (
     EXTERNALLY_MERGED,
     MergeSettlements,
+    Settlement,
     SettlementBinding,
     SettlementConflict,
 )
 from hermes_orchestrator.verdicts import CorrectionPacket, ReviewVerdict
+
+# Non-settling refusal: the settlement's stored reviewer thread and
+# generation no longer match the live ready reviewer channel. The row
+# stays resumable (``recorded``, or released back to it) but can never
+# settle until a fresh generation-bound explicit submission re-approves
+# the candidate, which re-binds the settlement to the live identity.
+STALE_SETTLEMENT = "stale_settlement"
 
 # Review states that still own the issue's review slot.
 _LIVE_STATES = (
@@ -284,6 +292,34 @@ class ReviewService:
                         manifest_version=manifest.manifest_version,
                     ),
                 )
+                # Sol 165f5ee6 packet 3: the settlement insert is
+                # replay-ignored, so a fresh generation-bound approval
+                # of the same wake event must supersede a stale stored
+                # reviewer identity. The UPDATE-if-stale CAS (the
+                # submitted_verdicts supersession idiom) re-binds the
+                # event's single settlement row to the approving
+                # thread/generation — only while it is unclaimed or its
+                # claim lease has expired, in the same transaction as
+                # the verdict — so exactly one settlement per event
+                # survives and only the live binding can settle it.
+                connection.execute(
+                    "UPDATE merge_settlements SET thread_id = ?, "
+                    "thread_generation = ?, updated_at = ? "
+                    "WHERE settlement_id = ? "
+                    "AND (state = 'recorded' OR (state = 'merging' "
+                    "AND lease_expires_at IS NOT NULL "
+                    "AND lease_expires_at < ?)) "
+                    "AND (thread_id != ? OR thread_generation != ?)",
+                    (
+                        admitted.thread_id,
+                        admitted.generation,
+                        stamp,
+                        review_id,
+                        stamp,
+                        admitted.thread_id,
+                        admitted.generation,
+                    ),
+                )
         record = self._get(review_id)
         if record.state == "corrections_required":
             self._dispatch_packets(
@@ -346,6 +382,27 @@ class ReviewService:
             return _outcome(record, reason=record.reason or "merged")
         if settlement.state == "failed":
             return _outcome(record, reason=settlement.reason or record.state)
+        if record.state == "approved" and settlement.state == "recorded":
+            # Settlement-claim fence (Sol 165f5ee6 packet 3, scope
+            # refined by Sol eadf249b packet 2): every recovery entry —
+            # startup resume, intake-boundary resume, the merge-settle
+            # CLI, and the direct submission drive — converges here, and
+            # a PRE-MUTATION ``recorded`` settlement whose stored
+            # reviewer thread/generation is no longer the live ready
+            # channel is never claimed: nothing external can have
+            # happened, so the stale refusal is immediate. An in-flight
+            # ``merging`` row is NOT fenced at this boundary — its
+            # previous owner may have crossed the GitHub boundary before
+            # crashing, so once its lease expires it is claimed and
+            # driven: the drive inspects authoritative PR/effect state,
+            # reconciles an already-completed exact-head merge into its
+            # receipts, and still applies the final pre-mutation
+            # revalidation before any NEW merge call. A ``merged``
+            # settlement's receipt tail replays for a mutation that
+            # already exists.
+            stale = self._stale_settlement_reason(settlement)
+            if stale is not None:
+                return _outcome(record, state=STALE_SETTLEMENT, reason=stale)
         token = self._settlements.claim(review_id)
         if token is None:
             return _outcome(
@@ -369,7 +426,10 @@ class ReviewService:
                 ),
             )
             self._settlements.mark_settled(review_id, token=token)
-        elif outcome.state == "deferred":
+        elif outcome.state in ("deferred", STALE_SETTLEMENT):
+            # Nothing external happened under the claim: a stale
+            # pre-mutation revalidation releases back to ``recorded`` so
+            # the settlement stays resumable but non-settling.
             self._settlements.release(review_id, token=token)
         else:
             self._settlements.mark_failed(review_id, token=token, reason=outcome.reason)
@@ -476,6 +536,15 @@ class ReviewService:
                 reason="unresolved merge window is full",
             )
 
+        # Final pre-mutation revalidation (Sol 165f5ee6 packet 3): the
+        # channel can be replaced between the claim fence and this exact
+        # point, so the live ready reviewer channel is re-read one last
+        # time immediately before the GitHub merge call. A stale binding
+        # returns without any mutation and the caller releases the claim
+        # back to ``recorded``.
+        stale = self._stale_settlement_reason(self._settlements.get(review_id))
+        if stale is not None:
+            return _outcome(record, state=STALE_SETTLEMENT, reason=stale)
         try:
             proven = self._merge.merge_approved(
                 record.project_key,
@@ -751,6 +820,40 @@ class ReviewService:
         return None if row is None else str(row["issue_id"])
 
     # -- internals --------------------------------------------------------
+
+    def _stale_settlement_reason(self, settlement: Settlement) -> str | None:
+        """The refusal reason when the stored reviewer binding went stale.
+
+        Sol 165f5ee6 packet 3: a durable settlement carries the reviewer
+        thread and generation whose submission approved it, and it may
+        settle only while that exact identity is still the live ready
+        reviewer channel. The check reads the durable
+        ``reviewer_channels`` row directly, so every recovery entry point
+        fences against the same truth the submission fence uses; a
+        missing or not-ready channel fails closed. Externally-merged
+        reconciliation settlements carry no live-channel binding — the
+        mutation already exists on GitHub — and are exempt.
+        """
+
+        if settlement.path == EXTERNALLY_MERGED:
+            return None
+        row = self._database.execute(
+            "SELECT thread_id, generation FROM reviewer_channels "
+            "WHERE project_key = ? AND state = 'ready'",
+            (settlement.project_key,),
+        ).fetchone()
+        if (
+            row is not None
+            and str(row["thread_id"]) == settlement.thread_id
+            and int(row["generation"]) == settlement.thread_generation
+        ):
+            return None
+        return (
+            "the settlement's reviewed thread and generation no longer "
+            "match the ready reviewer channel; the settlement stays "
+            "resumable and non-settling until a fresh generation-bound "
+            "submission re-approves the candidate"
+        )
 
     def _get(self, review_id: str) -> ReviewRecord:
         row = self._database.execute(

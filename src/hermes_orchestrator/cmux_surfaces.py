@@ -15,14 +15,22 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
+import threading
+import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from hermes_orchestrator.channel_trust import (
+    ChannelTrustAnchors,
+    ChannelTrustGate,
+    TrustVerdict,
+)
 from hermes_orchestrator.cmux import (
     CmuxControlPort,
     CmuxError,
@@ -63,19 +71,36 @@ class SeatAuthRefused(RuntimeError):
 
 # The complete grammar of a classic in-pane lead command: the native
 # interactive Claude TUI addressing exactly one session — never a
-# prompt, flag soup, or credential. The one permitted extension is the
+# prompt, flag soup, or credential. Immediately after the session UUID
+# sits the fixed ``--dangerously-skip-permissions`` literal (INFRA-197
+# operator decision infra-197-managed-claude-skip-permissions-20260830-
+# v1: every Hermes-managed classic launch carries it) — it is not
+# caller-supplied, sits before any channel extension so every extended
+# command inherits it by construction, and no grammar position lets a
+# caller express a different or additional flag there. Exactly two
+# extensions are permitted after it, mutually exclusive: the
 # controller-generated session-scoped MCP config plus the fixed
-# hermes-control development-channel entry; arbitrary flags, commands,
-# and user-selected paths remain structurally impossible.
+# hermes-control development-channel entry — the one production
+# extension (Sol correction b4b545f3, v5) — or the fixed official
+# fakechat channel plugin literal, retained in the grammar only so
+# historical v4 commands still validate-or-refuse exactly; no
+# production path composes the fakechat form any more. Arbitrary
+# flags, commands, and user-selected paths remain structurally
+# impossible.
 _UUID_PATTERN = (
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 CHANNEL_ENTRY = "server:hermes-control"
+FAKECHAT_CHANNEL_ENTRY = "plugin:fakechat@claude-plugins-official"
+SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 _CLASSIC_COMMAND = re.compile(
-    r"^claude --(resume|session-id) " + _UUID_PATTERN + r"( --mcp-config "
-    r"/[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
-    r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY) + r")?$"
+    r"^claude --(resume|session-id) " + _UUID_PATTERN
+    + " " + re.escape(SKIP_PERMISSIONS_FLAG) + r"("
+    r" --mcp-config /[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
+    r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY)
+    + r"| --channels " + re.escape(FAKECHAT_CHANNEL_ENTRY)
+    + r")?$"
 )
 # The config path may hold nothing a shell, cmux, or argv parser could
 # reinterpret — no spaces, quotes, or metacharacters.
@@ -87,12 +112,17 @@ def classic_resume_command(session_id: str, *, resume: bool) -> str:
 
     ``--resume`` reattaches an existing session; ``--session-id`` starts
     a new one under the exact preassigned identity. The session id must
-    parse as a UUID, so nothing else can ever ride along.
+    parse as a UUID, so nothing else can ever ride along. The fixed
+    ``--dangerously-skip-permissions`` literal (INFRA-197 operator
+    decision infra-197-managed-claude-skip-permissions-20260830-v1)
+    always follows the UUID, before any channel extension, so every
+    Hermes-managed classic launch — and every command built on top of
+    this one — carries it by construction; it is never caller-supplied.
     """
 
     canonical = str(uuid.UUID(str(session_id)))
     flag = "--resume" if resume else "--session-id"
-    return f"claude {flag} {canonical}"
+    return f"claude {flag} {canonical} {SKIP_PERMISSIONS_FLAG}"
 
 
 def classic_channel_command(
@@ -104,7 +134,9 @@ def classic_channel_command(
     metacharacter-free path whose filename is exactly this session's
     canonical UUID plus ``.mcp.json`` — and the fixed
     ``server:hermes-control`` entry. Anything else refuses before any
-    command exists.
+    command exists. The base command from :func:`classic_resume_command`
+    already carries the fixed ``--dangerously-skip-permissions`` literal
+    ahead of this extension.
     """
 
     base = classic_resume_command(session_id, resume=resume)
@@ -122,6 +154,23 @@ def classic_channel_command(
         f"{base} --mcp-config {path} "
         f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
     )
+
+
+def classic_fakechat_command(session_id: str, *, resume: bool) -> str:
+    """The classic command extended with the fixed fakechat channel.
+
+    Retired from production (Sol correction b4b545f3, v5): no seat
+    composition calls this builder any more — the hermes-control
+    channel launch in :func:`classic_channel_command` is the one
+    production extension. The builder survives, still grammar-exact,
+    only so the historical v4 command shape remains constructible for
+    validation and tests; nothing about it is caller-supplied beyond
+    the session id round-tripping through
+    :func:`classic_resume_command`.
+    """
+
+    base = classic_resume_command(session_id, resume=resume)
+    return f"{base} --channels {FAKECHAT_CHANNEL_ENTRY}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1095,11 +1144,12 @@ async def _activate_lead_seat(
     # (``OK workspace:<n>``) to exactly one workspace through the
     # metadata listing; zero or multiple matches fail closed inside the
     # adapter.
+    env: dict[str, str] = {"CLAUDE_CONFIG_DIR": str(config_dir)}
     ref = await port.create_workspace(
         title=f"{title} {intent.title_marker}",
         cwd=cwd,
         command=command,
-        env={"CLAUDE_CONFIG_DIR": str(config_dir)},
+        env=env,
         resolve_marker=intent.title_marker,
     )
     try:
@@ -1112,7 +1162,9 @@ async def _activate_lead_seat(
             await port.close_workspace(ref.workspace_uuid)
         raise
     try:
-        await port.set_surface_resume(ref, f"claude --resume {session_id}")
+        await port.set_surface_resume(
+            ref, classic_resume_command(session_id, resume=True)
+        )
         active = bindings.activate_residual(
             pending.binding_id, replacing=replacing, reason=replace_reason
         )
@@ -1231,6 +1283,189 @@ async def _resolve_residual_bindings(
             reclaimed.append(binding.binding_id)
 
 
+def live_claude_argv(session_id: str) -> list[str]:
+    """The live ``claude`` process argv for one exact session.
+
+    Read from ``ps`` at trust-gate time so the gate compares what is
+    actually running against the anchored launch template (mirrors the
+    CLI's ``channel-trust-confirm`` measurement). The classic command
+    grammar guarantees metacharacter-free, space-free tokens, so a
+    whitespace split reconstructs the argv exactly. Zero or two
+    matching processes both return an empty argv — the gate then fails
+    closed on the template comparison rather than guessing.
+    """
+
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "args="],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    matches = [
+        line.strip()
+        for line in listing.splitlines()
+        if session_id in line
+        and "claude" in line
+        and (" --resume " in line or " --session-id " in line)
+        and "ps -axo" not in line
+    ]
+    if len(matches) != 1:
+        return []
+    return matches[0].split()
+
+
+class ChannelTrustConfirmer:
+    """Bounded, single-shot channel-trust trigger for one managed seat.
+
+    Sol correction f0a5a403 (packet 4): the
+    :class:`~hermes_orchestrator.channel_trust.ChannelTrustGate` was
+    previously reachable only through the manually invoked
+    ``channel-trust-confirm`` CLI command, so a newly seated trusted
+    launch still required a human. This collaborator is composed by
+    ``open_runtime`` and injected into :class:`CmuxLeadSeater`, which
+    triggers it exactly once for each newly created channel-launched
+    binding: one bounded watch for the development-channel dialog on
+    the exact bound surface, then one gate evaluation. The gate is
+    reused as-is — claim-before-Enter CAS, mismatch refusal, and
+    explicit ambiguous outcomes all hold, so repeated or concurrent
+    triggers for one launch (this trigger and the CLI included) still
+    send at most one Enter. A watcher timeout is an absent dialog, not
+    a trust refusal: zero keys and no durable trust receipt.
+
+    Sol correction a9cc6d5f (packet 3): the watch snapshot is only the
+    trigger and initial evidence — the gate's ``read_screen``
+    collaborator is wired to a live bounded re-read of the exact bound
+    surface, so the gate's last-moment verify re-reads that surface
+    immediately before the Enter and sends no key when the dialog is
+    no longer freshly, uniquely, and identically present.
+    """
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        events: EventStore,
+        control: ControlOperations,
+        port: CmuxControlPort,
+        entry_resolver: Callable[[], Path],
+        live_argv: Callable[[str], list[str]] | None = None,
+        wait_seconds: int = 90,
+        poll_seconds: float = 2.0,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        self._database = database
+        self._events = events
+        self._control = control
+        self._port = port
+        self._entry_resolver = entry_resolver
+        self._live_argv = live_argv if live_argv is not None else live_claude_argv
+        self._wait_seconds = wait_seconds
+        self._poll_seconds = poll_seconds
+        self._clock = clock if clock is not None else time.monotonic
+        self._sleep = sleep if sleep is not None else asyncio.sleep
+
+    async def confirm_seat(self, binding: CmuxBinding) -> TrustVerdict | None:
+        """Watch for the dialog on the exact bound surface, then run
+        one gate evaluation. ``None`` means the dialog never appeared
+        within the bounded window — nothing was pressed and no durable
+        trust receipt exists; any pressed-or-refused outcome is the
+        gate's own :class:`TrustVerdict` with its durable receipt."""
+
+        if binding.cell_id is None or binding.session_id is None:
+            return None
+        session_id = str(binding.session_id)
+        ref = binding.ref
+        # Bounded watch, mirroring the CLI's pattern: the dialog either
+        # appears within the window or this trigger does nothing at all.
+        deadline = self._clock() + max(1, self._wait_seconds)
+        screen = ""
+        while True:
+            try:
+                screen = await self._port.read_screen(ref, lines=200)
+            except CmuxError:
+                screen = ""
+            if (
+                "Loading development channels" in screen
+                and CHANNEL_ENTRY in screen
+            ):
+                break
+            if self._clock() >= deadline:
+                return None
+            await self._sleep(self._poll_seconds)
+        entry_path = self._entry_resolver()
+        launch_argv = self._live_argv(session_id)
+
+        def _run_bounded(operation: Callable[[], Awaitable[Any]]) -> Any:
+            # The gate calls its collaborators synchronously between
+            # its durable claim and its completion receipt, while this
+            # coroutine's own event loop is blocked inside
+            # ``gate.evaluate`` — so each bounded cmux operation runs
+            # its own loop on a short-lived helper thread; any failure
+            # re-raises into the gate's fail-closed handling.
+            outcome: list[Any] = []
+            failure: list[BaseException] = []
+
+            def _runner() -> None:
+                try:
+                    outcome.append(asyncio.run(operation()))
+                except BaseException as error:
+                    failure.append(error)
+
+            worker = threading.Thread(target=_runner, daemon=True)
+            worker.start()
+            worker.join()
+            if failure:
+                raise failure[0]
+            return outcome[0]
+
+        def _read_live() -> str:
+            # Sol correction a9cc6d5f (packet 3): the gate's
+            # last-moment verify re-reads the EXACT bound surface live
+            # immediately before the Enter — never the watch snapshot
+            # above, which is only the trigger evidence
+            # (``screen_text``). A replaced or vanished surface fails
+            # this bounded read and the gate then sends no key.
+            return str(
+                _run_bounded(lambda: self._port.read_screen(ref, lines=200))
+            )
+
+        def _press() -> None:
+            # The one non-parameterizable Enter; a failure re-raises
+            # into the gate's explicit ambiguous-outcome handling.
+            _run_bounded(lambda: self._port.confirm_channel_dialog(ref))
+
+        gate = ChannelTrustGate(
+            self._database,
+            self._events,
+            ChannelTrustAnchors(self._database, events=self._events),
+            self._control,
+            _read_live,
+            _press,
+        )
+        return gate.evaluate(
+            cell_id=str(binding.cell_id),
+            session_id=session_id,
+            workspace_uuid=binding.workspace_uuid,
+            surface_uuid=binding.surface_uuid,
+            profile_alias=str(binding.profile_alias),
+            entry_path=entry_path,
+            package_root=entry_path.parents[2],
+            launch_argv=launch_argv,
+            screen_text=screen,
+        )
+
+
+class ChannelTrustTrigger(Protocol):
+    """The seater-facing shape of :class:`ChannelTrustConfirmer`."""
+
+    async def confirm_seat(self, binding: CmuxBinding) -> TrustVerdict | None: ...
+
+
 class CmuxLeadSeater:
     """Ensure each confirmed lead session owns exactly one visible seat.
 
@@ -1251,6 +1486,7 @@ class CmuxLeadSeater:
         auth_probe: Callable[[str], bool] | None = None,
         channel_launch: ChannelLaunchSource | None = None,
         control: ControlOperations | None = None,
+        channel_trust: ChannelTrustTrigger | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
@@ -1259,6 +1495,7 @@ class CmuxLeadSeater:
         self._auth_probe = auth_probe
         self._channel_launch = channel_launch
         self._control = control
+        self._channel_trust = channel_trust
 
     async def ensure(
         self,
@@ -1322,6 +1559,11 @@ class CmuxLeadSeater:
             config_dir = self._profile_dirs.config_dir(profile_alias)
         except (KeyError, ValueError):
             return None
+        # Sol correction b4b545f3 (v5): the fakechat seat-command
+        # substitution is retired — the hermes-control channel launch
+        # below is the one production extension path for a classic
+        # seat, with the documented plain-classic fallback.
+        channel_launched = False
         if classic_command is not None and self._channel_launch is not None:
             # Channel attachment for the new pane: the session-scoped
             # config and capability are generated under the private
@@ -1344,6 +1586,7 @@ class CmuxLeadSeater:
                     resume="--resume" in classic_command,
                     channel_config=config,
                 )
+                channel_launched = True
             except Exception as error:
                 if self._control is not None:
                     with suppress(Exception):
@@ -1375,6 +1618,17 @@ class CmuxLeadSeater:
         if classic_command is not None:
             self._bindings.record_classic(bound.binding_id, session_id)
         await self._show_issue(bound, issue_id)
+        if channel_launched and self._channel_trust is not None:
+            # Sol correction f0a5a403 (packet 4): one bounded, single-
+            # shot trust-gate trigger for the exact newly created
+            # channel-launched binding — no manual channel-trust-confirm
+            # invocation required. The gate's durable claim CAS keeps
+            # concurrent or repeated triggers for this one launch at
+            # at most one Enter, and no trigger failure may break the
+            # already-bound seat. A seat composed without the
+            # collaborator behaves exactly as before.
+            with suppress(Exception):
+                await self._channel_trust.confirm_seat(bound)
         return bound
 
     async def _retire_rotated_seat(self, existing: CmuxBinding) -> None:

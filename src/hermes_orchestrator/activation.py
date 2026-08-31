@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import uuid
 from collections.abc import Callable
@@ -63,6 +64,7 @@ def materialize_artifact(
     checkout_root: Path,
     git_sha: str,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    build_sidecar: Callable[[Path], None] | None = None,
 ) -> Path:
     """Materialize one immutable runtime artifact for an exact commit.
 
@@ -75,6 +77,9 @@ def materialize_artifact(
     """
 
     runner = run or subprocess.run
+    builder = build_sidecar or (
+        lambda sidecar: _npm_sidecar_build(sidecar, run=runner)
+    )
     runtimes = state_dir / "runtimes"
     target = runtimes / git_sha
     marker = target / "RUNTIME_SHA"
@@ -120,6 +125,9 @@ def materialize_artifact(
             raise ActivationRefused(
                 f"could not extract the {git_sha[:12]} artifact"
             )
+        _materialize_sidecar(
+            source=checkout_root, staging=staging, build=builder
+        )
         (staging / "RUNTIME_SHA").write_text(
             git_sha + "\n", encoding="ascii"
         )
@@ -133,10 +141,91 @@ def materialize_artifact(
     finally:
         archive.unlink(missing_ok=True)
         if staging.is_dir() and staging != target:
-            import shutil as _shutil
-
-            _shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
     return target
+
+
+def _npm_sidecar_build(
+    sidecar: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """Build the hermes-control sidecar inside an exported candidate tree.
+
+    A fresh ``git archive`` export carries no ``node_modules``, so the
+    exact locked dependencies are installed first, then the build runs
+    — both bounded, with the failing step's output surfaced so the
+    refusal is actionable.
+    """
+
+    for step in (("npm", "ci"), ("npm", "run", "build")):
+        completed = run(
+            step,
+            cwd=str(sidecar),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise ActivationRefused(
+                f"the hermes-control sidecar build step '{' '.join(step)}' "
+                f"failed in {sidecar}: {detail[-500:]}"
+            )
+
+
+def _materialize_sidecar(
+    *, source: Path, staging: Path, build: Callable[[Path], None]
+) -> None:
+    """Build the hermes-control sidecar from the exported candidate source.
+
+    The sidecar's ``dist/`` is compiled JS output that Git never tracks
+    (it is gitignored), so ``git archive`` — the export this function
+    runs after — never carries it. The mutable source checkout's own
+    ``dist`` is never consulted either: those bytes may be a stale
+    build of some other commit's sidecar source. Instead ``build`` runs
+    against the exported candidate source inside the staging artifact,
+    so the materialized ``dist`` provably comes from the exact tree of
+    the candidate commit. A build that fails, or completes without
+    producing ``dist/``, refuses materialization the same way a failed
+    export or extract does, so the caller sees a durable ``failed``
+    attempt (via :meth:`RuntimeActivator.activate_artifact`) rather
+    than a channel-less or foreign-build runtime discovered later at
+    launch time.
+    """
+
+    sidecar_staging = staging / "channels" / "hermes-control"
+    # ``channels/hermes-control`` itself may already exist from tracked
+    # files the git-archive export just extracted (package.json, src,
+    # ...); ``dist/`` — always gitignored — is exclusively the build's
+    # to create.
+    sidecar_staging.mkdir(parents=True, exist_ok=True)
+    try:
+        build(sidecar_staging)
+    except ActivationRefused:
+        raise
+    except Exception as error:
+        raise ActivationRefused(
+            "the hermes-control sidecar build failed against the exported "
+            f"candidate source in {sidecar_staging}: {error}"
+        ) from error
+    if not (sidecar_staging / "dist").is_dir():
+        raise ActivationRefused(
+            "the hermes-control sidecar build completed without producing "
+            "channels/hermes-control/dist; refusing to materialize an "
+            "artifact without a sidecar build"
+        )
+    protocol = sidecar_staging / "PROTOCOL.md"
+    if not protocol.is_file():
+        protocol_source = source / "channels" / "hermes-control" / "PROTOCOL.md"
+        if not protocol_source.is_file():
+            raise ActivationRefused(
+                f"{source} is missing channels/hermes-control/PROTOCOL.md; "
+                "refusing to materialize an artifact without the sidecar "
+                "wire contract"
+            )
+        shutil.copy2(protocol_source, protocol)
 
 
 def checkout_migration_max(checkout_root: Path) -> int:
@@ -163,12 +252,14 @@ class RuntimeActivator:
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
         run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+        sidecar_build: Callable[[Path], None] | None = None,
     ) -> None:
         self._database = database
         self._events = events
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or (lambda: datetime.now(UTC))
         self._run = run or subprocess.run
+        self._sidecar_build = sidecar_build
 
     def current(self) -> RuntimeActivation | None:
         row = self._database.execute(
@@ -379,12 +470,28 @@ class RuntimeActivator:
         """
 
         git_sha = self._validate(source_checkout)
-        artifact = materialize_artifact(
-            state_dir=state_dir,
-            checkout_root=source_checkout,
-            git_sha=git_sha,
-            run=self._run,
-        )
+        try:
+            artifact = materialize_artifact(
+                state_dir=state_dir,
+                checkout_root=source_checkout,
+                git_sha=git_sha,
+                run=self._run,
+                build_sidecar=self._sidecar_build,
+            )
+        except ActivationRefused as refusal:
+            # A candidate that cannot materialize (its sidecar build
+            # failed, say) aborts BEFORE the active runtime changes:
+            # the refusal is a durable failed attempt and the prior
+            # activation stays active — the safe rollback.
+            target = state_dir / "runtimes" / git_sha
+            self._record_attempt(
+                state="failed",
+                binary_path=target / ".venv" / "bin" / "hermes-orchestrator",
+                checkout_root=target,
+                git_sha=git_sha,
+                reason=str(refusal),
+            )
+            raise
         if prepare is not None:
             try:
                 prepare(artifact)

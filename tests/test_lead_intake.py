@@ -793,7 +793,7 @@ def test_the_lead_contract_documents_the_signal_protocol() -> None:
     assert "HERMES_CORRECTION_READY <id>" in contract
     assert "HERMES_WORK_READY <id>" in contract
     assert "signal only" in contract
-    assert "Terminal text is never authoritative" in contract
+    assert "only the durable SQLite record is" in contract
     assert "fallback" in contract
 
 

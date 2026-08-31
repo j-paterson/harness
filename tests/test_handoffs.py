@@ -77,4 +77,109 @@ def test_acknowledgement_requires_restarted_next_action(
             record.handoff_id,
             UUID("22222222-2222-4222-8222-222222222222"),
             "   ",
+            profile_alias="max-b",
         )
+
+
+REPLACEMENT = UUID("22222222-2222-4222-8222-222222222222")
+NEXT_ACTION = "Run the failing test and correct ENG-9."
+
+
+def test_acknowledgement_persists_replacement_profile_atomically(
+    handoffs: HandoffService, database: Database
+) -> None:
+    """Sol b4b545f3 P2: the selected replacement session AND profile become
+    durable in the same transition that marks the handoff acknowledged, so
+    recovery can reconstruct the exact identities."""
+
+    record = handoffs.submit(valid_handoff())
+
+    acknowledged = handoffs.acknowledge(
+        record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-b"
+    )
+
+    assert acknowledged.state == "acknowledged"
+    assert acknowledged.replacement_session_id == REPLACEMENT
+    assert acknowledged.replacement_profile_alias == "max-b"
+    row = database.execute(
+        "SELECT state, replacement_session_id, replacement_profile_alias "
+        "FROM handoffs WHERE handoff_id = ?",
+        (record.handoff_id,),
+    ).fetchone()
+    assert str(row["state"]) == "acknowledged"
+    assert str(row["replacement_session_id"]) == str(REPLACEMENT)
+    assert str(row["replacement_profile_alias"]) == "max-b"
+
+
+def test_acknowledgement_requires_replacement_profile(
+    handoffs: HandoffService, database: Database
+) -> None:
+    record = handoffs.submit(valid_handoff())
+
+    with pytest.raises(HandoffRejected, match="profile"):
+        handoffs.acknowledge(
+            record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="   "
+        )
+
+    row = database.execute(
+        "SELECT state, replacement_session_id, replacement_profile_alias "
+        "FROM handoffs WHERE handoff_id = ?",
+        (record.handoff_id,),
+    ).fetchone()
+    assert str(row["state"]) == "submitted"
+    assert row["replacement_session_id"] is None
+    assert row["replacement_profile_alias"] is None
+
+
+def test_repeat_acknowledgement_with_same_identities_is_idempotent(
+    handoffs: HandoffService,
+) -> None:
+    record = handoffs.submit(valid_handoff())
+    handoffs.acknowledge(
+        record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-b"
+    )
+
+    repeated = handoffs.acknowledge(
+        record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-b"
+    )
+
+    assert repeated.state == "acknowledged"
+    assert repeated.replacement_profile_alias == "max-b"
+
+
+def test_repeat_acknowledgement_with_a_different_profile_is_rejected(
+    handoffs: HandoffService,
+) -> None:
+    record = handoffs.submit(valid_handoff())
+    handoffs.acknowledge(
+        record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-b"
+    )
+
+    with pytest.raises(HandoffRejected, match="profile"):
+        handoffs.acknowledge(
+            record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-c"
+        )
+
+
+def test_reacknowledgement_backfills_a_legacy_row_without_a_profile(
+    handoffs: HandoffService, database: Database
+) -> None:
+    """A row acknowledged before migration 0051 carries NULL for the
+    replacement profile; an identical re-acknowledgement that now names the
+    profile repairs the row instead of rejecting it."""
+
+    record = handoffs.submit(valid_handoff())
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE handoffs SET state = 'acknowledged', "
+            "replacement_session_id = ?, restated_next_action = ? "
+            "WHERE handoff_id = ?",
+            (str(REPLACEMENT), NEXT_ACTION, record.handoff_id),
+        )
+
+    repaired = handoffs.acknowledge(
+        record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-b"
+    )
+
+    assert repaired.state == "acknowledged"
+    assert repaired.replacement_profile_alias == "max-b"

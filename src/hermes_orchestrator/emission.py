@@ -11,14 +11,12 @@ registered wake deduplicates.
 
 from __future__ import annotations
 
-import hashlib
 import re
-import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 from hermes_orchestrator.ci_window import MergeWindowExhausted, PriorMergeFailed
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
@@ -37,10 +35,6 @@ from hermes_orchestrator.manifests import (
 )
 from hermes_orchestrator.review_intake import CandidateRejected
 from hermes_orchestrator.verdicts import CorrectionPacket
-
-if TYPE_CHECKING:
-    from hermes_orchestrator.subagent_packets import SubagentPackets
-    from hermes_orchestrator.verifier import Verifier
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,81 +122,6 @@ class EmissionBlocked(RuntimeError):
     """The local clone is not at a valid immutable freeze boundary."""
 
 
-# The ledger's own absent-file sentinel (``subagent_packets._ABSENT_BLOB``).
-# Duplicated here (rather than imported) because it is a stable, documented
-# string contract between the ledger and every consumer of its blobs, not
-# an implementation detail of the ledger module.
-_ABSENT_BLOB = "absent"
-
-# Bounded runtime for each head-blob git invocation (INFRA-194 Sol finding,
-# PR #30): a hang while proving a candidate's head content must fail
-# closed, never block emission forever.
-_HEAD_BLOB_TIMEOUT = 60.0
-
-
-def _default_head_blob(repo: Path, head: str, path: str) -> bytes | None:
-    """Prove ``path``'s content at ``head``, or its positive absence.
-
-    This is a raw ``subprocess.run`` seam — deliberately NOT the
-    text-mode ``self._run``/``GitRunner`` seam — because the credit
-    decision this feeds must be binary-safe and must classify every
-    outcome explicitly:
-
-    - presence is proven with ``git ls-tree --full-tree <head> --
-      <path>``: a nonzero exit (bad head, corrupt repository, unknown
-      object) is repository failure, never absence, and fails closed;
-      exit 0 with empty stdout is the ONLY positive proof of absence.
-    - content is then read with ``git cat-file blob <head>:<path>``,
-      captured with no text decoding at all so the returned bytes are
-      exactly the blob's raw bytes, comparable byte-for-byte against
-      the ledger's own raw-bytes sha256 measurement.
-
-    A timeout, an ``OSError`` launching git, or a nonzero exit from
-    either command raises :class:`EmissionBlocked` — this function
-    never silently degrades an unproven outcome into "absent".
-    """
-
-    try:
-        presence = subprocess.run(
-            ("git", "-C", str(repo), "ls-tree", "--full-tree", head, "--", path),
-            capture_output=True,
-            timeout=_HEAD_BLOB_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise EmissionBlocked(
-            f"could not determine whether {path!r} exists at {head}: "
-            f"{type(error).__name__}"
-        ) from error
-    if presence.returncode != 0:
-        stderr = presence.stderr.decode("utf-8", errors="replace")[:200]
-        raise EmissionBlocked(
-            f"git ls-tree failed for {path!r} at {head} with exit code "
-            f"{presence.returncode}: {stderr}"
-        )
-    if not presence.stdout.strip():
-        return None
-
-    try:
-        content = subprocess.run(
-            ("git", "-C", str(repo), "cat-file", "blob", f"{head}:{path}"),
-            capture_output=True,
-            timeout=_HEAD_BLOB_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise EmissionBlocked(
-            f"could not read {path!r} at {head}: {type(error).__name__}"
-        ) from error
-    if content.returncode != 0:
-        stderr = content.stderr.decode("utf-8", errors="replace")[:200]
-        raise EmissionBlocked(
-            f"git cat-file failed for {path!r} at {head} with exit code "
-            f"{content.returncode}: {stderr}"
-        )
-    return content.stdout
-
-
 @dataclass(frozen=True, slots=True)
 class EmissionResult:
     """One emitted candidate: its wake, manifest path, and delivery."""
@@ -229,10 +148,6 @@ class CandidateEmitter:
         intake_gate: IntakeGatePort | None = None,
         lead: CorrectionSinkPort | None = None,
         issue_for_failure: Callable[[str, str], str | None] | None = None,
-        packets: SubagentPackets | None = None,
-        verifier: Verifier | None = None,
-        candidate_gate_id: str = "candidate-full-gate",
-        head_blob: Callable[[Path, str, str], bytes | None] | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -242,10 +157,6 @@ class CandidateEmitter:
         self._intake_gate = intake_gate
         self._lead = lead
         self._issue_for_failure = issue_for_failure
-        self._packets = packets
-        self._verifier = verifier
-        self._candidate_gate_id = candidate_gate_id
-        self._head_blob = head_blob if head_blob is not None else _default_head_blob
 
     async def emit(
         self,
@@ -300,17 +211,6 @@ class CandidateEmitter:
         )
         head, branch = facts.head, facts.branch
         base, changed = facts.base, facts.changed_files
-        delegation_extra: tuple[tuple[str, str], ...] = ()
-        if self._packets is not None:
-            delegation_extra = self._enforce_delegation_evidence(
-                repo, issue_id, base, head, changed
-            )
-        verification_extra: tuple[tuple[str, str], ...] = ()
-        if self._verifier is not None:
-            receipt_id = self._enforce_final_gate_receipt(repo)
-            verification_extra = (
-                (f"gate:{self._candidate_gate_id}", f"receipt:{receipt_id}"),
-            )
         # A fresh event per freeze boundary: a deferred candidate must be
         # re-woken as a new event, and the durable wake registry deduplicates
         # by candidate identity, so re-emission is always safe.
@@ -325,7 +225,10 @@ class CandidateEmitter:
             branch=branch,
             linear_issues=(issue_id,),
             changed_files=changed,
-            verification=verification + delegation_extra + verification_extra,
+            # Advisory pass-through (operator directive, 2026-08-30):
+            # verification entries are recorded exactly as supplied —
+            # Sol and CI own verification, admission does not.
+            verification=verification,
             blockers=blockers,
             created_at=self._now().astimezone(UTC).isoformat(),
         )
@@ -399,301 +302,6 @@ class CandidateEmitter:
         except CandidateRejected as rejected:
             return "rejected", str(rejected)
         return "clear", ""
-
-    def _enforce_delegation_evidence(
-        self,
-        repo: Path,
-        issue_id: str,
-        base: str,
-        head: str,
-        changed: tuple[str, ...],
-    ) -> tuple[tuple[str, str], ...]:
-        """Refuse a non-trivial candidate with no delegation evidence, and
-        reconcile the actual diff against accepted packet scopes.
-
-        Triviality is proven from the same freeze-boundary diff: at most
-        two changed files and at most thirty added-plus-deleted lines. A
-        trivial candidate needs no reconciliation and contributes no
-        verification entries.
-
-        A non-trivial diff is reconciled path-by-path against every
-        ``accepted`` subagent packet for this issue: a packet whose
-        evidence carries ``exception_reason`` is a DIRECT EXCEPTION,
-        every other accepted packet is REGULAR. A path claimed by one or
-        more regular packets is credited to the most recently accepted
-        one (regular packets may legitimately share files across
-        sequential waves); a path claimed only by exceptions is credited
-        to the sole claiming exception, but two or more exceptions
-        claiming the same path fail closed. An uncovered path fails
-        closed, naming it. Each credited exception's paths and measured
-        lines must stay inside both the fixed reviewer-fix scale and its
-        own declared ``expected_lines``. Every credited packet must share
-        one ``(session_id, worktree, generation)`` identity.
-
-        Path coverage alone is not enough: every credited packet must
-        also carry immutable, MEASURED execution provenance proving it
-        actually produced the credited fragment, never a mere claim in
-        its agent-authored evidence JSON. A regular packet needs both a
-        ``reserved_blobs`` and a ``returned_blobs`` snapshot and is
-        credited for a path only when that path's content changed inside
-        its reservation window (``reserved != returned`` — otherwise the
-        packet was created after its claimed changes already existed and
-        the path has no valid owner). A direct exception needs at least
-        its ``returned_blobs`` snapshot (inherently post-hoc, but still
-        measured at record time). For every credited path, of either
-        kind, the packet's returned blob must equal the sha256 of that
-        path's actual content at the candidate head, proven fresh via
-        ``git show``. Never inferred — always proven from the durable
-        ledger and the actual git diff and tree.
-        """
-
-        numstat = self._run(repo, "diff", "--numstat", base, head)
-        total_lines = 0
-        for line in numstat.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-            try:
-                total_lines += int(parts[0]) + int(parts[1])
-            except ValueError:
-                continue
-        non_trivial = len(changed) > 2 or total_lines > 30
-        if not non_trivial:
-            return ()
-
-        changed_set = set(changed)
-        lines_by_path: dict[str, int] = {}
-        for line in numstat.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) < 2:
-                continue
-            path = parts[-1]
-            try:
-                added = int(parts[0])
-                deleted = int(parts[1])
-            except ValueError as error:
-                if path in changed_set:
-                    raise EmissionBlocked(
-                        f"could not measure the diff for {path!r}: "
-                        "git numstat did not report parseable line counts "
-                        "(binary or otherwise unmeasurable)"
-                    ) from error
-                continue
-            lines_by_path[path] = lines_by_path.get(path, 0) + added + deleted
-
-        assert self._packets is not None
-        accepted = [
-            packet
-            for packet in self._packets.for_issue(issue_id)
-            if packet.state == "accepted"
-        ]
-        if not accepted:
-            raise EmissionBlocked(
-                "delegation evidence missing: a non-trivial candidate "
-                "requires accepted subagent packets or a recorded "
-                "direct-work exception (record_direct_exception)"
-            )
-
-        regular = []
-        exceptions = []
-        for packet in accepted:
-            evidence = packet.evidence or {}
-            if "exception_reason" in evidence:
-                exceptions.append(packet)
-            else:
-                regular.append(packet)
-
-        def recency_key(packet: object) -> tuple[datetime, str]:
-            return (self._packet_timestamp(packet), packet.packet_id)
-
-        credited_by_path: dict[str, object] = {}
-        for path in changed:
-            regular_claimants = [p for p in regular if path in p.allowed_files]
-            exception_claimants = [p for p in exceptions if path in p.allowed_files]
-            if regular_claimants:
-                credited_by_path[path] = max(regular_claimants, key=recency_key)
-            elif exception_claimants:
-                if len(exception_claimants) > 1:
-                    raise EmissionBlocked(
-                        "delegation evidence conflict: "
-                        f"{path!r} is claimed by more than one direct "
-                        "exception"
-                    )
-                credited_by_path[path] = exception_claimants[0]
-            else:
-                raise EmissionBlocked(
-                    "delegation evidence missing: "
-                    f"{path!r} is not covered by any accepted subagent "
-                    "packet"
-                )
-
-        packet_paths: dict[str, list[str]] = {}
-        packet_by_id: dict[str, object] = {}
-        for path, packet in credited_by_path.items():
-            packet_paths.setdefault(packet.packet_id, []).append(path)
-            packet_by_id[packet.packet_id] = packet
-
-        # Every credited packet must carry immutable, measured execution
-        # provenance — the agent-authored evidence JSON never substitutes
-        # for it. A regular packet needs BOTH its reserve-time and
-        # settle-time blob snapshots; a direct exception (post-hoc by
-        # nature) needs at least its settle-time snapshot. A regular
-        # packet is credited for a path only when that path's content
-        # actually changed inside the packet's reservation window
-        # (reserved != returned) — a packet fabricated after its claimed
-        # changes already existed measures identical blobs and earns
-        # nothing, leaving the path with no valid owner. Every credited
-        # path's returned blob must also equal the sha256 of that path's
-        # ACTUAL content at the candidate head, proven fresh from git —
-        # never inferred from the packet's own say-so.
-        for packet_id, paths in packet_paths.items():
-            packet = packet_by_id[packet_id]
-            evidence = packet.evidence or {}
-            is_exception = "exception_reason" in evidence
-            if is_exception:
-                if packet.returned_blobs is None:
-                    raise EmissionBlocked(
-                        f"packet {packet_id!r} lacks immutable execution "
-                        "provenance: no measured returned blobs"
-                    )
-            elif packet.reserved_blobs is None or packet.returned_blobs is None:
-                raise EmissionBlocked(
-                    f"packet {packet_id!r} lacks immutable execution "
-                    "provenance: no measured reserved/returned blobs"
-                )
-            for path in paths:
-                returned_blob = packet.returned_blobs.get(path)
-                if not is_exception:
-                    reserved_blob = packet.reserved_blobs.get(path)
-                    if reserved_blob == returned_blob:
-                        raise EmissionBlocked(
-                            "delegation evidence missing: "
-                            f"{path!r} is not covered by any accepted "
-                            "subagent packet"
-                        )
-                head_blob = self._head_blob_hash(repo, head, path)
-                if returned_blob != head_blob:
-                    raise EmissionBlocked(
-                        f"packet {packet_id!r} returned blob for {path!r} "
-                        "does not match the candidate head content"
-                    )
-
-        for packet in exceptions:
-            paths = packet_paths.get(packet.packet_id)
-            if not paths:
-                continue
-            if len(paths) > 2:
-                raise EmissionBlocked(
-                    f"direct exception {packet.packet_id!r} exceeds the "
-                    "reviewer-fix scale: more than two credited files"
-                )
-            credited_lines = sum(lines_by_path.get(path, 0) for path in paths)
-            if credited_lines > 30:
-                raise EmissionBlocked(
-                    f"direct exception {packet.packet_id!r} exceeds the "
-                    "reviewer-fix scale: more than thirty credited lines"
-                )
-            evidence = packet.evidence or {}
-            expected_lines_raw = evidence.get("expected_lines")
-            if expected_lines_raw is not None:
-                try:
-                    expected_lines = int(expected_lines_raw)
-                except (TypeError, ValueError):
-                    expected_lines = None
-                if expected_lines is not None and credited_lines > expected_lines:
-                    raise EmissionBlocked(
-                        f"direct exception {packet.packet_id!r} exceeds its "
-                        "own declared expected_lines bound"
-                    )
-
-        credited_packets = list(packet_by_id.values())
-        identities = {
-            (packet.session_id, packet.worktree, packet.generation)
-            for packet in credited_packets
-        }
-        if len(identities) > 1:
-            raise EmissionBlocked(
-                "delegation evidence identity mismatch: credited packets "
-                "do not share one session, worktree, and generation"
-            )
-
-        return tuple(
-            sorted(
-                (
-                    f"packet:{packet_id}",
-                    f"files={len(paths)};lines="
-                    f"{sum(lines_by_path.get(path, 0) for path in paths)}",
-                )
-                for packet_id, paths in packet_paths.items()
-            )
-        )
-
-    @staticmethod
-    def _packet_timestamp(packet: object) -> datetime:
-        raw = getattr(packet, "updated_at", None)
-        if not raw:
-            return datetime.min.replace(tzinfo=UTC)
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return datetime.min.replace(tzinfo=UTC)
-
-    def _enforce_final_gate_receipt(self, repo: Path) -> str:
-        """Require a fresh, signed receipt for the mandatory complete
-        gate on this EXACT proven tree before any candidate publishes.
-
-        The gate's own command is bound INSIDE the attested receipt
-        document and is reported to reviewers from there, so this
-        transition validator does not restate or compare a command —
-        it only needs to prove that SOME green attested run of
-        ``candidate_gate_id`` happened on exactly this tree. It walks
-        the newest receipts for the gate (``receipt_ids_for_gate``) and
-        accepts the first that ``validate_for_tree`` reports fresh;
-        never inferred, always proven from the durable, HMAC-signed
-        ledger.
-        """
-
-        assert self._verifier is not None
-        for receipt_id in self._verifier.receipt_ids_for_gate(
-            self._candidate_gate_id
-        ):
-            valid, reason = self._verifier.validate_for_tree(
-                receipt_id, cwd=repo, gate_id=self._candidate_gate_id
-            )
-            if valid and reason == "fresh":
-                return receipt_id
-        raise EmissionBlocked(
-            "final candidate-gate receipt missing or stale: run the "
-            "mandatory complete gate through `hermes-orchestrator "
-            f"verify --gate {self._candidate_gate_id} -- <full test "
-            "command>` on this exact tree"
-        )
-
-    def _head_blob_hash(self, repo: Path, head: str, path: str) -> str:
-        """The sha256 hexdigest of ``path``'s content at ``head``, proven
-        fresh from git and comparable against the ledger's raw-byte
-        measurement.
-
-        This defers entirely to the ``head_blob`` seam
-        (:func:`_default_head_blob` unless overridden), which returns
-        the path's raw blob bytes when present, ``None`` ONLY when git
-        has positively proven the path absent at ``head``, and raises
-        :class:`EmissionBlocked` for every other outcome (repository
-        corruption, an invalid head, a timeout, or any other git
-        failure). Only a positively-proven absence maps to the ledger's
-        own ``"absent"`` sentinel; every unproven outcome propagates as
-        a raised failure and never reaches this return at all, so it
-        can never be mistaken for absence. The bytes are hashed as-is —
-        no text decoding — so this is directly comparable, byte for
-        byte, against the ledger's own raw-bytes sha256 measurement.
-        """
-
-        content = self._head_blob(repo, head, path)
-        if content is None:
-            return _ABSENT_BLOB
-        return hashlib.sha256(content).hexdigest()
 
     def _run(self, repo: Path, *args: str) -> str:
         try:

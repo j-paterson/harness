@@ -75,6 +75,7 @@ class HandoffRecord:
     document: HandoffDocument
     markdown: str
     replacement_session_id: UUID | None
+    replacement_profile_alias: str | None
     restated_next_action: str | None
     created_at: str
     updated_at: str
@@ -161,27 +162,55 @@ class HandoffService:
         handoff_id: str,
         session_id: UUID,
         restated_next_action: str,
+        *,
+        profile_alias: str,
     ) -> HandoffRecord:
-        """Record the replacement session's concrete continuation commitment."""
+        """Record the replacement session's concrete continuation commitment.
+
+        Sol correction b4b545f3 P2: the selected replacement profile is
+        persisted in the SAME durable transition as the acknowledgement, so
+        an acknowledged-but-untransferred rotation can reconstruct the exact
+        identities on recovery without reselecting capacity.
+        """
 
         next_action = restated_next_action.strip()
         if not next_action:
             raise HandoffRejected("acknowledgement must restate the next action")
+        profile = profile_alias.strip()
+        if not profile:
+            raise HandoffRejected(
+                "acknowledgement must name the selected replacement profile"
+            )
         current = self.get(handoff_id)
         if current.state == "acknowledged":
             if (
-                current.replacement_session_id == session_id
-                and current.restated_next_action == next_action
+                current.replacement_session_id != session_id
+                or current.restated_next_action != next_action
             ):
+                raise HandoffRejected("handoff was acknowledged by another session")
+            if current.replacement_profile_alias == profile:
                 return current
-            raise HandoffRejected("handoff was acknowledged by another session")
+            if current.replacement_profile_alias is not None:
+                raise HandoffRejected(
+                    "handoff was acknowledged with a different replacement "
+                    "profile"
+                )
+            # A row acknowledged before migration 0051 carries no profile:
+            # an identical re-acknowledgement backfills the identity.
+            with self._database.transaction() as connection:
+                connection.execute(
+                    "UPDATE handoffs SET replacement_profile_alias = ?, "
+                    "updated_at = ? WHERE handoff_id = ?",
+                    (profile, self._aware_now().isoformat(), handoff_id),
+                )
+            return self.get(handoff_id)
         now = self._aware_now().isoformat()
         with self._database.transaction() as connection:
             connection.execute(
                 "UPDATE handoffs SET state = 'acknowledged', "
-                "replacement_session_id = ?, restated_next_action = ?, "
-                "updated_at = ? WHERE handoff_id = ?",
-                (str(session_id), next_action, now, handoff_id),
+                "replacement_session_id = ?, replacement_profile_alias = ?, "
+                "restated_next_action = ?, updated_at = ? WHERE handoff_id = ?",
+                (str(session_id), profile, next_action, now, handoff_id),
             )
         return self.get(handoff_id)
 
@@ -195,6 +224,7 @@ class HandoffService:
         if row is None:
             raise KeyError(handoff_id)
         replacement = row["replacement_session_id"]
+        replacement_profile = row["replacement_profile_alias"]
         return HandoffRecord(
             handoff_id=str(row["handoff_id"]),
             cell_id=str(row["cell_id"]),
@@ -202,6 +232,9 @@ class HandoffService:
             document=HandoffDocument.model_validate_json(row["document_json"]),
             markdown=str(row["markdown"]),
             replacement_session_id=(UUID(str(replacement)) if replacement else None),
+            replacement_profile_alias=(
+                str(replacement_profile) if replacement_profile else None
+            ),
             restated_next_action=row["restated_next_action"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +16,19 @@ from hermes_orchestrator.cmux import (
     CmuxSurfaceRef,
     CmuxUnavailable,
 )
+from hermes_orchestrator.cmux_surfaces import (
+    _CLASSIC_COMMAND,
+    CHANNEL_ENTRY,
+    FAKECHAT_CHANNEL_ENTRY,
+    SKIP_PERMISSIONS_FLAG,
+    CmuxLeadSeater,
+    CmuxSurfaceBindings,
+    classic_fakechat_command,
+    classic_resume_command,
+)
+from hermes_orchestrator.control_operations import ControlOperations
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventStore
 
 WORKSPACE = "11111111-2222-4333-8444-555555555555"
 SURFACE = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -519,3 +534,415 @@ async def test_everything_outside_the_signal_grammar_is_refused(
     assert factory.calls == []
     with pytest.raises(ValueError, match="not allow-listed"):
         await port._run("send")
+
+
+# ---------------------------------------------------------------------------
+# T2 (INFRA-197 v5.1 amendment): the channel-trust gate's bounded read-screen
+# and single-Enter confirmation, per decision
+# infra-197-trusted-channel-auto-approval-20260830-v1.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_screen_builds_exact_argv_and_returns_output() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"pane text here\n")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    output = await port.read_screen(ref, lines=42)
+
+    assert output == "pane text here\n"
+    assert factory.calls[0][0] == (
+        "/apps/cmux",
+        "read-screen",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        "--lines",
+        "42",
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_screen_default_lines_is_sixty() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.read_screen(ref)
+
+    assert factory.calls[0][0][-1] == "60"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_lines", [0, -1, -60, 2001, 10_000])
+async def test_read_screen_bounds_refuse_before_any_subprocess(
+    bad_lines: int,
+) -> None:
+    factory = FakeFactory()
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    with pytest.raises(ValueError, match="positive int"):
+        await port.read_screen(ref, lines=bad_lines)
+
+    # Refusal happens before any external effect.
+    assert factory.calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_screen_at_the_upper_bound_is_accepted() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.read_screen(ref, lines=2000)
+
+    assert factory.calls[0][0][-1] == "2000"
+
+
+@pytest.mark.asyncio
+async def test_read_screen_targets_only_the_exact_ref_given() -> None:
+    other_workspace = "77777777-7777-4777-8777-777777777777"
+    other_surface = "77777777-7777-4777-8777-888888888888"
+    factory = FakeFactory(results=[FakeProcess(stdout=b"")])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(
+        workspace_uuid=other_workspace, surface_uuid=other_surface
+    )
+
+    await port.read_screen(ref)
+
+    argv = factory.calls[0][0]
+    assert WORKSPACE not in argv and SURFACE not in argv
+    assert other_workspace in argv and other_surface in argv
+
+
+@pytest.mark.asyncio
+async def test_confirm_channel_dialog_sends_exactly_one_enter() -> None:
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.confirm_channel_dialog(ref)
+
+    assert len(factory.calls) == 1
+    assert factory.calls[0][0] == (
+        "/apps/cmux",
+        "send-key",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        "enter",
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_channel_dialog_targets_only_the_exact_ref_given() -> None:
+    other_workspace = "77777777-7777-4777-8777-777777777777"
+    other_surface = "77777777-7777-4777-8777-888888888888"
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(
+        workspace_uuid=other_workspace, surface_uuid=other_surface
+    )
+
+    await port.confirm_channel_dialog(ref)
+
+    argv = factory.calls[0][0]
+    assert WORKSPACE not in argv and SURFACE not in argv
+    assert other_workspace in argv and other_surface in argv
+
+
+def test_confirm_channel_dialog_signature_takes_only_the_ref() -> None:
+    # The Enter key is a fixed literal inside the method, never a
+    # parameter: no caller can express any other key or any text
+    # through this method's signature.
+    signature = inspect.signature(CmuxCliAdapter.confirm_channel_dialog)
+    parameters = list(signature.parameters)
+    assert parameters == ["self", "ref"]
+    for name in parameters:
+        param = signature.parameters[name]
+        assert param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+
+
+@pytest.mark.asyncio
+async def test_screen_and_key_ops_stay_out_of_the_general_vocabulary() -> None:
+    # The general command surface (_run / _ALLOWED_COMMANDS) still
+    # rejects read-screen and send-key outright; these two bounded,
+    # fixed-shape operations are the sole exceptions, reached only
+    # through their own dedicated methods.
+    port = adapter(FakeFactory())
+
+    for forbidden in ("read-screen", "send-key"):
+        with pytest.raises(ValueError, match="not allow-listed"):
+            await port._run(forbidden)
+
+
+# ---------------------------------------------------------------------------
+# H6 (INFRA-197, Sol correction b4b545f3 v5): the fakechat seat-command
+# substitution is retired — hermes-control channel launch is the primary
+# classic-seat path. The fakechat command builder and its grammar
+# alternative survive only so legacy commands stay validate-or-refuse.
+# ---------------------------------------------------------------------------
+
+LEAD_SESSION = "99999999-9999-4999-8999-999999999999"
+ROTATED_SESSION = "88888888-8888-4888-8888-888888888888"
+LEAD_CELL = "cell-demo"
+LEAD_PROJECT = "demo"
+LEAD_PROFILE = "max-a"
+LEAD_WORKSPACE = CmuxSurfaceRef(
+    workspace_uuid="33333333-3333-4333-8333-333333333333",
+    surface_uuid="33333333-3333-4333-8333-444444444444",
+)
+ROTATED_WORKSPACE = CmuxSurfaceRef(
+    workspace_uuid="66666666-6666-4666-8666-666666666666",
+    surface_uuid="66666666-6666-4666-8666-777777777777",
+)
+
+
+@dataclass
+class FakeSeaterPort:
+    """Minimal fake CmuxControlPort sufficient to drive CmuxLeadSeater
+    through a single fresh-seat activation (no reconciliation surfaces)."""
+
+    next_refs: list[CmuxSurfaceRef] = field(default_factory=list)
+    live: set[CmuxSurfaceRef] = field(default_factory=set)
+    created: list[dict[str, object]] = field(default_factory=list)
+    resumes: list[tuple[CmuxSurfaceRef, str]] = field(default_factory=list)
+    closed: list[str] = field(default_factory=list)
+
+    async def ping(self) -> None:
+        return None
+
+    async def create_workspace(
+        self,
+        *,
+        title: str,
+        cwd: Path,
+        command: str | None = None,
+        env: dict[str, str] | None = None,
+        resolve_marker: str | None = None,
+    ) -> CmuxSurfaceRef:
+        self.created.append(
+            {"title": title, "cwd": cwd, "command": command, "env": env}
+        )
+        ref = self.next_refs.pop(0)
+        self.live.add(ref)
+        return ref
+
+    async def live_workspace_uuids(self) -> frozenset[str]:
+        return frozenset(ref.workspace_uuid for ref in self.live)
+
+    async def surface_alive(self, ref: CmuxSurfaceRef) -> bool:
+        return ref in self.live
+
+    async def close_workspace(self, workspace_uuid: str) -> None:
+        self.closed.append(workspace_uuid)
+        self.live = {
+            ref for ref in self.live if ref.workspace_uuid != workspace_uuid
+        }
+
+    async def set_surface_resume(self, ref: CmuxSurfaceRef, command: str) -> None:
+        self.resumes.append((ref, command))
+
+    async def set_status(self, workspace_uuid: str, key: str, value: str) -> None:
+        return None
+
+    async def rename_workspace(self, workspace_uuid: str, title: str) -> None:
+        return None
+
+    async def find_workspace_uuids(self, *, title_marker: str) -> frozenset[str]:
+        raise NotImplementedError(
+            "these tests never exercise reconciliation or residual/"
+            "pending-intent resolution"
+        )
+
+
+class FakeProfileDirs:
+    def __init__(self, dirs: dict[str, Path]) -> None:
+        self._dirs = dirs
+
+    def config_dir(self, alias: str) -> Path:
+        return self._dirs[alias]
+
+
+class FakeChannelLaunch:
+    """Records dev-channel launch-material generation and retirement."""
+
+    def __init__(self, config: Path | None = None) -> None:
+        self.config = config
+        self.generated: list[dict[str, object]] = []
+        self.cleaned: list[str] = []
+
+    def generate(self, **kwargs: object) -> Path:
+        self.generated.append(kwargs)
+        assert self.config is not None
+        return self.config
+
+    def cleanup(self, session_id: str) -> None:
+        self.cleaned.append(session_id)
+
+
+@pytest.fixture
+def seater_database(tmp_path: Path) -> Iterator[Database]:
+    value = Database.open(tmp_path / "seater-state.db")
+    try:
+        yield value
+    finally:
+        value.close()
+
+
+@pytest.fixture
+def seater_bindings(seater_database: Database) -> CmuxSurfaceBindings:
+    counter = iter(range(1, 100))
+    return CmuxSurfaceBindings(
+        database=seater_database,
+        events=EventStore(seater_database),
+        ids=lambda: f"binding-{next(counter)}",
+    )
+
+
+def make_seater(
+    bindings: CmuxSurfaceBindings,
+    port: FakeSeaterPort,
+    *,
+    channel_launch: FakeChannelLaunch | None = None,
+    control: ControlOperations | None = None,
+) -> CmuxLeadSeater:
+    return CmuxLeadSeater(
+        bindings=bindings,
+        port=port,
+        project_paths={LEAD_PROJECT: Path("/repos/demo")},
+        profile_dirs=FakeProfileDirs({LEAD_PROFILE: Path("/profiles/max-a")}),
+        channel_launch=channel_launch,
+        control=control,
+    )
+
+
+def test_classic_fakechat_command_is_exact_and_grammar_bound() -> None:
+    command = classic_fakechat_command(LEAD_SESSION, resume=True)
+
+    assert command == (
+        f"claude --resume {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
+        f"--channels {FAKECHAT_CHANNEL_ENTRY}"
+    )
+    assert _CLASSIC_COMMAND.fullmatch(command) is not None
+
+
+def test_classic_fakechat_command_canonicalizes_the_session_uuid() -> None:
+    command = classic_fakechat_command(LEAD_SESSION.upper(), resume=False)
+
+    assert command == (
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
+        f"--channels {FAKECHAT_CHANNEL_ENTRY}"
+    )
+    with pytest.raises(ValueError):
+        classic_fakechat_command("not-a-uuid", resume=True)
+
+
+def test_classic_fakechat_grammar_rejects_anything_extra() -> None:
+    base = classic_fakechat_command(LEAD_SESSION, resume=True)
+    other_plugin = base.replace(
+        FAKECHAT_CHANNEL_ENTRY, "plugin:other@claude-plugins-official"
+    )
+
+    for rogue in (
+        base + " --extra flag",
+        other_plugin,
+        base + f" --channels {FAKECHAT_CHANNEL_ENTRY}",
+        base + "; rm -rf /",
+        base.replace("claude ", "bash -c 'claude '"),
+        # The fixed flag cannot be dropped, duplicated, or displaced —
+        # a caller-supplied command missing it (the pre-INFRA-197 shape)
+        # or repeating it must fail closed too.
+        base.replace(f" {SKIP_PERMISSIONS_FLAG}", ""),
+        base.replace(
+            f" {SKIP_PERMISSIONS_FLAG}",
+            f" {SKIP_PERMISSIONS_FLAG} {SKIP_PERMISSIONS_FLAG}",
+        ),
+        (
+            f"claude --resume {LEAD_SESSION} "
+            f"--channels {FAKECHAT_CHANNEL_ENTRY} {SKIP_PERMISSIONS_FLAG}"
+        ),
+    ):
+        assert _CLASSIC_COMMAND.fullmatch(rogue) is None
+
+
+def test_classic_resume_command_carries_the_fixed_flag_before_extensions() -> None:
+    # INFRA-197 operator decision
+    # infra-197-managed-claude-skip-permissions-20260830-v1: every
+    # Hermes-managed classic launch carries the fixed flag, positioned
+    # immediately after the UUID so every extension built on top of the
+    # builder inherits it by construction.
+    assert classic_resume_command(LEAD_SESSION, resume=True) == (
+        f"claude --resume {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}"
+    )
+    assert classic_resume_command(LEAD_SESSION, resume=False) == (
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}"
+    )
+    assert _CLASSIC_COMMAND.fullmatch(
+        classic_resume_command(LEAD_SESSION, resume=True)
+    ) is not None
+    # No caller input reaches this builder except the session id
+    # (already required to parse as a UUID); the flag itself is never a
+    # parameter, so nothing expressible through this function's
+    # signature can change, remove, or duplicate it.
+    assert "resume" not in SKIP_PERMISSIONS_FLAG
+
+
+def test_classic_command_without_the_fixed_flag_no_longer_validates() -> None:
+    # The pre-INFRA-197 shape (no flag at all) must be refused now that
+    # the grammar requires it.
+    for legacy in (
+        f"claude --resume {LEAD_SESSION}",
+        f"claude --session-id {LEAD_SESSION}",
+        f"claude --resume {LEAD_SESSION} --channels {FAKECHAT_CHANNEL_ENTRY}",
+    ):
+        assert _CLASSIC_COMMAND.fullmatch(legacy) is None
+
+
+def test_seater_accepts_no_fakechat_signal_ports_collaborator() -> None:
+    """Sol correction b4b545f3 (v5): the seat-command substitution is
+    structurally gone — CmuxLeadSeater exposes no signal_ports port
+    source, so no composition can ever re-enable the fakechat form."""
+
+    parameters = inspect.signature(CmuxLeadSeater.__init__).parameters
+    assert "signal_ports" not in parameters
+    assert "channel_launch" in parameters
+
+
+@pytest.mark.asyncio
+async def test_channel_launch_is_the_primary_classic_seat_path(
+    seater_bindings: CmuxSurfaceBindings,
+) -> None:
+    # v5: the hermes-control channel launch is the primary path for a
+    # composed classic seat; nothing fakechat-shaped rides along.
+    port = FakeSeaterPort(next_refs=[LEAD_WORKSPACE])
+    channel_launch = FakeChannelLaunch(
+        config=Path(f"/state/channels/{LEAD_SESSION}.mcp.json")
+    )
+    ensure = make_seater(seater_bindings, port, channel_launch=channel_launch)
+
+    seat = await ensure.ensure(
+        project_key=LEAD_PROJECT,
+        cell_id=LEAD_CELL,
+        session_id=LEAD_SESSION,
+        profile_alias=LEAD_PROFILE,
+        classic_command=f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG}",
+    )
+
+    assert seat is not None
+    [created] = port.created
+    assert created["command"] == (
+        f"claude --session-id {LEAD_SESSION} {SKIP_PERMISSIONS_FLAG} "
+        f"--mcp-config /state/channels/{LEAD_SESSION}.mcp.json "
+        f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
+    )
+    assert "fakechat" not in str(created["command"])
+    assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
