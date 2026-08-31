@@ -192,6 +192,19 @@ class RecordDirectExceptionCommand(_Command):
     worktree: str | None = None
 
 
+class RequireAcceptanceCommand(_Command):
+    intent: Literal["require_acceptance"]
+    issue_id: NonEmptyText
+    instruction_id: NonEmptyText
+    predicates: list[NonEmptyText] = Field(min_length=1)
+
+
+class SatisfyAcceptanceCommand(_Command):
+    intent: Literal["satisfy_acceptance"]
+    issue_id: NonEmptyText
+    evidence: dict[NonEmptyText, NonEmptyText] = Field(min_length=1)
+
+
 class ApplyOperatorDecisionCommand(_Command):
     """The only event shape that may resolve a pending decision.
 
@@ -230,7 +243,9 @@ HermesCommand = Annotated[
     | CreatePacketCommand
     | AcceptPacketCommand
     | RejectPacketCommand
-    | RecordDirectExceptionCommand,
+    | RecordDirectExceptionCommand
+    | RequireAcceptanceCommand
+    | SatisfyAcceptanceCommand,
     Field(discriminator="intent"),
 ]
 
@@ -263,6 +278,8 @@ _ALLOWED_INTENTS = frozenset(
         "accept_packet",
         "reject_packet",
         "record_direct_exception",
+        "require_acceptance",
+        "satisfy_acceptance",
     }
 )
 

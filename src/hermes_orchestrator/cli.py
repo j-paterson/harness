@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
+from hermes_orchestrator.acceptance import AcceptanceGates
 from hermes_orchestrator.cells import ProfileCapacityEvidence, ProjectCellService
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
@@ -65,6 +66,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeDelivery,
     LeadWakeReconciler,
 )
+from hermes_orchestrator.linear import LinearProjection, ProjectLinearRouter
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
 from hermes_orchestrator.merger_session import MergerSession
 from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
@@ -957,6 +959,33 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
     )
 
 
+def _open_acceptance_linear(settings: Any, runtime: Runtime) -> ProjectLinearRouter:
+    """Compose only the Linear projector ``satisfy_acceptance`` needs.
+
+    INFRA-198 J2: satisfying an acceptance gate still must project the
+    completed issue through Linear's exact idempotent effect path — the
+    same :class:`~hermes_orchestrator.linear.ExternalEffectStore`-backed
+    ``project()`` every merge settlement already uses, so a replayed
+    ``satisfy_acceptance`` call produces no duplicate Linear effect.
+    Unlike ``_open_merge_flow`` it never opens the rest of the merge
+    graph (GitHub, CircleCI, the Codex RPC client): those collaborators
+    would cost extra Keychain reads and process wiring this single
+    status projection never touches, so composing the full merge flow
+    here would be disproportionate. This builds a fresh router from the
+    same validated per-project routing config and Keychain token the
+    daemon uses; a fresh object is safe every call because the effect's
+    idempotency lives in the durable ``external_effects`` table, keyed
+    by ``effect_id``, not in this object's identity.
+    """
+
+    return build_linear_router(
+        settings,
+        database=runtime.database,
+        queue=runtime.queue,
+        keychain=Keychain(),
+    )
+
+
 ROTATION_REGISTRATION_WAIT_SECONDS = 60.0
 """How long ``rotate-lead`` waits for the replacement session's active
 hermes-control channel registration before reporting the rotation
@@ -1438,6 +1467,46 @@ def _hermes_handlers(
             "reason": outcome.reason,
         }
 
+    def require_acceptance(command: Any) -> dict[str, Any]:
+        # The gate binds an instruction to a queued issue; an issue that
+        # was never admitted has nothing to hold, so this refuses before
+        # touching the acceptance table (KeyError -> "rejected", the
+        # same idiom every other unknown-issue refusal here uses).
+        runtime.queue.get(command.issue_id)
+        acceptance = AcceptanceGates(
+            runtime.database, events=EventStore(runtime.database)
+        )
+        gate = acceptance.require(
+            command.issue_id,
+            instruction_id=command.instruction_id,
+            predicates=command.predicates,
+        )
+        return gate.as_dict()
+
+    def satisfy_acceptance(command: Any) -> dict[str, Any]:
+        acceptance = AcceptanceGates(
+            runtime.database, events=EventStore(runtime.database)
+        )
+        gate = acceptance.satisfy(command.issue_id, evidence=command.evidence)
+        runtime.queue.transition(
+            command.issue_id,
+            IssueState.DONE,
+            actor="operator_acceptance",
+            reason=f"acceptance satisfied for instruction {gate.instruction_id}",
+        )
+        linear = _open_acceptance_linear(settings, runtime)
+        asyncio.run(
+            linear.project(
+                command.issue_id,
+                LinearProjection(status="Done", assignee_alias="operator"),
+                effect_id=(
+                    f"linear:{command.issue_id}:acceptance-satisfied:"
+                    f"{gate.instruction_id}"
+                ),
+            )
+        )
+        return gate.as_dict()
+
     playbooks = PlaybookService(
         runtime.database,
         EventStore(runtime.database),
@@ -1607,6 +1676,8 @@ def _hermes_handlers(
         "accept_packet": accept_packet,
         "reject_packet": reject_packet,
         "record_direct_exception": record_direct_exception,
+        "require_acceptance": require_acceptance,
+        "satisfy_acceptance": satisfy_acceptance,
     }
 
 

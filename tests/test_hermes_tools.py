@@ -483,3 +483,142 @@ def test_packet_intents_without_handlers_are_unavailable(
     ):
         result = command_service.execute({"intent": intent, **payload})
         assert result.code == "intent_unavailable", intent
+
+
+def test_acceptance_intents_are_strict_and_routed(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def required(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"issue_id": command.issue_id, "state": "pending"}
+
+    def satisfied(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"issue_id": command.issue_id, "state": "satisfied"}
+
+    service = HermesCommandService(
+        queue,
+        handlers={"require_acceptance": required, "satisfy_acceptance": satisfied},
+    )
+
+    require_result = service.execute(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": ["tests pass"],
+        }
+    )
+    assert require_result.code == "accepted"
+    assert require_result.state == {"issue_id": "ENG-9", "state": "pending"}
+    assert seen[0].predicates == ["tests pass"]
+
+    satisfy_result = service.execute(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": {"tests pass": "pytest output attached"},
+        }
+    )
+    assert satisfy_result.code == "accepted"
+    assert satisfy_result.state == {"issue_id": "ENG-9", "state": "satisfied"}
+    assert seen[1].evidence == {"tests pass": "pytest output attached"}
+
+    invalid_require_empty = service.execute(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": [],
+        }
+    )
+    assert invalid_require_empty.code == "invalid_command"
+
+    invalid_require_blank = service.execute(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": [""],
+        }
+    )
+    assert invalid_require_blank.code == "invalid_command"
+
+    invalid_satisfy_empty = service.execute(
+        {"intent": "satisfy_acceptance", "issue_id": "ENG-9", "evidence": {}}
+    )
+    assert invalid_satisfy_empty.code == "invalid_command"
+
+    invalid_satisfy_blank = service.execute(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": {"tests pass": ""},
+        }
+    )
+    assert invalid_satisfy_blank.code == "invalid_command"
+
+
+def test_acceptance_conflict_surfaces_as_a_rejection(database: Database) -> None:
+    from hermes_orchestrator.acceptance import AcceptanceGateConflict
+
+    queue = QueueService(database, EventStore(database), {"demo"})
+
+    def refusing(command: object) -> dict[str, object]:
+        raise AcceptanceGateConflict(
+            f"acceptance gate for {command.issue_id} is already satisfied; "
+            "it cannot be re-required"
+        )
+
+    service = HermesCommandService(queue, handlers={"require_acceptance": refusing})
+    result = service.execute(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": ["tests pass"],
+        }
+    )
+    assert result.code == "rejected"
+    assert "already satisfied" in str(result.state["reason"])
+
+
+def test_acceptance_intents_without_handlers_are_unavailable(
+    command_service: HermesCommandService,
+) -> None:
+    missing_require = command_service.execute(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": ["tests pass"],
+        }
+    )
+    assert missing_require.code == "intent_unavailable"
+
+    missing_satisfy = command_service.execute(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": {"tests pass": "evidence"},
+        }
+    )
+    assert missing_satisfy.code == "intent_unavailable"
+
+
+def test_supports_reflects_acceptance_intents(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    bare = HermesCommandService(queue)
+    assert not bare.supports("require_acceptance")
+    assert not bare.supports("satisfy_acceptance")
+
+    wired = HermesCommandService(
+        queue,
+        handlers={
+            "require_acceptance": lambda c: {},
+            "satisfy_acceptance": lambda c: {},
+        },
+    )
+    assert wired.supports("require_acceptance")
+    assert wired.supports("satisfy_acceptance")

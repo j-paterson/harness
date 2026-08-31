@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -3565,3 +3566,221 @@ def test_channel_trust_confirm_capture_fails_closed_on_extra_displayed_channel(
         "operator-recorded normalized structure" in payload["error"]
     )
     assert calls == []
+
+
+# INFRA-198 J2 (acceptance-completion policy root fix): require_acceptance
+# and satisfy_acceptance drive the durable acceptance gate from strict
+# hermes-command intents. satisfy_acceptance's Linear projection must go
+# through the same idempotent external-effect machinery every merge
+# settlement uses, so these tests stand in for the live Linear router
+# with a fake that is itself backed by the real ExternalEffectStore —
+# faithfully reproducing the read-before-write contract
+# ``LinearClient.project`` uses in production, so "recorded exactly
+# once" is proven against the real durable table, not just a call count.
+class _RecordingAcceptanceLinear:
+    def __init__(self, effects: Any) -> None:
+        self._effects = effects
+        self.calls: list[str] = []
+
+    async def project(self, issue_id: str, target: Any, effect_id: str) -> object:
+        effect = self._effects.get(effect_id)
+        if effect is not None and effect.state == "completed":
+            return effect.response
+        self._effects.begin(
+            effect_id,
+            target=issue_id,
+            request={
+                "issue_id": issue_id,
+                "target": target.model_dump(mode="json"),
+            },
+        )
+        self.calls.append(effect_id)
+        return self._effects.complete(
+            effect_id, {"issue_id": issue_id, "changed_fields": ["status"]}
+        )
+
+
+def test_hermes_command_require_then_satisfy_acceptance_completes_the_issue(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.linear import ExternalEffectStore
+    from hermes_orchestrator.queue import QueueService
+
+    _repo_root, state_dir = configured_repo
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+
+    def command(payload: dict[str, object]) -> dict[str, object]:
+        result = invoke(
+            [
+                *base_arguments(configured_repo),
+                "hermes-command",
+                "--json",
+                json.dumps(payload),
+            ]
+        )
+        assert result.exit_code == 0, result.output
+        return json.loads(result.stdout)
+
+    require = command(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": ["tests pass", "docs updated"],
+        }
+    )
+    assert require["code"] == "accepted"
+    assert require["state"]["state"] == "pending"
+    assert require["state"]["predicates"] == ["tests pass", "docs updated"]
+
+    database = Database.open(state_dir / "state.db")
+    effects = ExternalEffectStore(database)
+    linear = _RecordingAcceptanceLinear(effects)
+    monkeypatch.setattr(
+        cli_module, "_open_acceptance_linear", lambda settings, runtime: linear
+    )
+    queue = QueueService(database, EventStore(database), {"demo"})
+
+    partial = command(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": {"tests pass": "pytest output attached"},
+        }
+    )
+    assert partial["code"] == "rejected"
+    assert "missing" in str(partial["state"]["reason"])
+    assert linear.calls == []
+    assert queue.get("ENG-9").state.value == "queued"
+
+    still_pending = command(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": ["tests pass", "docs updated"],
+        }
+    )
+    assert still_pending["code"] == "accepted"
+    assert still_pending["state"]["state"] == "pending"
+
+    full_evidence = {
+        "tests pass": "pytest output attached",
+        "docs updated": "README diff attached",
+    }
+    satisfied = command(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": full_evidence,
+        }
+    )
+    assert satisfied["code"] == "accepted", satisfied
+    assert satisfied["state"]["state"] == "satisfied"
+    assert satisfied["state"]["evidence"] == full_evidence
+    assert queue.get("ENG-9").state.value == "done"
+    assert len(linear.calls) == 1
+    effect_id = linear.calls[0]
+
+    replay = command(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": full_evidence,
+        }
+    )
+    assert replay["code"] == "accepted"
+    assert replay["state"]["evidence"] == full_evidence
+    assert queue.get("ENG-9").state.value == "done"
+    # Replay-safe: no duplicate queue transition event and no duplicate
+    # Linear effect for the same effect id.
+    assert linear.calls == [effect_id]
+
+    require_after_satisfied = command(
+        {
+            "intent": "require_acceptance",
+            "issue_id": "ENG-9",
+            "instruction_id": "chat-9",
+            "predicates": ["tests pass", "docs updated"],
+        }
+    )
+    assert require_after_satisfied["code"] == "rejected"
+    assert "already satisfied" in str(require_after_satisfied["state"]["reason"])
+
+    database.close()
+
+
+def test_hermes_command_require_acceptance_refuses_unknown_issue(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "require_acceptance",
+                    "issue_id": "ENG-404",
+                    "instruction_id": "chat-404",
+                    "predicates": ["tests pass"],
+                }
+            ),
+        ]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "rejected"
+
+
+def test_hermes_command_satisfy_acceptance_refuses_without_a_gate(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "satisfy_acceptance",
+                    "issue_id": "ENG-9",
+                    "evidence": {"tests pass": "pytest output"},
+                }
+            ),
+        ]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "rejected"
