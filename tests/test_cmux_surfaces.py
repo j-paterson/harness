@@ -2763,6 +2763,11 @@ class TestReconcilerChannelTrust:
         [lost_id] = report.lost
         assert bindings.get(lost_id).state == "lost"
         assert bindings.active_lead("cell-demo") is None
+        # No stale classic-seat evidence survives an unproven
+        # confirmation, and the exact replacement workspace — never the
+        # dead predecessor's — is closed through the port.
+        assert bindings.is_classic(lost_id, SESSION) is False
+        assert port.closed == [FRESH.workspace_uuid]
         # The trust trigger saw the exact successor binding — the new
         # surface, not the dead predecessor's.
         [seen] = trigger.calls
@@ -2796,8 +2801,10 @@ class TestReconcilerChannelTrust:
         ).reconcile()
 
         assert report.replaced == ()
-        assert len(report.lost) == 1
+        [lost_id] = report.lost
         assert bindings.active_lead("cell-demo") is None
+        assert bindings.is_classic(lost_id, SESSION) is False
+        assert port.closed == [FRESH.workspace_uuid]
         [receipt] = control.pending_for_session(SESSION)
         assert receipt.kind == "channel.blocked"
         assert receipt.result["trigger_error"] == "watcher exploded"
@@ -2836,9 +2843,11 @@ class TestReconcilerChannelTrust:
         ).reconcile()
 
         assert report.replaced == ()
-        assert len(report.lost) == 1
+        [lost_id] = report.lost
         assert bindings.active_lead("cell-demo") is None
         assert port.confirmed == []
+        assert bindings.is_classic(lost_id, SESSION) is False
+        assert port.closed == [FRESH.workspace_uuid]
         # The gate's own refusal receipt still records; the reconciler
         # adds its own seat-level channel.blocked receipt on top.
         assert "channel.approval_required" in control_operation_kinds(database)
@@ -2867,11 +2876,122 @@ class TestReconcilerChannelTrust:
         ).reconcile()
 
         assert report.replaced == ()
-        assert len(report.lost) == 1
+        [lost_id] = report.lost
         assert bindings.active_lead("cell-demo") is None
+        assert bindings.is_classic(lost_id, SESSION) is False
+        assert port.closed == [FRESH.workspace_uuid]
         [receipt] = control.pending_for_session(SESSION)
         assert receipt.kind == "channel.blocked"
         assert "CHANNEL TRUST UNCONFIRMED" in str(receipt.reason)
+
+    @pytest.mark.asyncio
+    async def test_classic_evidence_is_recorded_only_after_a_confirmed_verdict(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+    ) -> None:
+        """Sol correction 57c46faa (packet 2): classic evidence must
+        never exist before the trust trigger returns a confirmed
+        verdict — recording it up front would let a failed or
+        unproven confirmation leave stale classic evidence behind."""
+
+        bind_demo_lead(bindings)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(next_refs=[FRESH])
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        observed: dict[str, object] = {}
+
+        class OrderingTrigger:
+            async def confirm_seat(self, binding: object) -> TrustVerdict:
+                # The successor is already the active binding by the
+                # time trust is checked, but classic evidence must not
+                # exist yet.
+                observed["binding_id"] = binding.binding_id
+                observed["active_before_confirm"] = (
+                    bindings.active_lead("cell-demo").binding_id
+                    == binding.binding_id
+                )
+                observed["classic_before_confirm"] = bindings.is_classic(
+                    binding.binding_id, SESSION
+                )
+                return TrustVerdict(confirmed=True, anchor_id="anchor-1")
+
+        report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=OrderingTrigger(),
+        ).reconcile()
+
+        successor_id = observed["binding_id"]
+        assert report.replaced == (successor_id,)
+        assert observed["active_before_confirm"] is True
+        assert observed["classic_before_confirm"] is False
+        assert bindings.is_classic(successor_id, SESSION) is True
+        assert bindings.get(successor_id).state == "active"
+
+    @pytest.mark.asyncio
+    async def test_a_workspace_closure_failure_retains_residual_ownership(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+    ) -> None:
+        """When trust is unconfirmed AND the compensated close cannot
+        be confirmed either, the binding must not be marked lost
+        outright — it is held as residual ownership evidence, exposing
+        no active or classic seat, until a later reconciliation pass
+        reclaims the exact surface."""
+
+        bind_demo_lead(bindings)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(
+            next_refs=[FRESH],
+            fail={"close_workspace": CmuxUnavailable("cmux socket busy")},
+        )
+        launch = FakeChannelLaunch(
+            config=Path(f"/state/channels/{SESSION}.mcp.json")
+        )
+        trigger = FakeTrustTrigger()  # always returns None (unconfirmed)
+
+        report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=trigger,
+        ).reconcile()
+
+        assert report.replaced == ()
+        assert report.lost == ()
+        assert bindings.active_lead("cell-demo") is None
+        [seen] = trigger.calls
+        successor_id = seen.binding_id
+        successor = bindings.get(successor_id)
+        assert successor.state == "residual"
+        assert successor.ref == FRESH
+        assert bindings.is_classic(successor_id, SESSION) is False
+        # The close was attempted but never confirmed — the workspace
+        # is not recorded closed.
+        assert port.closed == []
+
+        # A later reconciliation pass, once cmux can confirm the close,
+        # reclaims the exact residual surface instead of leaking it.
+        port.fail.pop("close_workspace")
+        port.live.add(FRESH)
+        second_report = await reconciler(
+            bindings,
+            port,
+            channel_launch=launch,
+            control=control,
+            channel_trust=FakeTrustTrigger(),
+        ).reconcile()
+
+        assert successor_id in second_report.reclaimed
+        assert bindings.get(successor_id).state == "closed"
+        assert port.closed == [FRESH.workspace_uuid]
 
     @pytest.mark.asyncio
     async def test_normal_seating_and_restart_recovery_bind_identical_identity(

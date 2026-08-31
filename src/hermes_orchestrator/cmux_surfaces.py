@@ -969,6 +969,18 @@ class CmuxSurfaceReconciler:
     resolves it. A reconciler composed with a launcher but no
     ``channel_trust`` trigger can never obtain that proof either, so it
     fails exactly the same way.
+
+    Sol correction 57c46faa (packet 2): the successor's classic-seat
+    evidence (``cmux_classic_seats``) is written only once a confirmed
+    verdict actually comes back — never up front — and a failed or
+    unproven confirmation closes the exact newly created workspace
+    through the same compensated-closure lifecycle used elsewhere in
+    this module before the binding is marked lost, so a failed or
+    unproven trust decision can never leave stale classic evidence or
+    an unowned live cmux surface behind. When cmux cannot confirm that
+    close, the binding is held as residual ownership evidence instead
+    of being marked lost outright, so the exact surface is reclaimed by
+    a later reconciliation pass rather than leaked.
     """
 
     def __init__(
@@ -1188,10 +1200,19 @@ class CmuxSurfaceReconciler:
             replace_reason="surface_missing",
             command=command,
         )
-        # The classic-seat evidence the lead-intake transport and the
-        # channel hub both require, recorded exactly as normal seating
-        # records it.
-        self._bindings.record_classic(successor.binding_id, session_id)
+        # Sol correction 57c46faa (packet 2): classic evidence is
+        # deferred until trust is actually confirmed. Recording it
+        # up front (as normal seating does) let a failed or unproven
+        # confirmation leave a stale ``cmux_classic_seats`` row behind
+        # for a seat whose active ownership was about to be
+        # relinquished. Deferring cannot deadlock the sidecar's
+        # registration: the development channel — and therefore the
+        # sidecar that registers over it — only actually loads once
+        # this exact gate presses Enter on the dialog, which is the
+        # same synchronous call whose confirmed return is required
+        # below before classic evidence is written; no registration
+        # can arrive first.
+        #
         # Sol correction c5600e31: restart recovery fails closed on
         # trust — see the class docstring for the exact contract.
         # ``confirm_seat`` runs the same bounded watch-then-gate path
@@ -1210,15 +1231,42 @@ class CmuxSurfaceReconciler:
         except Exception as error:
             trust_error = str(error)[:200]
         if verdict is not None and verdict.confirmed:
+            # The classic-seat evidence the lead-intake transport and
+            # the channel hub both require, recorded exactly as normal
+            # seating records it — but only now that trust is actually
+            # proven, never before.
+            self._bindings.record_classic(successor.binding_id, session_id)
             replaced.append(successor.binding_id)
             return
         # Unconfirmed, refused, ambiguous, or never-attempted: durable
-        # state may not call this seat usable. The gate itself already
-        # records its own receipt for a refusal it actually reached
-        # (e.g. ``channel.approval_required``); this receipt is the
-        # seat-level record that restart recovery could not hand off a
-        # usable lead, covering the timeout/no-trigger cases the gate
-        # never sees too.
+        # state may not call this seat usable, and no classic evidence
+        # was ever written for it. The exact newly created workspace is
+        # closed through the same compensated-closure lifecycle used
+        # elsewhere in this module (``_release_pending_seat``) so a
+        # failed or unproven trust decision never leaves an unowned
+        # live cmux surface behind: only once cmux confirms the close
+        # is the binding marked lost. When the close itself cannot be
+        # confirmed, the binding is held as residual ownership evidence
+        # instead — never active, never classic — so a later
+        # reconciliation pass (``_reclaim_residuals``) reclaims the
+        # exact surface rather than leaking it.
+        try:
+            await self._port.close_workspace(successor.workspace_uuid)
+        except CmuxError:
+            self._bindings.mark_residual(
+                successor.binding_id,
+                reason="channel_trust_unconfirmed_close_uncertain",
+            )
+        else:
+            self._bindings.mark_lost(
+                successor.binding_id, reason="channel_trust_unconfirmed"
+            )
+            lost.append(successor.binding_id)
+        # The gate itself already records its own receipt for a refusal
+        # it actually reached (e.g. ``channel.approval_required``); this
+        # receipt is the seat-level record that restart recovery could
+        # not hand off a usable lead, covering the timeout/no-trigger/
+        # closure-ambiguous cases the gate never sees too.
         if self._control is not None:
             with suppress(Exception):
                 self._control.record(
@@ -1246,10 +1294,6 @@ class CmuxSurfaceReconciler:
                         "cell"
                     ),
                 )
-        self._bindings.mark_lost(
-            successor.binding_id, reason="channel_trust_unconfirmed"
-        )
-        lost.append(successor.binding_id)
 
 
 async def _activate_lead_seat(
