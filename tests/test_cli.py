@@ -2821,7 +2821,8 @@ class _IdleLinear:
         on_project: object = None,
     ) -> None:
         self.validations: list[tuple[str, str]] = []
-        self.targets: list[tuple[str, str, str]] = []
+        self.targets: list[tuple[str, str | None, str]] = []
+        self.effect_ids: list[str] = []
         self._validate_error = validate_error
         self._project_error = project_error
         self._on_project = on_project
@@ -2841,6 +2842,7 @@ class _IdleLinear:
         if self._project_error is not None:
             raise self._project_error
         self.targets.append((issue_id, target.status, target.assignee_alias))
+        self.effect_ids.append(effect_id)
         result = object()
         self._completed[effect_id] = result
         return result
@@ -2965,6 +2967,60 @@ def _idle_dispatch_counts(state_dir: Path) -> tuple[int, int, str | None]:
         return started, assigned, (
             str(issue_state) if issue_state is not None else None
         )
+    finally:
+        database.close()
+
+
+def _open_idle_intents(state_dir: Path) -> tuple[object, ...]:
+    from hermes_orchestrator.cells import open_activation_intents
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        return open_activation_intents(database, "demo")
+    finally:
+        database.close()
+
+
+def _idle_event_count(state_dir: Path, event_type: str) -> int:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        return int(
+            database.scalar(
+                "SELECT count(*) FROM events WHERE event_type = ?",
+                (event_type,),
+            )
+        )
+    finally:
+        database.close()
+
+
+def _set_idle_issue_state(state_dir: Path, state: str) -> None:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE admitted_issues SET state = ? "
+                "WHERE issue_id = 'INFRA-9'",
+                (state,),
+            )
+    finally:
+        database.close()
+
+
+def _set_idle_sample_age(state_dir: Path, sampled_at: str) -> None:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE resource_samples SET sampled_at = ?", (sampled_at,)
+            )
     finally:
         database.close()
 
@@ -3104,53 +3160,129 @@ def test_intake_poll_idle_dispatch_rechecks_freshness_at_commit_time(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Freshness is proven at TWO points, not just the initial snapshot
-    (INFRA-199 Finding 2): a sample that reads fresh for candidate
-    selection but degrades to stale before the activation transaction
-    commits must still refuse dispatch, with zero local writes — even
-    though the Linear side already completed its projection."""
+    (INFRA-199 Finding 2), and a commit-time refusal after the
+    completed projection no longer strands the two systems apart (Sol
+    0453ff62): the refusal leaves a DURABLE open activation intent —
+    journaled before the projection — with zero activation writes, and
+    the very next dispatch pass converges it exactly once: the same
+    intent (same idempotent effect id) completes the activation, so
+    Linear and the queue agree afterward."""
 
     _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
 
     import hermes_orchestrator.cli as cli_module
 
-    class _StalingLinear:
-        def __init__(self) -> None:
-            self.targets: list[str] = []
+    linear = _IdleLinear()
+    compositions = {"count": 0}
 
-        async def validate(self, project_key: str, issue_id: str) -> object:
-            return object()
-
-        async def project(
-            self, issue_id: str, target: object, effect_id: str
-        ) -> object:
-            self.targets.append(issue_id)
-            return object()
-
-    linear = _StalingLinear()
-
-    def _open_and_stale(settings: object, *, database: object, queue: object) -> object:
-        # Degrade the sample the instant it is composed — well before
-        # the activation transaction's guard re-reads it — to model a
-        # sampler tick landing mid-dispatch.
-        stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-        with database.transaction() as connection:  # type: ignore[attr-defined]
-            connection.execute(
-                "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
-            )
+    def _open(settings: object, *, database: object, queue: object) -> object:
+        compositions["count"] += 1
+        if compositions["count"] == 1:
+            # Degrade the sample the instant it is composed — well
+            # before the activation transaction's guard re-reads it —
+            # to model a sampler tick landing mid-dispatch.
+            stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+            with database.transaction() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
+                )
         return linear
 
-    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open_and_stale)
+    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open)
 
-    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    first = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
-    assert result.exit_code == 0
+    assert first.exit_code == 0
     # The projection itself is not gated by capacity freshness — only
-    # local activation is — so Linear still observed the call.
-    assert linear.targets == ["INFRA-9"]
-    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
-    assert (started, assigned) == (0, 0)
-    assert issue_state == "queued"
+    # local activation is — so Linear still observed the call, and the
+    # divergence is pinned by a durable open intent, never silence.
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+    assert (
+        _idle_dispatch_counts(state_dir) == (0, 0, "queued")
+    )
+    intents = _open_idle_intents(state_dir)
+    assert [intent.issue_id for intent in intents] == ["INFRA-9"]  # type: ignore[attr-defined]
+
+    # A fresh sample lands before the next idle boundary; the next
+    # dispatch pass completes the SAME intent — no duplicate
+    # projection, one issue.started, one assignment, both sides agree.
+    _set_idle_sample_age(state_dir, datetime.now(UTC).isoformat())
+    second = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert second.exit_code == 0
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+    assert _open_idle_intents(state_dir) == ()
+    assert _idle_event_count(state_dir, "issue.activation_completed") == 1
+
+    # Any further pass is a strict no-op: convergence is exactly-once.
+    third = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert third.exit_code == 0
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+    assert _idle_event_count(state_dir, "issue.activation_completed") == 1
+
+
+def test_intake_poll_compensates_an_open_intent_for_a_held_issue(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the issue is no longer eligible after the refusal (paused —
+    an operator hold that removes it from ranking), the next dispatch
+    pass COMPENSATES instead of completing: the transition table
+    permits no In Development -> Todo reverse, so the compliant
+    compensation releases the Linear assignee back to the human
+    ("ryan") under the intent-scoped effect id, closes the intent, and
+    later passes converge nothing further."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+
+    import hermes_orchestrator.cli as cli_module
+
+    linear = _IdleLinear()
+    compositions = {"count": 0}
+
+    def _open(settings: object, *, database: object, queue: object) -> object:
+        compositions["count"] += 1
+        if compositions["count"] == 1:
+            stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+            with database.transaction() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
+                )
+        return linear
+
+    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open)
+
+    first = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert first.exit_code == 0
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+    assert _idle_dispatch_counts(state_dir) == (0, 0, "queued")
+    assert len(_open_idle_intents(state_dir)) == 1
+
+    # The operator pauses the issue before the next idle boundary.
+    _set_idle_issue_state(state_dir, "paused")
+
+    second = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert second.exit_code == 0
+    assert linear.targets == [
+        ("INFRA-9", "In Development", "operator"),
+        ("INFRA-9", None, "ryan"),
+    ]
+    assert linear.effect_ids[-1].startswith(
+        "linear:INFRA-9:activation-compensation:"
+    )
+    assert _open_idle_intents(state_dir) == ()
+    assert _idle_event_count(state_dir, "issue.activation_compensated") == 1
+    assert _idle_dispatch_counts(state_dir) == (0, 0, "paused")
+
+    # A further pass finds no open intent: no composition, no
+    # projection, no journal growth — compensation is exactly-once.
+    third = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert third.exit_code == 0
+    assert compositions["count"] == 2
+    assert len(linear.targets) == 2
+    assert _idle_event_count(state_dir, "issue.activation_compensated") == 1
 
 
 def test_intake_poll_idle_dispatch_refuses_an_unknown_linear_issue(

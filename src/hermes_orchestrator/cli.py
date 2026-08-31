@@ -2417,11 +2417,22 @@ def _dispatch_idle_lead(
     Candidate eligibility additionally requires a resource sample fresh
     enough to trust (INFRA-199 Finding 2); that freshness is checked
     once for candidate selection and rechecked inside the same atomic
-    transaction that activates the candidate, closing the race between
-    the two reads.
+    transaction that activates the candidate — which also re-proves
+    every other mutable predicate (occupancy, exact source state,
+    dependency readiness, operator decisions, cell/lease identity) at
+    commit time. Before anything else, the project's open activation
+    intents are converged through the exact sweep the daemon dispatch
+    path runs (``cells.converge_activation_intents``): an intent left
+    open by an earlier commit-time refusal or crash after its Linear
+    projection is completed or compensated here, and one that is still
+    an eligible candidate is reused by this very dispatch.
     """
 
-    from hermes_orchestrator.cells import activate_admitted_issue
+    from hermes_orchestrator.cells import (
+        activate_admitted_issue,
+        converge_activation_intents,
+        open_activation_intents,
+    )
     from hermes_orchestrator.lead_assignments import LeadAssignments
     from hermes_orchestrator.queue import QueueService
 
@@ -2434,13 +2445,31 @@ def _dispatch_idle_lead(
     if cell is None:
         return
     settings = load_settings(args.repo_root, args.state_dir)
+    project_key = str(cell["project_key"])
+    events = EventStore(database)
+    queue = QueueService(database, events, registered_projects=())
+    linear = None
+    if open_activation_intents(database, project_key):
+        # Convergence needs Linear (a compensation is a projection), so
+        # the router is composed before the capacity gate: closing an
+        # open intent must not wait for a fresh sample. A composition
+        # failure raises into the hook's suppress(Exception): fail
+        # closed, converge nothing, dispatch nothing.
+        linear = _open_idle_linear_router(settings, database=database, queue=queue)
+        asyncio.run(
+            converge_activation_intents(
+                database=database,
+                events=events,
+                linear=linear,
+                project_key=project_key,
+            )
+        )
     freshness_minutes = settings.policy.resource_sample_freshness_minutes
     max_priority = _idle_admission_priority(
         database, now=datetime.now(UTC), freshness_minutes=freshness_minutes
     )
     if max_priority is None:
         return
-    project_key = str(cell["project_key"])
     # One issue in development per project at a time: a project already
     # mid-flight on another issue never gets a second one started here.
     already_working = database.execute(
@@ -2451,8 +2480,6 @@ def _dispatch_idle_lead(
     if already_working is not None:
         return
     decisions = OperatorDecisions(database)
-    events = EventStore(database)
-    queue = QueueService(database, events, registered_projects=())
     ranked = queue.list_ranked(datetime.now(UTC))
     candidate = None
     for issue in ranked:
@@ -2471,7 +2498,10 @@ def _dispatch_idle_lead(
     # credential, an unregistered project) raises here and is caught by
     # this hook's own suppress(Exception) at the call site: fail closed,
     # no dispatch, no crash, before any local write is even attempted.
-    linear = _open_idle_linear_router(settings, database=database, queue=queue)
+    if linear is None:
+        linear = _open_idle_linear_router(
+            settings, database=database, queue=queue
+        )
     assignments = LeadAssignments(database, events=events)
 
     def _still_eligible(connection: sqlite3.Connection) -> bool:
