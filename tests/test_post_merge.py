@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
-from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.post_merge import PostMergeAdvance
 from hermes_orchestrator.processes import ProcessLeaseInput, ProcessRegistry
@@ -1128,6 +1129,19 @@ async def test_tick_reaps_dead_applier_lease_without_manual_mark_exited(
     assert row["reason"] == "applier exited without a terminal apply record"
     assert len(spawn.calls) == 1  # never respawned
 
+    # Ambiguous exactly once: further ticks journal nothing new and
+    # never respawn.
+    await advance.tick()
+    assert len(spawn.calls) == 1
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = "
+            "'activation.ambiguous' AND aggregate_id = ?",
+            (apply_id,),
+        )
+        == 1
+    )
+
 
 # -- the applier is resolved by exact journaled lease binding --------------
 
@@ -1292,3 +1306,351 @@ async def test_tick_reaps_exactly_the_bound_lease_beside_a_live_duplicate(
     # premature ambiguous verdict; the intent simply waits.
     assert row["state"] == "intended"
     assert len(spawn.calls) == 1
+
+
+# -- crash-safe durable identity binding (Sol correction 57c46faa) ---------
+
+
+def _seed_and_intend(
+    advance: PostMergeAdvance, database: Database
+) -> str:
+    """Seed one merged self-host review and record its durable intent."""
+
+    seed_merged_review(
+        database,
+        review_id="review:demo:evt-1",
+        project_key="demo",
+        issue_id="ENG-1",
+        merge_sha=MERGE_SHA,
+        updated_at="2026-08-31T10:00:00+00:00",
+    )
+    advance.on_merged(
+        project_key="demo",
+        issue_id="ENG-1",
+        review_id="review:demo:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    return f"activate:{MERGE_SHA}"
+
+
+def _journal_applier_claim(
+    database: Database, events: EventStore, *, apply_id: str, target_checkout: str
+) -> None:
+    """Journal the write-ahead claim the way a crashed prior life did."""
+
+    with database.transaction() as connection:
+        events.append(
+            connection,
+            EventInput(
+                event_type="activation.applier_claimed",
+                aggregate_type="activation_apply",
+                aggregate_id=apply_id,
+                payload={
+                    "apply_id": apply_id,
+                    "project_key": "demo",
+                    "worker_id": MERGE_SHA,
+                    "target_checkout": target_checkout,
+                },
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_spawn_claims_before_and_binds_atomically_after(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """One write-ahead ``activation.applier_claimed`` event commits
+    before the OS spawn and one atomic transaction commits the lease row
+    with the ``activation.applier_spawned`` binding after it. Both carry
+    the full identity — the owning project_key included — and the claim
+    durably orders before the binding."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry = _registry(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = _seed_and_intend(advance, database)
+    target_checkout = str(tmp_path / "state" / "checkouts" / MERGE_SHA)
+
+    await advance.tick()
+
+    assert len(spawn.calls) == 1
+    lease = registry.active()[0]
+    claims = database.execute(
+        "SELECT sequence, payload_json FROM events "
+        "WHERE event_type = 'activation.applier_claimed' AND aggregate_id = ?",
+        (apply_id,),
+    ).fetchall()
+    assert len(claims) == 1
+    assert json.loads(claims[0]["payload_json"]) == {
+        "apply_id": apply_id,
+        "project_key": "demo",
+        "worker_id": MERGE_SHA,
+        "target_checkout": target_checkout,
+    }
+    spawned = database.execute(
+        "SELECT sequence, payload_json FROM events "
+        "WHERE event_type = 'activation.applier_spawned' AND aggregate_id = ?",
+        (apply_id,),
+    ).fetchall()
+    assert len(spawned) == 1
+    assert json.loads(spawned[0]["payload_json"]) == {
+        "apply_id": apply_id,
+        "pid": FAKE_PID,
+        "lease_id": lease.lease_id,
+        "project_key": "demo",
+        "worker_id": MERGE_SHA,
+        "target_checkout": target_checkout,
+    }
+    assert int(claims[0]["sequence"]) < int(spawned[0]["sequence"])
+
+
+@pytest.mark.asyncio
+async def test_restart_after_atomic_binding_commit_recognizes_the_applier(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A crash immediately after the atomic lease+binding commit (the
+    former lease-committed-but-journal-missing window no longer exists —
+    the two can never diverge): a restarted advance over the durable
+    rows recognizes exactly the one bound applier, spawns nothing
+    beside it, and keeps the intent open while it verifies."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry = _registry(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = _seed_and_intend(advance, database)
+
+    await advance.tick()
+    assert len(spawn.calls) == 1
+
+    # The daemon dies right after the commit; the restarted life builds a
+    # fresh registry over the same durable rows and the applier survives.
+    restarted_registry = _registry(database, events)
+    restarted = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=restarted_registry,
+        spawn=spawn,
+    )
+    await restarted.tick()
+    await restarted.tick()
+
+    assert len(spawn.calls) == 1
+    row = database.execute(
+        "SELECT state FROM activation_applies WHERE apply_id = ?", (apply_id,)
+    ).fetchone()
+    assert row["state"] == "intended"
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = "
+            "'activation.applier_spawned' AND aggregate_id = ?",
+            (apply_id,),
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_claim_without_completion_resolves_ambiguous_exactly_once(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A prior life crashed between its write-ahead claim and the atomic
+    lease+binding commit: whether its child ever spawned — or still runs
+    unregistered, which the reconciler's unknown-process scan reports —
+    can never be proven from durable state. The restarted tick resolves
+    the claim to ambiguous exactly once and never spawns beside it."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry = _registry(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = _seed_and_intend(advance, database)
+    _journal_applier_claim(
+        database,
+        events,
+        apply_id=apply_id,
+        target_checkout=str(tmp_path / "state" / "checkouts" / MERGE_SHA),
+    )
+
+    await advance.tick()
+
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == "ambiguous"
+    assert row["reason"] == "applier claim never completed"
+    assert spawn.calls == []
+
+    await advance.tick()
+    assert spawn.calls == []
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = "
+            "'activation.ambiguous' AND aggregate_id = ?",
+            (apply_id,),
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_binding_reaps_the_child_and_the_claim_fails_closed(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """The atomic lease+binding transaction cannot commit (registration
+    refuses the spawned pid): the exact new child is reaped before the
+    error propagates, the rollback leaves no lease row and no binding,
+    and the still-open claim resolves the intent to ambiguous on the
+    next tick — never a second spawn."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    # A registry whose evidence knows no pid at all refuses registration.
+    registry = ProcessRegistry(database, events, os_port=FakeOs(), info=FakeInfo())
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    reaped: list[int] = []
+
+    async def fake_terminate(process: Any) -> None:
+        reaped.append(int(process.pid))
+
+    advance._terminate_group = fake_terminate  # type: ignore[method-assign]
+    apply_id = _seed_and_intend(advance, database)
+
+    await advance.tick()
+
+    assert len(spawn.calls) == 1
+    assert reaped == [FAKE_PID]
+    assert registry.active() == ()
+    assert database.scalar("SELECT count(*) FROM process_leases") == 0
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = "
+            "'activation.applier_spawned'"
+        )
+        == 0
+    )
+
+    await advance.tick()
+
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == "ambiguous"
+    assert row["reason"] == "applier claim never completed"
+    assert len(spawn.calls) == 1  # never respawned
+
+
+@pytest.mark.asyncio
+async def test_bound_lease_owned_by_another_project_is_never_adopted(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """The journaled binding names a lease whose row is owned by a
+    different project (same worker_id and cwd): project ownership is
+    part of the exact binding (Sol correction 57c46faa), so that lease
+    is never "the applier" — the tick adopts nothing, spawns nothing,
+    fails closed to ambiguous, and never signals or reaps the foreign
+    lease (reconciliation reports it as a blocking orphan)."""
+
+    queue = QueueService(database=database, events=events, registered_projects={"demo"})
+    registry, _info = _registry_with_impostor_room(database, events)
+    spawn = FakeSpawn()
+    advance = make_advance(
+        database,
+        events,
+        projects={"demo": SELF_HOST},
+        queue=queue,
+        tmp_path=tmp_path,
+        registry=registry,
+        spawn=spawn,
+    )
+    apply_id = _seed_and_intend(advance, database)
+    target_checkout = str(tmp_path / "state" / "checkouts" / MERGE_SHA)
+    foreign = registry.register(
+        ProcessLeaseInput(
+            pid=IMPOSTOR_PID,
+            pgid=IMPOSTOR_PID,
+            project_key="other",
+            kind="runtime_applier",
+            worker_id=MERGE_SHA,
+            executable="/usr/bin/uv",
+            cwd=target_checkout,
+        )
+    )
+    _journal_applier_claim(
+        database, events, apply_id=apply_id, target_checkout=target_checkout
+    )
+    with database.transaction() as connection:
+        events.append(
+            connection,
+            EventInput(
+                event_type="activation.applier_spawned",
+                aggregate_type="activation_apply",
+                aggregate_id=apply_id,
+                payload={
+                    "apply_id": apply_id,
+                    "pid": IMPOSTOR_PID,
+                    "lease_id": foreign.lease_id,
+                    "project_key": "demo",
+                    "worker_id": MERGE_SHA,
+                    "target_checkout": target_checkout,
+                },
+            ),
+        )
+
+    await advance.tick()
+    await advance.tick()
+
+    assert spawn.calls == []
+    assert registry.get(foreign.lease_id).state == "active"
+    row = database.execute(
+        "SELECT state, reason FROM activation_applies WHERE apply_id = ?",
+        (apply_id,),
+    ).fetchone()
+    assert row["state"] == "ambiguous"
+    assert row["reason"] == "applier exited without a terminal apply record"
+    assert (
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = "
+            "'activation.ambiguous' AND aggregate_id = ?",
+            (apply_id,),
+        )
+        == 1
+    )

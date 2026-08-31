@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.processes import (
     ProcessLease,
     ProcessLeaseInput,
@@ -507,3 +507,110 @@ def test_identity_loss_during_grace_never_kills(
     result = process_registry.request_stop(lease.lease_id, checkpoint_id="cp-1")
     assert (result.signal_sent, result.reason) == (int(signal.SIGTERM), "terminated")
     assert fake_os.killpg_calls == [(120, signal.SIGTERM)]
+
+
+# -- caller-transaction registration (Sol correction 57c46faa) -------------
+
+
+def test_register_on_commits_lease_and_caller_binding_atomically(
+    process_registry: ProcessRegistry, database: Database
+) -> None:
+    """A launcher registers the lease and appends its own binding journal
+    inside ONE caller-held transaction: both land together, and the
+    lease is immediately active with its exact recorded identity."""
+
+    events = EventStore(database)
+    with database.transaction() as connection:
+        lease = process_registry.register_on(
+            connection,
+            ProcessLeaseInput(
+                pid=120,
+                pgid=120,
+                project_key="demo",
+                kind="runtime_applier",
+                worker_id="d" * 40,
+                executable="/usr/bin/uv",
+                cwd="/state/checkouts/d",
+            ),
+        )
+        events.append(
+            connection,
+            EventInput(
+                event_type="activation.applier_spawned",
+                aggregate_type="activation_apply",
+                aggregate_id="activate:" + "d" * 40,
+                payload={"lease_id": lease.lease_id, "project_key": "demo"},
+            ),
+        )
+    assert lease.lease_id == "lease-1"
+    assert (lease.pid, lease.pgid, lease.state) == (120, 120, "active")
+    assert (lease.kind, lease.worker_id, lease.project_key) == (
+        "runtime_applier",
+        "d" * 40,
+        "demo",
+    )
+    assert process_registry.active("demo") == (lease,)
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'process.registered'"
+    ) == 1
+    assert database.scalar(
+        "SELECT count(*) FROM events "
+        "WHERE event_type = 'activation.applier_spawned'"
+    ) == 1
+
+
+def test_register_on_rolls_back_with_the_caller_transaction(
+    process_registry: ProcessRegistry, database: Database
+) -> None:
+    """The lease row and the caller's own binding write commit together
+    or not at all: a failure after registration inside the same
+    transaction leaves no lease row, no registration event, and no
+    active lease behind."""
+
+    class Boom(RuntimeError):
+        pass
+
+    with pytest.raises(Boom), database.transaction() as connection:
+        process_registry.register_on(
+            connection,
+            ProcessLeaseInput(
+                pid=120, pgid=120, project_key="demo", kind="runtime_applier"
+            ),
+        )
+        raise Boom("the caller's binding write failed")
+    assert process_registry.active() == ()
+    assert database.scalar("SELECT count(*) FROM process_leases") == 0
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'process.registered'"
+    ) == 0
+
+
+def test_register_on_validates_identity_like_register(
+    process_registry: ProcessRegistry, database: Database, fake_os: FakeOs
+) -> None:
+    """The caller-transaction path keeps every identity gate of
+    :meth:`register` — an unknown pid or a foreign process group refuses
+    registration and the enclosing transaction rolls back clean."""
+
+    with (
+        pytest.raises(ValueError, match="not running"),
+        database.transaction() as connection,
+    ):
+        process_registry.register_on(
+            connection,
+            ProcessLeaseInput(
+                pid=999, pgid=999, project_key="demo", kind="claude"
+            ),
+        )
+    fake_os.groups[120] = 77
+    with (
+        pytest.raises(ValueError, match="process group 77"),
+        database.transaction() as connection,
+    ):
+        process_registry.register_on(
+            connection,
+            ProcessLeaseInput(
+                pid=120, pgid=120, project_key="demo", kind="claude"
+            ),
+        )
+    assert database.scalar("SELECT count(*) FROM process_leases") == 0

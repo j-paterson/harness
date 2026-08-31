@@ -669,8 +669,10 @@ class Reconciler:
           already recorded, fails closed;
         * the latest journaled ``activation.applier_spawned`` event for
           ``activate:<sha>`` carries a non-null lease_id equal to this
-          lease's lease_id — a null or absent journaled lease_id
-          excuses NOTHING;
+          lease's lease_id AND a non-null project_key equal to this
+          lease's owning project (Sol correction 57c46faa: project
+          ownership is part of the exact binding) — a null or absent
+          journaled lease_id or project_key excuses NOTHING;
         * the lease's cwd is the intent row's exact target checkout.
 
         Liveness and identity validity are already proven upstream:
@@ -691,10 +693,13 @@ class Reconciler:
         ).fetchone()
         if intent is None:
             return False
-        journaled_lease_id = self._journaled_applier_lease_id(apply_id)
-        if journaled_lease_id is None:
+        binding = self._journaled_applier_binding(apply_id)
+        if binding is None:
             return False
-        if journaled_lease_id != str(getattr(lease, "lease_id", "")):
+        bound_lease_id, bound_project = binding
+        if bound_lease_id != str(getattr(lease, "lease_id", "")):
+            return False
+        if bound_project != str(getattr(lease, "project_key", "")):
             return False
         if getattr(lease, "cwd", None) != str(intent["target_checkout"]):
             return False
@@ -708,14 +713,19 @@ class Reconciler:
         ).fetchone()
         return applier_row is not None
 
-    def _journaled_applier_lease_id(self, apply_id: str) -> str | None:
-        """The non-null lease_id from the latest journaled applier spawn.
+    def _journaled_applier_binding(
+        self, apply_id: str
+    ) -> tuple[str, str] | None:
+        """The (lease_id, project_key) from the latest journaled binding.
 
         The post-merge advance journals ``activation.applier_spawned``
-        on the ``activate:<sha>`` intent with the exact registered
-        lease_id; that durable record is the only activation-to-lease
-        binding. A missing event, an unreadable payload, or a null
-        lease_id (a spawn with no registry) binds nothing — fail closed.
+        on the ``activate:<sha>`` intent atomically with the lease
+        registration itself, carrying the exact registered lease_id and
+        the owning project_key; that durable record is the only
+        activation-to-lease binding, and project ownership is part of it
+        (Sol correction 57c46faa). A missing event, an unreadable
+        payload, a null lease_id (a spawn with no registry), or a null
+        project_key binds nothing — fail closed.
         """
 
         row = self._database.execute(
@@ -730,11 +740,17 @@ class Reconciler:
             payload = json.loads(row["payload_json"])
         except (TypeError, ValueError):
             return None
-        lease_id = (
-            payload.get("lease_id") if isinstance(payload, dict) else None
-        )
-        if isinstance(lease_id, str) and lease_id:
-            return lease_id
+        if not isinstance(payload, dict):
+            return None
+        lease_id = payload.get("lease_id")
+        project_key = payload.get("project_key")
+        if (
+            isinstance(lease_id, str)
+            and lease_id
+            and isinstance(project_key, str)
+            and project_key
+        ):
+            return lease_id, project_key
         return None
 
     # -- stage 3: worker sessions ------------------------------------------

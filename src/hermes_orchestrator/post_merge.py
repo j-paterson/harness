@@ -57,7 +57,7 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.git import GitError, GitVerifier, WorktreeGit
-from hermes_orchestrator.processes import ProcessRegistry, register_spawned
+from hermes_orchestrator.processes import ProcessLeaseInput, ProcessRegistry
 from hermes_orchestrator.queue import QueueService
 
 _TERMINAL_APPLIER_STATES = frozenset(
@@ -524,6 +524,21 @@ class PostMergeAdvance:
                 reason="applier exited without a terminal apply record",
             )
             return
+        if self._open_applier_claim(apply_id):
+            # Sol correction 57c46faa: a durable write-ahead claim with
+            # no completed binding means a prior life crashed somewhere
+            # between claiming and the atomic lease+binding commit —
+            # whether its child ever spawned, or still runs unregistered,
+            # is unprovable from durable state. Never spawn beside it;
+            # resolve to ambiguous exactly once. A live unregistered
+            # survivor is the reconciler's unknown-process scan's to
+            # report, and admission stays closed on it.
+            self._mark_intent(
+                apply_id,
+                state="ambiguous",
+                reason="applier claim never completed",
+            )
+            return
         project_key = self._project_for_merge(merge_sha)
         if project_key is None:
             return
@@ -542,6 +557,24 @@ class PostMergeAdvance:
         merge_sha: str,
         target_checkout: Path,
     ) -> None:
+        """Spawn the applier behind one crash-safe durable identity binding.
+
+        Sol correction 57c46faa: the OS spawn itself can never be
+        transactional, so durability brackets it on both sides. A
+        write-ahead ``activation.applier_claimed`` event — carrying the
+        exact identity the child will hold: apply_id, the owning
+        project_key, worker_id (the merge sha), and the target checkout
+        — commits BEFORE the spawn; the process-lease registration and
+        the ``activation.applier_spawned`` binding then commit together
+        in ONE transaction after it (:meth:`_bind_spawned_applier`), so
+        the lease row and the journaled binding can never diverge. A
+        crash anywhere between the claim and that atomic commit leaves a
+        claim-without-completion the next tick resolves to ambiguous
+        exactly once — never a second spawn. A spawn that provably never
+        started (OSError) resolves its own claim with
+        ``activation.applier_spawn_failed`` so a later tick may retry.
+        """
+
         project = self.projects.get(project_key)
         if project is None:
             return
@@ -551,6 +584,21 @@ class PostMergeAdvance:
         log_dir = self.state_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"runtime-applier-{merge_sha}.log"
+        with self.database.transaction() as connection:
+            self.events.append(
+                connection,
+                EventInput(
+                    event_type="activation.applier_claimed",
+                    aggregate_type="activation_apply",
+                    aggregate_id=apply_id,
+                    payload={
+                        "apply_id": apply_id,
+                        "project_key": project_key,
+                        "worker_id": merge_sha,
+                        "target_checkout": str(target_checkout),
+                    },
+                ),
+            )
         with open(log_path, "ab") as log_handle:
             try:
                 process = await self.spawn(
@@ -577,31 +625,100 @@ class PostMergeAdvance:
                     f"{merge_sha!r}: {error}",
                     file=sys.stderr,
                 )
+                # The OSError proves no child was created: the claim
+                # resolves durably so the next tick may retry with a
+                # fresh claim instead of failing closed to ambiguous.
+                with self.database.transaction() as connection:
+                    self.events.append(
+                        connection,
+                        EventInput(
+                            event_type="activation.applier_spawn_failed",
+                            aggregate_type="activation_apply",
+                            aggregate_id=apply_id,
+                            payload={
+                                "apply_id": apply_id,
+                                "error": type(error).__name__,
+                            },
+                        ),
+                    )
                 return
-        lease_id = await register_spawned(
-            self.registry,
+        await self._bind_spawned_applier(
             process,
+            apply_id=apply_id,
             project_key=project_key,
-            kind="runtime_applier",
-            worker_id=merge_sha,
-            executable=self.uv_binary,
-            cwd=str(target_checkout),
-            terminate=self._terminate_group,
+            merge_sha=merge_sha,
+            target_checkout=target_checkout,
         )
-        with self.database.transaction() as connection:
-            self.events.append(
-                connection,
-                EventInput(
-                    event_type="activation.applier_spawned",
-                    aggregate_type="activation_apply",
-                    aggregate_id=apply_id,
-                    payload={
-                        "apply_id": apply_id,
-                        "pid": int(process.pid),
-                        "lease_id": lease_id,
-                    },
-                ),
-            )
+
+    async def _bind_spawned_applier(
+        self,
+        process: Any,
+        *,
+        apply_id: str,
+        project_key: str,
+        merge_sha: str,
+        target_checkout: Path,
+    ) -> None:
+        """Commit the lease row and the durable binding in one transaction.
+
+        Sol correction 57c46faa: ``ProcessRegistry.register_on`` runs the
+        process-lease insert on this method's own transaction, so the
+        lease and the ``activation.applier_spawned`` binding — which
+        carries the exact lease_id AND the owning project_key — commit
+        atomically: no crash point can leave a registered applier with
+        no binding, or a binding naming no lease. On any failure the
+        exact new group is reaped before the error propagates (mirroring
+        ``register_spawned``'s fail-closed contract), the rollback
+        leaves nothing durable, and the still-open claim resolves the
+        intent to ambiguous on a later tick.
+        """
+
+        try:
+            with self.database.transaction() as connection:
+                lease_id: str | None = None
+                if self.registry is not None:
+                    lease = self.registry.register_on(
+                        connection,
+                        ProcessLeaseInput(
+                            pid=int(process.pid),
+                            pgid=int(process.pid),
+                            project_key=project_key,
+                            kind="runtime_applier",
+                            worker_id=merge_sha,
+                            executable=self.uv_binary,
+                            cwd=str(target_checkout),
+                        ),
+                    )
+                    lease_id = lease.lease_id
+                self.events.append(
+                    connection,
+                    EventInput(
+                        event_type="activation.applier_spawned",
+                        aggregate_type="activation_apply",
+                        aggregate_id=apply_id,
+                        payload={
+                            "apply_id": apply_id,
+                            "pid": int(process.pid),
+                            "lease_id": lease_id,
+                            "project_key": project_key,
+                            "worker_id": merge_sha,
+                            "target_checkout": str(target_checkout),
+                        },
+                    ),
+                )
+        except BaseException as error:
+            # The transaction already rolled back: stop and reap the
+            # exact new group before propagating. Exception text is
+            # redacted to its type.
+            await self._terminate_group(process)
+            if isinstance(
+                error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            ):
+                raise
+            raise RuntimeError(
+                "managed runtime_applier process could not be bound: "
+                f"{type(error).__name__}"
+            ) from None
 
     async def _terminate_group(self, process: Any) -> None:
         """Stop the whole owned process group: TERM, bounded wait, KILL."""
@@ -634,10 +751,12 @@ class PostMergeAdvance:
         spawned. The lease counts if and only if its ``lease_id`` equals
         the non-null ``lease_id`` journaled by this module's own latest
         ``activation.applier_spawned`` event for ``activate:<sha>`` AND
-        its kind, worker_id, and cwd match the applier's exact identity
-        (``runtime_applier``, the merge sha, the intent's target
-        checkout). A null or absent journaled lease_id excuses nothing
-        and resolves nothing — fail closed.
+        its kind, worker_id, cwd, and project_key match the applier's
+        exact identity (``runtime_applier``, the merge sha, the intent's
+        target checkout, the binding's own journaled project_key — Sol
+        correction 57c46faa: project ownership is part of the exact
+        binding). A null or absent journaled lease_id or project_key
+        excuses nothing and resolves nothing — fail closed.
 
         A bound lease whose process is gone with nothing recording its
         exit is reaped here, by exact lease_id, so the ambiguous rule in
@@ -648,11 +767,10 @@ class PostMergeAdvance:
 
         if self.registry is None:
             return None
-        bound_lease_id = self._journaled_applier_lease_id(
-            f"activate:{merge_sha}"
-        )
-        if bound_lease_id is None:
+        binding = self._journaled_applier_binding(f"activate:{merge_sha}")
+        if binding is None:
             return None
+        bound_lease_id, bound_project = binding
         for lease in self.registry.active():
             if lease.lease_id != bound_lease_id:
                 continue
@@ -660,9 +778,11 @@ class PostMergeAdvance:
                 lease.kind != "runtime_applier"
                 or lease.worker_id != merge_sha
                 or lease.cwd != target_checkout
+                or lease.project_key != bound_project
             ):
                 # The journaled binding no longer describes this lease's
-                # identity: unprovable, never "the applier".
+                # exact identity — project ownership included: unprovable,
+                # never "the applier".
                 return None
             if not self.registry.snapshot(lease.lease_id).alive:
                 self.registry.mark_exited(lease.lease_id)
@@ -682,9 +802,8 @@ class PostMergeAdvance:
 
         if self.registry is None:
             return False
-        bound_lease_id = self._journaled_applier_lease_id(
-            f"activate:{merge_sha}"
-        )
+        binding = self._journaled_applier_binding(f"activate:{merge_sha}")
+        bound_lease_id = None if binding is None else binding[0]
         for lease in self.registry.active():
             if lease.kind != "runtime_applier" or lease.worker_id != merge_sha:
                 continue
@@ -694,14 +813,19 @@ class PostMergeAdvance:
                 return True
         return False
 
-    def _journaled_applier_lease_id(self, apply_id: str) -> str | None:
-        """The non-null lease_id from the latest journaled applier spawn.
+    def _journaled_applier_binding(
+        self, apply_id: str
+    ) -> tuple[str, str] | None:
+        """The (lease_id, project_key) from the latest journaled binding.
 
-        :meth:`_spawn_applier` journals ``activation.applier_spawned``
-        with the exact ``register_spawned`` lease_id; that durable
-        record is the only activation-to-lease binding. A missing event,
-        an unreadable payload, or a null lease_id (a spawn with no
-        registry) binds nothing — fail closed.
+        :meth:`_bind_spawned_applier` journals
+        ``activation.applier_spawned`` atomically with the lease
+        registration itself, carrying the exact lease_id and the owning
+        project_key; that durable record is the only activation-to-lease
+        binding, and project ownership is part of it (Sol correction
+        57c46faa). A missing event, an unreadable payload, a null
+        lease_id (a spawn with no registry), or a null project_key binds
+        nothing — fail closed.
         """
 
         row = self.database.execute(
@@ -716,12 +840,42 @@ class PostMergeAdvance:
             payload = json.loads(row["payload_json"])
         except (TypeError, ValueError):
             return None
-        lease_id = (
-            payload.get("lease_id") if isinstance(payload, dict) else None
-        )
-        if isinstance(lease_id, str) and lease_id:
-            return lease_id
+        if not isinstance(payload, dict):
+            return None
+        lease_id = payload.get("lease_id")
+        project_key = payload.get("project_key")
+        if (
+            isinstance(lease_id, str)
+            and lease_id
+            and isinstance(project_key, str)
+            and project_key
+        ):
+            return lease_id, project_key
         return None
+
+    def _open_applier_claim(self, apply_id: str) -> bool:
+        """Whether the latest durable applier claim is still unresolved.
+
+        :meth:`_spawn_applier` claims before it spawns and resolves the
+        claim with either the atomic ``activation.applier_spawned``
+        binding or an ``activation.applier_spawn_failed`` record. A
+        claim that is the latest of the three marks a crash between the
+        claim and its resolution — whether the child ever spawned can
+        never be proven from durable state, so the claim's resolver
+        (:meth:`_advance_intent`) fails closed to ambiguous, exactly
+        once, and never spawns beside it (Sol correction 57c46faa).
+        """
+
+        row = self.database.execute(
+            "SELECT event_type FROM events WHERE aggregate_id = ? "
+            "AND event_type IN ('activation.applier_claimed', "
+            "'activation.applier_spawned', 'activation.applier_spawn_failed') "
+            "ORDER BY sequence DESC LIMIT 1",
+            (apply_id,),
+        ).fetchone()
+        return row is not None and (
+            str(row["event_type"]) == "activation.applier_claimed"
+        )
 
     def _has_spawn_event(self, apply_id: str) -> bool:
         row = self.database.execute(

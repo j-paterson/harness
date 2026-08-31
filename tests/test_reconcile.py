@@ -531,11 +531,14 @@ def journal_applier_spawned(
     apply_id: str,
     lease_id: str | None,
     pid: int = 901,
+    project_key: str | None = "demo",
 ) -> None:
     """Journal the durable activation-to-lease binding the way the
     post-merge advance does: ``activation.applier_spawned`` on the
     ``activate:<sha>`` intent, carrying the registered lease_id (null
-    when the spawn ran with no registry)."""
+    when the spawn ran with no registry) and the owning project_key
+    (Sol correction 57c46faa: project ownership is part of the exact
+    binding)."""
 
     with database.transaction() as connection:
         events.append(
@@ -548,6 +551,7 @@ def journal_applier_spawned(
                     "apply_id": apply_id,
                     "pid": pid,
                     "lease_id": lease_id,
+                    "project_key": project_key,
                 },
             ),
         )
@@ -796,6 +800,87 @@ def test_applier_lease_with_mismatched_cwd_stays_blocking(
     finding = by_kind(report, "orphan_process")[0]
     assert finding.aggregate_id == "applier-1"
     assert finding.blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_applier_lease_from_another_project_stays_a_blocking_orphan(
+    database: Database, events: EventStore
+) -> None:
+    """The journaled binding carries the owning project_key (Sol
+    correction 57c46faa); a live lease matching the bound lease_id,
+    worker_id, and cwd but owned by a different project is never
+    excused — it stays a blocking orphan."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database,
+        events,
+        apply_id=f"activate:{merge_sha}",
+        lease_id="applier-1",
+        project_key="demo",
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+                project_key="other",
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    finding = by_kind(report, "orphan_process")[0]
+    assert finding.aggregate_id == "applier-1"
+    assert finding.blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_applier_binding_without_project_key_excuses_nothing(
+    database: Database, events: EventStore
+) -> None:
+    """A binding journaled without a project_key (an older event shape,
+    or a corrupt payload) binds nothing (Sol correction 57c46faa): the
+    survivor fails closed as a blocking orphan even when every other
+    identity field matches."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database,
+        events,
+        apply_id=f"activate:{merge_sha}",
+        lease_id="applier-1",
+        project_key=None,
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    assert by_kind(report, "orphan_process")[0].blocking is True
     assert report.safe_to_open_admission is False
 
 
