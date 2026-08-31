@@ -717,3 +717,236 @@ def test_lossy_textconv_driver_is_never_consulted_by_the_proof(
         "with textconv enabled, two genuinely different blobs that convert "
         "to the same constant text show as no difference at all"
     )
+
+
+# -- Sol correction 61690353: exact positional/preimage proof ---------------
+#
+# ``git apply`` relocates a hunk to wherever its full recorded context
+# matches, searching outward from the recorded line. If the advanced parent
+# edits a context line the reviewed hunk itself captured, the hunk's exact
+# context no longer matches at its reviewed position; when an identical
+# block remains elsewhere in the file, git can relocate the hunk there
+# instead, and if the squash happened to change *that* block, the applied
+# tree could still equal the merge tree even though the reviewed hunk never
+# actually landed on the reviewed target. The positional proof in
+# ``GitVerifier.apply_to_tree`` closes this: every reviewed hunk's base
+# preimage range is checked against the base-to-parent edits before the
+# isolated application ever runs, so a context edit *inside* that range
+# (target drift) and an ambiguous or relocated preimage both fail closed,
+# while a shift caused only by edits strictly *above* the range (the live
+# PR #39 shape) is still accepted.
+
+_POS_BLOCK = "def foo():\n    x = 1\n    return x\n"
+_POS_BLOCK_CHANGED = "def foo():\n    x = 2\n    return x\n"
+# Padding between two occurrences of the block, wide enough that neither
+# hunk's default 3-line context ever reaches the other occurrence.
+_POS_PAD = (
+    "\n\n# pad 1\n# pad 2\n# pad 3\n# pad 4\n# pad 5\n# pad 6\n# pad 7\n# pad 8\n\n\n"
+)
+
+
+def test_target_drift_with_a_remaining_identical_block_requires_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """(i) REGRESSION for the defect this correction fixes.
+
+    The file carries two identical blocks; the candidate changes the FIRST.
+    The advanced parent edits ``top3``, a context line the reviewed hunk's
+    own recorded context captures (within its default 3-line radius) --
+    exactly the drift that let ``git apply`` relocate the old (pre-
+    correction) proof's hunk onto the second, untouched-by-the-edit block.
+    The squash on that advanced parent then changes the SECOND block. The
+    positional proof must reject this before ever reaching the isolated
+    application: the drifted context line intersects the reviewed hunk's
+    own base preimage range, so the reviewed target itself is proven to
+    have changed on the parent.
+    """
+
+    prefix = "top1\ntop2\ntop3\n"
+    base_text = prefix + _POS_BLOCK + _POS_PAD + _POS_BLOCK
+    candidate_text = prefix + _POS_BLOCK_CHANGED + _POS_PAD + _POS_BLOCK
+    # The advanced parent edits "top3", inside the reviewed hunk's own
+    # captured context (old_start=2, old_len=7 covers lines 2-8).
+    advanced_text = "top1\ntop2\ntop3-EDITED\n" + _POS_BLOCK + _POS_PAD + _POS_BLOCK
+    # The squash changes the SECOND block instead of the first.
+    squash_text = (
+        "top1\ntop2\ntop3-EDITED\n" + _POS_BLOCK + _POS_PAD + _POS_BLOCK_CHANGED
+    )
+
+    repo = Repo(tmp_path)
+    (repo.path / "drift.py").write_text(base_text)
+    base_sha = repo.commit_all("base")
+
+    repo.checkout_new("candidate", base_sha)
+    (repo.path / "drift.py").write_text(candidate_text)
+    candidate_sha = repo.commit_all("candidate: change the first occurrence")
+
+    repo.checkout("main")
+    (repo.path / "drift.py").write_text(advanced_text)
+    advanced_sha = repo.commit_all("advance main: edit the context beside block one")
+
+    repo.checkout_new("squash-wrong-block", advanced_sha)
+    (repo.path / "drift.py").write_text(squash_text)
+    merge_sha = repo.commit_all("squash-wrong-block")
+    repo.push_main(merge_sha)
+    executor = _executor(repo)
+
+    with pytest.raises(ReconciliationRequired):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=candidate_sha,
+            candidate_branch="candidate",
+            pr_number=1,
+            merge_sha=merge_sha,
+            base_sha=base_sha,
+        )
+
+
+def test_pure_shift_above_a_repeated_block_file_still_proves(
+    tmp_path: Path,
+) -> None:
+    """(ii) CONTROL: the live PR #39 acceptance shape must keep working.
+
+    Same repeated-block file shape as the regression above (so the
+    reviewed hunk's preimage is unique, not ambiguous -- block one is
+    followed by real content, block two sits at end of file with nothing
+    after it), but this time the advanced parent only inserts unrelated
+    lines ABOVE both blocks: a pure shift, with no edit anywhere near
+    either block. The squash reproduces the candidate's exact change at
+    the shifted position. This must still prove ``patch_equivalent``: a
+    blanket "reject any offset" rule would wrongly fail this case.
+    """
+
+    # Five header lines keep the hunk's old_start comfortably above 1;
+    # git's own offset search special-cases a hunk recorded at line 1.
+    header = "h1\nh2\nh3\nh4\nh5\n"
+    base_text = header + _POS_BLOCK + _POS_PAD + _POS_BLOCK
+    candidate_text = header + _POS_BLOCK_CHANGED + _POS_PAD + _POS_BLOCK
+    inserted = "# inserted 1\n# inserted 2\n# inserted 3\n"
+    advanced_text = inserted + base_text
+    squash_text = inserted + candidate_text
+
+    repo = Repo(tmp_path)
+    (repo.path / "shift.py").write_text(base_text)
+    base_sha = repo.commit_all("base")
+
+    repo.checkout_new("candidate", base_sha)
+    (repo.path / "shift.py").write_text(candidate_text)
+    candidate_sha = repo.commit_all("candidate: change the first occurrence")
+
+    repo.checkout("main")
+    (repo.path / "shift.py").write_text(advanced_text)
+    advanced_sha = repo.commit_all(
+        "advance main: insert unrelated lines above both blocks"
+    )
+
+    repo.checkout_new("squash-shifted", advanced_sha)
+    (repo.path / "shift.py").write_text(squash_text)
+    merge_sha = repo.commit_all("squash-shifted")
+    repo.push_main(merge_sha)
+    executor = _executor(repo)
+
+    outcome = executor.prove_landed(
+        "demo",
+        candidate_sha=candidate_sha,
+        candidate_branch="candidate",
+        pr_number=1,
+        merge_sha=merge_sha,
+        base_sha=base_sha,
+    )
+
+    assert outcome.relation == "patch_equivalent"
+    assert outcome.applied_tree_sha == outcome.merge_tree_sha
+
+
+def test_symmetric_repeated_context_untouched_by_parent_rejects_as_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """(iii) AMBIGUITY: the advanced parent leaves both blocks (and their
+    surrounding context) completely untouched, and the blocks' immediate
+    surrounding context is made deliberately identical on both sides so
+    the reviewed hunk's exact preimage -- context included -- occurs
+    twice. Neither occurrence is closer or further per any edit; the
+    positional proof must fail closed as ambiguous rather than trust
+    whichever occurrence a search happens to land on first.
+    """
+
+    ctx = "# ctx1\n# ctx2\n# ctx3\n"
+    filler = "".join(f"# filler {i}\n" for i in range(1, 11))
+    base_text = ctx + _POS_BLOCK + ctx + filler + ctx + _POS_BLOCK + ctx
+    candidate_text = (
+        ctx + _POS_BLOCK_CHANGED + ctx + filler + ctx + _POS_BLOCK + ctx
+    )
+
+    repo = Repo(tmp_path)
+    (repo.path / "ambiguous.py").write_text(base_text)
+    base_sha = repo.commit_all("base")
+
+    repo.checkout_new("candidate", base_sha)
+    (repo.path / "ambiguous.py").write_text(candidate_text)
+    candidate_sha = repo.commit_all("candidate: change the first occurrence")
+
+    repo.checkout("main")
+    (repo.path / "unrelated.txt").write_text("advanced main content\n")
+    advanced_sha = repo.commit_all("advance main unrelated to ambiguous.py")
+
+    repo.checkout_new("squash-ambiguous", advanced_sha)
+    (repo.path / "ambiguous.py").write_text(candidate_text)
+    merge_sha = repo.commit_all("squash-ambiguous")
+    repo.push_main(merge_sha)
+    executor = _executor(repo)
+
+    with pytest.raises(ReconciliationRequired, match="ambiguous or relocated"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=candidate_sha,
+            candidate_branch="candidate",
+            pr_number=1,
+            merge_sha=merge_sha,
+            base_sha=base_sha,
+        )
+
+
+def test_deletion_above_the_hunk_yields_negative_shift_and_still_proves(
+    tmp_path: Path,
+) -> None:
+    """(iv) A deletion strictly above the reviewed hunk's range on the
+    advanced parent produces a negative shift; the mapped position moves
+    backward and the proof must still succeed when the squash reproduces
+    the candidate's exact change at that shifted-back position."""
+
+    base_text = "p1\np2\np3\np4\np5\ndef foo():\n    x = 1\n    return x\n"
+    candidate_text = "p1\np2\np3\np4\np5\ndef foo():\n    x = 99\n    return x\n"
+    # Delete p1 and p2 -- two lines strictly above the hunk's range.
+    advanced_text = "p3\np4\np5\ndef foo():\n    x = 1\n    return x\n"
+    squash_text = "p3\np4\np5\ndef foo():\n    x = 99\n    return x\n"
+
+    repo = Repo(tmp_path)
+    (repo.path / "negshift.py").write_text(base_text)
+    base_sha = repo.commit_all("base")
+
+    repo.checkout_new("candidate", base_sha)
+    (repo.path / "negshift.py").write_text(candidate_text)
+    candidate_sha = repo.commit_all("candidate: change the body")
+
+    repo.checkout("main")
+    (repo.path / "negshift.py").write_text(advanced_text)
+    advanced_sha = repo.commit_all("advance main: delete two lines above the hunk")
+
+    repo.checkout_new("squash-negshift", advanced_sha)
+    (repo.path / "negshift.py").write_text(squash_text)
+    merge_sha = repo.commit_all("squash-negshift")
+    repo.push_main(merge_sha)
+    executor = _executor(repo)
+
+    outcome = executor.prove_landed(
+        "demo",
+        candidate_sha=candidate_sha,
+        candidate_branch="candidate",
+        pr_number=1,
+        merge_sha=merge_sha,
+        base_sha=base_sha,
+    )
+
+    assert outcome.relation == "patch_equivalent"
+    assert outcome.applied_tree_sha == outcome.merge_tree_sha

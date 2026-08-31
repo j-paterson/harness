@@ -92,9 +92,14 @@ class ProvenMerge:
     (merge commit), ``reviewed_tree_equivalent`` (squash or rebase whose
     final tree is byte-identical to the reviewed tree), or
     ``patch_equivalent`` (squash or rebase onto an advanced base, proven by
-    isolated Git application: the recorded candidate's exact reviewed patch,
-    applied to the merge's first parent in a throwaway index, reproduces
-    the merge commit's own tree byte-for-byte -- never a digest comparison).
+    an exact positional/preimage application proof: every hunk of the
+    recorded candidate's exact reviewed patch is first proven to land at
+    its mapped reviewed target on the merge's first parent -- shifted only
+    by unrelated edits strictly above it, with any target drift, ambiguity,
+    fuzz, or conflict failing closed -- and only then is the patch applied,
+    in a throwaway index, reproducing the merge commit's own tree
+    byte-for-byte; never a digest comparison, and never just "the context
+    matched somewhere").
     This object is the only permit for a Linear Done projection.
     """
 
@@ -267,11 +272,17 @@ class IntegrationMerge:
         fail, merge_method is squash or rebase, and the recorded candidate
         base is supplied, a fourth relation — patch equivalence against an
         advanced base — is tried before giving up. That fourth relation is
-        never a digest comparison: it is an isolated Git application, in a
-        throwaway index that never touches the user's worktree or real
-        index, of the exact reviewed patch onto the merge's first parent,
-        accepted only when the resulting tree is byte-identical to the
-        merge commit's own tree.
+        never a digest comparison and never just "the reviewed context
+        matched somewhere": it is an exact positional/preimage application
+        proof. Every reviewed hunk must first be proven to land at its
+        mapped reviewed target on the merge's first parent -- its mapped
+        position shifted only by unrelated edits strictly above it, with a
+        changed target, an ambiguous or relocated preimage, apply fuzz, or
+        an unexplained applied offset all failing closed -- before the
+        exact reviewed patch is applied, in a throwaway index that never
+        touches the user's worktree or real index, onto the merge's first
+        parent; accepted only when the resulting tree is byte-identical to
+        the merge commit's own tree.
         """
 
         integration_ref = f"origin/{project.integration_branch}"
