@@ -130,6 +130,15 @@ def test_active_runtime_assembles_live_dispatch_without_identity_persistence(
         ]
         assert all(health.eligible for health in runtime.profile_health)
         assert len(profiles.config_dirs) == 4
+        # Sol correction a06cbce0: the daemon's own seeding bootstraps
+        # each profile, so eligibility implies no first-run dialogs.
+        for alias in ("max-a", "max-b", "max-c", "max-d"):
+            document = json.loads(
+                (tmp_path / alias / ".claude.json").read_text(encoding="utf-8")
+            )
+            assert document["hasCompletedOnboarding"] is True
+            trusted = document["projects"][str(tmp_path)]
+            assert trusted["hasTrustDialogAccepted"] is True
         assert keychain.reads == [
             ("hermes-orchestrator-linear", "default"),
             ("hermes-orchestrator-github", "default"),

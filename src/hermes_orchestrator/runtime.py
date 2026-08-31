@@ -94,6 +94,7 @@ from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
     JsonCommand,
+    ProfileBootstrap,
     ProfileHealth,
     ProfilePool,
     ProfileRegistry,
@@ -569,10 +570,22 @@ def open_runtime(
             pool = ProfilePool(
                 registry, capacity_evidence=ProfileCapacityEvidence(database)
             )
+            # Sol correction a06cbce0: the daemon's readiness seeding
+            # gates on the same deterministic bootstrap as rotate-lead,
+            # so an authenticated but uninitialized profile never seats.
+            managed_repo_paths = tuple(
+                dict.fromkeys(
+                    project.lead_worktree or project.repo_path
+                    for project in settings.projects.values()
+                )
+            )
             probe = ClaudeProfileProbe(
                 registry,
                 command=profile_command,
                 base_env=environment,
+                bootstrap=ProfileBootstrap(
+                    registry, repo_paths=managed_repo_paths
+                ),
             )
             checked: list[ProfileHealth] = []
             for profile in registry.profiles:
