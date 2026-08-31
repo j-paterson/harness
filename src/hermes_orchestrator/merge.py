@@ -72,6 +72,14 @@ class AncestryVerifier(Protocol):
 
     def tree_of(self, repo_path: Path, commit: str) -> str: ...
 
+    def first_parent(self, repo_path: Path, commit: str) -> str: ...
+
+    def changed_paths(
+        self, repo_path: Path, base: str, head: str
+    ) -> tuple[str, ...]: ...
+
+    def patch_id(self, repo_path: Path, base: str, head: str) -> str: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ProvenMerge:
@@ -79,9 +87,12 @@ class ProvenMerge:
 
     ``relation`` records how the reviewed candidate relates to the merge
     commit: ``merge_commit_is_candidate`` (fast-forward), ``candidate_reachable``
-    (merge commit), or ``reviewed_tree_equivalent`` (squash or rebase whose
-    final tree is byte-identical to the reviewed tree). This object is the
-    only permit for a Linear Done projection.
+    (merge commit), ``reviewed_tree_equivalent`` (squash or rebase whose
+    final tree is byte-identical to the reviewed tree), or
+    ``patch_equivalent`` (squash or rebase onto an advanced base whose diff
+    from the recorded candidate base is identical, by changed paths and
+    stable patch id, to the merge's diff from its first parent). This
+    object is the only permit for a Linear Done projection.
     """
 
     project_key: str
@@ -92,6 +103,26 @@ class ProvenMerge:
     merge_sha: str
     integration_branch: str
     relation: str
+    base_sha: str | None = None
+    merge_parent_sha: str | None = None
+    patch_id: str | None = None
+    changed_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _Proof:
+    """Internal outcome of :meth:`IntegrationMerge._prove`.
+
+    Carries the relation plus whatever facts the fourth relation
+    (``patch_equivalent``) binds; the first three relations leave the
+    bound-fact fields at their defaults.
+    """
+
+    relation: str
+    base_sha: str | None = None
+    merge_parent_sha: str | None = None
+    patch_id: str | None = None
+    changed_paths: tuple[str, ...] = ()
 
 
 class IntegrationMerge:
@@ -115,6 +146,7 @@ class IntegrationMerge:
         *,
         effect_id: str,
         merge_method: str = "squash",
+        base_sha: str | None = None,
     ) -> ProvenMerge:
         """Merge the approved exact-SHA verdict and prove integration.
 
@@ -146,8 +178,12 @@ class IntegrationMerge:
             raise ReconciliationRequired(
                 f"merge ownership is ambiguous: {error}"
             ) from error
-        relation = self._prove(
-            project, verdict.reviewed_sha, result.merge_sha, merge_method
+        proof = self._prove(
+            project,
+            verdict.reviewed_sha,
+            result.merge_sha,
+            merge_method,
+            base_sha=base_sha,
         )
         return ProvenMerge(
             project_key=project_key,
@@ -157,7 +193,11 @@ class IntegrationMerge:
             candidate_branch=verdict.branch,
             merge_sha=result.merge_sha,
             integration_branch=project.integration_branch,
-            relation=relation,
+            relation=proof.relation,
+            base_sha=proof.base_sha,
+            merge_parent_sha=proof.merge_parent_sha,
+            patch_id=proof.patch_id,
+            changed_paths=proof.changed_paths,
         )
 
     def prove_landed(
@@ -169,6 +209,7 @@ class IntegrationMerge:
         pr_number: int,
         merge_sha: str,
         merge_method: str = "squash",
+        base_sha: str | None = None,
     ) -> ProvenMerge:
         """Prove an externally performed merge landed the reviewed work.
 
@@ -183,7 +224,9 @@ class IntegrationMerge:
         project = self._projects.get(project_key)
         if project is None:
             raise MergeBlocked(f"unknown project {project_key!r}")
-        relation = self._prove(project, candidate_sha, merge_sha, merge_method)
+        proof = self._prove(
+            project, candidate_sha, merge_sha, merge_method, base_sha=base_sha
+        )
         return ProvenMerge(
             project_key=project_key,
             repository=project.github_repo,
@@ -192,7 +235,11 @@ class IntegrationMerge:
             candidate_branch=candidate_branch,
             merge_sha=merge_sha,
             integration_branch=project.integration_branch,
-            relation=relation,
+            relation=proof.relation,
+            base_sha=proof.base_sha,
+            merge_parent_sha=proof.merge_parent_sha,
+            patch_id=proof.patch_id,
+            changed_paths=proof.changed_paths,
         )
 
     def _prove(
@@ -201,13 +248,18 @@ class IntegrationMerge:
         candidate_sha: str,
         merge_sha: str,
         merge_method: str,
-    ) -> str:
+        *,
+        base_sha: str | None = None,
+    ) -> _Proof:
         """Prove the merge result carries the reviewed work, per method.
 
         A merge-method merge preserves commit identity, so only the exact
         candidate or candidate ancestry is proof; tree equivalence is
         accepted only for squash and rebase, whose merge commit is a new
-        identity carrying the reviewed tree.
+        identity carrying the reviewed tree. When those three relations all
+        fail, merge_method is squash or rebase, and the recorded candidate
+        base is supplied, a fourth relation — patch equivalence against an
+        advanced base — is tried before giving up.
         """
 
         integration_ref = f"origin/{project.integration_branch}"
@@ -223,9 +275,9 @@ class IntegrationMerge:
                     "merge commit is not reachable from the integration branch"
                 )
             if merge_sha == candidate_sha:
-                return "merge_commit_is_candidate"
+                return _Proof(relation="merge_commit_is_candidate")
             if self._git.is_ancestor(project.repo_path, candidate_sha, merge_sha):
-                return "candidate_reachable"
+                return _Proof(relation="candidate_reachable")
             if merge_method == "merge":
                 raise ReconciliationRequired(
                     "merge-method merge requires candidate ancestry: tree "
@@ -234,7 +286,39 @@ class IntegrationMerge:
             if self._git.tree_of(project.repo_path, merge_sha) == self._git.tree_of(
                 project.repo_path, candidate_sha
             ):
-                return "reviewed_tree_equivalent"
+                return _Proof(relation="reviewed_tree_equivalent")
+            if merge_method in ("squash", "rebase") and base_sha is not None:
+                parent = self._git.first_parent(project.repo_path, merge_sha)
+                if not self._git.is_ancestor(project.repo_path, base_sha, parent):
+                    raise ReconciliationRequired(
+                        "candidate base is not reachable from the merge "
+                        "commit's first parent"
+                    )
+                candidate_paths = self._git.changed_paths(
+                    project.repo_path, base_sha, candidate_sha
+                )
+                merge_paths = self._git.changed_paths(
+                    project.repo_path, parent, merge_sha
+                )
+                if not candidate_paths or candidate_paths != merge_paths:
+                    raise ReconciliationRequired(
+                        "merge changed paths differ from the reviewed candidate"
+                    )
+                candidate_patch = self._git.patch_id(
+                    project.repo_path, base_sha, candidate_sha
+                )
+                merge_patch = self._git.patch_id(project.repo_path, parent, merge_sha)
+                if candidate_patch != merge_patch:
+                    raise ReconciliationRequired(
+                        "merge content differs from the reviewed candidate"
+                    )
+                return _Proof(
+                    relation="patch_equivalent",
+                    base_sha=base_sha,
+                    merge_parent_sha=parent,
+                    patch_id=merge_patch,
+                    changed_paths=merge_paths,
+                )
         except GitError as error:
             raise ReconciliationRequired(
                 f"merge ancestry proof failed: {error}"

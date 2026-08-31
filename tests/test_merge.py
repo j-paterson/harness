@@ -157,6 +157,12 @@ class FakeGit:
     trees: dict[str, str] = field(default_factory=dict)
     fetch_error: GitError | None = None
     calls: list[tuple[str, ...]] = field(default_factory=list)
+    parents: dict[str, str] = field(default_factory=dict)
+    paths: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    patch_ids: dict[tuple[str, str], str] = field(default_factory=dict)
+    first_parent_error: GitError | None = None
+    changed_paths_error: GitError | None = None
+    patch_id_error: GitError | None = None
 
     def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
         self.calls.append(("fetch", str(repo_path), remote, branch))
@@ -170,6 +176,26 @@ class FakeGit:
     def tree_of(self, repo_path: Path, commit: str) -> str:
         self.calls.append(("tree_of", str(repo_path), commit))
         return self.trees[commit]
+
+    def first_parent(self, repo_path: Path, commit: str) -> str:
+        self.calls.append(("first_parent", str(repo_path), commit))
+        if self.first_parent_error is not None:
+            raise self.first_parent_error
+        return self.parents[commit]
+
+    def changed_paths(
+        self, repo_path: Path, base: str, head: str
+    ) -> tuple[str, ...]:
+        self.calls.append(("changed_paths", str(repo_path), base, head))
+        if self.changed_paths_error is not None:
+            raise self.changed_paths_error
+        return self.paths[(base, head)]
+
+    def patch_id(self, repo_path: Path, base: str, head: str) -> str:
+        self.calls.append(("patch_id", str(repo_path), base, head))
+        if self.patch_id_error is not None:
+            raise self.patch_id_error
+        return self.patch_ids[(base, head)]
 
 
 @pytest.fixture
@@ -386,6 +412,231 @@ def test_ambiguous_ownership_requires_reconciliation(
     with pytest.raises(ReconciliationRequired, match="ambiguous"):
         executor.merge_approved("demo", approved_verdict(), effect_id="e-1")
     assert git.calls == []
+
+
+PARENT = "7" * 40
+CANDIDATE_PATHS = ("A\tsrc/new.py", "M\tsrc/app.py")
+
+
+def _advanced_base_git(**overrides: Any) -> FakeGit:
+    """A FakeGit wired so the three existing relations fail but the fourth,
+    patch equivalence against an advanced base, succeeds."""
+
+    arguments: dict[str, Any] = {
+        "ancestor": {
+            (MERGE_SHA, "origin/main"): True,
+            (CANDIDATE, MERGE_SHA): False,
+            (BASE, PARENT): True,
+        },
+        "trees": {MERGE_SHA: TREE, CANDIDATE: "6" * 40},
+        "parents": {MERGE_SHA: PARENT},
+        "paths": {
+            (BASE, CANDIDATE): CANDIDATE_PATHS,
+            (PARENT, MERGE_SHA): CANDIDATE_PATHS,
+        },
+        "patch_ids": {
+            (BASE, CANDIDATE): "8" * 40,
+            (PARENT, MERGE_SHA): "8" * 40,
+        },
+    }
+    arguments.update(overrides)
+    return FakeGit(**arguments)
+
+
+def test_prove_landed_proves_advanced_base_patch_equivalence(
+    github: FakeGitHub,
+) -> None:
+    git = _advanced_base_git()
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    outcome = executor.prove_landed(
+        "demo",
+        candidate_sha=CANDIDATE,
+        candidate_branch="feature/eng-9",
+        pr_number=14,
+        merge_sha=MERGE_SHA,
+        base_sha=BASE,
+    )
+    assert outcome.relation == "patch_equivalent"
+    assert outcome.base_sha == BASE
+    assert outcome.merge_parent_sha == PARENT
+    assert outcome.patch_id == "8" * 40
+    assert outcome.changed_paths == CANDIDATE_PATHS
+
+
+def test_merge_approved_proves_advanced_base_patch_equivalence(
+    github: FakeGitHub,
+) -> None:
+    git = _advanced_base_git()
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    outcome = executor.merge_approved(
+        "demo", approved_verdict(), effect_id="e-1", base_sha=BASE
+    )
+    assert outcome.relation == "patch_equivalent"
+    assert outcome.base_sha == BASE
+    assert outcome.merge_parent_sha == PARENT
+    assert outcome.patch_id == "8" * 40
+    assert outcome.changed_paths == CANDIDATE_PATHS
+
+
+def test_patch_equivalence_rejects_content_difference(
+    github: FakeGitHub,
+) -> None:
+    """Same changed paths, different patch id: one changed hunk."""
+
+    git = _advanced_base_git(
+        patch_ids={
+            (BASE, CANDIDATE): "8" * 40,
+            (PARENT, MERGE_SHA): "9" * 40,
+        }
+    )
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    with pytest.raises(ReconciliationRequired, match="content differs"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=CANDIDATE,
+            candidate_branch="feature/eng-9",
+            pr_number=14,
+            merge_sha=MERGE_SHA,
+            base_sha=BASE,
+        )
+
+
+@pytest.mark.parametrize(
+    "merge_paths",
+    [
+        ("A\tsrc/new.py", "A\tsrc/extra.py", "M\tsrc/app.py"),  # added path
+        ("M\tsrc/app.py",),  # deleted path
+        ("A\tsrc/new.py", "M\tsrc/app.py", "R100\told.py\tnew.py"),  # renamed path
+    ],
+    ids=["added", "deleted", "renamed"],
+)
+def test_patch_equivalence_rejects_changed_path_difference(
+    github: FakeGitHub, merge_paths: tuple[str, ...]
+) -> None:
+    git = _advanced_base_git(
+        paths={
+            (BASE, CANDIDATE): CANDIDATE_PATHS,
+            (PARENT, MERGE_SHA): merge_paths,
+        }
+    )
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    with pytest.raises(ReconciliationRequired, match="changed paths differ"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=CANDIDATE,
+            candidate_branch="feature/eng-9",
+            pr_number=14,
+            merge_sha=MERGE_SHA,
+            base_sha=BASE,
+        )
+
+
+def test_patch_equivalence_rejects_base_not_ancestor_of_parent(
+    github: FakeGitHub,
+) -> None:
+    git = _advanced_base_git(
+        ancestor={
+            (MERGE_SHA, "origin/main"): True,
+            (CANDIDATE, MERGE_SHA): False,
+            (BASE, PARENT): False,
+        }
+    )
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    with pytest.raises(ReconciliationRequired, match="candidate base is not reachable"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=CANDIDATE,
+            candidate_branch="feature/eng-9",
+            pr_number=14,
+            merge_sha=MERGE_SHA,
+            base_sha=BASE,
+        )
+    assert all(call[0] not in ("changed_paths", "patch_id") for call in git.calls)
+
+
+def test_patch_equivalence_not_attempted_without_base_sha(
+    github: FakeGitHub,
+) -> None:
+    """base_sha None preserves today's unrelated-merge behaviour exactly."""
+
+    git = _advanced_base_git()
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    with pytest.raises(ReconciliationRequired, match="unrelated"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=CANDIDATE,
+            candidate_branch="feature/eng-9",
+            pr_number=14,
+            merge_sha=MERGE_SHA,
+        )
+    assert all(
+        call[0] not in ("first_parent", "changed_paths", "patch_id")
+        for call in git.calls
+    )
+
+
+def test_merge_method_merge_never_tries_patch_equivalence(
+    github: FakeGitHub,
+) -> None:
+    git = _advanced_base_git()
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    with pytest.raises(ReconciliationRequired, match="ancestry"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=CANDIDATE,
+            candidate_branch="feature/eng-9",
+            pr_number=14,
+            merge_sha=MERGE_SHA,
+            merge_method="merge",
+            base_sha=BASE,
+        )
+    assert all(
+        call[0] not in ("first_parent", "changed_paths", "patch_id")
+        for call in git.calls
+    )
+
+
+@pytest.mark.parametrize(
+    "error_field",
+    ["first_parent_error", "changed_paths_error", "patch_id_error"],
+)
+def test_git_error_in_patch_equivalence_primitive_requires_reconciliation(
+    github: FakeGitHub, error_field: str
+) -> None:
+    git = _advanced_base_git(**{error_field: GitError("git invocation failed")})
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    with pytest.raises(ReconciliationRequired, match="merge ancestry proof failed"):
+        executor.prove_landed(
+            "demo",
+            candidate_sha=CANDIDATE,
+            candidate_branch="feature/eng-9",
+            pr_number=14,
+            merge_sha=MERGE_SHA,
+            base_sha=BASE,
+        )
+
+
+def test_existing_relations_win_before_patch_equivalence_is_tried(
+    github: FakeGitHub, git: FakeGit
+) -> None:
+    """The three existing proofs pre-empt the fourth even when a base is
+    supplied: candidate_reachable here, with no first_parent/patch calls."""
+
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+    outcome = executor.prove_landed(
+        "demo",
+        candidate_sha=CANDIDATE,
+        candidate_branch="feature/eng-9",
+        pr_number=14,
+        merge_sha=MERGE_SHA,
+        base_sha=BASE,
+    )
+    assert outcome.relation == "candidate_reachable"
+    assert outcome.base_sha is None
+    assert all(
+        call[0] not in ("first_parent", "changed_paths", "patch_id")
+        for call in git.calls
+    )
 
 
 def candidate_manifest(**overrides: Any) -> CandidateManifest:

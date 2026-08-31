@@ -31,7 +31,9 @@ class GitResult:
 class GitRunner(Protocol):
     """Execution boundary: one argv vector, one repository, no shell."""
 
-    def run(self, args: tuple[str, ...], cwd: Path) -> GitResult: ...
+    def run(
+        self, args: tuple[str, ...], cwd: Path, *, input: str | None = None
+    ) -> GitResult: ...
 
 
 class SubprocessGitRunner:
@@ -46,7 +48,9 @@ class SubprocessGitRunner:
         self._env = dict(env) if env is not None else None
         self._timeout = timeout
 
-    def run(self, args: tuple[str, ...], cwd: Path) -> GitResult:
+    def run(
+        self, args: tuple[str, ...], cwd: Path, *, input: str | None = None
+    ) -> GitResult:
         try:
             completed = subprocess.run(
                 args,
@@ -56,6 +60,7 @@ class SubprocessGitRunner:
                 text=True,
                 timeout=self._timeout,
                 check=False,
+                input=input,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise GitError(f"git invocation failed: {type(error).__name__}") from error
@@ -127,6 +132,65 @@ class GitVerifier:
         if _SHA_PATTERN.match(tree) is None:
             raise GitError("git rev-parse returned an invalid tree identity")
         return tree
+
+    def first_parent(self, repo_path: Path, commit: str) -> str:
+        """Return the first-parent commit identity of one exact commit."""
+
+        _require_sha(commit)
+        result = self._runner.run(
+            ("git", "rev-parse", "--verify", f"{commit}^1"), repo_path
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git rev-parse failed with exit code {result.returncode}"
+            )
+        parent = result.stdout.strip()
+        if _SHA_PATTERN.match(parent) is None:
+            raise GitError("git rev-parse returned an invalid parent identity")
+        return parent
+
+    def changed_paths(self, repo_path: Path, base: str, head: str) -> tuple[str, ...]:
+        """Return the sorted, renameless status/path lines between two commits."""
+
+        _require_sha(base)
+        _require_sha(head)
+        result = self._runner.run(
+            ("git", "diff", "--name-status", "--no-renames", base, head), repo_path
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git diff --name-status failed with exit code {result.returncode}"
+            )
+        lines = [line for line in result.stdout.splitlines() if line]
+        return tuple(sorted(lines))
+
+    def patch_id(self, repo_path: Path, base: str, head: str) -> str:
+        """Return the stable patch id of the diff between two commits."""
+
+        _require_sha(base)
+        _require_sha(head)
+        diff_result = self._runner.run(
+            ("git", "diff", "--full-index", base, head), repo_path
+        )
+        if diff_result.returncode != 0:
+            raise GitError(
+                f"git diff --full-index failed with exit code {diff_result.returncode}"
+            )
+        patch_result = self._runner.run(
+            ("git", "patch-id", "--stable"), repo_path, input=diff_result.stdout
+        )
+        if patch_result.returncode != 0:
+            raise GitError(
+                f"git patch-id failed with exit code {patch_result.returncode}"
+            )
+        stdout = patch_result.stdout.strip()
+        if not stdout:
+            raise GitError("git patch-id returned no patch id for an empty diff")
+        first_line = stdout.splitlines()[0]
+        token = first_line.split(" ", 1)[0]
+        if _SHA_PATTERN.match(token) is None:
+            raise GitError("git patch-id returned a malformed patch id")
+        return token
 
 
 @dataclass(frozen=True, slots=True)

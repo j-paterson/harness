@@ -467,6 +467,7 @@ class ReviewService:
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
         project = self._projects[record.project_key]
+        settlement = self._settlements.get(review_id)
 
         pull = self._github.get_pull_request(record.repository, record.pr_number)
         if (
@@ -488,6 +489,7 @@ class ReviewService:
                     candidate_branch=record.branch,
                     pr_number=record.pr_number,
                     merge_sha=pull.merge_commit_sha,
+                    base_sha=settlement.base_sha,
                 )
             except ReconciliationRequired as error:
                 record = self._transition(
@@ -542,7 +544,8 @@ class ReviewService:
         # time immediately before the GitHub merge call. A stale binding
         # returns without any mutation and the caller releases the claim
         # back to ``recorded``.
-        stale = self._stale_settlement_reason(self._settlements.get(review_id))
+        settlement = self._settlements.get(review_id)
+        stale = self._stale_settlement_reason(settlement)
         if stale is not None:
             return _outcome(record, state=STALE_SETTLEMENT, reason=stale)
         try:
@@ -550,6 +553,7 @@ class ReviewService:
                 record.project_key,
                 record.as_verdict(),
                 effect_id=f"merge:{review_id}",
+                base_sha=settlement.base_sha,
             )
         except MergeBlocked as error:
             record = self._transition(record, "blocked", reason=str(error))
@@ -578,8 +582,59 @@ class ReviewService:
             merge_sha=proven.merge_sha,
             projection=projection,
         )
+        self._record_merge_proven(record, proven, reason=reason)
         await self._project_after_merge(record)
         return _outcome(record, reason=record.reason or "merged")
+
+    def _record_merge_proven(
+        self, record: ReviewRecord, proven: Any, *, reason: str
+    ) -> None:
+        """Append the one durable ``merge.proven`` event for this review.
+
+        ``_transition`` owns its own transaction for the ``merged`` state
+        change, so this appends in a separate small transaction right
+        after it, skipping the append when an identical event already
+        exists so a replay is a no-op. ``getattr`` with ``None`` defaults
+        keeps this safe against older :class:`ProvenMerge` shapes.
+        """
+
+        with self._database.transaction() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM events WHERE event_type = 'merge.proven' "
+                "AND aggregate_id = ? LIMIT 1",
+                (record.review_id,),
+            ).fetchone()
+            if existing is not None:
+                return
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="merge.proven",
+                    aggregate_type="review",
+                    aggregate_id=record.review_id,
+                    correlation_id=record.event_id,
+                    payload={
+                        "repository": getattr(proven, "repository", None),
+                        "pr_number": getattr(proven, "pr_number", None),
+                        "candidate_sha": getattr(proven, "candidate_sha", None),
+                        "candidate_branch": getattr(proven, "candidate_branch", None),
+                        "base_sha": getattr(proven, "base_sha", None),
+                        "merge_sha": getattr(proven, "merge_sha", None),
+                        "merge_parent_sha": getattr(
+                            proven, "merge_parent_sha", None
+                        ),
+                        "integration_branch": getattr(
+                            proven, "integration_branch", None
+                        ),
+                        "relation": getattr(proven, "relation", None),
+                        "patch_id": getattr(proven, "patch_id", None),
+                        "changed_paths": list(
+                            getattr(proven, "changed_paths", ()) or ()
+                        ),
+                        "reason": reason,
+                    },
+                ),
+            )
 
     # -- external reconciliation ------------------------------------------
 
@@ -635,6 +690,7 @@ class ReviewService:
             candidate_branch=manifest.branch,
             pr_number=pr_number,
             merge_sha=pull.merge_commit_sha,
+            base_sha=manifest.base_sha,
         )
 
         stamp = self._now().isoformat()
@@ -652,7 +708,11 @@ class ReviewService:
                     raise ValueError(
                         "review id is already bound to a different candidate"
                     )
-                if record.state not in ("approved", "merged"):
+                if record.state not in (
+                    "approved",
+                    "merged",
+                    "reconciliation_required",
+                ):
                     raise ValueError(
                         f"a review in state {record.state!r} cannot be "
                         "reconciled as merged"
@@ -717,7 +777,31 @@ class ReviewService:
         if settlement.state == "settled":
             return _outcome(record, reason=record.reason or "merged")
         if settlement.state == "failed":
-            return _outcome(record, reason=settlement.reason or record.state)
+            # This path exists exactly to repair a post-merge proof
+            # failure: reopen only when the failed settlement's own
+            # merge effect actually completed and its response sha is
+            # the exact merge commit this fresh proof just bound —
+            # never invent or repeat a mutation.
+            effect = (
+                self._merge_journal.get(f"merge:{review_id}")
+                if self._merge_journal is not None
+                else None
+            )
+            reopenable = (
+                effect is not None
+                and effect.state == "completed"
+                and effect.response is not None
+                and str(effect.response.get("sha")) == proven.merge_sha
+            )
+            if not reopenable:
+                return _outcome(record, reason=settlement.reason or record.state)
+            self._settlements.reopen_failed(
+                review_id,
+                reason=(
+                    f"reconciled {proven.relation} at base {manifest.base_sha}"
+                ),
+            )
+            settlement = self._settlements.get(review_id)
         token = self._settlements.claim(review_id)
         if token is None:
             return _outcome(

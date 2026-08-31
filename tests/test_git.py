@@ -26,10 +26,14 @@ class FakeRunner:
     """Deterministic recording runner keyed by exact argv vectors."""
 
     results: dict[tuple[str, ...], GitResult] = field(default_factory=dict)
-    calls: list[tuple[tuple[str, ...], Path]] = field(default_factory=list)
+    calls: list[tuple[tuple[str, ...], Path, str | None]] = field(
+        default_factory=list
+    )
 
-    def run(self, args: tuple[str, ...], cwd: Path) -> GitResult:
-        self.calls.append((args, cwd))
+    def run(
+        self, args: tuple[str, ...], cwd: Path, *, input: str | None = None
+    ) -> GitResult:
+        self.calls.append((args, cwd, input))
         if args not in self.results:
             raise AssertionError(f"unexpected git argv {args!r}")
         return self.results[args]
@@ -50,7 +54,9 @@ def test_fetch_runs_exact_argv_in_repo(
 ) -> None:
     runner.results[("git", "fetch", "--", "origin", "main")] = GitResult(0, "", "")
     verifier.fetch(REPO, "origin", "main")
-    assert runner.calls == [(("git", "fetch", "--", "origin", "main"), REPO)]
+    assert runner.calls == [
+        (("git", "fetch", "--", "origin", "main"), REPO, None)
+    ]
 
 
 def test_fetch_failure_raises_git_error(
@@ -123,6 +129,148 @@ def test_tree_of_failure_fails_closed(
     runner.results[argv] = GitResult(128, "", "fatal: needed a single revision")
     with pytest.raises(GitError, match="rev-parse"):
         verifier.tree_of(REPO, CANDIDATE)
+
+
+def test_first_parent_returns_validated_commit_id(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "rev-parse", "--verify", f"{MERGE_SHA}^1")
+    runner.results[argv] = GitResult(0, CANDIDATE + "\n", "")
+    assert verifier.first_parent(REPO, MERGE_SHA) == CANDIDATE
+
+
+def test_first_parent_rejects_malformed_output(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "rev-parse", "--verify", f"{MERGE_SHA}^1")
+    runner.results[argv] = GitResult(0, "not-a-sha\n", "")
+    with pytest.raises(GitError, match="parent"):
+        verifier.first_parent(REPO, MERGE_SHA)
+
+
+def test_first_parent_failure_fails_closed(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "rev-parse", "--verify", f"{MERGE_SHA}^1")
+    runner.results[argv] = GitResult(128, "", "fatal: needed a single revision")
+    with pytest.raises(GitError, match="rev-parse"):
+        verifier.first_parent(REPO, MERGE_SHA)
+
+
+def test_first_parent_requires_full_lowercase_commit_sha(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    with pytest.raises(GitError):
+        verifier.first_parent(REPO, "HEAD")
+    assert runner.calls == []
+
+
+def test_changed_paths_returns_sorted_name_status_lines(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "diff", "--name-status", "--no-renames", CANDIDATE, MERGE_SHA)
+    runner.results[argv] = GitResult(
+        0, "M\tb.txt\nA\ta.txt\nD\tc.txt\n", ""
+    )
+    assert verifier.changed_paths(REPO, CANDIDATE, MERGE_SHA) == (
+        "A\ta.txt",
+        "D\tc.txt",
+        "M\tb.txt",
+    )
+
+
+def test_changed_paths_drops_trailing_blank_lines(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "diff", "--name-status", "--no-renames", CANDIDATE, MERGE_SHA)
+    runner.results[argv] = GitResult(0, "M\ta.txt\n\n", "")
+    assert verifier.changed_paths(REPO, CANDIDATE, MERGE_SHA) == ("M\ta.txt",)
+
+
+def test_changed_paths_failure_fails_closed(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "diff", "--name-status", "--no-renames", CANDIDATE, MERGE_SHA)
+    runner.results[argv] = GitResult(128, "", "fatal: bad revision")
+    with pytest.raises(GitError, match="git diff"):
+        verifier.changed_paths(REPO, CANDIDATE, MERGE_SHA)
+
+
+def test_changed_paths_requires_full_lowercase_commit_shas(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    with pytest.raises(GitError):
+        verifier.changed_paths(REPO, "HEAD", MERGE_SHA)
+    assert runner.calls == []
+
+
+PATCH_ID = "d" * 40
+
+
+def test_patch_id_diffs_then_pipes_stdin_to_patch_id(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
+    patch_argv = ("git", "patch-id", "--stable")
+    runner.results[diff_argv] = GitResult(0, "diff --git a/x b/x\n", "")
+    runner.results[patch_argv] = GitResult(0, f"{PATCH_ID} {MERGE_SHA}\n", "")
+    assert verifier.patch_id(REPO, CANDIDATE, MERGE_SHA) == PATCH_ID
+    assert runner.calls == [
+        (diff_argv, REPO, None),
+        (patch_argv, REPO, "diff --git a/x b/x\n"),
+    ]
+
+
+def test_patch_id_diff_failure_fails_closed(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(128, "", "fatal: bad revision")
+    with pytest.raises(GitError, match="git diff"):
+        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+
+
+def test_patch_id_command_failure_fails_closed(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
+    patch_argv = ("git", "patch-id", "--stable")
+    runner.results[diff_argv] = GitResult(0, "diff --git a/x b/x\n", "")
+    runner.results[patch_argv] = GitResult(128, "", "fatal: broken")
+    with pytest.raises(GitError, match="git patch-id"):
+        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+
+
+def test_patch_id_empty_diff_raises_git_error(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    """An empty diff yields no patch-id line: fail closed rather than guess."""
+
+    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
+    patch_argv = ("git", "patch-id", "--stable")
+    runner.results[diff_argv] = GitResult(0, "", "")
+    runner.results[patch_argv] = GitResult(0, "", "")
+    with pytest.raises(GitError, match="patch id"):
+        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+
+
+def test_patch_id_rejects_malformed_output(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
+    patch_argv = ("git", "patch-id", "--stable")
+    runner.results[diff_argv] = GitResult(0, "diff --git a/x b/x\n", "")
+    runner.results[patch_argv] = GitResult(0, "not-a-patch-id\n", "")
+    with pytest.raises(GitError, match="malformed"):
+        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+
+
+def test_patch_id_requires_full_lowercase_commit_shas(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    with pytest.raises(GitError):
+        verifier.patch_id(REPO, "HEAD", MERGE_SHA)
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize(
