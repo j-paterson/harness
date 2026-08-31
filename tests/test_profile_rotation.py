@@ -14,6 +14,8 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.profiles import (
     CapacityObservation,
+    ClaudeProfileProbe,
+    ProfileBootstrap,
     ProfileHealth,
     ProfilePool,
     ProfileRegistry,
@@ -507,6 +509,86 @@ def test_pool_without_capacity_port_behaves_as_today(tmp_path: Path) -> None:
 
     assert reservation is not None
     assert reservation.profile_alias == "max-b"
+
+
+# --- INFRA-198 (Sol correction a06cbce0): bootstrap gates admission ---
+#
+# Motivating incident: Hermes selected profile max-a and Claude stopped
+# first on the theme chooser and then on repository trust, because the
+# profile had authentication but incomplete onboarding/project-trust
+# state. Auth health alone is not readiness evidence, so a profile
+# whose deterministic bootstrap has not completed must not be seated,
+# exactly like a fable-capped candidate is skipped today.
+
+
+class _AuthenticatedCommand:
+    """A ``JsonCommand`` double that always reports first-party Max."""
+
+    def run_json(
+        self, command: list[str], env: dict[str, str]
+    ) -> dict[str, object]:
+        return {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "max",
+        }
+
+
+def _bootstrap_registry(tmp_path: Path) -> ProfileRegistry:
+    config = tmp_path / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        "  - alias: max-a\n"
+        f"    config_dir: {tmp_path / '.claude-max-a'}\n"
+        "  - alias: max-b\n"
+        f"    config_dir: {tmp_path / '.claude-max-b'}\n"
+        "  - alias: max-c\n"
+        f"    config_dir: {tmp_path / '.claude-max-c'}\n"
+        "  - alias: max-d\n"
+        f"    config_dir: {tmp_path / '.claude-max-d'}\n",
+        encoding="utf-8",
+    )
+    return ProfileRegistry.load(config)
+
+
+def test_reserve_replacement_skips_an_uninitialized_profile_until_bootstrap_completes(
+    tmp_path: Path,
+) -> None:
+    registry = _bootstrap_registry(tmp_path)
+    bootstrap = ProfileBootstrap(registry, repo_paths=[tmp_path / "repo"])
+    probe = ClaudeProfileProbe(
+        registry, _AuthenticatedCommand(), base_env={}, bootstrap=bootstrap
+    )
+
+    # max-b is authenticated, but its .claude.json is unparseable, so its
+    # bootstrap fails closed and it must never be seated.
+    config_dir = registry.get("max-b").config_dir
+    config_dir.mkdir(parents=True)
+    (config_dir / ".claude.json").write_text("{not valid json", encoding="utf-8")
+
+    pool = ProfilePool(registry, now=lambda: NOW)
+    for profile in registry.profiles:
+        pool.record_health(probe.check(profile.alias))
+    pool.restore("demo", "max-a", NOW)
+
+    reservation = pool.reserve_replacement("demo", "max-a")
+
+    # max-b (next in scheduling order) is skipped for its unresolved
+    # bootstrap; max-c is the first candidate whose bootstrap completed.
+    assert reservation is not None
+    assert reservation.profile_alias == "max-c"
+
+    # An operator repairs max-b's file; the next probe cycle lets its
+    # bootstrap complete and restores it as a seatable candidate.
+    (config_dir / ".claude.json").write_text("{}", encoding="utf-8")
+    pool.cancel_replacement("demo")
+    pool.record_health(probe.check("max-b"))
+
+    repaired_reservation = pool.reserve_replacement("demo", "max-a")
+
+    assert repaired_reservation is not None
+    assert repaired_reservation.profile_alias == "max-b"
 
 
 def test_context_only_rotation_retains_the_incumbent_profile(

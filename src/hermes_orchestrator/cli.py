@@ -84,6 +84,7 @@ from hermes_orchestrator.packet_admission import PacketAdmission
 from hermes_orchestrator.post_merge import PostMergeAdvance
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
+    ProfileBootstrap,
     ProfileHealth,
     ProfilePool,
     ProfileRegistry,
@@ -1004,7 +1005,21 @@ def _open_rotation_collaborators(
         raise ValueError("the cell service or seater is unavailable")
     registry = ProfileRegistry.load(profile_path)
     environment = dict(os.environ)
-    probe = ClaudeProfileProbe(registry, base_env=environment)
+    # Sol correction a06cbce0: an authenticated profile is eligible only
+    # once its onboarding/theme/trust state is deterministically
+    # established for exactly the managed repositories a seated lead
+    # actually runs from — the same paths the seater launches from (see
+    # ``lead_worktree = project.lead_worktree or project.repo_path`` at
+    # this command's rotation call site) — otherwise a restored session
+    # can still stop on a first-run dialog instead of Hermes's handoff.
+    managed_repo_paths = tuple(
+        dict.fromkeys(
+            project.lead_worktree or project.repo_path
+            for project in settings.projects.values()
+        )
+    )
+    bootstrap = ProfileBootstrap(registry, repo_paths=managed_repo_paths)
+    probe = ClaudeProfileProbe(registry, base_env=environment, bootstrap=bootstrap)
     # Mirrors open_runtime's own startup seeding (runtime.py:453-458): a
     # freshly built ProfilePool starts every slot ineligible, and only
     # ``record_health`` ever flips one to eligible, so the pool this

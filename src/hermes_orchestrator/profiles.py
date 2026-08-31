@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
-from collections.abc import Callable, Mapping
+import tempfile
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -167,6 +169,121 @@ class ProfileHealth:
         }
 
 
+class ProfileBootstrap:
+    """Deterministically establish pre-flight state before a profile seats.
+
+    Sol correction a06cbce0: Hermes selected an authenticated profile
+    (max-a) and Claude stopped first on the theme chooser and then on
+    repository trust, because authentication alone said nothing about
+    onboarding/theme/trust state. A profile admitted for managed
+    rotation must reach only the hermes-control trust gate (when
+    required) and then the restored session — never a first-run dialog.
+
+    ``ensure`` reads ``<config_dir>/.claude.json`` (treating a missing
+    file as ``{}``) and establishes exactly four non-secret keys when
+    absent or not already satisfied: ``hasCompletedOnboarding`` (true),
+    ``theme`` (left untouched when already set, otherwise ``"dark"``),
+    ``bypassPermissionsModeAccepted`` (true — every managed launch uses
+    ``--dangerously-skip-permissions``, so its one-time warning dialog
+    must never appear either), and a trust entry for exactly the
+    managed repository path(s) this instance was given. Every other key
+    — including all credential/identity fields — is preserved
+    untouched. Any read, parse, or write failure fails closed: the file
+    is left exactly as found and the profile is reported not
+    bootstrapped, never a crash.
+    """
+
+    def __init__(
+        self,
+        registry: ProfileRegistry,
+        *,
+        repo_paths: Iterable[Path],
+    ) -> None:
+        self._registry = registry
+        self._repo_paths = tuple(str(path) for path in repo_paths)
+
+    def ensure(self, alias: str) -> bool:
+        """Idempotently establish onboarding/theme/trust state for alias.
+
+        Returns whether ``.claude.json`` now satisfies every managed
+        key. A missing file starts from ``{}``; unparseable JSON or any
+        I/O failure fails closed without modifying the file.
+        """
+
+        config_dir = self._registry.get(alias).config_dir
+        path = config_dir / ".claude.json"
+        try:
+            raw = path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            return False
+        try:
+            original: Any = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(original, dict):
+            return False
+
+        document = dict(original)
+        if document.get("hasCompletedOnboarding") is not True:
+            document["hasCompletedOnboarding"] = True
+        if "theme" not in document:
+            document["theme"] = "dark"
+        if document.get("bypassPermissionsModeAccepted") is not True:
+            document["bypassPermissionsModeAccepted"] = True
+
+        existing_projects = original.get("projects")
+        projects = (
+            dict(existing_projects) if isinstance(existing_projects, dict) else {}
+        )
+        for repo_path in self._repo_paths:
+            existing_entry = projects.get(repo_path)
+            entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+            entry["hasTrustDialogAccepted"] = True
+            projects[repo_path] = entry
+        document["projects"] = projects
+
+        if document == original:
+            return True
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            self._write_atomic(path, document)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _write_atomic(path: Path, document: dict[str, Any]) -> None:
+        """Validated temp file, fsync, atomic replace, directory fsync.
+
+        Mirrors ``hook_install.ProfileHookInstaller._write_atomic``: the
+        original ``.claude.json`` stays complete and parseable through
+        any interruption, and its permissions survive the replacement.
+        """
+
+        payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
+        json.loads(payload)  # the document must round-trip before it lands
+        mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".claude-", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            os.write(descriptor, payload.encode("utf-8"))
+            os.fsync(descriptor)
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
+        try:
+            os.replace(temporary, path)
+        except BaseException:
+            os.unlink(temporary)
+            raise
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 class ClaudeProfileProbe:
     """Verify that Claude CLI resolves to first-party subscription auth."""
 
@@ -177,14 +294,24 @@ class ClaudeProfileProbe:
         *,
         base_env: Mapping[str, str],
         now: Callable[[], datetime] | None = None,
+        bootstrap: ProfileBootstrap | None = None,
     ) -> None:
         self._registry = registry
         self._command = command or SubprocessJsonCommand()
         self._base_env = base_env
         self._now = now or (lambda: datetime.now(UTC))
+        self._bootstrap = bootstrap
 
     def check(self, alias: str) -> ProfileHealth:
-        """Probe one profile and discard all account identity fields."""
+        """Probe one profile and discard all account identity fields.
+
+        Authentication alone is not enough to admit a profile for
+        managed rotation (Sol correction a06cbce0): when this probe
+        carries a :class:`ProfileBootstrap`, an authenticated profile is
+        eligible only once its onboarding/theme/trust state is
+        deterministically established, so no first-run dialog can ever
+        surface in a restored session.
+        """
 
         result = self._command.run_json(
             ["claude", "auth", "status", "--json"],
@@ -196,10 +323,17 @@ class ClaudeProfileProbe:
             and result.get("apiProvider") == "firstParty"
             and result.get("subscriptionType") == "max"
         )
+        reason = "eligible" if eligible else "not_first_party_subscription"
+        if eligible and self._bootstrap is not None:
+            if self._bootstrap.ensure(alias):
+                reason = "eligible"
+            else:
+                eligible = False
+                reason = "bootstrap_incomplete"
         return ProfileHealth(
             profile_alias=alias,
             eligible=eligible,
-            reason="eligible" if eligible else "not_first_party_subscription",
+            reason=reason,
             last_checked_at=self._now(),
         )
 

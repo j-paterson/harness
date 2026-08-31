@@ -8,6 +8,7 @@ import pytest
 
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
+    ProfileBootstrap,
     ProfileHealth,
     ProfilePool,
     ProfileRegistry,
@@ -204,3 +205,178 @@ def test_unprobed_profiles_are_not_eligible(registry: ProfileRegistry) -> None:
     pool = ProfilePool(registry)
 
     assert pool.acquire("demo") is None
+
+
+def _authenticated_command() -> RecordingCommand:
+    return RecordingCommand(
+        {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "subscriptionType": "max",
+        }
+    )
+
+
+def test_bootstrap_establishes_exactly_the_four_managed_keys(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    """INFRA-198 (Sol correction a06cbce0): an authenticated profile with
+    no prior ``.claude.json`` must never surface the theme chooser, the
+    onboarding flow, the bypass-permissions warning, or repository
+    trust — bootstrap establishes all four deterministically."""
+
+    config_dir = registry.get("max-a").config_dir
+    repo = tmp_path / "repo"
+    bootstrap = ProfileBootstrap(registry, repo_paths=[repo])
+
+    assert bootstrap.ensure("max-a") is True
+
+    document = json.loads((config_dir / ".claude.json").read_text(encoding="utf-8"))
+    assert document == {
+        "hasCompletedOnboarding": True,
+        "theme": "dark",
+        "bypassPermissionsModeAccepted": True,
+        "projects": {str(repo): {"hasTrustDialogAccepted": True}},
+    }
+
+
+def test_bootstrap_preserves_an_existing_theme_choice(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    config_dir = registry.get("max-a").config_dir
+    config_dir.mkdir(parents=True)
+    (config_dir / ".claude.json").write_text(
+        json.dumps({"theme": "light"}), encoding="utf-8"
+    )
+    bootstrap = ProfileBootstrap(registry, repo_paths=[tmp_path / "repo"])
+
+    assert bootstrap.ensure("max-a") is True
+
+    document = json.loads((config_dir / ".claude.json").read_text(encoding="utf-8"))
+    assert document["theme"] == "light"
+
+
+def test_bootstrap_preserves_unrelated_keys(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    config_dir = registry.get("max-a").config_dir
+    config_dir.mkdir(parents=True)
+    original = {
+        "numStartups": 12,
+        "oauthAccount": {"emailAddress": "must-not-be-touched@example.com"},
+        "projects": {
+            "/some/other/repo": {
+                "hasTrustDialogAccepted": True,
+                "allowedTools": ["Bash"],
+            }
+        },
+    }
+    (config_dir / ".claude.json").write_text(json.dumps(original), encoding="utf-8")
+    repo = tmp_path / "repo"
+    bootstrap = ProfileBootstrap(registry, repo_paths=[repo])
+
+    assert bootstrap.ensure("max-a") is True
+
+    document = json.loads((config_dir / ".claude.json").read_text(encoding="utf-8"))
+    assert document["numStartups"] == 12
+    assert document["oauthAccount"] == {
+        "emailAddress": "must-not-be-touched@example.com"
+    }
+    assert document["projects"]["/some/other/repo"] == {
+        "hasTrustDialogAccepted": True,
+        "allowedTools": ["Bash"],
+    }
+    assert document["projects"][str(repo)] == {"hasTrustDialogAccepted": True}
+
+
+def test_bootstrap_fails_closed_on_unparseable_json(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    config_dir = registry.get("max-a").config_dir
+    config_dir.mkdir(parents=True)
+    claude_json = config_dir / ".claude.json"
+    claude_json.write_text("{not valid json", encoding="utf-8")
+    bootstrap = ProfileBootstrap(registry, repo_paths=[tmp_path / "repo"])
+
+    assert bootstrap.ensure("max-a") is False
+    assert claude_json.read_text(encoding="utf-8") == "{not valid json"
+
+
+def test_bootstrap_trusts_exactly_the_managed_repository_paths(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    config_dir = registry.get("max-a").config_dir
+    repo_one = tmp_path / "repo-one"
+    repo_two = tmp_path / "repo-two"
+    bootstrap = ProfileBootstrap(registry, repo_paths=[repo_one, repo_two])
+
+    assert bootstrap.ensure("max-a") is True
+
+    document = json.loads((config_dir / ".claude.json").read_text(encoding="utf-8"))
+    assert set(document["projects"]) == {str(repo_one), str(repo_two)}
+    for repo in (repo_one, repo_two):
+        assert document["projects"][str(repo)] == {"hasTrustDialogAccepted": True}
+
+
+def test_bootstrap_is_idempotent(tmp_path: Path, registry: ProfileRegistry) -> None:
+    repo = tmp_path / "repo"
+    bootstrap = ProfileBootstrap(registry, repo_paths=[repo])
+
+    assert bootstrap.ensure("max-a") is True
+    claude_json = registry.get("max-a").config_dir / ".claude.json"
+    first_write = claude_json.stat().st_mtime_ns
+    first_document = claude_json.read_text(encoding="utf-8")
+
+    assert bootstrap.ensure("max-a") is True
+    assert claude_json.read_text(encoding="utf-8") == first_document
+    # Nothing was left to establish, so the file is not rewritten.
+    assert claude_json.stat().st_mtime_ns == first_write
+
+
+def test_probe_is_not_eligible_until_bootstrap_completes(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    """An authenticated profile whose onboarding/theme/trust state is
+    not yet established must not be reported eligible."""
+
+    config_dir = registry.get("max-a").config_dir
+    config_dir.mkdir(parents=True)
+    (config_dir / ".claude.json").write_text("{not valid json", encoding="utf-8")
+    bootstrap = ProfileBootstrap(registry, repo_paths=[tmp_path / "repo"])
+    probe = ClaudeProfileProbe(
+        registry, _authenticated_command(), base_env={}, bootstrap=bootstrap
+    )
+
+    health = probe.check("max-a")
+
+    assert health.eligible is False
+    assert health.reason == "bootstrap_incomplete"
+
+
+def test_probe_is_eligible_once_bootstrap_completes(
+    tmp_path: Path, registry: ProfileRegistry
+) -> None:
+    bootstrap = ProfileBootstrap(registry, repo_paths=[tmp_path / "repo"])
+    probe = ClaudeProfileProbe(
+        registry, _authenticated_command(), base_env={}, bootstrap=bootstrap
+    )
+
+    health = probe.check("max-a")
+
+    assert health.eligible is True
+    assert health.reason == "eligible"
+
+
+def test_probe_without_bootstrap_keeps_prior_auth_only_behavior(
+    registry: ProfileRegistry,
+) -> None:
+    """Construction sites that predate this defect fix (no ``bootstrap``
+    supplied) must keep their historical auth-only eligibility."""
+
+    probe = ClaudeProfileProbe(registry, _authenticated_command(), base_env={})
+
+    health = probe.check("max-a")
+
+    assert health.eligible is True
+    assert health.reason == "eligible"

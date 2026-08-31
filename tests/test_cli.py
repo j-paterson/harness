@@ -2386,6 +2386,49 @@ def test_open_rotation_collaborators_wires_channel_launch_and_trust_with_node(
         runtime.close()
 
 
+def test_open_rotation_collaborators_composes_bootstrap_with_managed_repo_paths(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-198 (Sol correction a06cbce0): the one-shot rotate-lead
+    seater must gate profile readiness on the same deterministic
+    onboarding/theme/trust bootstrap the live daemon needs, wired with
+    exactly the managed repository path a seated lead actually runs
+    from — the project's ``lead_worktree`` when configured, else its
+    ``repo_path`` — otherwise a restored session can still stop on a
+    first-run dialog instead of Hermes's handoff."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
+    from hermes_orchestrator.runtime import open_runtime
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    captured_repo_paths: list[tuple[object, ...]] = []
+
+    class _FakeBootstrap:
+        def __init__(self, registry: object, *, repo_paths: object) -> None:
+            captured_repo_paths.append(tuple(repo_paths))
+
+        def ensure(self, alias: str) -> bool:
+            return True
+
+    monkeypatch.setattr(cli_module, "ProfileBootstrap", _FakeBootstrap)
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        cli_module._open_rotation_collaborators(settings, runtime)
+    finally:
+        runtime.close()
+
+    assert len(captured_repo_paths) == 1
+    project = settings.projects["demo"]
+    expected = project.lead_worktree or project.repo_path
+    assert captured_repo_paths[0] == (expected,)
+
+
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:
     result = invoke(
         [
