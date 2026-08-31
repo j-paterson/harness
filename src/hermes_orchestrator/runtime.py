@@ -89,10 +89,12 @@ from hermes_orchestrator.orchestrator_workspace import (
     OrchestratorWorkspaceOwner,
     WorkspaceRefused,
 )
+from hermes_orchestrator.post_merge import PostMergeAdvance
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
     JsonCommand,
+    ProfileBootstrap,
     ProfileHealth,
     ProfilePool,
     ProfileRegistry,
@@ -206,6 +208,7 @@ class Runtime:
     cells: ProjectCellService | None
     profile_health: tuple[ProfileHealth, ...]
     merge_flow: MergeFlow | None = None
+    post_merge: PostMergeAdvance | None = None
     processes: ProcessRegistry | None = None
     checkpoints: CheckpointRequests | None = None
     resets: ScheduledResets | None = None
@@ -541,6 +544,7 @@ def open_runtime(
         cells: ProjectCellService | None = None
         dispatch: Dispatch | None = None
         merge_flow: MergeFlow | None = None
+        post_merge: PostMergeAdvance | None = None
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
@@ -566,10 +570,26 @@ def open_runtime(
             pool = ProfilePool(
                 registry, capacity_evidence=ProfileCapacityEvidence(database)
             )
+            # Sol correction a06cbce0: the daemon's readiness seeding
+            # gates on the same deterministic bootstrap as rotate-lead,
+            # so an authenticated but uninitialized profile never seats.
+            # Sol correction c5600e31: bootstrap trust is derived from
+            # the same canonical ``project.lead_cwd`` that seat and cell
+            # composition below use, so an eligible profile can never
+            # pass bootstrap against one path while the seat launches in
+            # another.
+            managed_repo_paths = tuple(
+                dict.fromkeys(
+                    project.lead_cwd for project in settings.projects.values()
+                )
+            )
             probe = ClaudeProfileProbe(
                 registry,
                 command=profile_command,
                 base_env=environment,
+                bootstrap=ProfileBootstrap(
+                    registry, repo_paths=managed_repo_paths
+                ),
             )
             checked: list[ProfileHealth] = []
             for profile in registry.profiles:
@@ -599,6 +619,22 @@ def open_runtime(
                 base_env=environment,
                 processes=processes,
             )
+            # INFRA-198 P2: composed only in live/active mode, where a
+            # durable database exists. ReviewService is built inside
+            # ``build_merge_flow`` (out of reach here), so the fast
+            # ``on_merged`` accelerator is attached to the already-built
+            # instance as a public attribute; the daemon's 30s tick is
+            # the restart-safe, always-correct discovery path regardless.
+            post_merge = PostMergeAdvance(
+                database=database,
+                events=events,
+                projects=settings.projects,
+                queue=queue,
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+                registry=processes,
+            )
+            merge_flow.reviews.on_merged = post_merge.on_merged
             runner = ClaudeRunner(
                 registry,
                 prompt_file=prompt_path,
@@ -620,8 +656,12 @@ def open_runtime(
                     base_env=environment,
                     password_source=cmux_password_source(reader),
                 )
+                # Sol correction c5600e31: the canonical managed lead
+                # cwd — with a configured lead_worktree this is now the
+                # worktree, not repo_path, so the seat launches in the
+                # same directory bootstrap already trusted.
                 cmux_project_paths = {
-                    alias: project.repo_path
+                    alias: project.lead_cwd
                     for alias, project in settings.projects.items()
                 }
                 cmux_profile_dirs = RegistryProfileDirectory(registry)
@@ -674,6 +714,19 @@ def open_runtime(
                     project_paths=cmux_project_paths,
                     profile_dirs=cmux_profile_dirs,
                     environ=environment,
+                    # Sol correction a06cbce0: restart recovery reseats a
+                    # missing lead through the same hermes-control
+                    # channel launcher the seater uses, and records the
+                    # durable channel.blocked receipt when it cannot —
+                    # never an active binding over a blank terminal.
+                    channel_launch=channel_launcher,
+                    control=control_operations,
+                    # Sol correction c5600e31: the exact same trust
+                    # trigger the seater uses, so restart recovery
+                    # completes the same bounded channel-trust
+                    # confirmation and registration path normal seating
+                    # runs before durable state calls the seat usable.
+                    channel_trust=channel_confirmer,
                 )
                 cmux_hibernation = CmuxHibernationDriver(
                     gate=CmuxHibernationGate(
@@ -731,8 +784,12 @@ def open_runtime(
                 profiles=pool,
                 runner=runner,
                 linear=linear,
+                # Sol correction c5600e31: same canonical lead cwd as
+                # ``cmux_project_paths`` above and the bootstrap trust
+                # paths — cell composition must agree with the seat it
+                # launches into.
                 project_paths={
-                    alias: project.repo_path
+                    alias: project.lead_cwd
                     for alias, project in settings.projects.items()
                 },
                 handoffs=HandoffService(database),
@@ -794,6 +851,7 @@ def open_runtime(
             cells=cells,
             profile_health=profile_health,
             merge_flow=merge_flow,
+            post_merge=post_merge,
             processes=processes,
             checkpoints=checkpoints,
             resets=resets,

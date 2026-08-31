@@ -13,6 +13,7 @@ from hermes_orchestrator.git import (
     GitResult,
     GitVerifier,
     SubprocessGitRunner,
+    WorktreeGit,
 )
 
 MERGE_SHA = "a" * 40
@@ -779,3 +780,61 @@ def test_subprocess_runner_proves_real_ancestry(tmp_path: Path) -> None:
     assert verifier.is_ancestor(repo, first, "main") is True
     assert verifier.is_ancestor(repo, second, first) is False
     assert verifier.tree_of(repo, second) == git("rev-parse", "HEAD^{tree}")
+
+
+# -- WorktreeGit.worktree_add_detached (INFRA-198 P2) ------------------
+
+
+@pytest.fixture
+def worktree_git(runner: FakeRunner) -> WorktreeGit:
+    return WorktreeGit(runner=runner)
+
+
+def test_worktree_add_detached_runs_exact_argv(
+    worktree_git: WorktreeGit, runner: FakeRunner, tmp_path: Path
+) -> None:
+    target = tmp_path / "checkouts" / MERGE_SHA
+    runner.results[("git", "worktree", "add", "--detach", str(target), MERGE_SHA)] = (
+        GitResult(0, "", "")
+    )
+
+    worktree_git.worktree_add_detached(REPO, target, MERGE_SHA)
+
+    assert runner.calls == [
+        (
+            ("git", "worktree", "add", "--detach", str(target), MERGE_SHA),
+            REPO,
+            None,
+            None,
+        )
+    ]
+
+
+def test_worktree_add_detached_requires_full_lowercase_sha(
+    worktree_git: WorktreeGit, runner: FakeRunner, tmp_path: Path
+) -> None:
+    target = tmp_path / "checkouts" / "x"
+    with pytest.raises(GitError):
+        worktree_git.worktree_add_detached(REPO, target, "not-a-sha")
+    assert runner.calls == []
+
+
+def test_worktree_add_detached_requires_absolute_path(
+    worktree_git: WorktreeGit, runner: FakeRunner
+) -> None:
+    with pytest.raises(GitError):
+        worktree_git.worktree_add_detached(
+            REPO, Path("relative/checkout"), MERGE_SHA
+        )
+    assert runner.calls == []
+
+
+def test_worktree_add_detached_raises_on_git_failure(
+    worktree_git: WorktreeGit, runner: FakeRunner, tmp_path: Path
+) -> None:
+    target = tmp_path / "checkouts" / MERGE_SHA
+    runner.results[("git", "worktree", "add", "--detach", str(target), MERGE_SHA)] = (
+        GitResult(1, "", "fatal: already exists")
+    )
+    with pytest.raises(GitError):
+        worktree_git.worktree_add_detached(REPO, target, MERGE_SHA)

@@ -539,6 +539,31 @@ class Reconciler:
             for lease in self._processes.find_orphans():
                 lease_id = str(lease.lease_id)
                 reported.add(lease_id)
+                if self._expected_applier_lease(lease):
+                    findings.append(
+                        Finding(
+                            kind="expected_applier_lease",
+                            subsystem="process_leases",
+                            severity="info",
+                            aggregate_id=lease_id,
+                            recommended_action=(
+                                "none; this runtime_applier is bound to a "
+                                "live activation intent and is expected to "
+                                "survive the kickstart that spawned this "
+                                "daemon; the post-merge tick reaps its exit "
+                                "by exact identity"
+                            ),
+                            evidence={
+                                "project_key": getattr(
+                                    lease, "project_key", None
+                                ),
+                                "pid": getattr(lease, "pid", None),
+                                "cwd": getattr(lease, "cwd", None),
+                                "worker_id": getattr(lease, "worker_id", None),
+                            },
+                        )
+                    )
+                    continue
                 findings.append(
                     Finding(
                         kind="orphan_process",
@@ -620,6 +645,113 @@ class Reconciler:
                         evidence={"pid": int(pid)},
                     )
                 )
+
+    def _expected_applier_lease(self, lease: Any) -> bool:
+        """A live ``runtime_applier`` lease bound to an open activation.
+
+        Sol correction e716a420: a still-verifying applier survives this
+        daemon's own kickstart-triggered death; without this, a bare
+        ``find_orphans`` would block admission for the applier's entire
+        lifetime and never record its exit. Exactly the intent-bound
+        lease is excused — every other surviving lease, including any
+        other ``runtime_applier``, stays a fail-closed orphan.
+
+        Sol correction c5600e31: "bound" is exact identity, never a
+        ``(kind, worker_id)`` scan — two live leases can share a
+        worker_id and at most one of them is the spawned applier. The
+        lease is expected if and only if ALL of these hold:
+
+        * its kind is ``runtime_applier`` and its ``worker_id`` (the
+          merge sha) has an ``activate:<sha>`` intent still
+          ``intended``, or the applier's own apply row for that same
+          target checkout is ``intended``, ``activated``, or
+          ``restarted`` — no intent at all, or a terminal outcome
+          already recorded, fails closed;
+        * the latest journaled ``activation.applier_spawned`` event for
+          ``activate:<sha>`` carries a non-null lease_id equal to this
+          lease's lease_id AND a non-null project_key equal to this
+          lease's owning project (Sol correction 57c46faa: project
+          ownership is part of the exact binding) — a null or absent
+          journaled lease_id or project_key excuses NOTHING;
+        * the lease's cwd is the intent row's exact target checkout.
+
+        Liveness and identity validity are already proven upstream:
+        ``find_orphans`` only ever surfaces live, identity-valid leases,
+        and nothing here weakens that.
+        """
+
+        if getattr(lease, "kind", None) != "runtime_applier":
+            return False
+        worker_id = getattr(lease, "worker_id", None)
+        if not worker_id:
+            return False
+        apply_id = f"activate:{worker_id}"
+        intent = self._database.execute(
+            "SELECT state, target_checkout FROM activation_applies "
+            "WHERE apply_id = ?",
+            (apply_id,),
+        ).fetchone()
+        if intent is None:
+            return False
+        binding = self._journaled_applier_binding(apply_id)
+        if binding is None:
+            return False
+        bound_lease_id, bound_project = binding
+        if bound_lease_id != str(getattr(lease, "lease_id", "")):
+            return False
+        if bound_project != str(getattr(lease, "project_key", "")):
+            return False
+        if getattr(lease, "cwd", None) != str(intent["target_checkout"]):
+            return False
+        if str(intent["state"]) == "intended":
+            return True
+        applier_row = self._database.execute(
+            "SELECT 1 FROM activation_applies WHERE apply_id != ? "
+            "AND target_checkout = ? "
+            "AND state IN ('intended', 'activated', 'restarted')",
+            (apply_id, str(intent["target_checkout"])),
+        ).fetchone()
+        return applier_row is not None
+
+    def _journaled_applier_binding(
+        self, apply_id: str
+    ) -> tuple[str, str] | None:
+        """The (lease_id, project_key) from the latest journaled binding.
+
+        The post-merge advance journals ``activation.applier_spawned``
+        on the ``activate:<sha>`` intent atomically with the lease
+        registration itself, carrying the exact registered lease_id and
+        the owning project_key; that durable record is the only
+        activation-to-lease binding, and project ownership is part of it
+        (Sol correction 57c46faa). A missing event, an unreadable
+        payload, a null lease_id (a spawn with no registry), or a null
+        project_key binds nothing — fail closed.
+        """
+
+        row = self._database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = 'activation.applier_spawned' "
+            "AND aggregate_id = ? ORDER BY sequence DESC LIMIT 1",
+            (apply_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        lease_id = payload.get("lease_id")
+        project_key = payload.get("project_key")
+        if (
+            isinstance(lease_id, str)
+            and lease_id
+            and isinstance(project_key, str)
+            and project_key
+        ):
+            return lease_id, project_key
+        return None
 
     # -- stage 3: worker sessions ------------------------------------------
 

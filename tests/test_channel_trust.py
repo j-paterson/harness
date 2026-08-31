@@ -24,6 +24,8 @@ from hermes_orchestrator.channel_trust import (
     ChannelTrustAnchors,
     ChannelTrustGate,
     TrustRefused,
+    _dialog_region,
+    displayed_channel_entries_valid,
 )
 from hermes_orchestrator.cmux import CmuxSurfaceRef
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
@@ -2289,3 +2291,79 @@ def test_gate_dialog_content_drift_at_the_boundary_sends_zero_keys(
     _assert_final_boundary_refused(
         result, control, confirm, database, first_failure="final_prompt_drift"
     )
+
+
+# Sol correction a06cbce0: prompt-shape validation must be structural
+# to the DISPLAYED dialog Channels list, not a raw substring count over
+# the whole captured screen — a full-scrollback capture legitimately
+# echoes the shell's own
+# ``--dangerously-load-development-channels server:hermes-control``
+# launch argument above the dialog, which must never be conjured into
+# a second Channels entry.
+
+_LAUNCH_ECHO = (
+    "claude --resume 11111111-1111-4111-8111-111111111111 "
+    "--dangerously-skip-permissions "
+    "--dangerously-load-development-channels server:hermes-control\n"
+    "\n"
+)
+
+
+def test_dialog_region_excludes_text_above_the_opening_marker() -> None:
+    screen = _LAUNCH_ECHO + DIALOG_TEXT + "\ntrailing noise"
+
+    region = _dialog_region(screen)
+
+    assert region is not None
+    assert region.startswith("Loading development channels")
+    assert "--dangerously-load-development-channels" not in region
+    assert region.endswith("Enter to confirm")
+    assert "trailing noise" not in region
+
+
+def test_dialog_region_is_none_without_both_boundary_markers() -> None:
+    assert _dialog_region(_LAUNCH_ECHO) is None
+    assert _dialog_region("Loading development channels\nno end here") is None
+    # The closing marker appearing only BEFORE the opening one does not
+    # count as bounding a region.
+    assert _dialog_region("Enter to confirm\nLoading development channels") is None
+
+
+def test_displayed_channel_entries_valid_ignores_echoed_launch_argv() -> None:
+    """The regression: `server:hermes-control` legitimately appears
+    twice in the full screen (once in the echoed shell argv, once in
+    the displayed Channels line) but only once inside the dialog
+    region — this must validate."""
+
+    screen = _LAUNCH_ECHO + DIALOG_TEXT
+
+    assert screen.count(CHANNEL_ENTRY) == 2
+    assert displayed_channel_entries_valid(screen) is True
+
+
+def test_displayed_channel_entries_valid_fails_closed_on_second_displayed_entry() -> (
+    None
+):
+    screen = _LAUNCH_ECHO + DIALOG_TEXT.replace(
+        f"  - {CHANNEL_ENTRY}\n",
+        f"  - {CHANNEL_ENTRY}\n  - server:evil\n",
+    )
+
+    assert displayed_channel_entries_valid(screen) is False
+
+
+def test_displayed_channel_entries_valid_fails_closed_on_duplicate_entry() -> None:
+    """A second DISPLAYED ``hermes-control`` line inside the dialog
+    region — not merely echoed argv above it — still refuses."""
+
+    screen = _LAUNCH_ECHO + DIALOG_TEXT.replace(
+        f"  - {CHANNEL_ENTRY}\n",
+        f"  - {CHANNEL_ENTRY}\n  - {CHANNEL_ENTRY}\n",
+    )
+
+    assert displayed_channel_entries_valid(screen) is False
+
+
+def test_displayed_channel_entries_valid_fails_closed_without_a_dialog_region() -> None:
+    assert displayed_channel_entries_valid(_LAUNCH_ECHO) is False
+    assert displayed_channel_entries_valid("") is False

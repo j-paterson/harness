@@ -252,6 +252,58 @@ def _validate_prompt_pattern(prompt_pattern: str) -> None:
         )
 
 
+_CHANNEL_ENTRY_TOKEN = re.compile(r"server:[A-Za-z0-9._-]+")
+
+
+def _dialog_region(screen: str) -> str | None:
+    """The substring of ``screen`` spanning the displayed confirmation
+    dialog: from the first ``"Loading development channels"`` marker
+    through the end of the first ``"Enter to confirm"`` marker that
+    follows it, inclusive of both boundaries.
+
+    ``None`` when either boundary marker is absent, or the closing
+    marker never follows the opening one — callers must treat that as
+    "no dialog", never as an empty dialog. Text outside this span —
+    most notably an echoed shell launch command sitting above the
+    dialog in a full-scrollback capture — is never folded into the
+    region.
+    """
+
+    start = screen.find(APPROVED_PROMPT_MARKERS[0])
+    if start == -1:
+        return None
+    end_marker = APPROVED_PROMPT_MARKERS[-1]
+    end = screen.find(end_marker, start)
+    if end == -1:
+        return None
+    return screen[start : end + len(end_marker)]
+
+
+def displayed_channel_entries_valid(screen: str) -> bool:
+    """Fail-closed structural replacement for counting
+    :data:`CHANNEL_ENTRY` across an entire captured screen: exactly
+    one channel-entry token (any ``server:<name>`` occurrence) is
+    displayed inside the dialog region — the span from
+    ``"Loading development channels"`` through ``"Enter to confirm"``,
+    see :func:`_dialog_region` — and that one entry is
+    :data:`CHANNEL_ENTRY` exactly.
+
+    Returns ``False`` for a missing dialog region, for a second
+    displayed ``server:hermes-control`` line, and for any other
+    displayed ``server:<name>`` entry alike — every one of those is an
+    unexpected development-channel entry and must fail closed. A
+    ``CHANNEL_ENTRY`` occurrence outside the region — most notably the
+    echoed shell launch command's own
+    ``--dangerously-load-development-channels server:hermes-control``
+    argument sitting above the dialog — is never counted.
+    """
+
+    region = _dialog_region(screen)
+    if region is None:
+        return False
+    return tuple(_CHANNEL_ENTRY_TOKEN.findall(region)) == (CHANNEL_ENTRY,)
+
+
 def _is_uuid(token: str) -> bool:
     try:
         uuid.UUID(token)

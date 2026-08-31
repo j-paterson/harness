@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -224,6 +224,49 @@ class MergerTurnService:
             ).fetchone()
             if row is not None:
                 return _row_to_event(row), state
+        return None
+
+    def has_pending_submission(self, project_key: str) -> bool:
+        """True iff a ``submitted_verdicts`` row for the project is 'submitted'.
+
+        Read-only SQLite check (INFRA-198 P1): used by ``MergerSession`` to
+        decide whether review work is active without any RPC or model
+        call. Distinct from ``_pending_submission``, which is scoped to
+        one exact wake's ``event_id``.
+        """
+
+        row = self._database.execute(
+            "SELECT 1 FROM submitted_verdicts "
+            "WHERE project_key = ? AND state = 'submitted' LIMIT 1",
+            (project_key,),
+        ).fetchone()
+        return row is not None
+
+    async def settle_idle_thread(
+        self, projects: Sequence[str], thread_id: str
+    ) -> TurnOutcome | None:
+        """Non-cli reuse of the idle-thread crash-recovery settlement.
+
+        Same rule as ``cli._settle_idle_merger_thread`` (INFRA-198 P1):
+        an idle ``thread/status/changed`` for a project's bound reviewer
+        channel resumes settlement ONLY when a durable ``submitted``
+        verdict already exists for the project's outstanding wake; it
+        never pulls the thread's report as a verdict. Kept here, not in
+        cli.py, so ``MergerSession``'s own listener can reuse it without
+        importing the CLI module.
+        """
+
+        for project_key in projects:
+            channel = self._merger.read_channel(project_key)
+            if channel is None or channel.thread_id != thread_id:
+                continue
+            outstanding = self.outstanding_wake(project_key)
+            if outstanding is None:
+                return None
+            event, _state = outstanding
+            if self._pending_submission(project_key, event.event_id) is None:
+                return None
+            return await self.handle_turn(project_key)
         return None
 
     async def on_notification(

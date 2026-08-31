@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sqlite3
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -200,6 +201,25 @@ class ProcessRegistry:
     # -- registration -----------------------------------------------------
 
     def register(self, request: ProcessLeaseInput) -> ProcessLease:
+        with self._database.transaction() as connection:
+            return self.register_on(connection, request)
+
+    def register_on(
+        self, connection: sqlite3.Connection, request: ProcessLeaseInput
+    ) -> ProcessLease:
+        """Register within the caller's open transaction.
+
+        Sol correction 57c46faa: a launcher whose durable identity
+        binding must be crash-safe registers the lease and appends its
+        own binding journal in ONE caller-held transaction, so the lease
+        row and the binding can never diverge — they commit together or
+        roll back together. Validation is identical to :meth:`register`;
+        the caller owns the commit, and its rollback leaves no lease row
+        behind (a stale in-memory ownership mark for a rolled-back
+        lease_id is harmless — ownership is only ever read against
+        durable rows).
+        """
+
         if request.pid <= 0:
             raise ValueError("pid must be positive")
         if request.pgid is None or request.pgid <= 0:
@@ -220,57 +240,59 @@ class ProcessRegistry:
             )
         lease_id = self._ids()
         stamp = self._now().isoformat()
-        with self._database.transaction() as connection:
-            # A worktree claimed for cleanup (INFRA-171) admits no new
-            # attachment; checking inside the write transaction serializes
-            # this refusal against the cleanup claim itself.
-            if request.cwd is not None:
-                claimed = connection.execute(
-                    "SELECT path FROM worktree_leases "
-                    "WHERE state = 'reclaiming'"
-                ).fetchall()
-                for row in claimed:
-                    if Path(request.cwd).is_relative_to(Path(str(row["path"]))):
-                        raise ValueError(
-                            f"cwd {request.cwd} is inside worktree "
-                            f"{row['path']}, which is claimed for cleanup"
-                        )
-            connection.execute(
-                "INSERT INTO process_leases("
-                "lease_id, worker_id, project_key, kind, pid, pgid, executable, "
-                "cwd, create_time, state, acquired_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
-                (
-                    lease_id,
-                    request.worker_id,
-                    request.project_key,
-                    request.kind,
-                    request.pid,
-                    request.pgid,
-                    request.executable,
-                    request.cwd,
-                    create_time,
-                    stamp,
-                    stamp,
-                ),
-            )
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="process.registered",
-                    aggregate_type="process_lease",
-                    aggregate_id=lease_id,
-                    payload={
-                        "pid": request.pid,
-                        "pgid": request.pgid,
-                        "kind": request.kind,
-                        "project_key": request.project_key,
-                        "worker_id": request.worker_id,
-                    },
-                ),
-            )
+        # A worktree claimed for cleanup (INFRA-171) admits no new
+        # attachment; checking inside the write transaction serializes
+        # this refusal against the cleanup claim itself.
+        if request.cwd is not None:
+            claimed = connection.execute(
+                "SELECT path FROM worktree_leases "
+                "WHERE state = 'reclaiming'"
+            ).fetchall()
+            for row in claimed:
+                if Path(request.cwd).is_relative_to(Path(str(row["path"]))):
+                    raise ValueError(
+                        f"cwd {request.cwd} is inside worktree "
+                        f"{row['path']}, which is claimed for cleanup"
+                    )
+        connection.execute(
+            "INSERT INTO process_leases("
+            "lease_id, worker_id, project_key, kind, pid, pgid, executable, "
+            "cwd, create_time, state, acquired_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+            (
+                lease_id,
+                request.worker_id,
+                request.project_key,
+                request.kind,
+                request.pid,
+                request.pgid,
+                request.executable,
+                request.cwd,
+                create_time,
+                stamp,
+                stamp,
+            ),
+        )
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="process.registered",
+                aggregate_type="process_lease",
+                aggregate_id=lease_id,
+                payload={
+                    "pid": request.pid,
+                    "pgid": request.pgid,
+                    "kind": request.kind,
+                    "project_key": request.project_key,
+                    "worker_id": request.worker_id,
+                },
+            ),
+        )
         self._owned.add(lease_id)
-        return self.get(lease_id)
+        row = connection.execute(
+            "SELECT * FROM process_leases WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        return _row_to_lease(row)
 
     def get(self, lease_id: str) -> ProcessLease:
         row = self._database.execute(

@@ -22,7 +22,7 @@ import pytest
 
 from hermes_orchestrator.config import PolicyConfig, ProjectConfig
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.linear import LinearIssue
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.reconcile import (
@@ -55,6 +55,8 @@ class FakeLease:
     cwd: str | None = None
     project_key: str = "demo"
     pid: int = 901
+    kind: str = "claude"
+    worker_id: str | None = None
 
 
 @dataclass
@@ -501,6 +503,383 @@ def test_orphan_process_keeps_admission_closed(
     report = build(database, events, processes=processes).run()
     assert processes.expire_calls == 1
     assert by_kind(report, "process_lease_expired")[0].blocking is False
+    assert by_kind(report, "orphan_process")[0].blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def activation_apply(
+    database: Database,
+    *,
+    apply_id: str,
+    target_checkout: str,
+    state: str,
+) -> None:
+    seed(
+        database,
+        "INSERT INTO activation_applies("
+        "apply_id, target_checkout, prior_generation, target_generation, "
+        "state, reason, created_at, updated_at"
+        ") VALUES (?, ?, NULL, NULL, ?, 'test', ?, ?)",
+        (apply_id, target_checkout, state, PAST, PAST),
+    )
+
+
+def journal_applier_spawned(
+    database: Database,
+    events: EventStore,
+    *,
+    apply_id: str,
+    lease_id: str | None,
+    pid: int = 901,
+    project_key: str | None = "demo",
+) -> None:
+    """Journal the durable activation-to-lease binding the way the
+    post-merge advance does: ``activation.applier_spawned`` on the
+    ``activate:<sha>`` intent, carrying the registered lease_id (null
+    when the spawn ran with no registry) and the owning project_key
+    (Sol correction 57c46faa: project ownership is part of the exact
+    binding)."""
+
+    with database.transaction() as connection:
+        events.append(
+            connection,
+            EventInput(
+                event_type="activation.applier_spawned",
+                aggregate_type="activation_apply",
+                aggregate_id=apply_id,
+                payload={
+                    "apply_id": apply_id,
+                    "pid": pid,
+                    "lease_id": lease_id,
+                    "project_key": project_key,
+                },
+            ),
+        )
+
+
+def test_expected_applier_lease_is_expected_while_unrelated_lease_blocks(
+    database: Database, events: EventStore
+) -> None:
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database, events, apply_id=f"activate:{merge_sha}", lease_id="applier-1"
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+            FakeLease("proc-1", cwd="/tmp/wt"),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    expected = by_kind(report, "expected_applier_lease")[0]
+    assert expected.severity == "info"
+    assert expected.aggregate_id == "applier-1"
+    assert expected.evidence["worker_id"] == merge_sha
+    unrelated = by_kind(report, "orphan_process")[0]
+    assert unrelated.aggregate_id == "proc-1"
+    assert unrelated.blocking is True
+    # The unrelated orphan alone keeps admission closed.
+    assert report.safe_to_open_admission is False
+
+
+def test_expected_applier_lease_via_the_applier_own_apply_row(
+    database: Database, events: EventStore
+) -> None:
+    merge_sha = "f" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    # The primary intent row already moved past 'intended' (a prior tick
+    # marked it verified/etc is not modeled here; only that it no longer
+    # reads 'intended'), but the applier's own progress row proves it is
+    # still mid-flight.
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="activated",
+    )
+    activation_apply(
+        database,
+        apply_id="applier-uuid-1",
+        target_checkout=target_checkout,
+        state="restarted",
+    )
+    journal_applier_spawned(
+        database, events, apply_id=f"activate:{merge_sha}", lease_id="applier-2"
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-2",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    expected = by_kind(report, "expected_applier_lease")[0]
+    assert expected.blocking is False
+    assert report.safe_to_open_admission is True
+
+
+def test_unbound_runtime_applier_lease_stays_a_blocking_orphan(
+    database: Database, events: EventStore
+) -> None:
+    # A runtime_applier lease with no matching activation intent at all
+    # (e.g. a stale row from a wholly different life) is never excused.
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-3", kind="runtime_applier", worker_id="c" * 40
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    finding = by_kind(report, "orphan_process")[0]
+    assert finding.blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_only_the_journal_bound_applier_lease_is_excused_among_duplicates(
+    database: Database, events: EventStore
+) -> None:
+    """Two live runtime_applier leases share the same worker_id but only
+    one lease_id was ever journaled for the activation (Sol correction
+    c5600e31): exactly the bound lease is excused; the duplicate — a
+    (kind, worker_id) match with a mismatched lease_id — stays a
+    blocking orphan."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database, events, apply_id=f"activate:{merge_sha}", lease_id="applier-bound"
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-bound",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+            FakeLease(
+                "applier-duplicate",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    excused = by_kind(report, "expected_applier_lease")
+    assert [finding.aggregate_id for finding in excused] == ["applier-bound"]
+    blocked = by_kind(report, "orphan_process")
+    assert [finding.aggregate_id for finding in blocked] == ["applier-duplicate"]
+    assert blocked[0].blocking is True
+    assert report.safe_to_open_admission is False
+
+
+@pytest.mark.parametrize("journaled_lease_id", [None, "some-other-lease"])
+def test_applier_lease_without_exact_journaled_binding_stays_blocking(
+    database: Database, events: EventStore, journaled_lease_id: str | None
+) -> None:
+    """A null journaled lease_id (a spawn with no registry) excuses
+    nothing, and a journaled lease_id naming a different lease binds
+    only that lease — either way this survivor fails closed."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database,
+        events,
+        apply_id=f"activate:{merge_sha}",
+        lease_id=journaled_lease_id,
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    finding = by_kind(report, "orphan_process")[0]
+    assert finding.aggregate_id == "applier-1"
+    assert finding.blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_applier_lease_with_absent_spawn_journal_stays_blocking(
+    database: Database, events: EventStore
+) -> None:
+    # An open intent and a matching (kind, worker_id) alone were enough
+    # before Sol correction c5600e31; without the journaled
+    # activation.applier_spawned binding they no longer excuse anything.
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    assert by_kind(report, "orphan_process")[0].blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_applier_lease_with_mismatched_cwd_stays_blocking(
+    database: Database, events: EventStore
+) -> None:
+    """The journaled lease_id matches but the lease works somewhere other
+    than the intent's exact target checkout: never excused."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database, events, apply_id=f"activate:{merge_sha}", lease_id="applier-1"
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd="/somewhere/else",
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    finding = by_kind(report, "orphan_process")[0]
+    assert finding.aggregate_id == "applier-1"
+    assert finding.blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_applier_lease_from_another_project_stays_a_blocking_orphan(
+    database: Database, events: EventStore
+) -> None:
+    """The journaled binding carries the owning project_key (Sol
+    correction 57c46faa); a live lease matching the bound lease_id,
+    worker_id, and cwd but owned by a different project is never
+    excused — it stays a blocking orphan."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database,
+        events,
+        apply_id=f"activate:{merge_sha}",
+        lease_id="applier-1",
+        project_key="demo",
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+                project_key="other",
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
+    finding = by_kind(report, "orphan_process")[0]
+    assert finding.aggregate_id == "applier-1"
+    assert finding.blocking is True
+    assert report.safe_to_open_admission is False
+
+
+def test_applier_binding_without_project_key_excuses_nothing(
+    database: Database, events: EventStore
+) -> None:
+    """A binding journaled without a project_key (an older event shape,
+    or a corrupt payload) binds nothing (Sol correction 57c46faa): the
+    survivor fails closed as a blocking orphan even when every other
+    identity field matches."""
+
+    merge_sha = "e" * 40
+    target_checkout = f"/state/checkouts/{merge_sha}"
+    activation_apply(
+        database,
+        apply_id=f"activate:{merge_sha}",
+        target_checkout=target_checkout,
+        state="intended",
+    )
+    journal_applier_spawned(
+        database,
+        events,
+        apply_id=f"activate:{merge_sha}",
+        lease_id="applier-1",
+        project_key=None,
+    )
+    processes = FakeProcesses(
+        orphans=[
+            FakeLease(
+                "applier-1",
+                kind="runtime_applier",
+                worker_id=merge_sha,
+                cwd=target_checkout,
+            ),
+        ]
+    )
+    report = build(database, events, processes=processes).run()
+    assert by_kind(report, "expected_applier_lease") == []
     assert by_kind(report, "orphan_process")[0].blocking is True
     assert report.safe_to_open_admission is False
 

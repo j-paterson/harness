@@ -9,3 +9,7 @@ projects:
     # (the repository has no CI; merged items resolve as ci_not_configured
     # with zero CircleCI calls). Never inferred from a CI response.
     ci: none
+    # This project's merged integration branch IS this orchestrator's own
+    # runtime: a terminal merge triggers a durable self-host activation
+    # intent (INFRA-198 P2) instead of a manual runtime-activate --apply.
+    self_host: true

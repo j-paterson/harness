@@ -284,3 +284,84 @@ def test_complete_started_issue_keeps_persistent_project_cell(
     assert database.scalar(
         "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
     ) == "active"
+
+
+# -- mark_dependency_ready (INFRA-198 P2) -------------------------------
+
+
+def test_mark_dependency_ready_flips_only_blocked_not_ready_rows(
+    queue_service: QueueService, database: Database
+) -> None:
+    queue_service.admit(request("ENG-1", "chat-1", dependency_ready=False))
+    queue_service.transition(
+        "ENG-1", IssueState.BLOCKED, actor="operator", reason="blocked on ENG-0"
+    )
+    queue_service.admit(request("ENG-2", "chat-2", dependency_ready=True))
+    queue_service.transition(
+        "ENG-2", IssueState.BLOCKED, actor="operator", reason="already ready"
+    )
+    queue_service.admit(request("ENG-3", "chat-3", dependency_ready=False))
+    queue_service.transition(
+        "ENG-3", IssueState.PAUSED, actor="operator", reason="operator hold"
+    )
+    queue_service.admit(request("ENG-4", "chat-4", dependency_ready=False))
+    queue_service.transition(
+        "ENG-4", IssueState.IN_DEVELOPMENT, actor="operator", reason="in progress"
+    )
+    queue_service.admit(request("ENG-5", "chat-5", dependency_ready=True))
+    # ENG-5 stays queued.
+
+    flipped = queue_service.mark_dependency_ready(
+        "demo", actor="post_merge_advance", reason="merge:review:demo:evt-1"
+    )
+
+    assert flipped == ("ENG-1",)
+    assert queue_service.get("ENG-1").dependency_ready is True
+    assert queue_service.get("ENG-2").dependency_ready is True
+    assert queue_service.get("ENG-3").state is IssueState.PAUSED
+    assert queue_service.get("ENG-3").dependency_ready is False
+    assert queue_service.get("ENG-4").dependency_ready is False
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready'"
+    ) == 1
+
+    # Idempotent: rerunning after every row is already flipped touches
+    # and journals nothing.
+    again = queue_service.mark_dependency_ready(
+        "demo", actor="post_merge_advance", reason="merge:review:demo:evt-1"
+    )
+    assert again == ()
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready'"
+    ) == 1
+
+
+def test_mark_dependency_ready_is_scoped_to_its_project(
+    database: Database, clock: MutableClock
+) -> None:
+    service = QueueService(
+        database=database,
+        events=EventStore(database),
+        registered_projects={"demo", "other"},
+        now=clock.now,
+    )
+    service.admit(
+        AdmissionRequest(
+            issue_id="OTHER-1",
+            project_key="other",
+            linear_priority=2,
+            admitted_by="operator",
+            instruction_id="chat-o1",
+            dependency_ready=False,
+        )
+    )
+    service.transition("OTHER-1", IssueState.BLOCKED, actor="operator", reason="x")
+    service.admit(request("ENG-6", "chat-6", dependency_ready=False))
+    service.transition("ENG-6", IssueState.BLOCKED, actor="operator", reason="x")
+
+    flipped = service.mark_dependency_ready(
+        "demo", actor="post_merge_advance", reason="merge:x"
+    )
+
+    assert flipped == ("ENG-6",)
+    assert service.get("OTHER-1").dependency_ready is False

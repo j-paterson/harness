@@ -65,6 +65,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.merger_session import MergerSession
 from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
 from hermes_orchestrator.migration_gate import (
     MigrationGate,
@@ -80,8 +81,10 @@ from hermes_orchestrator.orchestrator_workspace import (
     OrchestratorWorkspaceOwner,
 )
 from hermes_orchestrator.packet_admission import PacketAdmission
+from hermes_orchestrator.post_merge import PostMergeAdvance
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
+    ProfileBootstrap,
     ProfileHealth,
     ProfilePool,
     ProfileRegistry,
@@ -659,9 +662,22 @@ async def _settle_idle_merger_thread(
 
 
 async def _listen_for_merger_turns(
-    flow: MergeFlow, projects: Sequence[str] = ()
+    flow: MergeFlow,
+    projects: Sequence[str] = (),
+    *,
+    session: MergerSession | None = None,
 ) -> None:
-    """Settle Merger turns as the App Server reports them; never poll."""
+    """Settle Merger turns as the App Server reports them; never poll.
+
+    INFRA-198 P1: when a ``session`` is given, an idle status also
+    reconciles it — the terminal-idle hook that releases the App Server
+    process lease the instant nothing is left outstanding. Reconciling
+    from inside this same listener task never deadlocks:
+    ``MergerSession.release`` recognizes it is running inside its own
+    listener task and skips the self-cancellation, only closing the RPC
+    inline, which is what lets this loop's own ``notifications()``
+    iteration end and return on its own right after.
+    """
 
     async for notification in flow.rpc.notifications():
         if notification.method == "thread/status/changed":
@@ -685,6 +701,8 @@ async def _listen_for_merger_turns(
                 )
                 if outcome is not None:
                     _print_merger_turn(outcome)
+                if session is not None:
+                    await session.reconcile("terminal_idle")
             continue
         outcome = await flow.turns.on_notification(notification)
         if outcome is not None:
@@ -719,6 +737,7 @@ async def _run_daemon(
     shutdown_event: asyncio.Event | None = None,
     merge_flow: MergeFlow | None = None,
     projects: Sequence[str] = (),
+    database: Database | None = None,
     request_checkpoint: Callable[[str, str], Awaitable[object]] | None = None,
     checkpoint_dispatcher: CheckpointDispatcher | None = None,
     wake_delivery: LeadWakeDelivery | None = None,
@@ -732,10 +751,22 @@ async def _run_daemon(
     activation: object | None = None,
     dashboard_refresh: DashboardRefreshAction | None = None,
     orchestrator_workspace: OrchestratorWorkspaceOwner | None = None,
+    post_merge: PostMergeAdvance | None = None,
 ) -> Supervisor:
+    # INFRA-198 P1: bound to the merge flow's lifetime once merge_flow is
+    # created below (only in the non-``once`` path); the maintenance
+    # closure reads this by reference at tick time, never at definition
+    # time, so it always observes the current session.
+    session: MergerSession | None = None
+
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
+        if session is not None:
+            # Event-scoped App Server ownership: open when review work
+            # is active and the session is closed, release when it is
+            # open and nothing is outstanding. Never raises.
+            await session.reconcile("maintenance")
         if orchestrator_workspace is not None:
             # The bounded reconciliation cadence for the two-pane
             # Orchestrator workspace: the owner absorbs cmux failures
@@ -761,6 +792,12 @@ async def _run_daemon(
             # commit-time router already signaled fresh envelopes;
             # this sweep re-wakes whatever stayed announced.
             fakechat_router.signal_pending()
+        if post_merge is not None:
+            # INFRA-198 P2: discover any terminal merge the review
+            # flow's fast path missed, and advance any pending
+            # self-host activation intent or successor dependency
+            # flip from durable rows. Contains its own failures.
+            await post_merge.tick()
 
     supervisor = Supervisor(
         service,
@@ -777,6 +814,8 @@ async def _run_daemon(
                 and channel_hub is None
                 and dashboard_refresh is None
                 and orchestrator_workspace is None
+                and merge_flow is None
+                and post_merge is None
             )
             else _maintenance
         ),
@@ -843,20 +882,28 @@ async def _run_daemon(
             if channel_hub is not None:
                 await channel_hub.stop()
         return supervisor
-    listener: asyncio.Task[None] | None = None
-    if merge_flow is not None and await _start_merge_flow(merge_flow, projects):
-        # Startup settlement recovery: an approved review whose merge
-        # was separated from its verdict by a crash, a full window, or
-        # a lost completion event is re-driven from its durable
-        # settlement row before any new turn is listened for.
-        await merge_flow.reviews.resume_settlements()
-        # Then recover any completed review whose turn notification
-        # was lost: the delivered wake and the thread report are
-        # durable, so one boundary pass settles them exactly once.
-        await merge_flow.turns.recover_outstanding(tuple(projects))
-        listener = asyncio.create_task(
-            _listen_for_merger_turns(merge_flow, tuple(projects))
+    if merge_flow is not None:
+        # INFRA-198 P1: the session owns the App Server connection's
+        # whole lifecycle — startup recovery (open, resume_settlements,
+        # recover_outstanding, then release unless work is still
+        # outstanding), the maintenance-tick open/release above, the
+        # listener's own terminal-idle release, and daemon shutdown
+        # below — so the process lease is held only while review work is
+        # actually active.
+        session = MergerSession(
+            merge_flow,
+            tuple(projects),
+            events=(EventStore(database) if database is not None else None),
+            database=database,
+            listener_factory=(
+                lambda flow, session_projects, active_session: (
+                    _listen_for_merger_turns(
+                        flow, session_projects, session=active_session
+                    )
+                )
+            ),
         )
+        await session.startup()
     stop = shutdown_event or asyncio.Event()
     registered_signals: list[signal.Signals] = []
     if shutdown_event is None:
@@ -876,12 +923,8 @@ async def _run_daemon(
             for shutdown_signal in registered_signals:
                 loop.remove_signal_handler(shutdown_signal)
         await supervisor.shutdown()
-        if listener is not None:
-            listener.cancel()
-            with suppress(asyncio.CancelledError):
-                await listener
-        if merge_flow is not None:
-            await merge_flow.rpc.close()
+        if session is not None:
+            await session.shutdown()
         if channel_hub is not None:
             await channel_hub.stop()
     return supervisor
@@ -962,7 +1005,24 @@ def _open_rotation_collaborators(
         raise ValueError("the cell service or seater is unavailable")
     registry = ProfileRegistry.load(profile_path)
     environment = dict(os.environ)
-    probe = ClaudeProfileProbe(registry, base_env=environment)
+    # Sol correction a06cbce0: an authenticated profile is eligible only
+    # once its onboarding/theme/trust state is deterministically
+    # established for exactly the managed repositories a seated lead
+    # actually runs from — the same paths the seater launches from (see
+    # ``lead_worktree = project.lead_cwd`` at this command's rotation
+    # call site) — otherwise a restored session can still stop on a
+    # first-run dialog instead of Hermes's handoff.
+    # Sol correction c5600e31: derived from ``project.lead_cwd`` — the
+    # one canonical managed lead cwd — so bootstrap trust and the
+    # ``project_paths`` handed to the seater/cell service below can
+    # never disagree.
+    managed_repo_paths = tuple(
+        dict.fromkeys(
+            project.lead_cwd for project in settings.projects.values()
+        )
+    )
+    bootstrap = ProfileBootstrap(registry, repo_paths=managed_repo_paths)
+    probe = ClaudeProfileProbe(registry, base_env=environment, bootstrap=bootstrap)
     # Mirrors open_runtime's own startup seeding (runtime.py:453-458): a
     # freshly built ProfilePool starts every slot ineligible, and only
     # ``record_health`` ever flips one to eligible, so the pool this
@@ -991,8 +1051,11 @@ def _open_rotation_collaborators(
                 last_checked_at=datetime.now(UTC),
             )
         pool.record_health(health)
+    # Sol correction c5600e31: the same canonical ``lead_cwd`` used for
+    # ``managed_repo_paths`` above — the seater and cell service must
+    # launch into exactly the directory bootstrap already trusted.
     project_paths: Mapping[str, Path] = {
-        alias: project.repo_path for alias, project in settings.projects.items()
+        alias: project.lead_cwd for alias, project in settings.projects.items()
     }
     cmux_port = CmuxCliAdapter(
         settings.cmux.cli,
@@ -3040,6 +3103,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ChannelTrustAnchors,
                 ChannelTrustGate,
                 TrustRefused,
+                displayed_channel_entries_valid,
             )
             from hermes_orchestrator.runtime import resolve_sidecar_entry
 
@@ -3118,7 +3182,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     "Enter to confirm",
                 )
                 missing = [m for m in markers if m not in screen]
-                if missing or screen.count("server:hermes-control") != 1:
+                if missing or not displayed_channel_entries_valid(screen):
                     _print(
                         {
                             "error": "live dialog does not match the "
@@ -3238,14 +3302,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
             from hermes_orchestrator.lead_rotation import LeadRotation
 
             binding = runtime.cmux_bindings.active_lead(args.cell)
-            if binding is None or binding.project_key is None:
-                _print(
-                    {"error": "no active lead binding for this cell"},
-                    json_output=args.json,
-                    human="no active lead binding for this cell.",
+            if binding is not None and binding.project_key is not None:
+                project_key = binding.project_key
+            else:
+                # A lost or never-registered classic seat must not
+                # refuse to resume an already-acknowledged durable
+                # transition (Sol a06cbce0): fall back to the durable
+                # cell row LeadRotation itself reads from, and let it
+                # reseat the exact named replacement.
+                from hermes_orchestrator.lead_rotation import (
+                    live_cell_project_key,
                 )
-                return 1
-            project = settings.projects.get(binding.project_key)
+
+                project_key = live_cell_project_key(database, args.cell)
+                if project_key is None:
+                    _print(
+                        {"error": "no active lead binding for this cell"},
+                        json_output=args.json,
+                        human="no active lead binding for this cell.",
+                    )
+                    return 1
+            project = settings.projects.get(project_key)
             if project is None:
                 _print(
                     {"error": "the cell's project is not configured"},
@@ -3266,8 +3343,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
             # the project configures one; ``repo_path`` itself must
             # stay the stable primary checkout (see the linked-worktree
             # rejection in ``load_settings``), so the rotation probe
-            # validates the lead's actual candidate tree instead.
-            lead_worktree = project.lead_worktree or project.repo_path
+            # validates the lead's actual candidate tree instead. Sol
+            # correction c5600e31: derived from the same canonical
+            # ``project.lead_cwd`` the seater/cell composition and
+            # bootstrap trust in ``_open_rotation_collaborators`` use.
+            lead_worktree = project.lead_cwd
             rotation = LeadRotation(
                 database=database,
                 handoffs=HandoffService(database),
@@ -3586,6 +3666,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     dispatch=runtime.dispatch,
                     merge_flow=runtime.merge_flow,
                     projects=tuple(settings.projects),
+                    database=runtime.database,
                     request_checkpoint=(
                         None
                         if runtime.cells is None
@@ -3636,6 +3717,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     dashboard_refresh=runtime.dashboard_refresh,
                     orchestrator_workspace=runtime.orchestrator_workspace,
                     fakechat_router=runtime.fakechat_router,
+                    post_merge=runtime.post_merge,
                 )
             )
             payload = {
