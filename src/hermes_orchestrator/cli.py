@@ -3280,14 +3280,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
             from hermes_orchestrator.lead_rotation import LeadRotation
 
             binding = runtime.cmux_bindings.active_lead(args.cell)
-            if binding is None or binding.project_key is None:
-                _print(
-                    {"error": "no active lead binding for this cell"},
-                    json_output=args.json,
-                    human="no active lead binding for this cell.",
+            if binding is not None and binding.project_key is not None:
+                project_key = binding.project_key
+            else:
+                # A lost or never-registered classic seat must not
+                # refuse to resume an already-acknowledged durable
+                # transition (Sol a06cbce0): fall back to the durable
+                # cell row LeadRotation itself reads from, and let it
+                # reseat the exact named replacement.
+                from hermes_orchestrator.lead_rotation import (
+                    live_cell_project_key,
                 )
-                return 1
-            project = settings.projects.get(binding.project_key)
+
+                project_key = live_cell_project_key(database, args.cell)
+                if project_key is None:
+                    _print(
+                        {"error": "no active lead binding for this cell"},
+                        json_output=args.json,
+                        human="no active lead binding for this cell.",
+                    )
+                    return 1
+            project = settings.projects.get(project_key)
             if project is None:
                 _print(
                     {"error": "the cell's project is not configured"},

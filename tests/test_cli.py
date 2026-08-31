@@ -1745,6 +1745,72 @@ def _seed_rotation_cell_state(state_dir: Path) -> None:
         database.close()
 
 
+def _seed_acknowledged_replacement_with_lost_binding(
+    state_dir: Path,
+    *,
+    cell_id: str = "cell-demo",
+    incumbent_session: str = "11111111-1111-4111-8111-111111111111",
+    incumbent_profile: str = "max-b",
+    replacement_session: str = "44444444-4444-4444-8444-444444444444",
+    replacement_profile: str = "max-c",
+) -> None:
+    """Durably seed the exact shape Sol correction a06cbce0 found refused:
+    an incumbent cell still durably ``active``, its handoff already
+    ``acknowledged`` with the replacement session/profile persisted, but
+    whose classic lead seat was lost — never rebound to the replacement —
+    so ``cmux_bindings.active_lead(cell_id)`` returns ``None``.
+    """
+
+    from uuid import UUID
+
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.handoffs import HandoffService
+    from tests.test_handoffs import valid_handoff
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) "
+                "VALUES (?, 'demo', 'active', ?, ?, ?, ?)",
+                (cell_id, incumbent_profile, incumbent_session, now, now),
+            )
+            connection.execute(
+                "INSERT INTO profile_leases("
+                "profile_alias, project_key, state, acquired_at) "
+                "VALUES (?, 'demo', 'active', ?)",
+                (incumbent_profile, now),
+            )
+        bindings = CmuxSurfaceBindings(database=database, events=EventStore(database))
+        lost = bindings.bind_lead(
+            project_key="demo",
+            cell_id=cell_id,
+            session_id=incumbent_session,
+            profile_alias=incumbent_profile,
+            ref=CmuxSurfaceRef(
+                workspace_uuid="22222222-2222-4222-8222-222222222222",
+                surface_uuid="33333333-3333-4333-8333-333333333333",
+            ),
+        )
+        bindings.mark_lost(lost.binding_id, reason="replacement seat failed to launch")
+        handoffs = HandoffService(database, handoff_ids=lambda: "handoff-1")
+        handoffs.submit(valid_handoff().model_copy(update={"cell_id": cell_id}))
+        handoffs.acknowledge(
+            "handoff-1",
+            UUID(replacement_session),
+            "Resume the rotation and finish ENG-9.",
+            profile_alias=replacement_profile,
+        )
+    finally:
+        database.close()
+
+
 def _seed_capacity_observation(
     state_dir: Path,
     alias: str,
@@ -2053,6 +2119,237 @@ def test_rotate_lead_fails_closed_when_every_replacement_is_fable_capped(
         assert binding.session_id == "11111111-1111-4111-8111-111111111111"
     finally:
         database.close()
+
+
+def test_rotate_lead_resumes_an_acknowledged_replacement_when_the_seat_was_lost(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sol correction a06cbce0: a lost (or never re-bound) classic lead
+    seat must not refuse rotate-lead when the durable cell is still live
+    and its newest handoff already names the exact replacement to
+    reseat. The CLI derives the project from the durable cell row
+    instead of the (absent) active binding, and LeadRotation's existing
+    acknowledged-handoff recovery reconstructs the replacement without
+    reselecting capacity or launching a fresh lead process."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_acknowledged_replacement_with_lost_binding(state_dir)
+    started = _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "complete"
+    assert payload["profile"] == "max-c"
+    assert payload["replacement_session"] == "44444444-4444-4444-8444-444444444444"
+    assert payload["failure"] is None
+    # Recovery reconstructs the identities persisted at acknowledgement;
+    # it never calls the lead runner to start a fresh replacement.
+    assert started == []
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT state, profile_alias, session_id FROM project_cells "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["state"]) == "active"
+        assert str(cell["profile_alias"]) == "max-c"
+        assert str(cell["session_id"]) == "44444444-4444-4444-8444-444444444444"
+        handoff = database.execute(
+            "SELECT state, replacement_session_id, replacement_profile_alias "
+            "FROM handoffs WHERE handoff_id = 'handoff-1'"
+        ).fetchone()
+        assert str(handoff["state"]) == "acknowledged"
+        assert str(handoff["replacement_session_id"]) == (
+            "44444444-4444-4444-8444-444444444444"
+        )
+        assert str(handoff["replacement_profile_alias"]) == "max-c"
+        lease = database.execute(
+            "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+        ).fetchone()
+        assert str(lease["profile_alias"]) == "max-c"
+    finally:
+        database.close()
+
+
+def test_rotate_lead_retry_after_seating_the_recovery_reuses_the_same_binding(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the recovered replacement's seat is durably bound, a retry
+    must resume through the very same derivation (durable cell, not the
+    binding) and report the identical effective replacement without a
+    second transfer or a second seat activation: ``already_rotated``
+    short-circuits the transfer, and the seat phase's own durable
+    binding check short-circuits activation."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_acknowledged_replacement_with_lost_binding(state_dir)
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+
+    ensure_calls: list[str] = []
+
+    async def _persisting_ensure(self: object, **kwargs: object) -> object:
+        # Unlike the shared fake, this seat activation durably rebinds
+        # the classic lead (as the real ``CmuxLeadSeater`` does), so a
+        # retry's ``active_lead`` read can find it and skip reactivating.
+        ensure_calls.append(str(kwargs["session_id"]))
+        database = Database.open(state_dir / "state.db")
+        try:
+            binding = CmuxSurfaceBindings(
+                database=database, events=EventStore(database)
+            ).bind_lead(
+                project_key=str(kwargs["project_key"]),
+                cell_id=str(kwargs["cell_id"]),
+                session_id=str(kwargs["session_id"]),
+                profile_alias=str(kwargs["profile_alias"]),
+                ref=CmuxSurfaceRef(
+                    workspace_uuid="55555555-5555-4555-8555-555555555555",
+                    surface_uuid="66666666-6666-4666-8666-666666666666",
+                ),
+            )
+        finally:
+            database.close()
+        _seed_channel_registration(
+            state_dir,
+            project_key=str(kwargs["project_key"]),
+            cell_id=str(kwargs["cell_id"]),
+            session_id=str(kwargs["session_id"]),
+            profile_alias=str(kwargs["profile_alias"]),
+        )
+        return binding
+
+    monkeypatch.setattr(cli_module.CmuxLeadSeater, "ensure", _persisting_ensure)
+
+    first = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+    assert first.exit_code == 0
+    first_payload = json.loads(first.stdout)
+    assert first_payload["phase"] == "complete"
+    assert first_payload["profile"] == "max-c"
+
+    second = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+
+    assert second.exit_code == 0
+    second_payload = json.loads(second.stdout)
+    assert second_payload["phase"] == "complete"
+    assert second_payload["replacement_session"] == first_payload["replacement_session"]
+    assert second_payload["profile"] == "max-c"
+    assert second_payload["binding_id"] == first_payload["binding_id"]
+    assert second_payload["failure"] is None
+    # Seat activation ran exactly once across both invocations.
+    assert ensure_calls == [first_payload["replacement_session"]]
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        leases = database.execute(
+            "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+        ).fetchall()
+        assert [str(row["profile_alias"]) for row in leases] == ["max-c"]
+    finally:
+        database.close()
+
+
+def test_rotate_lead_refuses_with_neither_an_active_binding_nor_a_live_cell(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """Nothing to derive project identity from — no active binding, and
+    no durable cell row at all — must still refuse cleanly rather than
+    guess or crash."""
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-nowhere",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "no active lead binding for this cell"
+
+
+def test_rotate_lead_refuses_when_the_durable_cell_is_in_a_terminal_state(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """A durable cell row that exists but is no longer live (e.g. it
+    already failed) must not be treated as a resumable rotation target
+    just because it names a project — the refusal from a missing
+    binding still applies."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) "
+                "VALUES ('cell-failed', 'demo', 'failed', 'max-b', ?, ?, ?)",
+                ("11111111-1111-4111-8111-111111111111", now, now),
+            )
+    finally:
+        database.close()
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-failed",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "no active lead binding for this cell"
 
 
 def test_open_rotation_collaborators_wires_channel_launch_and_trust_with_node(

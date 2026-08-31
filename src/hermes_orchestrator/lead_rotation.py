@@ -46,6 +46,31 @@ _LIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 _RESUMABLE_HANDOFF_STATES = ("submitted", "acknowledged")
 
 
+def live_cell_project_key(database: Database, cell_id: str) -> str | None:
+    """Read the durable project key for ``cell_id`` without requiring an
+    active cmux lead binding.
+
+    ``rotate-lead`` used to demand ``active_lead(cell_id)`` before it
+    would even construct :class:`LeadRotation`, so a lost or
+    never-registered classic seat refused the command outright — even
+    when the durable cell and its acknowledged handoff already named
+    the exact replacement to reseat (Sol a06cbce0). Project identity
+    only needs to survive long enough to look up ``settings.projects``;
+    :meth:`LeadRotation.rotate` re-derives every other fact itself from
+    ``project_cells`` and ``handoffs``. Returns ``None`` when the cell
+    does not exist or is not in a live state, so the caller can fail
+    closed exactly as it already does for a missing binding.
+    """
+
+    row = database.execute(
+        "SELECT project_key, state FROM project_cells WHERE cell_id = ?",
+        (cell_id,),
+    ).fetchone()
+    if row is None or str(row["state"]) not in _LIVE_CELL_STATES:
+        return None
+    return str(row["project_key"])
+
+
 class SeatEnsurer(Protocol):
     """The standard managed classic seat path used by lead rotation."""
 
