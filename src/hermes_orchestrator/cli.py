@@ -17,7 +17,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -948,6 +948,27 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
         keychain=keychain,
         base_env=os.environ,
         processes=runtime.processes,
+    )
+
+
+def _open_idle_linear_router(
+    settings: Settings, *, database: Database, queue: Any
+) -> Any:
+    """Compose the live Linear router the idle dispatcher validates and
+    projects through — Keychain + settings, exactly the way
+    ``_open_merge_flow`` composes it for the merge flow (INFRA-199
+    Finding 1).
+
+    Raises on any composition failure (missing ``config/linear.yaml``,
+    an unreadable Keychain credential, an unregistered project). The
+    Stop-hook idle path (``_dispatch_idle_lead``) is always invoked
+    under the hook's own ``suppress(Exception)``, so letting a
+    composition failure raise here fails the whole idle dispatch
+    closed — no dispatch, no crash, and never a bypass of Linear.
+    """
+
+    return build_linear_router(
+        settings, database=database, queue=queue, keychain=Keychain()
     )
 
 
@@ -2351,21 +2372,56 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     return 0
 
 
-def _dispatch_idle_lead(database: Database, session_id: str) -> None:
+def _idle_admission_priority(
+    executor: Any, *, now: datetime, freshness_minutes: int
+) -> int | None:
+    """The highest issue priority the freshest resource sample
+    authorizes right now, or ``None`` when nothing may be admitted.
+
+    A missing, malformed, implausibly future-dated, or stale sample
+    (INFRA-199 Finding 2) all fail closed here exactly like an explicit
+    red/unknown pressure reading does — refuse admission, never guess.
+    """
+
+    from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
+    from hermes_orchestrator.resources import read_fresh_sample
+
+    reading = read_fresh_sample(
+        executor,
+        now=now,
+        max_age=timedelta(minutes=freshness_minutes),
+    )
+    if reading is None:
+        return None
+    return {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
+        reading.pressure
+    )
+
+
+def _dispatch_idle_lead(
+    database: Database, session_id: str, args: argparse.Namespace
+) -> None:
     """At the calling lead's own genuine idle boundary, hand its live
     cell one ready, non-conflicting, capacity-permitted assignment
     (INFRA-199). Only the session's OWN active ``project_cells`` row
     is ever resolved (mirrors ``LeadIntakePoll.next_offer``'s query).
-    The activation below mirrors ``ProjectCellService._activate_issue``
-    (cells.py) statement-for-statement: the active-profile-lease
-    guard, the ``admitted_issues`` CAS into ``in_development``, the
-    journaled ``issue.started`` event, and the durable assignment
-    packet, all in one transaction — so replaying an already-activated
-    idle boundary is a strict no-op.
+
+    The activation itself is never reimplemented here: it runs through
+    ``cells.activate_admitted_issue``, the ONE shared durable service
+    that also backs ``ProjectCellService``'s explicit dispatch path
+    (INFRA-199 Finding 1). That service validates the candidate issue
+    against Linear, completes its idempotent ``In Development``
+    projection, and only then performs the activation transaction — a
+    Linear validation or projection failure leaves zero local writes,
+    and a replay after a completed projection is a strict no-op.
+    Candidate eligibility additionally requires a resource sample fresh
+    enough to trust (INFRA-199 Finding 2); that freshness is checked
+    once for candidate selection and rechecked inside the same atomic
+    transaction that activates the candidate, closing the race between
+    the two reads.
     """
 
-    from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
-    from hermes_orchestrator.events import EventInput
+    from hermes_orchestrator.cells import activate_admitted_issue
     from hermes_orchestrator.lead_assignments import LeadAssignments
     from hermes_orchestrator.queue import QueueService
 
@@ -2377,15 +2433,10 @@ def _dispatch_idle_lead(database: Database, session_id: str) -> None:
     ).fetchone()
     if cell is None:
         return
-    sample = database.execute(
-        "SELECT pressure FROM resource_samples ORDER BY sampled_at DESC LIMIT 1",
-    ).fetchone()
-    max_priority = (
-        {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
-            str(sample["pressure"])
-        )
-        if sample is not None
-        else None
+    settings = load_settings(args.repo_root, args.state_dir)
+    freshness_minutes = settings.policy.resource_sample_freshness_minutes
+    max_priority = _idle_admission_priority(
+        database, now=datetime.now(UTC), freshness_minutes=freshness_minutes
     )
     if max_priority is None:
         return
@@ -2401,9 +2452,8 @@ def _dispatch_idle_lead(database: Database, session_id: str) -> None:
         return
     decisions = OperatorDecisions(database)
     events = EventStore(database)
-    ranked = QueueService(database, events, registered_projects=()).list_ranked(
-        datetime.now(UTC)
-    )
+    queue = QueueService(database, events, registered_projects=())
+    ranked = queue.list_ranked(datetime.now(UTC))
     candidate = None
     for issue in ranked:
         if issue.project_key != project_key or not issue.dependency_ready:
@@ -2417,61 +2467,34 @@ def _dispatch_idle_lead(database: Database, session_id: str) -> None:
     if candidate is None:
         return
 
-    now = datetime.now(UTC).isoformat()
+    # Composition failure (no config/linear.yaml, an unreadable Keychain
+    # credential, an unregistered project) raises here and is caught by
+    # this hook's own suppress(Exception) at the call site: fail closed,
+    # no dispatch, no crash, before any local write is even attempted.
+    linear = _open_idle_linear_router(settings, database=database, queue=queue)
     assignments = LeadAssignments(database, events=events)
-    assignment = None
-    with database.transaction() as connection:
-        issue_row = connection.execute(
-            "SELECT state, instruction_id FROM admitted_issues "
-            "WHERE issue_id = ?",
-            (candidate.issue_id,),
-        ).fetchone()
-        if issue_row is None or str(issue_row["state"]) == IssueState.DONE.value:
-            return
-        prior_state = str(issue_row["state"])
-        activated = connection.execute(
-            "UPDATE project_cells SET state = 'active', updated_at = ? "
-            "WHERE cell_id = ? AND state IN ('starting', 'active') "
-            "AND EXISTS (SELECT 1 FROM profile_leases WHERE "
-            "project_key = ? AND profile_alias = ? AND state = 'active')",
-            (now, cell["cell_id"], project_key, cell["profile_alias"]),
+
+    def _still_eligible(connection: sqlite3.Connection) -> bool:
+        current_max = _idle_admission_priority(
+            connection, now=datetime.now(UTC), freshness_minutes=freshness_minutes
         )
-        if activated.rowcount == 0:
-            return
-        updated = connection.execute(
-            "UPDATE admitted_issues SET state = ?, updated_at = ? "
-            "WHERE issue_id = ? AND state != ?",
-            (
-                IssueState.IN_DEVELOPMENT.value,
-                now,
-                candidate.issue_id,
-                IssueState.DONE.value,
-            ),
-        )
-        if updated.rowcount == 0:
-            return
-        events.append(
-            connection,
-            EventInput(
-                event_type="issue.started",
-                aggregate_type="issue",
-                aggregate_id=candidate.issue_id,
-                payload={"cell_id": str(cell["cell_id"])},
-            ),
-        )
-        assignment = assignments.publish_in(
-            connection,
-            project_key=project_key,
-            issue_id=candidate.issue_id,
+        return current_max is not None and candidate.linear_priority <= current_max
+
+    activated, assignment = asyncio.run(
+        activate_admitted_issue(
+            database=database,
+            events=events,
+            linear=linear,
+            assignments=assignments,
             cell_id=str(cell["cell_id"]),
-            session_id=session_id,
+            project_key=project_key,
             profile_alias=str(cell["profile_alias"]),
-            instruction_id=str(issue_row["instruction_id"]),
-            queue_transition=(
-                f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
-            ),
+            session_id=session_id,
+            issue_id=candidate.issue_id,
+            guard=_still_eligible,
         )
-    if assignment is not None:
+    )
+    if activated and assignment is not None:
         assignments.notify_committed(assignment)
 
 
@@ -2527,7 +2550,7 @@ def _intake_poll(args: argparse.Namespace) -> int:
                 # assignment before anything else, so a freshly
                 # published packet rides this same poll response.
                 with suppress(Exception):
-                    _dispatch_idle_lead(database, str(session))
+                    _dispatch_idle_lead(database, str(session), args)
         # INFRA-201: settle this session's maintenance receipts
         # silently before offering anything — no output either way,
         # for any hook event, so a wake never reaches the primary view

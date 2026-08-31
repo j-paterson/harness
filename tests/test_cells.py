@@ -9,7 +9,11 @@ from uuid import UUID
 
 import pytest
 
-from hermes_orchestrator.cells import ProjectCell, ProjectCellService
+from hermes_orchestrator.cells import (
+    ProjectCell,
+    ProjectCellService,
+    activate_admitted_issue,
+)
 from hermes_orchestrator.claude import (
     ClaudeEvent,
     ClaudeEventParser,
@@ -3515,3 +3519,271 @@ async def test_non_fable_limits_keep_the_flat_hour_cooldown(
     # Session and spend caps are not fable-capacity evidence: no
     # observation row is written for them.
     assert _capacity_rows(database) == []
+
+
+# --- activate_admitted_issue: the shared idle-dispatch activation ---------
+# ---------------------------------------------------------------- service --
+# (INFRA-199 correction: the Stop-hook idle dispatcher must never bypass
+# Linear or reimplement the activation state machine — it calls this
+# exact function, the same one ProjectCellService._activate_issue is
+# built on.)
+
+
+def _seed_active_cell(
+    database: Database,
+    *,
+    cell_id: str = "cell-demo",
+    project_key: str = "demo",
+    profile_alias: str = "max-a",
+    session_id: UUID = SESSION_ID,
+) -> None:
+    now = datetime(2026, 8, 26, tzinfo=UTC).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?, ?)",
+            (cell_id, project_key, profile_alias, str(session_id), now, now),
+        )
+        connection.execute(
+            "INSERT INTO profile_leases("
+            "profile_alias, project_key, state, acquired_at) "
+            "VALUES (?, ?, 'active', ?)",
+            (profile_alias, project_key, now),
+        )
+
+
+def _issue_started_count(database: Database) -> int:
+    return int(
+        database.scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'issue.started'"
+        )
+    )
+
+
+def _assignment_count(database: Database) -> int:
+    return int(database.scalar("SELECT count(*) FROM lead_assignments"))
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_validates_projects_and_activates(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    linear = RecordingLinear()
+    events = EventStore(database)
+    assignments = LeadAssignments(database, events=events)
+
+    activated, assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+    )
+
+    assert activated is True
+    assert linear.validations == [("demo", "ENG-9")]
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert assignment is not None
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_projects_before_activating(
+    database: Database, queue: QueueService
+) -> None:
+    """The projection must land BEFORE the local activation transaction:
+    a fake that inspects durable state from inside ``project`` sees the
+    issue still queued and zero committed assignments."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+
+    class OrderingLinear(RecordingLinear):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state_at_projection: IssueState | None = None
+            self.assignments_at_projection: int | None = None
+
+        async def project(
+            self, issue_id: str, target: LinearProjection, effect_id: str
+        ) -> object:
+            self.state_at_projection = queue.get(issue_id).state
+            self.assignments_at_projection = _assignment_count(database)
+            return await super().project(issue_id, target, effect_id)
+
+    linear = OrderingLinear()
+    assignments = LeadAssignments(database, events=events)
+
+    activated, assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+    )
+
+    assert activated is True
+    assert linear.state_at_projection == IssueState.QUEUED
+    assert linear.assignments_at_projection == 0
+    assert assignment is not None
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_refuses_a_failed_validation(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+
+    class UnknownIssueLinear(RecordingLinear):
+        async def validate(self, project_key: str, issue_id: str) -> object:
+            raise ValueError("Linear issue not found")
+
+    linear = UnknownIssueLinear()
+    assignments = LeadAssignments(database, events=events)
+
+    with pytest.raises(ValueError, match="Linear issue not found"):
+        await activate_admitted_issue(
+            database=database,
+            events=events,
+            linear=linear,
+            assignments=assignments,
+            cell_id="cell-demo",
+            project_key="demo",
+            profile_alias="max-a",
+            session_id=str(SESSION_ID),
+            issue_id="ENG-9",
+        )
+
+    # The issue stays exactly as runnable as it was: zero local writes.
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert linear.targets == []
+    assert _issue_started_count(database) == 0
+    assert _assignment_count(database) == 0
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_refuses_a_failed_projection(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+
+    class FailingProjectionLinear(RecordingLinear):
+        async def project(
+            self, issue_id: str, target: LinearProjection, effect_id: str
+        ) -> object:
+            raise TimeoutError("Linear is unavailable")
+
+    linear = FailingProjectionLinear()
+    assignments = LeadAssignments(database, events=events)
+
+    with pytest.raises(TimeoutError, match="Linear is unavailable"):
+        await activate_admitted_issue(
+            database=database,
+            events=events,
+            linear=linear,
+            assignments=assignments,
+            cell_id="cell-demo",
+            project_key="demo",
+            profile_alias="max-a",
+            session_id=str(SESSION_ID),
+            issue_id="ENG-9",
+        )
+
+    assert linear.validations == [("demo", "ENG-9")]
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
+    assert _assignment_count(database) == 0
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_replay_after_completed_projection_is_idempotent(
+    database: Database, queue: QueueService
+) -> None:
+    """A crash (or a guard refusal) between a completed Linear
+    projection and the local activation commit must not re-project on
+    replay (the real ``LinearClient.project`` is exactly-once per
+    ``effect_id`` via ``ExternalEffectStore``; this fake models that
+    same contract), and the eventual successful replay activates and
+    assigns exactly once."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+    assignments = LeadAssignments(database, events=events)
+
+    class IdempotentLinear(RecordingLinear):
+        def __init__(self) -> None:
+            super().__init__()
+            self._completed: dict[str, object] = {}
+
+        async def project(
+            self, issue_id: str, target: LinearProjection, effect_id: str
+        ) -> object:
+            if effect_id in self._completed:
+                return self._completed[effect_id]
+            result = await super().project(issue_id, target, effect_id)
+            self._completed[effect_id] = result
+            return result
+
+    linear = IdempotentLinear()
+
+    # First attempt: the projection completes but the guard refuses the
+    # activation transaction (simulating a crash/race after the durable
+    # Linear effect landed but before local activation committed).
+    first_activated, first_assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+        guard=lambda connection: False,
+    )
+    assert first_activated is False
+    assert first_assignment is None
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
+    assert _assignment_count(database) == 0
+
+    # Replay: the projection is idempotently replayed — still exactly
+    # one recorded target, because the same effect_id is already
+    # completed — and activation now succeeds exactly once.
+    second_activated, second_assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+    )
+    assert second_activated is True
+    assert second_assignment is not None
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1

@@ -190,6 +190,161 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _activate_issue_transaction(
+    *,
+    database: Database,
+    events: EventStore,
+    cell_id: str,
+    project_key: str,
+    profile_alias: str,
+    issue_id: str,
+    session_id: str,
+    assignments: LeadAssignments | None,
+    now: Callable[[], datetime],
+    guard: Callable[[sqlite3.Connection], bool] | None = None,
+) -> tuple[bool, LeadAssignment | None]:
+    """The one durable activation transaction every dispatch path shares:
+    the ``project_cells`` active-lease guard, the ``admitted_issues`` CAS
+    into ``in_development``, the journaled ``issue.started`` event, and
+    (when ``assignments`` is supplied) the durable assignment packet —
+    all in one transaction, so a queue transition can never again outrun
+    its assignment.
+
+    Both :meth:`ProjectCellService._activate_issue` (explicit dispatch)
+    and :func:`activate_admitted_issue` (the Stop-hook idle dispatcher,
+    ``cli.py``'s ``_dispatch_idle_lead``) call this exact function;
+    neither reimplements the state machine.
+
+    ``guard``, when supplied, runs first, on the same connection and
+    inside the same atomic transaction as the writes below (INFRA-199
+    Finding 2): it lets a caller revalidate eligibility (e.g. resource-
+    sample freshness) at the instant of commit rather than only at an
+    earlier snapshot read, closing the race between selecting a
+    candidate and activating it. A ``False`` result aborts with zero
+    writes, identically to every other guard below.
+    """
+
+    stamp = now().isoformat()
+    assignment: LeadAssignment | None = None
+    with database.transaction() as connection:
+        if guard is not None and not guard(connection):
+            return False, None
+        issue_row = connection.execute(
+            "SELECT state, instruction_id FROM admitted_issues "
+            "WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+        if issue_row is None:
+            raise KeyError(issue_id)
+        prior_state = str(issue_row["state"])
+        if prior_state == IssueState.DONE.value:
+            return False, None
+        activated = connection.execute(
+            "UPDATE project_cells SET state = 'active', updated_at = ? "
+            "WHERE cell_id = ? AND state IN ('starting', 'active') "
+            "AND EXISTS ("
+            "SELECT 1 FROM profile_leases "
+            "WHERE project_key = ? AND profile_alias = ? AND state = 'active'"
+            ")",
+            (stamp, cell_id, project_key, profile_alias),
+        )
+        if activated.rowcount == 0:
+            return False, None
+        updated = connection.execute(
+            "UPDATE admitted_issues SET state = ?, updated_at = ? "
+            "WHERE issue_id = ? AND state != ?",
+            (
+                IssueState.IN_DEVELOPMENT.value,
+                stamp,
+                issue_id,
+                IssueState.DONE.value,
+            ),
+        )
+        if updated.rowcount == 0:
+            return False, None
+        events.append(
+            connection,
+            EventInput(
+                event_type="issue.started",
+                aggregate_type="issue",
+                aggregate_id=issue_id,
+                payload={"cell_id": cell_id},
+            ),
+        )
+        if assignments is not None:
+            assignment = assignments.publish_in(
+                connection,
+                project_key=project_key,
+                issue_id=issue_id,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias=profile_alias,
+                instruction_id=str(issue_row["instruction_id"]),
+                queue_transition=(
+                    f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
+                ),
+            )
+    return True, assignment
+
+
+async def activate_admitted_issue(
+    *,
+    database: Database,
+    events: EventStore,
+    linear: LinearProjector,
+    assignments: LeadAssignments | None,
+    cell_id: str,
+    project_key: str,
+    profile_alias: str,
+    session_id: str,
+    issue_id: str,
+    now: Callable[[], datetime] = _utc_now,
+    guard: Callable[[sqlite3.Connection], bool] | None = None,
+) -> tuple[bool, LeadAssignment | None]:
+    """Dispatch one already-admitted issue onto a live cell durably.
+
+    INFRA-199 Finding 1: the Stop-hook idle dispatcher (``cli.py``'s
+    ``_dispatch_idle_lead``) calls this instead of reimplementing any
+    part of dispatch's Linear-then-activate sequence. It performs the
+    exact same steps, in the exact same order, as
+    ``ProjectCellService._dispatch_locked``'s own inline validate +
+    project + :meth:`ProjectCellService._activate_issue` sequence —
+    and the final step delegates to the very same
+    :func:`_activate_issue_transaction` that backs
+    ``_activate_issue`` — so the idle path can never again bypass
+    Linear or diverge from the activation state machine.
+
+    In order: (1) validate the exact issue/project against Linear
+    exactly the way ``ProjectCellService.dispatch`` does; (2) complete
+    (or idempotently replay) its ``In Development`` projection through
+    the same effect-id convention dispatch uses, so a projection begun
+    by one path is recognized as already-done by the other; (3) only
+    then run the shared activation transaction. A Linear validation or
+    projection failure raises here, before any local write — the issue
+    stays exactly as runnable as it was, with zero queue/event/
+    assignment effects.
+    """
+
+    await linear.validate(project_key, issue_id)
+    await linear.project(
+        issue_id,
+        LinearProjection(status="In Development", assignee_alias="operator"),
+        effect_id=f"linear:{issue_id}:in-development:v2",
+    )
+    return _activate_issue_transaction(
+        database=database,
+        events=events,
+        cell_id=cell_id,
+        project_key=project_key,
+        profile_alias=profile_alias,
+        issue_id=issue_id,
+        session_id=session_id,
+        assignments=assignments,
+        now=now,
+        guard=guard,
+    )
+
+
 class ProjectCellService:
     """Start or resume exactly one profile-pinned Claude lead per project."""
 
@@ -1269,67 +1424,26 @@ class ProjectCellService:
     ) -> tuple[bool, LeadAssignment | None]:
         """Activate the cell and issue; on the classic path, commit the
         durable assignment packet in the very same transaction, so a
-        queue transition can never again outrun its assignment."""
+        queue transition can never again outrun its assignment.
 
-        now = self._aware_now().isoformat()
-        assignment: LeadAssignment | None = None
-        with self._database.transaction() as connection:
-            issue_row = connection.execute(
-                "SELECT state, instruction_id FROM admitted_issues "
-                "WHERE issue_id = ?",
-                (issue_id,),
-            ).fetchone()
-            if issue_row is None:
-                raise KeyError(issue_id)
-            prior_state = str(issue_row["state"])
-            if prior_state == IssueState.DONE.value:
-                return False, None
-            activated = connection.execute(
-                "UPDATE project_cells SET state = 'active', updated_at = ? "
-                "WHERE cell_id = ? AND state IN ('starting', 'active') "
-                "AND EXISTS ("
-                "SELECT 1 FROM profile_leases "
-                "WHERE project_key = ? AND profile_alias = ? AND state = 'active'"
-                ")",
-                (now, cell.cell_id, cell.project_key, cell.profile_alias),
-            )
-            if activated.rowcount == 0:
-                return False, None
-            updated = connection.execute(
-                "UPDATE admitted_issues SET state = ?, updated_at = ? "
-                "WHERE issue_id = ? AND state != ?",
-                (
-                    IssueState.IN_DEVELOPMENT.value,
-                    now,
-                    issue_id,
-                    IssueState.DONE.value,
-                ),
-            )
-            if updated.rowcount == 0:
-                return False, None
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="issue.started",
-                    aggregate_type="issue",
-                    aggregate_id=issue_id,
-                    payload={"cell_id": cell.cell_id},
-                ),
-            )
-            if self._assignments is not None and self._classic_seats:
-                assignment = self._assignments.publish_in(
-                    connection,
-                    project_key=cell.project_key,
-                    issue_id=issue_id,
-                    cell_id=cell.cell_id,
-                    session_id=str(cell.session_id),
-                    profile_alias=cell.profile_alias,
-                    instruction_id=str(issue_row["instruction_id"]),
-                    queue_transition=(
-                        f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
-                    ),
-                )
-        return True, assignment
+        Delegates to the shared :func:`_activate_issue_transaction` — the
+        same activation state machine the idle dispatcher's
+        :func:`activate_admitted_issue` runs.
+        """
+
+        return _activate_issue_transaction(
+            database=self._database,
+            events=self._events,
+            cell_id=cell.cell_id,
+            project_key=cell.project_key,
+            profile_alias=cell.profile_alias,
+            issue_id=issue_id,
+            session_id=str(cell.session_id),
+            assignments=(
+                self._assignments if self._classic_seats else None
+            ),
+            now=self._aware_now,
+        )
 
     def _worker_key(self, cell: ProjectCell) -> str:
         return f"{cell.cell_id}:{cell.session_id}"

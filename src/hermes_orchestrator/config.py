@@ -170,6 +170,14 @@ class PolicyConfig(BaseModel):
     context_window_tokens: int = Field(default=200_000, ge=1_000)
     stall_consultations_before_automation: Literal[2] = 2
     resource_sample_retention_hours: int = Field(default=24, ge=1, le=168)
+    # INFRA-199 Finding 2: the idle-boundary dispatcher must never
+    # authorize new work from a resource sample it cannot trust as
+    # current. Samples persist for `resource_sample_retention_hours`
+    # (hours), but the daemon's own sampling tick runs every tens of
+    # seconds, so a bound of a few minutes is the tight, tunable MVP
+    # freshness policy: comfortably longer than one tick, far shorter
+    # than the retention window.
+    resource_sample_freshness_minutes: int = Field(default=5, ge=1, le=60)
     resource_thresholds: ResourcePolicy = Field(default_factory=ResourcePolicy)
 
 

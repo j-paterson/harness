@@ -2806,12 +2806,63 @@ def test_intake_poll_settles_a_maintenance_receipt_silently(
 # --- intake-poll idle-boundary dispatch (INFRA-199) ------------------------
 
 
+class _IdleLinear:
+    """Fake ``LinearProjector`` for the idle dispatcher's shared
+    ``activate_admitted_issue`` service, composed in place of
+    ``cli._open_idle_linear_router`` for these hook-level tests. Models
+    the real ``LinearClient``'s per-``effect_id`` idempotence so a
+    replay test can prove no duplicate projection is ever sent."""
+
+    def __init__(
+        self,
+        *,
+        validate_error: Exception | None = None,
+        project_error: Exception | None = None,
+        on_project: object = None,
+    ) -> None:
+        self.validations: list[tuple[str, str]] = []
+        self.targets: list[tuple[str, str, str]] = []
+        self._validate_error = validate_error
+        self._project_error = project_error
+        self._on_project = on_project
+        self._completed: dict[str, object] = {}
+
+    async def validate(self, project_key: str, issue_id: str) -> object:
+        self.validations.append((project_key, issue_id))
+        if self._validate_error is not None:
+            raise self._validate_error
+        return object()
+
+    async def project(self, issue_id: str, target: object, effect_id: str) -> object:
+        if effect_id in self._completed:
+            return self._completed[effect_id]
+        if self._on_project is not None:
+            self._on_project()
+        if self._project_error is not None:
+            raise self._project_error
+        self.targets.append((issue_id, target.status, target.assignee_alias))
+        result = object()
+        self._completed[effect_id] = result
+        return result
+
+
+def _patch_idle_linear(monkeypatch: pytest.MonkeyPatch, linear: object) -> None:
+    import hermes_orchestrator.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "_open_idle_linear_router",
+        lambda settings, *, database, queue: linear,
+    )
+
+
 def _seed_idle_dispatch(
     state_dir: Path,
     *,
     with_cell: bool = True,
     with_issue: bool = True,
     pressure: str | None = "green",
+    sampled_at: str | None = None,
     issue_priority: int = 1,
     issue_state: str = "queued",
     dependency_ready: int = 1,
@@ -2862,7 +2913,7 @@ def _seed_idle_dispatch(
                     "swap_used_bytes, load_one, logical_cpus, disk_json, "
                     "managed_rss_bytes"
                     ") VALUES ('s', ?, ?, 1, 2, 0, 0.1, 1, '{}', 1)",
-                    (now, pressure),
+                    (sampled_at if sampled_at is not None else now, pressure),
                 )
             if operator_decision_pending:
                 connection.execute(
@@ -2885,7 +2936,7 @@ def _seed_idle_dispatch(
 
 
 def _poll_at_idle_boundary(
-    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> CliResult:
     from tests.test_lead_intake import SESSION
 
@@ -2894,7 +2945,7 @@ def _poll_at_idle_boundary(
         "stdin",
         StringIO(json.dumps({"session_id": SESSION, "hook_event_name": "Stop"})),
     )
-    return invoke(["--state-dir", str(state_dir), "intake-poll"])
+    return invoke([*base_arguments(configured_repo), "intake-poll"])
 
 
 def _idle_dispatch_counts(state_dir: Path) -> tuple[int, int, str | None]:
@@ -2919,20 +2970,66 @@ def _idle_dispatch_counts(state_dir: Path) -> tuple[int, int, str | None]:
 
 
 def test_intake_poll_dispatches_ready_work_at_the_idle_boundary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state_dir = tmp_path / "state"
+    _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
+    linear = _IdleLinear()
+    _patch_idle_linear(monkeypatch, linear)
 
-    first = _poll_at_idle_boundary(state_dir, monkeypatch)
+    first = _poll_at_idle_boundary(configured_repo, monkeypatch)
     assert first.exit_code == 0
     assert "HERMES_ASSIGNMENT_READY" in json.loads(first.stdout)["reason"]
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+    # Finding 1: the idle path validates and projects through Linear
+    # exactly once, using the normal effect-id convention, before the
+    # assignment (asserted separately below).
+    assert linear.validations == [("demo", "INFRA-9")]
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
 
     # A repeated Stop at the same (now non-runnable) idle boundary is a
-    # strict no-op: the CAS has already fired.
-    second = _poll_at_idle_boundary(state_dir, monkeypatch)
+    # strict no-op: the CAS has already fired, and Linear is not
+    # touched again (the project_busy guard short-circuits first).
+    second = _poll_at_idle_boundary(configured_repo, monkeypatch)
     assert second.exit_code == 0
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+    assert linear.validations == [("demo", "INFRA-9")]
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+
+
+def test_intake_poll_idle_dispatch_projects_before_assigning(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Linear projection must complete BEFORE the local activation
+    transaction: a fake that inspects durable state from inside
+    ``project`` observes zero committed assignments and the issue still
+    queued."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+    from hermes_orchestrator.db import Database
+
+    observed: dict[str, object] = {}
+
+    def _observe() -> None:
+        database = Database.open(state_dir / "state.db")
+        try:
+            observed["assignments"] = int(
+                database.scalar("SELECT count(*) FROM lead_assignments")
+            )
+            observed["issue_state"] = database.scalar(
+                "SELECT state FROM admitted_issues WHERE issue_id = 'INFRA-9'"
+            )
+        finally:
+            database.close()
+
+    linear = _IdleLinear(on_project=_observe)
+    _patch_idle_linear(monkeypatch, linear)
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    assert observed == {"assignments": 0, "issue_state": "queued"}
     assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
 
 
@@ -2954,18 +3051,41 @@ def test_intake_poll_dispatches_ready_work_at_the_idle_boundary(
         pytest.param({"pressure": None}, False, id="no-sample"),
         pytest.param({"outstanding_child": True}, False, id="outstanding-children"),
         pytest.param({"with_cell": False}, True, id="no-live-cell"),
+        pytest.param(
+            {"sampled_at": "not-a-timestamp"}, False, id="malformed-sampled-at"
+        ),
+        pytest.param(
+            {
+                "sampled_at": (
+                    datetime.now(UTC) - timedelta(minutes=6)
+                ).isoformat()
+            },
+            False,
+            id="stale-sample",
+        ),
+        pytest.param(
+            {
+                "sampled_at": (
+                    datetime.now(UTC) + timedelta(minutes=10)
+                ).isoformat()
+            },
+            False,
+            id="future-skewed-sample",
+        ),
     ],
 )
 def test_intake_poll_never_dispatches_a_held_or_ineligible_lane(
-    tmp_path: Path,
+    configured_repo: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
     kwargs: dict,
     expect_silent: bool,
 ) -> None:
-    state_dir = tmp_path / "state"
+    _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir, **kwargs)
+    linear = _IdleLinear()
+    _patch_idle_linear(monkeypatch, linear)
 
-    result = _poll_at_idle_boundary(state_dir, monkeypatch)
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
     assert result.exit_code == 0
     if expect_silent:
@@ -2974,10 +3094,195 @@ def test_intake_poll_never_dispatches_a_held_or_ineligible_lane(
     assert (started, assigned) == (0, 0)
     if kwargs.get("with_issue", True) and kwargs.get("with_cell", True):
         assert issue_state == kwargs.get("issue_state", "queued")
+    # None of these ineligible lanes ever reach Linear: capacity/queue
+    # eligibility is decided before Linear composition even happens.
+    assert linear.validations == []
+    assert linear.targets == []
+
+
+def test_intake_poll_idle_dispatch_rechecks_freshness_at_commit_time(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freshness is proven at TWO points, not just the initial snapshot
+    (INFRA-199 Finding 2): a sample that reads fresh for candidate
+    selection but degrades to stale before the activation transaction
+    commits must still refuse dispatch, with zero local writes — even
+    though the Linear side already completed its projection."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+
+    import hermes_orchestrator.cli as cli_module
+
+    class _StalingLinear:
+        def __init__(self) -> None:
+            self.targets: list[str] = []
+
+        async def validate(self, project_key: str, issue_id: str) -> object:
+            return object()
+
+        async def project(
+            self, issue_id: str, target: object, effect_id: str
+        ) -> object:
+            self.targets.append(issue_id)
+            return object()
+
+    linear = _StalingLinear()
+
+    def _open_and_stale(settings: object, *, database: object, queue: object) -> object:
+        # Degrade the sample the instant it is composed — well before
+        # the activation transaction's guard re-reads it — to model a
+        # sampler tick landing mid-dispatch.
+        stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        with database.transaction() as connection:  # type: ignore[attr-defined]
+            connection.execute(
+                "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
+            )
+        return linear
+
+    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open_and_stale)
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    # The projection itself is not gated by capacity freshness — only
+    # local activation is — so Linear still observed the call.
+    assert linear.targets == ["INFRA-9"]
+    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
+    assert (started, assigned) == (0, 0)
+    assert issue_state == "queued"
+
+
+def test_intake_poll_idle_dispatch_refuses_an_unknown_linear_issue(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deleted/unknown/project-mismatched Linear issue must refuse the
+    whole idle dispatch — zero queue/event/assignment effects — never a
+    local activation that leaves Linear stale (INFRA-199 Finding 1)."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+    linear = _IdleLinear(validate_error=ValueError("Linear issue not found"))
+    _patch_idle_linear(monkeypatch, linear)
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    assert linear.validations == [("demo", "INFRA-9")]
+    assert linear.targets == []
+    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
+    assert (started, assigned) == (0, 0)
+    assert issue_state == "queued"
+
+
+def test_intake_poll_idle_dispatch_refuses_on_projection_failure(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Linear projection failure (network error, disallowed status
+    transition, etc.) must also leave the issue fully runnable — no
+    partial local activation."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+    linear = _IdleLinear(project_error=TimeoutError("Linear is unavailable"))
+    _patch_idle_linear(monkeypatch, linear)
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    assert linear.validations == [("demo", "INFRA-9")]
+    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
+    assert (started, assigned) == (0, 0)
+    assert issue_state == "queued"
+
+
+def test_intake_poll_idle_dispatch_fails_closed_when_linear_composition_fails(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Keychain/settings composition failure (INFRA-199 Finding 1)
+    must never crash the hook and must never fall back to bypassing
+    Linear: no dispatch, no crash, zero local writes."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+
+    import hermes_orchestrator.cli as cli_module
+
+    def _broken_composition(
+        settings: object, *, database: object, queue: object
+    ) -> object:
+        raise RuntimeError("Keychain credential unavailable")
+
+    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _broken_composition)
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
+    assert (started, assigned) == (0, 0)
+    assert issue_state == "queued"
+
+
+def test_intake_poll_idle_dispatch_replay_after_completed_projection_is_idempotent(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replay after the Linear projection already completed (but,
+    say, a prior process crashed before the local commit) must not
+    duplicate the projection, and the eventual successful activation
+    happens exactly once."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir)
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    linear = _IdleLinear()
+    attempts = {"count": 0}
+
+    def _open(settings: object, *, database: object, queue: object) -> object:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            # Degrade the resource sample during THIS composition, so
+            # the activation transaction's freshness guard refuses to
+            # commit after the projection completes — modeling a crash
+            # or race between the durable Linear effect and the local
+            # commit, without ever duplicating the projection itself.
+            stale_at = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+            with database.transaction() as connection:  # type: ignore[attr-defined]
+                connection.execute(
+                    "UPDATE resource_samples SET sampled_at = ?", (stale_at,)
+                )
+        return linear
+
+    monkeypatch.setattr(cli_module, "_open_idle_linear_router", _open)
+
+    first = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert first.exit_code == 0
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+    assert _idle_dispatch_counts(state_dir) == (0, 0, "queued")
+
+    # A fresh sample lands before the lead's next idle boundary.
+    fresh_at = datetime.now(UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE resource_samples SET sampled_at = ?", (fresh_at,)
+            )
+    finally:
+        database.close()
+
+    second = _poll_at_idle_boundary(configured_repo, monkeypatch)
+    assert second.exit_code == 0
+    # Same effect_id, already completed: no duplicate projection.
+    assert linear.targets == [("INFRA-9", "In Development", "operator")]
+    assert linear.validations == [("demo", "INFRA-9"), ("demo", "INFRA-9")]
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
 
 
 def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One issue in development per project at a time: a runnable
     queued lane is refused while another issue in the same project is
@@ -2985,8 +3290,10 @@ def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
 
     from hermes_orchestrator.db import Database
 
-    state_dir = tmp_path / "state"
+    _repo_root, state_dir = configured_repo
     _seed_idle_dispatch(state_dir)
+    linear = _IdleLinear()
+    _patch_idle_linear(monkeypatch, linear)
     database = Database.open(state_dir / "state.db")
     try:
         now = datetime.now(UTC).isoformat()
@@ -3002,12 +3309,13 @@ def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
     finally:
         database.close()
 
-    result = _poll_at_idle_boundary(state_dir, monkeypatch)
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
 
     assert result.exit_code == 0
     started, assigned, issue_state = _idle_dispatch_counts(state_dir)
     assert (started, assigned) == (0, 0)
     assert issue_state == "queued"
+    assert linear.validations == []
 
 
 # --- verify / verify-check (INFRA-186 P9: any-agent verifier CLI) ----------

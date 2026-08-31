@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,6 +15,81 @@ import psutil
 from hermes_orchestrator.config import PolicyConfig
 
 _GIB = 1024**3
+
+# INFRA-199 Finding 2: resource_samples persist up to
+# ``PolicyConfig.resource_sample_retention_hours`` (24h by default) so an
+# obsolete green row could otherwise authorize new work long after the
+# host state it described has changed. The daemon's tick cadence is tens
+# of seconds (``supervisor.Supervisor``'s default ``interval_seconds``),
+# so a small multiple of that — minutes, not hours — is the right MVP
+# bound: tight enough that a stalled sampler cannot silently keep
+# admitting work, loose enough to absorb one or two missed ticks. A
+# small, fixed clock-skew allowance (not policy-configurable — it is an
+# implementation tolerance, not an operator knob) guards the same check
+# against rejecting a genuinely fresh sample over sub-minute clock jitter
+# between the sampling process and the reading process.
+DEFAULT_RESOURCE_SAMPLE_CLOCK_SKEW = timedelta(seconds=60)
+
+
+class SampleExecutor(Protocol):
+    """The minimal read surface ``read_fresh_sample`` needs.
+
+    Both :class:`~hermes_orchestrator.db.Database` and a raw
+    ``sqlite3.Connection`` (as handed to callers inside
+    ``Database.transaction()``) satisfy this, so the same freshness
+    check can run outside a transaction (an initial snapshot read) and
+    again, on the very same connection, inside the atomic transaction
+    that consumes it.
+    """
+
+    def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FreshSample:
+    """One resource sample proven fresh enough to authorize dispatch."""
+
+    pressure: str
+    sampled_at: datetime
+
+
+def read_fresh_sample(
+    executor: SampleExecutor,
+    *,
+    now: datetime,
+    max_age: timedelta,
+    clock_skew: timedelta = DEFAULT_RESOURCE_SAMPLE_CLOCK_SKEW,
+) -> FreshSample | None:
+    """Read the newest ``resource_samples`` row, or ``None`` when it
+    cannot be trusted to authorize new work right now.
+
+    Fails closed (returns ``None``) when the sample is absent, its
+    ``sampled_at`` is unparseable, it is dated more than ``clock_skew``
+    into the future, or it is older than ``max_age``. Every one of
+    those is a caller signal to refuse dispatch, never to guess at
+    current capacity from evidence it cannot trust.
+    """
+
+    row = executor.execute(
+        "SELECT pressure, sampled_at FROM resource_samples "
+        "ORDER BY sampled_at DESC LIMIT 1",
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        sampled_at = datetime.fromisoformat(str(row["sampled_at"]))
+    except ValueError:
+        return None
+    sampled_at = (
+        sampled_at.replace(tzinfo=UTC)
+        if sampled_at.tzinfo is None
+        else sampled_at.astimezone(UTC)
+    )
+    if sampled_at - now > clock_skew:
+        return None
+    if now - sampled_at > max_age:
+        return None
+    return FreshSample(pressure=str(row["pressure"]), sampled_at=sampled_at)
 
 
 class PressureLevel(StrEnum):
