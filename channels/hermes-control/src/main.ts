@@ -8,6 +8,42 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+function logContained(prefix: string, err: unknown): void {
+  try {
+    const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+    process.stderr.write(`hermes-control: ${prefix}: ${detail}\n`);
+  } catch {
+    // Best-effort logging only; if stderr itself is broken there is
+    // nothing further we can do here.
+  }
+}
+
+// The host is the sidecar's only wake channel and it never respawns a
+// dead stdio MCP server mid-session: any uncaught exception here would
+// permanently sever that channel for the rest of the session. These
+// are a last-resort backstop behind the per-call containment in
+// hub-client.ts and mcp.ts — contain, log, and keep serving. The only
+// path that may still exit the process once running is the MCP stdio
+// "close" handler below (the host itself is gone, so there is nothing
+// left to keep serving for).
+process.on("uncaughtException", (err) => {
+  logContained("uncaught exception (contained)", err);
+});
+process.on("unhandledRejection", (reason) => {
+  logContained("unhandled rejection (contained)", reason);
+});
+
+function optionalPositiveInteger(name: string, defaultValue: number): number {
+  const value = process.env[name];
+  if (typeof value !== "string" || value.length === 0) {
+    return defaultValue;
+  }
+  if (!/^\d+$/.test(value) || Number.parseInt(value, 10) <= 0) {
+    fail(`environment variable ${name} must be a positive integer`);
+  }
+  return Number.parseInt(value, 10);
+}
+
 function requireNonEmpty(name: string): string {
   const value = process.env[name];
   if (typeof value !== "string" || value.length === 0) {
@@ -55,6 +91,16 @@ function main(): void {
   const generation = requireInteger("HERMES_CONTROL_GENERATION");
   const capabilityFile = requireAbsolutePath("HERMES_CONTROL_CAPABILITY_FILE");
   const capability = readCapability(capabilityFile);
+  // Not part of the documented sidecar configuration (PROTOCOL.md):
+  // an internal knob so tests don't have to wait a full minute for
+  // the parked retry cadence. Absent in normal operation, where the
+  // 60s default applies.
+  const parkedRetryMs = optionalPositiveInteger("HERMES_CONTROL_PARK_RETRY_MS", 60000);
+  // Not part of the documented sidecar configuration (PROTOCOL.md):
+  // an internal knob so tests don't have to wait a full minute for
+  // the event coalescing window. Absent in normal operation, where
+  // the 60s default applies.
+  const coalesceMs = optionalPositiveInteger("HERMES_CONTROL_COALESCE_MS", 60000);
 
   const onLog = (message: string): void => {
     process.stderr.write(`${message}\n`);
@@ -70,19 +116,14 @@ function main(): void {
     profile,
     generation,
     capability,
+    parkedRetryMs,
+    coalesceMs,
     readCapability: () => {
       // A reissued capability heals a running session on the next
       // registration attempt; a failed re-read falls back to the
       // startup value rather than killing the channel.
       const raw = fs.readFileSync(capabilityFile, "utf8").trim();
       return CAPABILITY_RE.test(raw) ? raw : "";
-    },
-    onTerminal: (reason) => {
-      onLog(
-        `hermes-control: terminal refusal (${reason}); exiting so the ` +
-          "host surfaces the failed server"
-      );
-      process.exit(1);
     },
     onEvent: (kind, packetId, eventId) => {
       mcp?.notifyChannelEvent(kind, packetId, eventId);

@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 
 import pytest
 
-from hermes_orchestrator.cli import _run_daemon, main
+from hermes_orchestrator.cli import _listen_for_merger_turns, _run_daemon, main
+from hermes_orchestrator.codex_rpc import RpcNotification
+from hermes_orchestrator.merger_turns import TurnOutcome
 from tests.test_supervisor import FakeService
 
 
@@ -66,7 +71,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 47
+    assert json.loads(result.stdout)["schema_version"] == 52
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -308,6 +313,28 @@ def test_merge_flow_commands_are_registered() -> None:
     assert args.status == "FABLE_READY"
     turn = _parser().parse_args(["merger-turn", "--project", "demo"])
     assert turn.command == "merger-turn"
+    submit = _parser().parse_args(
+        [
+            "submit-review",
+            "--project",
+            "demo",
+            "--issue",
+            "ENG-9",
+            "--event",
+            "evt-1",
+            "--candidate-sha",
+            "a" * 40,
+            "--thread",
+            "thread-1",
+            "--generation",
+            "3",
+            "--verdict",
+            "-",
+        ]
+    )
+    assert submit.command == "submit-review"
+    assert submit.generation == 3
+    assert submit.verdict == "-"
 
 
 def test_subagent_gate_blocks_only_frozen_sessions(tmp_path: Path) -> None:
@@ -1366,6 +1393,307 @@ def test_cmux_focus_fails_closed_from_binding_to_socket(
     assert json.loads(denied.stdout)["error"] == "CmuxUnavailable"
 
 
+def _write_cmux_config(repo_root: Path) -> None:
+    (repo_root / "config" / "cmux.yaml").write_text(
+        "cli:\n  - /usr/bin/false\n", encoding="utf-8"
+    )
+
+
+def _write_profiles_config(repo_root: Path) -> None:
+    (repo_root / "config" / "profiles.yaml").write_text(
+        "profiles:\n"
+        "  - alias: max-a\n"
+        "    config_dir: profiles/max-a\n"
+        "  - alias: max-b\n"
+        "    config_dir: profiles/max-b\n"
+        "  - alias: max-c\n"
+        "    config_dir: profiles/max-c\n"
+        "  - alias: max-d\n"
+        "    config_dir: profiles/max-d\n",
+        encoding="utf-8",
+    )
+
+
+def _bind_rotate_lead_cell(state_dir: Path, *, cell_id: str) -> None:
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        CmuxSurfaceBindings(database=database, events=EventStore(database)).bind_lead(
+            project_key="demo",
+            cell_id=cell_id,
+            session_id="11111111-1111-4111-8111-111111111111",
+            profile_alias="max-a",
+            ref=CmuxSurfaceRef(
+                workspace_uuid="22222222-2222-4222-8222-222222222222",
+                surface_uuid="33333333-3333-4333-8333-333333333333",
+            ),
+        )
+    finally:
+        database.close()
+
+
+@dataclass
+class _FakeRotationReport:
+    """Mirrors the lead's ``RotationReport`` contract for INFRA-197 P2."""
+
+    phase: str
+    cell_id: str
+    handoff_id: str | None
+    replacement_session: str | None
+    profile: str | None
+    binding_id: str | None
+    failure: str | None
+
+
+def _install_fake_lead_rotation(
+    monkeypatch: pytest.MonkeyPatch, *, report: _FakeRotationReport
+) -> list[dict[str, object]]:
+    """Stub the CLI's lazily-imported rotation boundary.
+
+    ``hermes_orchestrator.lead_rotation`` is concurrently authored by
+    another packet in this same worktree, so the real module is never
+    imported here: a fake module is injected into ``sys.modules`` ahead
+    of the CLI's own ``from hermes_orchestrator.lead_rotation import
+    LeadRotation``, which resolves it without touching the file on disk.
+    Returns the list of constructor kwargs the CLI passed, for callers
+    that want to assert on the collaborators it wired up.
+    """
+
+    calls: list[dict[str, object]] = []
+
+    class _FakeLeadRotation:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        async def rotate(self, cell_id: str) -> _FakeRotationReport:
+            assert cell_id == report.cell_id
+            return report
+
+    fake_module = types.ModuleType("hermes_orchestrator.lead_rotation")
+    fake_module.LeadRotation = _FakeLeadRotation  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_orchestrator.lead_rotation", fake_module)
+    return calls
+
+
+def test_rotate_lead_requires_cmux_configuration(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "cmux is not configured"
+
+
+def test_rotate_lead_reports_a_successful_rotation(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+    report = _FakeRotationReport(
+        phase="seated",
+        cell_id="cell-1",
+        handoff_id="handoff-1",
+        replacement_session="22222222-2222-4222-8222-222222222222",
+        profile="max-b",
+        binding_id="binding-1",
+        failure=None,
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "seated"
+    assert payload["cell_id"] == "cell-1"
+    assert payload["handoff_id"] == "handoff-1"
+    assert payload["profile"] == "max-b"
+    assert payload["binding_id"] == "binding-1"
+    assert payload["failure"] is None
+
+
+def test_rotate_lead_refuses_with_one_actionable_message(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+    report = _FakeRotationReport(
+        phase="refused",
+        cell_id="cell-1",
+        handoff_id=None,
+        replacement_session=None,
+        profile=None,
+        binding_id=None,
+        failure="no different healthy profile is available",
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [*base_arguments(configured_repo), "rotate-lead", "--cell", "cell-1"]
+    )
+
+    assert result.exit_code == 1
+    assert "no different healthy profile is available" in result.output
+
+
+def test_worktree_state_fails_closed_on_a_non_git_directory(tmp_path: Path) -> None:
+    from hermes_orchestrator.cli import _worktree_state
+
+    state = _worktree_state(tmp_path)
+
+    assert state.branch == ""
+    assert state.head == ""
+    assert state.origin_head == ""
+    assert state.dirty is True
+
+
+def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root = tmp_path
+    state_dir = tmp_path / "state"
+    lead_worktree = tmp_path / "lead-worktree"
+    lead_worktree.mkdir()
+    (repo_root / "config").mkdir()
+    (repo_root / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {repo_root}\n"
+        f"    lead_worktree: {lead_worktree}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (repo_root / "config/policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n",
+        encoding="utf-8",
+    )
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+
+    probed: list[Path] = []
+
+    def _fake_worktree_state(path: Path) -> cli_module.WorktreeState:
+        probed.append(path)
+        return cli_module.WorktreeState(
+            branch="main", head="a", origin_head="a", dirty=False
+        )
+
+    monkeypatch.setattr(cli_module, "_worktree_state", _fake_worktree_state)
+    report = _FakeRotationReport(
+        phase="seated",
+        cell_id="cell-1",
+        handoff_id="handoff-1",
+        replacement_session="22222222-2222-4222-8222-222222222222",
+        profile="max-b",
+        binding_id="binding-1",
+        failure=None,
+    )
+    calls = _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--state-dir",
+            str(state_dir),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    # The fake ``LeadRotation`` never calls ``worktree_state`` itself
+    # (it ignores its constructor kwargs), so the closure the CLI wired
+    # up is invoked here directly, exactly as the real gate would call
+    # it: with the project key, not the worktree path.
+    calls[0]["worktree_state"]("demo")
+    assert probed == [lead_worktree]
+
+
+def test_rotate_lead_seeds_the_profile_pool_before_reserving_a_replacement(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.profiles import ProfileHealth
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+
+    probed: list[str] = []
+
+    def _fake_check(self: object, alias: str) -> ProfileHealth:
+        probed.append(alias)
+        return ProfileHealth(
+            profile_alias=alias,
+            eligible=True,
+            reason="eligible",
+            last_checked_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(cli_module.ClaudeProfileProbe, "check", _fake_check)
+    report = _FakeRotationReport(
+        phase="seated",
+        cell_id="cell-1",
+        handoff_id="handoff-1",
+        replacement_session="22222222-2222-4222-8222-222222222222",
+        profile="max-b",
+        binding_id="binding-1",
+        failure=None,
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    # Every registry profile must be health-seeded into the pool the
+    # cell service receives — exactly once each — mirroring
+    # open_runtime's own startup loop; otherwise every slot stays at
+    # its default ineligible state and rotation can never reserve a
+    # replacement.
+    assert sorted(probed) == ["max-a", "max-b", "max-c", "max-d"]
+
+
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:
     result = invoke(
         [
@@ -1772,3 +2100,498 @@ def test_verify_check_is_fresh_then_stale_after_a_tree_change(
     payload = json.loads(stale.stdout)
     assert payload["valid"] is False
     assert payload["reason"] == "stale: tree changed"
+
+
+# SR2 listener demotion (supersedes fast-lane a3aa8cd8's idle-primary
+# design): an idle thread/status/changed for the project-bound Merger
+# thread is crash-recovery fallback ONLY — it resumes settlement solely
+# when a durable submitted_verdicts row in state 'submitted' exists for
+# the project's outstanding wake, and NEVER triggers a
+# thread-pull-and-infer settlement. turn/completed keeps its behavior.
+
+
+def _status_changed(thread_id: str, status_type: str) -> RpcNotification:
+    return RpcNotification(
+        "thread/status/changed",
+        {"threadId": thread_id, "status": {"type": status_type}},
+    )
+
+
+def _turn_completed(thread_id: str) -> RpcNotification:
+    return RpcNotification("turn/completed", {"threadId": thread_id})
+
+
+class _ListenerRpc:
+    """Finite notification feed; the listener returns when it drains."""
+
+    def __init__(self, notifications: list[RpcNotification]) -> None:
+        self._notifications = notifications
+
+    async def notifications(self):
+        for notification in self._notifications:
+            yield notification
+
+
+class _ListenerMerger:
+    """Read-only project-bound reviewer channels."""
+
+    def __init__(self, channels: dict[str, str]) -> None:
+        self._channels = channels
+
+    def read_channel(self, project_key: str) -> types.SimpleNamespace | None:
+        thread_id = self._channels.get(project_key)
+        if thread_id is None:
+            return None
+        return types.SimpleNamespace(thread_id=thread_id)
+
+
+class _ListenerTurns:
+    """Honest stand-in for MergerTurnService's single settlement path.
+
+    ``handle_turn`` is the one entry point: the first call for an
+    outstanding wake settles the completed structured verdict (recorded
+    in ``settlements``) and consumes the wake, exactly like the durable
+    claim; every later call finds no outstanding wake and no-ops. A
+    duplicate invocation is therefore visible as an extra entry in
+    ``handle_calls`` without an extra entry in ``settlements``, and a
+    parallel settlement architecture would show up as settlements not
+    produced by ``handle_turn``.
+    """
+
+    def __init__(
+        self,
+        merger: _ListenerMerger,
+        projects: tuple[str, ...],
+        outstanding: dict[str, str | None],
+        pending: dict[str, str | None] | None = None,
+    ) -> None:
+        self._merger = merger
+        self._projects = projects
+        self._outstanding = outstanding
+        self._pending = pending or {}
+        self.handle_calls: list[str] = []
+        self.settlements: list[str] = []
+
+    def outstanding_wake(
+        self, project_key: str
+    ) -> tuple[types.SimpleNamespace, str] | None:
+        state = self._outstanding.get(project_key)
+        if state is None:
+            return None
+        return (types.SimpleNamespace(event_id="evt-1"), state)
+
+    def _pending_submission(
+        self, project_key: str, event_id: str
+    ) -> types.SimpleNamespace | None:
+        if self._pending.get(project_key) != event_id:
+            return None
+        return types.SimpleNamespace(
+            event_id=event_id, project_key=project_key, state="submitted"
+        )
+
+    async def handle_turn(self, project_key: str) -> TurnOutcome:
+        self.handle_calls.append(project_key)
+        if self._outstanding.get(project_key) is None:
+            return TurnOutcome(
+                project_key,
+                "no_outstanding_wake",
+                None,
+                None,
+                "no delivered candidate wake; terminal idle",
+            )
+        self._outstanding[project_key] = None
+        # A resumed pending submission is durably marked settled.
+        self._pending[project_key] = None
+        self.settlements.append(project_key)
+        return TurnOutcome(
+            project_key,
+            "corrections_required",
+            "evt-1",
+            "ENG-1",
+            "structured corrections_required verdict settled",
+        )
+
+    async def on_notification(
+        self, notification: RpcNotification
+    ) -> TurnOutcome | None:
+        if notification.method not in ("turn/completed", "thread/turn/completed"):
+            return None
+        thread_id = notification.params.get("threadId")
+        for project_key in self._projects:
+            channel = self._merger.read_channel(project_key)
+            if channel is not None and channel.thread_id == thread_id:
+                return await self.handle_turn(project_key)
+        return None
+
+
+def _listener_flow(
+    *,
+    channels: dict[str, str],
+    outstanding: dict[str, str | None],
+    notifications: list[RpcNotification],
+    pending: dict[str, str | None] | None = None,
+) -> types.SimpleNamespace:
+    merger = _ListenerMerger(channels)
+    return types.SimpleNamespace(
+        rpc=_ListenerRpc(notifications),
+        merger=merger,
+        turns=_ListenerTurns(merger, tuple(channels), outstanding, pending),
+    )
+
+
+async def _run_listener(flow: types.SimpleNamespace, projects: tuple[str, ...]) -> str:
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        await _listen_for_merger_turns(flow, projects)
+    return stdout.getvalue()
+
+
+def _settled_lines(output: str) -> list[dict[str, object]]:
+    lines = [json.loads(line) for line in output.splitlines()]
+    return [line for line in lines if line.get("merger_turn") == "corrections_required"]
+
+
+@pytest.mark.asyncio
+async def test_idle_with_wake_but_no_submitted_verdict_is_a_noop() -> None:
+    # Demotion: idle with an outstanding wake but NO durable submitted
+    # verdict must never pull the thread and infer a settlement; the
+    # later turn/completed observation keeps its existing behavior.
+    flow = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "delivered"},
+        notifications=[
+            _status_changed("thread-1", "idle"),
+            _turn_completed("thread-1"),
+        ],
+    )
+
+    output = await _run_listener(flow, ("demo",))
+
+    # Exactly one handle_turn call — from turn/completed, not idle.
+    assert flow.turns.handle_calls == ["demo"]
+    assert flow.turns.settlements == ["demo"]
+    assert len(_settled_lines(output)) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_with_durable_pending_submission_settles_once() -> None:
+    # Crash-recovery fallback: an explicit submission durably in state
+    # 'submitted' whose settlement was cut short resumes on idle.
+    flow = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "admitted"},
+        pending={"demo": "evt-1"},
+        notifications=[_status_changed("thread-1", "idle")],
+    )
+
+    output = await _run_listener(flow, ("demo",))
+
+    assert flow.turns.handle_calls == ["demo"]
+    assert flow.turns.settlements == ["demo"]
+    settled = _settled_lines(output)
+    assert len(settled) == 1
+    assert settled[0]["event_id"] == "evt-1"
+    assert settled[0]["issue_id"] == "ENG-1"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_idle_and_turn_completed_settle_exactly_once() -> None:
+    flow = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "delivered"},
+        pending={"demo": "evt-1"},
+        notifications=[
+            _status_changed("thread-1", "idle"),
+            _status_changed("thread-1", "idle"),
+            _turn_completed("thread-1"),
+        ],
+    )
+
+    output = await _run_listener(flow, ("demo",))
+
+    # Exactly one settlement: no duplicate review, correction,
+    # projection, or merge from the replayed notifications.
+    assert flow.turns.settlements == ["demo"]
+    assert len(_settled_lines(output)) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_without_wake_and_non_idle_statuses_no_op() -> None:
+    no_wake = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": None},
+        notifications=[_status_changed("thread-1", "idle")],
+    )
+
+    await _run_listener(no_wake, ("demo",))
+
+    assert no_wake.turns.handle_calls == []
+    assert no_wake.turns.settlements == []
+
+    non_idle = _listener_flow(
+        channels={"demo": "thread-1"},
+        outstanding={"demo": "delivered"},
+        notifications=[
+            _status_changed("thread-1", "active"),
+            _status_changed("thread-9", "idle"),
+        ],
+    )
+
+    await _run_listener(non_idle, ("demo",))
+
+    assert non_idle.turns.handle_calls == []
+    assert non_idle.turns.settlements == []
+
+
+# SR2 submit-review (operator correction ec1f6bdf): the smallest strict
+# local subcommand for the bound Sol session — the verdict is submitted,
+# never inferred; exit 0 on a settled outcome, exit 1 with the rejection
+# message on SubmissionRejected or invalid input.
+
+
+class _FakeSubmitTurns:
+    def __init__(self, result: object) -> None:
+        self._result = result
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def submit_review(self, project_key: str, **kwargs: object) -> object:
+        self.calls.append((project_key, kwargs))
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+def _submit_arguments(configured_repo: tuple[Path, Path], verdict: str) -> list[str]:
+    return [
+        *base_arguments(configured_repo),
+        "submit-review",
+        "--project",
+        "demo",
+        "--issue",
+        "ENG-9",
+        "--event",
+        "evt-1",
+        "--candidate-sha",
+        "a" * 40,
+        "--thread",
+        "thread-1",
+        "--generation",
+        "3",
+        "--verdict",
+        verdict,
+    ]
+
+
+def test_submit_review_settles_the_submitted_verdict(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root, _state_dir = configured_repo
+    verdict_path = repo_root / "verdict.json"
+    verdict_path.write_text('{"pr_number": 7}', encoding="utf-8")
+    turns = _FakeSubmitTurns(
+        TurnOutcome(
+            "demo",
+            "approved",
+            "evt-1",
+            "ENG-9",
+            "review approved and merged",
+            review_id="rev-1",
+            merge_sha="b" * 40,
+        )
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_open_merge_flow",
+        lambda settings, runtime: types.SimpleNamespace(turns=turns),
+    )
+
+    result = invoke(_submit_arguments(configured_repo, str(verdict_path)))
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["merger_turn"] == "approved"
+    assert payload["event_id"] == "evt-1"
+    assert payload["issue_id"] == "ENG-9"
+    project_key, kwargs = turns.calls[0]
+    assert project_key == "demo"
+    assert kwargs == {
+        "issue_id": "ENG-9",
+        "event_id": "evt-1",
+        "candidate_sha": "a" * 40,
+        "reviewed_thread_id": "thread-1",
+        "reviewed_generation": 3,
+        "verdict_json": '{"pr_number": 7}',
+    }
+
+
+def test_submit_review_rejection_fails_closed_from_stdin(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.merger_turns import SubmissionRejected
+
+    turns = _FakeSubmitTurns(
+        SubmissionRejected("submission event does not match the outstanding wake")
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_open_merge_flow",
+        lambda settings, runtime: types.SimpleNamespace(turns=turns),
+    )
+    monkeypatch.setattr(sys, "stdin", StringIO('{"pr_number": 7}'))
+
+    result = invoke(_submit_arguments(configured_repo, "-"))
+
+    assert result.exit_code == 1
+    assert "does not match the outstanding wake" in result.stderr
+    # The stdin document reached the service verbatim before rejection.
+    assert turns.calls[0][1]["verdict_json"] == '{"pr_number": 7}'
+
+
+def test_submit_review_refuses_invalid_input_before_opening_the_flow(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+
+    def _never_opened(settings: object, runtime: object) -> object:
+        raise AssertionError("the merge flow must not open on invalid input")
+
+    monkeypatch.setattr(cli_module, "_open_merge_flow", _never_opened)
+
+    bad_sha = invoke(
+        [
+            *base_arguments(configured_repo),
+            "submit-review",
+            "--project",
+            "demo",
+            "--issue",
+            "ENG-9",
+            "--event",
+            "evt-1",
+            "--candidate-sha",
+            "not-a-sha",
+            "--thread",
+            "thread-1",
+            "--generation",
+            "3",
+            "--verdict",
+            "-",
+        ]
+    )
+    assert bad_sha.exit_code == 1
+    assert "40-hex" in bad_sha.stderr
+
+    repo_root, _state_dir = configured_repo
+    missing = invoke(
+        _submit_arguments(configured_repo, str(repo_root / "absent.json"))
+    )
+    assert missing.exit_code == 1
+    assert "cannot read verdict document" in missing.stderr
+
+    monkeypatch.setattr(sys, "stdin", StringIO("   \n"))
+    empty = invoke(_submit_arguments(configured_repo, "-"))
+    assert empty.exit_code == 1
+    assert "verdict document is empty" in empty.stderr
+
+
+# Sol f0a5a403 P3 (CLI half): channel-trust-confirm pins its exit codes —
+# confirmed=True exits 0; a refused or ambiguous non-success verdict
+# (confirmed=False, including first_failure="confirm_outcome_ambiguous")
+# exits nonzero with the state visible in the JSON output.
+
+
+def _invoke_channel_trust_confirm(
+    configured_repo: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: object,
+) -> CliResult:
+    import hermes_orchestrator.channel_trust as channel_trust_module
+    import hermes_orchestrator.cli as cli_module
+    import hermes_orchestrator.runtime as runtime_module
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-demo")
+
+    dialog = (
+        "Loading development channels\n"
+        "server:hermes-control\n"
+        "I am using this for local development\n"
+        "Enter to confirm\n"
+    )
+
+    async def _fake_read_screen(self: object, ref: object, lines: int = 200) -> str:
+        return dialog
+
+    monkeypatch.setattr(cli_module.CmuxCliAdapter, "read_screen", _fake_read_screen)
+    monkeypatch.setattr(
+        channel_trust_module.ChannelTrustAnchors,
+        "active_for_cell",
+        lambda self, cell_id: types.SimpleNamespace(
+            anchor_id="anchor-1",
+            prompt_pattern="pattern",
+            canonical_entry_path="/entry",
+        ),
+    )
+    entry = state_dir / "sidecar" / "dist" / "channel" / "entry.js"
+    monkeypatch.setattr(
+        runtime_module,
+        "resolve_sidecar_entry",
+        lambda *, repo_root, state_dir: entry,
+    )
+    monkeypatch.setattr(
+        cli_module, "_live_claude_argv", lambda session_id: ["claude"]
+    )
+    monkeypatch.setattr(
+        channel_trust_module.ChannelTrustGate,
+        "evaluate",
+        lambda self, **kwargs: verdict,
+    )
+
+    return invoke(
+        [
+            *base_arguments(configured_repo),
+            "channel-trust-confirm",
+            "--cell",
+            "cell-demo",
+            "--wait-seconds",
+            "1",
+            "--json",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("confirmed", "first_failure", "expected_exit"),
+    [
+        (True, None, 0),
+        (False, "entry_sha256", 1),
+        (False, "confirm_outcome_ambiguous", 1),
+    ],
+)
+def test_channel_trust_confirm_exit_codes_fail_closed(
+    configured_repo: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool,
+    first_failure: str | None,
+    expected_exit: int,
+) -> None:
+    from hermes_orchestrator.channel_trust import TrustVerdict
+
+    verdict = TrustVerdict(
+        confirmed=confirmed,
+        anchor_id="anchor-1",
+        first_failure=first_failure,
+        receipt_operation_id="op-1",
+    )
+
+    result = _invoke_channel_trust_confirm(configured_repo, monkeypatch, verdict)
+
+    assert result.exit_code == expected_exit
+    payload = json.loads(result.stdout)
+    assert payload["confirmed"] is confirmed
+    if first_failure is not None:
+        # The non-success state — ambiguous included — is visible.
+        assert payload["first_failure"] == first_failure

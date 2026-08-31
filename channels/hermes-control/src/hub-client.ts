@@ -17,11 +17,17 @@ export interface HubClientOptions {
    */
   readCapability?: () => string;
   /**
-   * Invoked once when the hub refuses this process terminally (wrong
-   * protocol or stale generation): no retry can ever succeed, so the
-   * host should exit and let the MCP layer surface the failure.
+   * Cadence for re-attempting registration while parked after a
+   * terminal refusal. Defaults to 60s; overridable so tests don't
+   * have to wait a full minute.
    */
-  onTerminal?: (reason: string) => void;
+  parkedRetryMs?: number;
+  /**
+   * Width of the per-connection-epoch coalescing window applied to
+   * repeated event_ids (see `forwardedAt` below). Defaults to 60s;
+   * overridable so tests don't have to wait a full minute.
+   */
+  coalesceMs?: number;
   onEvent: (kind: string, packetId: string, eventId: string) => void;
   onLog: (message: string) => void;
 }
@@ -35,19 +41,28 @@ export type AckResult =
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
 const ACK_TIMEOUT_MS = 10000;
+const DEFAULT_PARKED_RETRY_MS = 60000;
+const DEFAULT_COALESCE_MS = 60000;
 
-// Refusals no retry can ever cure from inside this process: the wire
-// protocol itself is wrong, or this process belongs to a superseded
-// seat generation. Everything else (a lagging seat binding, a
-// capability being reissued, a hub mid-restart) is retried with
+// Refusals no single retry can cure from inside this process: the
+// wire protocol itself is wrong, or this process belongs to a
+// superseded seat generation. Neither can be fixed by reconnecting
+// with the same identity — but the host never respawns a dead stdio
+// MCP server mid-session, so this process must NOT exit either: doing
+// so would permanently sever the host's only wake channel for the
+// rest of the session. Instead it parks (see below) and keeps
+// retrying slowly, so a later daemon fix, generation realignment, or
+// capability rotation restores the channel with no manual reconnect.
+// Everything else (a lagging seat binding, a capability being
+// reissued, a hub mid-restart) is retried with the ordinary doubling
 // backoff and a fresh capability read — the supported non-interactive
-// recovery path.
+// recovery path for transient refusals.
 const TERMINAL_REFUSALS = new Set<string>([
   "unsupported protocol version",
   "stale binding generation",
 ]);
 
-type State = "connecting" | "registered" | "refused";
+type State = "connecting" | "registered" | "parked";
 
 interface PendingAck {
   resolve: (result: AckResult) => void;
@@ -60,10 +75,18 @@ export class HubClient {
   private state: State = "connecting";
   private backoff = INITIAL_BACKOFF_MS;
   private recvBuffer: Buffer = Buffer.alloc(0);
-  private readonly seenEventIds = new Set<string>();
   private readonly pendingAcks = new Map<string, PendingAck>();
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /**
+   * event_id -> Date.now() of the last forward, scoped to the current
+   * connection epoch (cleared on every successful registration, see
+   * the "registered" case below). Bounds the visible burst from the
+   * hub's per-publish-pass resend without ever suppressing a genuinely
+   * lost event or a post-reconnect replay: see the "event" case for
+   * the coalescing rule itself.
+   */
+  private forwardedAt = new Map<string, number>();
 
   constructor(opts: HubClientOptions) {
     this.opts = opts;
@@ -71,6 +94,21 @@ export class HubClient {
 
   start(): void {
     this.connect();
+  }
+
+  /** Stop reconnecting and tear down the socket. Used by tests that
+   * construct a HubClient directly in-process (rather than inside a
+   * spawned sidecar, which is simply killed) so no reconnect timer is
+   * left running after the test ends. */
+  stop(): void {
+    this.stopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.socket) {
+      this.socket.destroy();
+    }
   }
 
   getState(): State {
@@ -92,7 +130,7 @@ export class HubClient {
     });
 
     socket.on("error", (err: Error) => {
-      this.opts.onLog(`hub-client: socket error: ${err.message}`);
+      this.safeLog(`hub-client: socket error: ${err.message}`);
     });
 
     socket.on("close", () => {
@@ -106,7 +144,7 @@ export class HubClient {
         const fresh = this.opts.readCapability();
         if (fresh) return fresh;
       } catch (err) {
-        this.opts.onLog(
+        this.safeLog(
           `hub-client: capability re-read failed: ${String(err)}`
         );
       }
@@ -178,22 +216,34 @@ export class HubClient {
       case "registered":
         this.state = "registered";
         this.backoff = INITIAL_BACKOFF_MS;
+        // A new connection epoch begins here, and the hub's replay
+        // follows: clear the coalescing map so every replayed event
+        // forwards immediately on this epoch, preserving retry after
+        // reconnect (see `forwardedAt` above and the "event" case
+        // below).
+        this.forwardedAt.clear();
         return true;
 
       case "refused": {
         const reasonRaw = (msg as Record<string, unknown>)["reason"];
         const reason = typeof reasonRaw === "string" ? reasonRaw : "refused";
-        this.opts.onLog(`hub-client: registration refused: ${reason}`);
+        this.safeLog(`hub-client: registration refused: ${reason}`);
         this.failAllPending({ kind: "refused", reason });
         if (TERMINAL_REFUSALS.has(reason)) {
-          // No retry can cure this process: stop, surface, and let
-          // the durable ledger plus the hub's blocked receipt carry
-          // the recovery story.
-          this.state = "refused";
+          // Park: stay alive, keep MCP stdio fully responsive, and
+          // keep retrying registration on a slow fixed cadence. A
+          // second (or later) terminal refusal while already parked
+          // is a no-op beyond this log line — it does not exit and
+          // does not fall back to the fast backoff.
+          const retryMs = this.opts.parkedRetryMs ?? DEFAULT_PARKED_RETRY_MS;
+          this.safeLog(
+            `hermes-control: parked after terminal refusal (${reason}); ` +
+              `retrying registration every ${retryMs}ms until it clears`
+          );
+          this.state = "parked";
           if (this.socket) {
             this.socket.destroy();
           }
-          this.opts.onTerminal?.(reason);
           return true;
         }
         // Transient refusal: keep reconnecting (with the ordinary
@@ -210,9 +260,46 @@ export class HubClient {
       case "event": {
         const validated = validateHubEvent(msg, this.opts.session);
         if (!validated) return false;
-        if (!this.seenEventIds.has(validated.event_id)) {
-          this.seenEventIds.add(validated.event_id);
+        // The sidecar stays transport only: it never deduplicates by
+        // event_id across connection epochs. The hub re-sends every
+        // unacknowledged event on registration replay and again on
+        // EVERY publish pass (which fires per maintenance tick AND per
+        // outbox commit), precisely so that a notification lost on the
+        // client side (e.g. delivered before the host's channel
+        // handler is registered) self-heals on the next resend.
+        // Suppressing re-forwards outright would defeat that design
+        // and can make a wake permanently invisible while the event
+        // stays durably unacknowledged.
+        //
+        // What it DOES do is coalesce repeats of the same event_id
+        // within one connection epoch inside a bounded window
+        // (`coalesceMs`, see `forwardedAt` above): a hub republish
+        // burst at cold start renders as one visible entry instead of
+        // three, while a genuinely lost, still-unacknowledged event
+        // re-surfaces the moment the window lapses, and a reconnect
+        // (new epoch, map cleared in the "registered" case above)
+        // replays immediately regardless of how recently it last
+        // forwarded. Exactly-once effect remains enforced downstream,
+        // by the durable drain's dedup and the hub's ack
+        // compare-and-set — not here.
+        const now = Date.now();
+        const last = this.forwardedAt.get(validated.event_id);
+        const coalesceMs = this.opts.coalesceMs ?? DEFAULT_COALESCE_MS;
+        if (last !== undefined && now - last < coalesceMs) {
+          return true;
+        }
+        this.forwardedAt.set(validated.event_id, now);
+
+        // onEvent ultimately drives sending a notification to the
+        // host over MCP stdio: it must never be allowed to take the
+        // whole process down. Contain, log, and keep the socket (and
+        // the stdio channel) alive for the next event.
+        try {
           this.opts.onEvent(validated.kind, validated.packet_id, validated.event_id);
+        } catch (err) {
+          this.safeLog(
+            `hermes-control: internal error handling event ${validated.event_id}: ${String(err)}`
+          );
         }
         return true;
       }
@@ -255,9 +342,23 @@ export class HubClient {
   }
 
   private violate(reason: string): void {
-    this.opts.onLog(`hub-client: protocol violation: ${reason}`);
+    this.safeLog(`hub-client: protocol violation: ${reason}`);
     if (this.socket) {
       this.socket.destroy();
+    }
+  }
+
+  /**
+   * Route every log line through here rather than calling
+   * `this.opts.onLog` directly: a throwing logger (e.g. a broken
+   * stderr pipe) must not be able to take the process down either.
+   */
+  private safeLog(message: string): void {
+    try {
+      this.opts.onLog(message);
+    } catch {
+      // Best-effort logging only; nothing further to do if even this
+      // fails.
     }
   }
 
@@ -266,7 +367,20 @@ export class HubClient {
     this.recvBuffer = Buffer.alloc(0);
     this.failAllPending({ kind: "disconnected" });
 
-    if (this.stopped || this.state === "refused") {
+    if (this.stopped) {
+      return;
+    }
+
+    if (this.state === "parked") {
+      // Slow fixed cadence, no doubling: this keeps trying forever
+      // until a daemon fix, generation realignment, or capability
+      // rotation lets registration succeed again, with no manual
+      // reconnect required.
+      const delay = this.opts.parkedRetryMs ?? DEFAULT_PARKED_RETRY_MS;
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connect();
+      }, delay);
       return;
     }
 
@@ -279,9 +393,6 @@ export class HubClient {
   }
 
   ack(eventId: string, packetId: string): Promise<AckResult> {
-    if (this.state === "refused") {
-      return Promise.resolve({ kind: "refused", reason: "channel refused" });
-    }
     if (this.state !== "registered" || !this.socket) {
       return Promise.resolve({ kind: "disconnected" });
     }

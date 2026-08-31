@@ -20,6 +20,11 @@ class ProjectConfig(BaseModel):
 
     linear_team: str = Field(min_length=1)
     repo_path: Path
+    # The dedicated lead/candidate worktree, when it differs from
+    # ``repo_path`` (the stable primary checkout ``repo_path`` is
+    # required to be). Optional: projects with no separate lead
+    # worktree simply omit it.
+    lead_worktree: Path | None = None
     integration_branch: str = Field(min_length=1)
     github_repo: str = Field(pattern=r"^[^/\s]+/[^/\s]+$")
     # Explicit CI policy. ``circleci`` reconciles merged candidates against

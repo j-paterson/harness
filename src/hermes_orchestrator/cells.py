@@ -24,11 +24,60 @@ from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.operator_decisions import OperatorDecisions
-from hermes_orchestrator.profiles import ProfilePool
+from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
+
+# A fable cap is a weekly-budget exhaustion, but the sanitized Claude
+# stream exposes no reset horizon. The conservative fallback is one full
+# weekly cycle — the documented worst case — never the flat hour that
+# session and monthly-spend caps keep.
+_FABLE_CAP_FALLBACK = timedelta(days=7)
+_FABLE_CAP_FALLBACK_DETAIL = (
+    "provider fable limit with no reset horizon in the stream; capped for "
+    "the worst-case weekly cycle unless a newer observation clears it"
+)
+
+
+class ProfileCapacityEvidence:
+    """Durable capacity-evidence port backed by the orchestrator database.
+
+    Reads satisfy the ``CapacityEvidencePort`` protocol consumed by
+    ``ProfilePool``; the newest observation per (profile_alias, model)
+    is the current evidence.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def latest(
+        self,
+        profile_alias: str,
+        model: str,
+    ) -> CapacityObservation | None:
+        row = self._database.execute(
+            "SELECT profile_alias, model, state, source, observed_at, "
+            "resets_at, detail FROM profile_capacity_observations "
+            "WHERE profile_alias = ? AND model = ? "
+            "ORDER BY observation_id DESC LIMIT 1",
+            (profile_alias, model),
+        ).fetchone()
+        if row is None:
+            return None
+        resets_at = row["resets_at"]
+        return CapacityObservation(
+            profile_alias=str(row["profile_alias"]),
+            model=str(row["model"]),
+            state=str(row["state"]),
+            source=str(row["source"]),
+            observed_at=datetime.fromisoformat(str(row["observed_at"])),
+            resets_at=(
+                datetime.fromisoformat(str(resets_at)) if resets_at else None
+            ),
+            detail=str(row["detail"]) if row["detail"] else None,
+        )
 
 
 class LeadStream(Protocol):
@@ -388,7 +437,11 @@ class ProjectCellService:
                         limit_kind = event.limit_kind
                         if session_confirmed:
                             handoff_required = True
-                            self._require_handoff(cell, "subscription_limit")
+                            self._require_handoff(
+                                cell,
+                                "subscription_limit",
+                                limit_kind=limit_kind,
+                            )
                         else:
                             start_capped = True
                             break
@@ -409,6 +462,7 @@ class ProjectCellService:
                 issue_id=issue_id,
                 capped=start_capped,
                 already_completed=issue_completed,
+                limit_kind=limit_kind,
             )
 
         if issue_completed:
@@ -732,15 +786,54 @@ class ProjectCellService:
         if getattr(handoff, "cell_id", None) != cell_id:
             raise RotationBlocked("handoff belongs to another project cell")
         current = self._get_cell(cell_id)
+        persisted_session = getattr(handoff, "replacement_session_id", None)
+        persisted_profile = getattr(handoff, "replacement_profile_alias", None)
+        already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
+        if already_acknowledged:
+            if persisted_session is not None and persisted_profile is not None:
+                # Sol correction b4b545f3 P2: the acknowledgement already
+                # persisted the exact replacement identities, so recovery
+                # reconstructs them — no lead-runner call, no capacity
+                # reselection.
+                return await self._recover_acknowledged_rotation(
+                    current,
+                    handoff_id,
+                    replacement_session=UUID(str(persisted_session)),
+                    replacement_profile=str(persisted_profile),
+                )
+            # Sol correction f0a5a403 P1: a migration-era acknowledged row
+            # can legitimately lack the durable replacement profile.
+            # Falling through would reserve fresh capacity and relaunch a
+            # lead for a handoff that is already acknowledged, so fail
+            # closed before any reservation or runner call.
+            missing = (
+                "replacement_profile_alias"
+                if persisted_session is not None
+                else "replacement_session_id and replacement_profile_alias"
+            )
+            raise RotationBlocked(
+                f"handoff {handoff_id} is acknowledged but its durable "
+                f"{missing} is missing (migration-era row): backfill it "
+                "with an identical re-acknowledgement naming the selected "
+                "profile_alias (or run operator recovery), then retry — "
+                "no capacity was reserved and no lead was launched"
+            )
+
         reservation = self._profiles.reserve_replacement(
             current.project_key,
             current.profile_alias,
         )
         if reservation is None:
-            raise RotationBlocked("no different healthy profile is available")
-        replacement_session = getattr(handoff, "replacement_session_id", None)
-        already_acknowledged = getattr(handoff, "state", None) == "acknowledged"
-        if not isinstance(replacement_session, UUID):
+            message = "no different healthy profile is available"
+            refusal = getattr(self._profiles, "last_refusal", None)
+            if refusal:
+                message = f"{message}: {refusal}"
+            raise RotationBlocked(message)
+        if persisted_session is not None:
+            # The durable column is TEXT; parse rather than minting a new
+            # session id for an acknowledgement that already named one.
+            replacement_session = UUID(str(persisted_session))
+        else:
             replacement_session = self._replacement_session_ids()
 
         request = LeadTurnRequest(
@@ -774,10 +867,13 @@ class ProjectCellService:
                         and event.session_id == replacement_session
                         and event.restated_next_action
                     ):
+                        # One durable transition persists the acknowledged
+                        # state together with BOTH selected identities.
                         self._handoffs.acknowledge(
                             handoff_id,
                             replacement_session,
                             event.restated_next_action,
+                            profile_alias=reservation.profile_alias,
                         )
                         acknowledged = True
             finally:
@@ -792,12 +888,73 @@ class ProjectCellService:
             self._profiles.cancel_replacement(current.project_key)
             raise RotationBlocked("handoff was not acknowledged by the replacement")
 
+        return await self._finalize_transfer(
+            current,
+            handoff_id,
+            replacement_session=replacement_session,
+            replacement_profile=reservation.profile_alias,
+            recovering=False,
+        )
+
+    async def _recover_acknowledged_rotation(
+        self,
+        current: ProjectCell,
+        handoff_id: str,
+        *,
+        replacement_session: UUID,
+        replacement_profile: str,
+    ) -> ProjectCell:
+        """Complete an acknowledged-but-untransferred rotation from the
+        identities persisted at acknowledgement (Sol b4b545f3 P2): never
+        call the lead runner again and never reselect capacity."""
+
+        if (
+            current.session_id == replacement_session
+            and current.profile_alias == replacement_profile
+        ):
+            # The transfer transaction already committed on a prior pass;
+            # only the pool's in-memory affinity may still need resyncing
+            # to the durable rows.
+            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.restore(
+                current.project_key, replacement_profile, self._aware_now()
+            )
+            return current
+        conflict = self._database.execute(
+            "SELECT project_key FROM profile_leases WHERE profile_alias = ?",
+            (replacement_profile,),
+        ).fetchone()
+        if conflict is not None:
+            raise RotationBlocked(
+                f"recovered replacement profile {replacement_profile!r} "
+                "already holds a profile lease "
+                f"(project {str(conflict['project_key'])!r})"
+            )
+        return await self._finalize_transfer(
+            current,
+            handoff_id,
+            replacement_session=replacement_session,
+            replacement_profile=replacement_profile,
+            recovering=True,
+        )
+
+    async def _finalize_transfer(
+        self,
+        current: ProjectCell,
+        handoff_id: str,
+        *,
+        replacement_session: UUID,
+        replacement_profile: str,
+        recovering: bool,
+    ) -> ProjectCell:
+        """Run the one transactional lease/cell transfer and its follow-ups."""
+
         now = self._aware_now().isoformat()
         rotated = ProjectCell(
             cell_id=current.cell_id,
             project_key=current.project_key,
             state="active",
-            profile_alias=reservation.profile_alias,
+            profile_alias=replacement_profile,
             session_id=replacement_session,
         )
         try:
@@ -838,12 +995,22 @@ class ProjectCellService:
                     ),
                 )
         except BaseException:
-            self._profiles.cancel_replacement(current.project_key)
+            if not recovering:
+                self._profiles.cancel_replacement(current.project_key)
             raise
-        self._profiles.commit_rotation(
-            current.project_key,
-            current.profile_alias,
-        )
+        if recovering:
+            # No in-memory reservation exists on recovery: rebuild the
+            # pool's affinity from the durable identities instead of
+            # committing a reservation that was never re-made.
+            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.restore(
+                current.project_key, replacement_profile, self._aware_now()
+            )
+        else:
+            self._profiles.commit_rotation(
+                current.project_key,
+                current.profile_alias,
+            )
         if self._safety is not None:
             self._safety.invalidate(rotated.cell_id, reason="session_rotated")
         if self._context is not None:
@@ -921,6 +1088,7 @@ class ProjectCellService:
         issue_id: str,
         capped: bool = False,
         already_completed: bool = False,
+        limit_kind: str | None = None,
     ) -> bool:
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason="start_failed")
@@ -930,7 +1098,9 @@ class ProjectCellService:
             )
         now_value = self._aware_now()
         now = now_value.isoformat()
-        cooldown_until = now_value + timedelta(hours=1) if capped else None
+        cooldown_until = (
+            self._cap_cooldown(now_value, limit_kind) if capped else None
+        )
         with self._database.transaction() as connection:
             updated = connection.execute(
                 "UPDATE project_cells SET state = 'failed', updated_at = ? "
@@ -949,6 +1119,13 @@ class ProjectCellService:
                         cell.profile_alias,
                     ),
                 )
+                if limit_kind == "fable":
+                    self._record_fable_cap(
+                        connection,
+                        cell.profile_alias,
+                        observed_at=now_value,
+                        resets_at=cooldown_until,
+                    )
             else:
                 connection.execute(
                     "DELETE FROM profile_leases WHERE project_key = ? "
@@ -1314,9 +1491,15 @@ class ProjectCellService:
             self._handoffs.request(cell_id, reason)
         return True
 
-    def _require_handoff(self, cell: ProjectCell, reason: str) -> None:
+    def _require_handoff(
+        self,
+        cell: ProjectCell,
+        reason: str,
+        *,
+        limit_kind: str | None = None,
+    ) -> None:
         now = self._aware_now()
-        cooldown_until = now + timedelta(hours=1)
+        cooldown_until = self._cap_cooldown(now, limit_kind)
         with self._database.transaction() as connection:
             updated = connection.execute(
                 "UPDATE project_cells SET state = 'handoff_required', updated_at = ? "
@@ -1330,6 +1513,13 @@ class ProjectCellService:
                 "WHERE profile_alias = ?",
                 (cooldown_until.isoformat(), cell.profile_alias),
             )
+            if limit_kind == "fable":
+                self._record_fable_cap(
+                    connection,
+                    cell.profile_alias,
+                    observed_at=now,
+                    resets_at=cooldown_until,
+                )
             self._events.append(
                 connection,
                 EventInput(
@@ -1345,6 +1535,43 @@ class ProjectCellService:
                 ),
             )
         self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
+
+    @staticmethod
+    def _cap_cooldown(now: datetime, limit_kind: str | None) -> datetime:
+        """Cooldown horizon for a cap: weekly worst case for fable caps.
+
+        A fable cap exhausts a weekly budget; the stream exposes no reset
+        time, so the cooldown conservatively covers one full cycle and the
+        recorded observation carries the same horizon — the two can never
+        disagree. Session and monthly-spend caps (and non-limit handoffs)
+        keep the historical flat hour.
+        """
+
+        if limit_kind == "fable":
+            return now + _FABLE_CAP_FALLBACK
+        return now + timedelta(hours=1)
+
+    def _record_fable_cap(
+        self,
+        connection: sqlite3.Connection,
+        profile_alias: str,
+        *,
+        observed_at: datetime,
+        resets_at: datetime,
+    ) -> None:
+        """Append the durable fable-capacity observation for a provider cap."""
+
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at, "
+            "detail) VALUES (?, 'fable', 'capped', 'provider_limit', ?, ?, ?)",
+            (
+                profile_alias,
+                observed_at.isoformat(),
+                resets_at.isoformat(),
+                _FABLE_CAP_FALLBACK_DETAIL,
+            ),
+        )
 
     def _aware_now(self) -> datetime:
         value = self._now()

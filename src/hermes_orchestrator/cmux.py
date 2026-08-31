@@ -5,10 +5,16 @@ cmux while durable SQLite/event state stays authoritative. This module is
 the only place that touches the cmux CLI. Business services consume the
 :class:`CmuxControlPort` protocol with typed workspace/surface identities —
 never shell strings and never terminal screen content. The adapter builds
-argv lists from a fixed allow-list of metadata commands, so screen reads
-and keystroke injection are structurally impossible, and it authenticates
-through the ``CMUX_SOCKET_PASSWORD`` environment variable only: the socket
-password never appears in argv, exceptions, logs, or durable payloads.
+argv lists from a fixed allow-list of metadata commands, so arbitrary
+screen reads, free text, and caller-chosen keystrokes remain structurally
+impossible except for three bounded fixed-shape operations:
+``deliver_intake_envelope`` (closed-grammar intake signal),
+``read_screen`` (read-only channel verification), and
+``confirm_channel_dialog`` (exactly one non-parameterizable Enter
+keypress for INFRA-197 v5.1 operator-decision approval). None can carry
+caller-chosen keys or free text. It authenticates through the
+``CMUX_SOCKET_PASSWORD`` environment variable only: the socket password
+never appears in argv, exceptions, logs, or durable payloads.
 """
 
 from __future__ import annotations
@@ -149,6 +155,12 @@ class CmuxControlPort(Protocol):
     async def deliver_intake_envelope(
         self, ref: CmuxSurfaceRef, envelope: str
     ) -> None: ...
+
+    async def read_screen(
+        self, ref: CmuxSurfaceRef, *, lines: int = 60
+    ) -> str: ...
+
+    async def confirm_channel_dialog(self, ref: CmuxSurfaceRef) -> None: ...
 
 
 ProcessFactory = Callable[..., "asyncio.Future[asyncio.subprocess.Process]"]
@@ -403,6 +415,63 @@ class CmuxCliAdapter:
                 "--surface",
                 ref.surface_uuid,
                 envelope,
+            )
+        )
+
+    async def read_screen(
+        self, ref: CmuxSurfaceRef, *, lines: int = 60
+    ) -> str:
+        """Return the pane's current visible text for one exact surface.
+
+        This is read-only and exists solely so the channel-trust gate
+        (INFRA-197 v5.1 amendment) can verify the exact development-
+        channel confirmation prompt is on screen before anything is
+        pressed. It never focuses the surface and never types or sends
+        anything. ``lines`` must be a positive int no greater than 2000
+        and is validated before any subprocess is started.
+        """
+
+        if lines <= 0 or lines > 2000:
+            raise ValueError(
+                "cmux read-screen line count must be a positive int no "
+                "greater than 2000"
+            )
+        return await self._spawn(
+            (
+                *self._argv_base,
+                "read-screen",
+                "--workspace",
+                ref.workspace_uuid,
+                "--surface",
+                ref.surface_uuid,
+                "--lines",
+                str(lines),
+            )
+        )
+
+    async def confirm_channel_dialog(self, ref: CmuxSurfaceRef) -> None:
+        """Send exactly one Enter keypress to one exact surface.
+
+        This is the single, non-parameterizable keypress the channel-
+        trust gate may send after an exact-build match, under operator
+        decision infra-197-trusted-channel-auto-approval-20260830-v1:
+        the key is a fixed literal inside this method, never a
+        parameter, so no caller can express any other key or any text
+        through it. The general ``send``/``send-key`` vocabulary stays
+        rejected by the allow-listed command surface (:meth:`_run`);
+        this bounded, fixed-shape operation is the sole exception, and
+        it addresses only the exact workspace/surface given.
+        """
+
+        await self._spawn(
+            (
+                *self._argv_base,
+                "send-key",
+                "--workspace",
+                ref.workspace_uuid,
+                "--surface",
+                ref.surface_uuid,
+                "enter",
             )
         )
 

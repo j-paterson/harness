@@ -13,14 +13,20 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequen
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 from hermes_orchestrator.profiles import ProfileRegistry
 
+if TYPE_CHECKING:
+    from hermes_orchestrator.control_operations import ControlOperations
+
 _SYNTHETIC_MODEL = "<synthetic>"
 _MAX_STREAM_LINE_BYTES = 1024 * 1024
+# INFRA-197 C1: a lead that dies before doing useful work must leave a
+# diagnosable identity behind. Only a bounded stderr tail is retained.
+_STDERR_TAIL_BYTES = 8192
 _COMPACTION_SUBTYPES = frozenset({"compact_boundary", "compaction", "compact"})
 _CONTEXT_ERROR_TEXT = re.compile(
     r"context window|prompt is too long|input length|context length exceeded"
@@ -374,6 +380,71 @@ class ClaudeEventParser:
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 
+@dataclass(frozen=True, slots=True)
+class LeadLaunchFailure:
+    """Durable identity of one lead process that exited nonzero.
+
+    Carries exactly the launch identity a vanished terminal cannot
+    reconstruct: the exact argv, the working directory, the single
+    CLAUDE_CONFIG_DIR value the scrubbed profile environment sets, the
+    profile alias, pid, exit code, session id, and a bounded stderr
+    tail. Never the wider environment — the scrubbed provider
+    credentials must never reach a durable payload.
+    """
+
+    argv: tuple[str, ...]
+    cwd: str
+    claude_config_dir: str
+    profile_alias: str
+    pid: int
+    exit_code: int
+    session_id: str
+    stderr_tail: str
+    project_key: str | None
+
+
+LaunchFailureRecorder = Callable[[LeadLaunchFailure], None]
+
+
+def control_launch_failure_recorder(
+    control: ControlOperations,
+) -> LaunchFailureRecorder:
+    """Adapt the durable control-operations log to the runner's port.
+
+    The runner knows its request's session id and profile alias but no
+    cell identity, so the receipt is addressed by session (the default
+    ``kind:session`` dedup key keeps at most one live receipt per lead)
+    with the cell marked unassigned, mirroring how the process registry
+    already records leads without a project key.
+    """
+
+    def record(failure: LeadLaunchFailure) -> None:
+        control.record(
+            kind="lead.launch_failed",
+            project_key=failure.project_key or "unassigned",
+            cell_id="unassigned",
+            session_id=failure.session_id,
+            result={
+                "argv": list(failure.argv),
+                "cwd": failure.cwd,
+                "claude_config_dir": failure.claude_config_dir,
+                "profile_alias": failure.profile_alias,
+                "pid": failure.pid,
+                "exit_code": failure.exit_code,
+                "session_id": failure.session_id,
+                "stderr_tail": failure.stderr_tail,
+            },
+            reason=(
+                "the lead process exited nonzero; this receipt carries "
+                "the exact launch identity (argv, cwd, config dir, pid, "
+                "stderr tail) that would otherwise be lost with the "
+                "terminal"
+            ),
+        )
+
+    return record
+
+
 class ClaudeRunner:
     """Launch profile-isolated Claude Code turns in owned process groups."""
 
@@ -389,11 +460,13 @@ class ClaudeRunner:
         processes: ProcessRegistry | None = None,
         freeze_dir: Path | None = None,
         gate_command: Sequence[str] | None = None,
+        launch_failure_recorder: LaunchFailureRecorder | None = None,
     ) -> None:
         if termination_timeout <= 0:
             raise ValueError("termination_timeout must be positive")
         self._registry = registry
         self._processes = processes
+        self._launch_failure_recorder = launch_failure_recorder
         # Explicit lead control path: a PreToolUse hook on the Agent tool
         # consults a durable per-session freeze marker and blocks new
         # subagent assignments while a rotation is pending.
@@ -571,6 +644,16 @@ class ClaudeRunner:
             returncode = await process.wait()
             expected_limit_exit = returncode == 1 and saw_subscription_limit
             if returncode != 0 and not expected_limit_exit:
+                # The process has exited, so its stderr is at EOF and
+                # the drain task completes without blocking.
+                self._record_launch_failure(
+                    request,
+                    command=command,
+                    environment=environment,
+                    pid=process.pid,
+                    returncode=returncode,
+                    stderr_tail=await stderr_task,
+                )
                 raise ClaudeProcessError(returncode)
         finally:
             if process.returncode is None:
@@ -579,12 +662,55 @@ class ClaudeRunner:
             if lease_id is not None and self._processes is not None:
                 self._processes.mark_exited(lease_id, exit_code=process.returncode)
 
-    @staticmethod
-    async def _drain(stream: asyncio.StreamReader) -> None:
-        """Drain and discard child diagnostics so its pipe cannot deadlock."""
+    def _record_launch_failure(
+        self,
+        request: LeadTurnRequest,
+        *,
+        command: Sequence[str],
+        environment: Mapping[str, str],
+        pid: int,
+        returncode: int,
+        stderr_tail: bytes,
+    ) -> None:
+        """Record one durable launch-identity receipt, never raising.
 
-        while await stream.read(65536):
-            pass
+        The payload names only launch identity plus the profile's
+        CLAUDE_CONFIG_DIR — never the wider environment, so the
+        scrubbed provider credentials cannot leak into durable state.
+        """
+
+        if self._launch_failure_recorder is None:
+            return
+        failure = LeadLaunchFailure(
+            argv=tuple(command),
+            cwd=str(request.cwd),
+            claude_config_dir=environment.get("CLAUDE_CONFIG_DIR", ""),
+            profile_alias=request.profile_alias,
+            pid=pid,
+            exit_code=returncode,
+            session_id=str(request.session_id),
+            stderr_tail=stderr_tail.decode("utf-8", errors="replace"),
+            project_key=request.project_key,
+        )
+        with suppress(Exception):
+            self._launch_failure_recorder(failure)
+
+    @staticmethod
+    async def _drain(stream: asyncio.StreamReader) -> bytes:
+        """Drain child diagnostics fully so its pipe cannot deadlock.
+
+        The pipe is always read to EOF, but only the last
+        ``_STDERR_TAIL_BYTES`` bytes are retained for the durable
+        launch-failure receipt; memory stays bounded no matter how
+        verbose the child is.
+        """
+
+        tail = bytearray()
+        while chunk := await stream.read(65536):
+            tail.extend(chunk)
+            if len(tail) > _STDERR_TAIL_BYTES:
+                del tail[:-_STDERR_TAIL_BYTES]
+        return bytes(tail)
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         """Terminate only the owned process group, then force a bounded stop."""

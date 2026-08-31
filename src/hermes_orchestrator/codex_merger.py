@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
+from hermes_orchestrator.codex_ponytail_guard import session_guard_config
 from hermes_orchestrator.codex_rpc import (
     CodexRateLimits,
     CodexRequestFailed,
@@ -37,7 +38,12 @@ MERGER_MODEL = "gpt-5.6-sol"
 # the dangerous unrestricted mode. Passing the same mode on every
 # thread/resume is the recoverable configuration path for a task
 # started under an older mode: the next load corrects it without
-# waking the thread or duplicating review intake.
+# waking the thread or duplicating review intake. The session-scoped
+# Ponytail review guard (operator correction c3f4aad5) rides the same
+# path: the thread config override on every start and resume is the
+# only place the guard is bound, so exactly the managed Sol session —
+# and no other Codex session — gates git commit and git push on a
+# Ponytail review of the current diff.
 SANDBOX_MODE = "workspace-write"
 
 # The durable thread goal is deliberately one succinct paragraph: the
@@ -979,8 +985,9 @@ class CodexMerger:
         A readable persisted thread is authoritative: ``thread/read`` is the
         only required call and its status is returned. Only a ``notLoaded``
         thread is asked to load via ``thread/resume``; the resume always
-        re-applies the bounded writable workspace mode, which is the
-        recoverable configuration path for a task started under a stale
+        re-applies the bounded writable workspace mode and the
+        session-scoped Ponytail guard binding, which is the recoverable
+        configuration path for a task started under a stale
         mode — no wake, no duplicate intake. If the App Server rejects
         the resume (observed live as ``-32600`` for an already-persisted
         readable task) the thread is re-read and stays usable when still
@@ -994,7 +1001,11 @@ class CodexMerger:
         try:
             await self._rpc.request(
                 "thread/resume",
-                {"threadId": thread_id, "sandbox": SANDBOX_MODE},
+                {
+                    "threadId": thread_id,
+                    "sandbox": SANDBOX_MODE,
+                    "config": session_guard_config(),
+                },
                 self._timeout,
             )
         except CodexRequestFailed:
@@ -1068,6 +1079,7 @@ class CodexMerger:
                     "approvalPolicy": "never",
                     "sandbox": SANDBOX_MODE,
                     "serviceName": _SERVICE_NAME,
+                    "config": session_guard_config(),
                 },
                 self._timeout,
             )

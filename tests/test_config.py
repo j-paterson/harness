@@ -28,6 +28,31 @@ def test_loads_registered_project(tmp_path: Path) -> None:
     )
     assert settings.policy.max_unresolved_ci_merges == 2
     assert settings.state_dir == tmp_path / "state"
+    assert settings.projects["polysizer"].lead_worktree is None
+
+
+def test_loads_project_with_a_dedicated_lead_worktree(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  polysizer:\n"
+        "    linear_team: ENG\n"
+        "    repo_path: /tmp/polysizer\n"
+        "    lead_worktree: /tmp/polysizer-lead\n"
+        "    integration_branch: polysizer-refactor-2\n"
+        "    github_repo: owner/polysizer\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.projects["polysizer"].lead_worktree == Path(
+        "/tmp/polysizer-lead"
+    )
 
 
 def test_resolves_relative_project_path_from_repo_root(tmp_path: Path) -> None:

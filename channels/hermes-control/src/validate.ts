@@ -62,6 +62,24 @@ export function validateHubEvent(
   return { event_id: eventId, kind, packet_id: packetId, session_id: sessionId };
 }
 
+/**
+ * Compose the notification envelope content for the client's
+ * `notifications/claude/channel` contract: `<KIND> <packet_id>`. The
+ * client treats a malformed `content` as a ProtocolError that kills
+ * the whole stdio connection (observed live), so the sidecar must
+ * never hand it one. Returns null when either input would violate the
+ * exact envelope grammar — the caller must then drop the notification
+ * rather than send it.
+ */
+export function composeNotificationContent(
+  kind: string,
+  packetId: string
+): string | null {
+  if (!EVENT_KINDS.has(kind)) return null;
+  if (!PACKET_ID_RE.test(packetId)) return null;
+  return `${kind} ${packetId}`;
+}
+
 export interface AckToolArgs {
   packet_id: string;
   event_id: string;

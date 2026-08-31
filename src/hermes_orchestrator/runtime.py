@@ -25,9 +25,13 @@ from hermes_orchestrator.circleci import (
     CircleCiStatusAdapter,
     HttpxCircleCiTransport,
 )
-from hermes_orchestrator.claude import ClaudeRunner
+from hermes_orchestrator.claude import (
+    ClaudeRunner,
+    control_launch_failure_recorder,
+)
 from hermes_orchestrator.cmux import CMUX_KEYCHAIN_SERVICE, CmuxCliAdapter
 from hermes_orchestrator.cmux_surfaces import (
+    ChannelTrustConfirmer,
     CmuxHibernationDriver,
     CmuxHibernationGate,
     CmuxLeadSeater,
@@ -41,6 +45,7 @@ from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.git import WorktreeGit
 from hermes_orchestrator.github import (
     GitHubClient,
@@ -178,6 +183,11 @@ class Runtime:
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
     control_operations: ControlOperations | None = None
+    # Sol correction b4b545f3 (v5): production composition no longer
+    # builds a fakechat wake plane, so this is always None from
+    # open_runtime; the field survives only because the CLI supervisor
+    # threads it through and treats None as "no fakechat routing".
+    fakechat_router: FakechatWakeRouter | None = None
     _daemon_lock: _DaemonLock | None = None
 
     def close(self) -> None:
@@ -212,6 +222,54 @@ def cmux_password_source(
         return cache[0]
 
     return read
+
+
+def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
+    """Resolve the hermes-control sidecar's launch entry point.
+
+    The sidecar build (``channels/hermes-control/dist/``) is compiled
+    JS output that Git never tracks, so a plain ``repo_root`` checkout
+    may carry none — the historical location the daemon has always
+    launched from when it runs directly out of a checkout. Runtime
+    activation (see ``activation.materialize_artifact``) copies a
+    proven sidecar build into every immutable runtime artifact, read
+    via the ``runtimes/ACTIVE`` pointer the same way the shell
+    bootstrap does.
+
+    Sol correction f0a5a403 (packet 2): once an ACTIVE runtime is
+    recorded (the pointer is readable and non-empty), the artifact-
+    derived entry path is returned REGARDLESS of whether the file
+    exists — an ACTIVE artifact missing or carrying an incomplete
+    sidecar must make
+    :class:`~hermes_orchestrator.channel_hub.ChannelLauncher` refuse
+    the missing entry (the durable ``channel.blocked`` receipt), never
+    silently execute mutable gitignored checkout bytes unrelated to
+    the active artifact identity. The ``repo_root`` fallback exists
+    only for the documented pre-activation state, when no ACTIVE
+    runtime is recorded; a resolution where that path does not exist
+    is not itself an error here — the caller's ``shutil.which("node")``
+    guard and the launcher's file-exists check remain the fail-closed
+    boundary.
+    """
+
+    fallback = (
+        repo_root / "channels" / "hermes-control" / "dist" / "src" / "main.js"
+    )
+    pointer = state_dir / "runtimes" / "ACTIVE"
+    try:
+        recorded = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback
+    if not recorded:
+        return fallback
+    return (
+        Path(recorded)
+        / "channels"
+        / "hermes-control"
+        / "dist"
+        / "src"
+        / "main.js"
+    )
 
 
 def build_linear_router(
@@ -429,6 +487,9 @@ def open_runtime(
                 base_env=environment,
                 processes=processes,
                 freeze_dir=settings.state_dir / "freezes",
+                launch_failure_recorder=control_launch_failure_recorder(
+                    control_operations
+                ),
             )
             cmux_seater: CmuxLeadSeater | None = None
             if settings.cmux is not None:
@@ -467,6 +528,11 @@ def open_runtime(
                 channel_router.attach(lead_assignments)
                 channel_router.attach(control_operations)
                 channel_router.attach(merge_flow.outbox)
+                # Sol correction b4b545f3 (v5): the fakechat wake plane
+                # (the v4 substitute) is retired from production
+                # composition — the hermes-control channel is the wake
+                # accelerator, and the announcements plus the Stop-hook
+                # poll remain the authoritative drain.
                 node_binary = shutil.which("node")
                 channel_launcher = (
                     None
@@ -474,11 +540,33 @@ def open_runtime(
                     else ChannelLauncher(
                         state_dir=settings.state_dir,
                         capabilities=channel_capabilities,
-                        sidecar_entry=(
-                            settings.repo_root
-                            / "channels/hermes-control/dist/src/main.js"
+                        sidecar_entry=resolve_sidecar_entry(
+                            repo_root=settings.repo_root,
+                            state_dir=settings.state_dir,
                         ),
                         node_binary=Path(node_binary),
+                    )
+                )
+                # Sol correction f0a5a403 (packet 4): the trust gate is
+                # part of the production managed-seat lifecycle — the
+                # seater triggers one bounded gate evaluation for each
+                # newly created channel-launched binding, so a trusted
+                # launch auto-confirms without the manual
+                # channel-trust-confirm command. The entry path is
+                # re-resolved per trigger so the gate always measures
+                # the ACTIVE artifact identity of that moment.
+                channel_confirmer = (
+                    None
+                    if channel_launcher is None
+                    else ChannelTrustConfirmer(
+                        database=database,
+                        events=events,
+                        control=control_operations,
+                        port=cmux_port,
+                        entry_resolver=lambda: resolve_sidecar_entry(
+                            repo_root=settings.repo_root,
+                            state_dir=settings.state_dir,
+                        ),
                     )
                 )
                 cmux_seater = CmuxLeadSeater(
@@ -493,6 +581,7 @@ def open_runtime(
                     auth_probe=lambda alias: probe.check(alias).eligible,
                     channel_launch=channel_launcher,
                     control=control_operations,
+                    channel_trust=channel_confirmer,
                 )
                 cmux_reconciler = CmuxSurfaceReconciler(
                     bindings=cmux_bindings,
@@ -609,6 +698,7 @@ def open_runtime(
             channel_hub=channel_hub,
             channel_capabilities=channel_capabilities,
             control_operations=control_operations,
+            fakechat_router=None,
             _daemon_lock=daemon_lock,
         )
     except BaseException:
