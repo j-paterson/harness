@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from hermes_orchestrator.acceptance import AcceptanceGates
 from hermes_orchestrator.ci_window import CircleCiIntakeGate, CiStatusPort, CiWindow
 from hermes_orchestrator.circleci import (
     CiCheck,
@@ -35,6 +36,7 @@ from hermes_orchestrator.github import (
     HttpxGitHubTransport,
     MergeEffectJournal,
 )
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.merge import GitHubIntakeGate, IntegrationMerge
 from hermes_orchestrator.merger_turns import CodexThreadReports, MergerTurnService
@@ -107,6 +109,7 @@ class MergeFlow:
     qa: QaRouter
     manifest_root: Path
     settlements: MergeSettlements | None = None
+    acceptance: AcceptanceGates | None = None
 
 
 def build_merge_flow(
@@ -121,8 +124,18 @@ def build_merge_flow(
     git_runner: GitRunner | None = None,
     queue_process_factory: Callable[..., Any] | None = None,
     processes: ProcessRegistry | None = None,
+    assignments: LeadAssignments | None = None,
 ) -> MergeFlow:
-    """Wire the production merge flow; fails closed on missing inputs."""
+    """Wire the production merge flow; fails closed on missing inputs.
+
+    INFRA-198 J1: the acceptance-gate policy is composed here for every
+    caller (like :class:`QaRouter` and :class:`MergeSettlements`), so a
+    gated issue holds after a proven merge no matter which entry built
+    the flow. ``assignments`` is the daemon's durable lead-assignment
+    store; when omitted, the acceptance hold still applies but the
+    acceptance action packet is dispatched by the reconciliation repair
+    instead of at settlement time.
+    """
 
     prompt_path = merger_contract_path(settings.repo_root)
     manifest_root = settings.state_dir / "manifests"
@@ -185,6 +198,7 @@ def build_merge_flow(
     )
     qa = QaRouter(database=database, events=events)
     settlements = MergeSettlements(database, events)
+    acceptance = AcceptanceGates(database, events=events)
     reviews = ReviewService(
         database=database,
         events=events,
@@ -202,6 +216,8 @@ def build_merge_flow(
         lead=outbox,
         settlements=settlements,
         merge_journal=merge_journal,
+        acceptance=acceptance,
+        assignments=assignments,
     )
     emitter = CandidateEmitter(
         projects=settings.projects,
@@ -243,6 +259,7 @@ def build_merge_flow(
         qa=qa,
         manifest_root=manifest_root,
         settlements=settlements,
+        acceptance=acceptance,
     )
 
 

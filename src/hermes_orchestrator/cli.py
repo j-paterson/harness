@@ -57,6 +57,7 @@ from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.lead_wakes import (
@@ -939,15 +940,20 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
     linear = build_linear_router(
         settings, database=runtime.database, queue=runtime.queue, keychain=keychain
     )
+    events = EventStore(runtime.database)
     return build_merge_flow(
         settings,
         database=runtime.database,
-        events=EventStore(runtime.database),
+        events=events,
         queue=runtime.queue,
         linear=linear,
         keychain=keychain,
         base_env=os.environ,
         processes=runtime.processes,
+        # INFRA-198 J1: a CLI-driven settlement publishes the same
+        # durable acceptance assignment the daemon would — the packet
+        # store is the shared database, not the process.
+        assignments=LeadAssignments(runtime.database, events=events),
     )
 
 

@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import MergeResult
@@ -1434,3 +1435,143 @@ class TestReconciliationAfterProofFailure:
         assert payload["relation"] == "patch_equivalent"
         assert payload["base_sha"] == BASE
         assert payload["merge_parent_sha"] == PARENT_SHA
+
+
+@pytest.mark.asyncio
+class TestAcceptanceGatedSettlement:
+    """INFRA-198 J1: a merge records implementation completion, not
+    operator acceptance. A pending acceptance gate holds the settled
+    issue in ``post_merge_acceptance``, projects In Development to the
+    operator, and dispatches exactly one durable acceptance assignment;
+    replays and crash-resumes stay exactly-once."""
+
+    def _gate(self, acceptance: Any, *, seat: bool = True) -> None:
+        if seat:
+            acceptance.seat_cell()
+        acceptance.gates.require(
+            "ENG-9",
+            instruction_id="chat-accept-eng-9",
+            predicates=("live_smoke",),
+        )
+
+    @staticmethod
+    def _assignments(acceptance: Any) -> list[Any]:
+        return acceptance.database.execute(
+            "SELECT * FROM lead_assignments WHERE issue_id = 'ENG-9' "
+            "ORDER BY rowid"
+        ).fetchall()
+
+    @staticmethod
+    def _hold_transitions(acceptance: Any) -> int:
+        return int(
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM events WHERE event_type = "
+                "'issue.transitioned' AND aggregate_id = 'ENG-9' AND "
+                "payload_json LIKE '%\"to\":\"post_merge_acceptance\"%'"
+            )
+        )
+
+    def _assert_held_exactly_once(self, acceptance: Any) -> None:
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert acceptance.linear.targets == [
+            ("ENG-9", "Review", "operator"),
+            ("ENG-9", "In Development", "operator"),
+        ]
+        rows = self._assignments(acceptance)
+        assert len(rows) == 1
+        assert rows[0]["state"] == "published"
+        assert rows[0]["instruction_id"] == "chat-accept-eng-9"
+        assert rows[0]["queue_transition"] == "review->post_merge_acceptance"
+        assert self._hold_transitions(acceptance) == 1
+
+    async def test_a_gated_merge_holds_and_dispatches_exactly_once(
+        self, acceptance: Any
+    ) -> None:
+        self._gate(acceptance)
+
+        outcome = await acceptance.submit("ENG-9", GOOD)
+
+        assert outcome.state == "merged"
+        assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
+        self._assert_held_exactly_once(acceptance)
+        # A settled replay changes nothing: one transition, one Linear
+        # effect, one durable assignment.
+        replay = await acceptance.service.merge_approved(outcome.review_id)
+        assert replay.state == "merged"
+        assert len(acceptance.github.merge_calls) == 1
+        self._assert_held_exactly_once(acceptance)
+
+    async def test_a_crash_before_the_ledger_resumes_into_one_gated_hold(
+        self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The pinned post-merge-boundary crash, gated: the resume applies
+        # the acceptance hold instead of Done, exactly once.
+        self._gate(acceptance)
+        await crashed_in_flight_merge(acceptance, monkeypatch)
+        expire_settlement_lease(acceptance)
+
+        [outcome] = await acceptance.service.resume_settlements("demo")
+
+        assert outcome.state == "merged"
+        assert len(acceptance.github.merge_calls) == 1
+        assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
+        self._assert_held_exactly_once(acceptance)
+
+    async def test_a_crash_inside_the_hold_projection_replays_exactly_once(
+        self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Crash between the queue hold + assignment and the Linear
+        # effect: the settlement stays 'merging' under its lease, and the
+        # resumed drive replays the hold without a second transition or
+        # assignment.
+        self._gate(acceptance)
+        original = acceptance.linear.project
+        calls = {"count": 0}
+
+        async def crash_once(issue_id: str, target: Any, effect_id: str) -> Any:
+            if "acceptance-hold" in effect_id:
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise RuntimeError("simulated crash before the projection")
+            return await original(issue_id, target, effect_id)
+
+        monkeypatch.setattr(acceptance.linear, "project", crash_once)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await acceptance.submit("ENG-9", GOOD)
+        assert acceptance.settlements.get("review:demo:evt-1").state == "merging"
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert len(self._assignments(acceptance)) == 1
+        expire_settlement_lease(acceptance)
+
+        [outcome] = await acceptance.service.resume_settlements("demo")
+
+        assert outcome.state == "merged"
+        assert len(acceptance.github.merge_calls) == 1
+        self._assert_held_exactly_once(acceptance)
+
+    async def test_without_a_live_cell_the_issue_still_holds(
+        self, acceptance: Any
+    ) -> None:
+        # No live project cell: the assignment is skipped (packet K's
+        # reconciliation re-derives it) but the hold still applies.
+        self._gate(acceptance, seat=False)
+
+        outcome = await acceptance.submit("ENG-9", GOOD)
+
+        assert outcome.state == "merged"
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert acceptance.linear.targets[-1] == (
+            "ENG-9",
+            "In Development",
+            "operator",
+        )
+        assert self._assignments(acceptance) == []

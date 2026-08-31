@@ -5,7 +5,9 @@ one durable, restart-safe flow. A recorded verdict either returns structured
 correction packets to the Claude lead or becomes an approved review; an
 approved review is merged only through :class:`IntegrationMerge`, journaled
 in the CircleCI merge window without any CI query, and only then projected
-to Done or QA by the :class:`QaRouter`. Any failure before ancestry proof
+to Done or QA by the :class:`QaRouter` — unless a pending acceptance gate
+(INFRA-198 J1) holds the issue in ``post_merge_acceptance`` with the next
+acceptance action dispatched durably. Any failure before ancestry proof
 leaves Linear in Review. A QA rejection supersedes the merged review,
 projects In Development to the operator, and returns a Critical packet to
 the lead. CircleCI is never polled here.
@@ -20,12 +22,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from hermes_orchestrator.acceptance import AcceptanceGate, AcceptanceGates
 from hermes_orchestrator.ci_window import CiWindow
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.github import MergeBlocked, MergeEffectJournal
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.manifests import CandidateManifest
 from hermes_orchestrator.merge import (
@@ -140,6 +144,8 @@ class ReviewService:
         lead: LeadCorrectionPort,
         settlements: MergeSettlements,
         merge_journal: MergeEffectJournal | None = None,
+        acceptance: AcceptanceGates | None = None,
+        assignments: LeadAssignments | None = None,
         now: Callable[[], datetime] | None = None,
         on_merged: Callable[..., None] | None = None,
     ) -> None:
@@ -166,6 +172,12 @@ class ReviewService:
         self._lead = lead
         self._settlements = settlements
         self._merge_journal = merge_journal
+        # INFRA-198 J1: optional post-merge acceptance policy. When wired
+        # and a pending gate exists, a proven merge holds the issue in
+        # ``post_merge_acceptance`` instead of completing it; ``None``
+        # keeps the pre-gate behavior byte-for-byte.
+        self._acceptance = acceptance
+        self._assignments = assignments
         self._now = now or (lambda: datetime.now(UTC))
         # INFRA-198 P2: an optional accelerator over durable rows, wired
         # by the caller (never by this constructor's own defaults) as a
@@ -1075,6 +1087,11 @@ class ReviewService:
         )
 
     async def _project_after_merge(self, record: ReviewRecord) -> None:
+        if self._acceptance is not None and self._acceptance.pending(
+            record.issue_id
+        ):
+            await self._hold_for_acceptance(record)
+            return
         projection = record.projection
         if projection is None:
             raise RuntimeError("merged review has no stored projection")
@@ -1089,6 +1106,90 @@ class ReviewService:
             projection,
             effect_id=f"linear:{record.issue_id}:after-merge:{record.review_id}",
         )
+
+    async def _hold_for_acceptance(self, record: ReviewRecord) -> None:
+        """Hold a merged, acceptance-gated issue short of completion.
+
+        INFRA-198 J1: the merge recorded implementation completion, not
+        operator acceptance. The queue holds the issue in
+        ``post_merge_acceptance``, exactly one durable acceptance
+        assignment dispatches the next post-merge action to the live
+        project cell, and Linear returns to In Development for the
+        operator. Every step is idempotent, so a settlement replay
+        produces one queue transition, one durable assignment, and one
+        Linear effect. Once the gate is satisfied (or absent), replays
+        of this projection complete the issue exactly as before.
+        """
+
+        assert self._acceptance is not None
+        gate = self._acceptance.get(record.issue_id)
+        assert gate is not None
+        prior_state = self._queue.get(record.issue_id).state
+        self._queue.transition(
+            record.issue_id,
+            IssueState.POST_MERGE_ACCEPTANCE,
+            actor="codex_merger",
+            reason=f"merged {record.merge_sha}; acceptance pending",
+        )
+        self._dispatch_acceptance_assignment(
+            record, gate, prior_state=prior_state.value
+        )
+        await self._linear.project(
+            record.issue_id,
+            LinearProjection(status="In Development", assignee_alias="operator"),
+            effect_id=(
+                f"linear:{record.issue_id}:acceptance-hold:{record.review_id}"
+            ),
+        )
+
+    def _dispatch_acceptance_assignment(
+        self,
+        record: ReviewRecord,
+        gate: AcceptanceGate,
+        *,
+        prior_state: str,
+    ) -> None:
+        """Publish the durable acceptance assignment packet, exactly once.
+
+        Follows the classic-dispatch contract: the packet commits inside
+        one transaction with the live project cell's exact identity, and
+        ``publish_in``'s own supersede/no-op logic makes replays durable
+        no-ops (an unconsumed ``published`` packet is never duplicated).
+        Without the wired :class:`LeadAssignments` collaborator, or when
+        the project has no live cell to return the acceptance action to,
+        the assignment is skipped — the issue still holds in
+        ``post_merge_acceptance``, and the reconciliation repair (packet
+        K) re-derives the missing dispatch from the durable gate.
+        """
+
+        if self._assignments is None:
+            return
+        assignment = None
+        with self._database.transaction() as connection:
+            cell = connection.execute(
+                "SELECT cell_id, session_id, profile_alias FROM project_cells "
+                "WHERE project_key = ? AND state IN "
+                "('starting', 'active', 'handoff_required', 'paused')",
+                (record.project_key,),
+            ).fetchone()
+            if cell is None or cell["session_id"] is None:
+                return
+            assignment = self._assignments.publish_in(
+                connection,
+                project_key=record.project_key,
+                issue_id=record.issue_id,
+                cell_id=str(cell["cell_id"]),
+                session_id=str(cell["session_id"]),
+                profile_alias=str(cell["profile_alias"] or ""),
+                instruction_id=gate.instruction_id,
+                queue_transition=(
+                    f"{prior_state}->{IssueState.POST_MERGE_ACCEPTANCE.value}"
+                ),
+            )
+        if assignment is not None:
+            # The durable row is already the truth; this only routes it
+            # to the channel immediately instead of the next repair tick.
+            self._assignments.notify_committed(assignment)
 
 
 def _outcome(

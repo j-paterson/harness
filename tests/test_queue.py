@@ -365,3 +365,55 @@ def test_mark_dependency_ready_is_scoped_to_its_project(
 
     assert flipped == ("ENG-6",)
     assert service.get("OTHER-1").dependency_ready is False
+
+
+# -- post_merge_acceptance (INFRA-198 J1) --------------------------------
+
+
+def test_transition_to_and_from_post_merge_acceptance(
+    queue_service: QueueService, database: Database
+) -> None:
+    queue_service.admit(request("ENG-7", "chat-123"))
+
+    held = queue_service.transition(
+        "ENG-7",
+        IssueState.POST_MERGE_ACCEPTANCE,
+        actor="codex_merger",
+        reason="merged abc123; acceptance pending",
+    )
+    assert held.state is IssueState.POST_MERGE_ACCEPTANCE
+
+    done = queue_service.transition(
+        "ENG-7",
+        IssueState.DONE,
+        actor="codex_merger",
+        reason="acceptance satisfied",
+    )
+    assert done.state is IssueState.DONE
+    transitions = database.execute(
+        "SELECT payload_json FROM events WHERE event_type = "
+        "'issue.transitioned' ORDER BY sequence"
+    ).fetchall()
+    assert [row["payload_json"] for row in transitions] == [
+        '{"from":"queued","reason":"merged abc123; acceptance pending",'
+        '"to":"post_merge_acceptance"}',
+        '{"from":"post_merge_acceptance","reason":"acceptance satisfied",'
+        '"to":"done"}',
+    ]
+
+
+def test_list_ranked_excludes_post_merge_acceptance(
+    queue_service: QueueService, clock: MutableClock
+) -> None:
+    queue_service.admit(request("ENG-7", "chat-123"))
+    queue_service.admit(request("ENG-8", "chat-124"))
+    queue_service.transition(
+        "ENG-7",
+        IssueState.POST_MERGE_ACCEPTANCE,
+        actor="codex_merger",
+        reason="merged abc123; acceptance pending",
+    )
+
+    ranked = queue_service.list_ranked(clock.now())
+
+    assert [item.issue_id for item in ranked] == ["ENG-8"]
