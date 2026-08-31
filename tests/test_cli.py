@@ -6,7 +6,7 @@ import sys
 import types
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -1692,6 +1692,323 @@ def test_rotate_lead_seeds_the_profile_pool_before_reserving_a_replacement(
     # its default ineligible state and rotation can never reserve a
     # replacement.
     assert sorted(probed) == ["max-a", "max-b", "max-c", "max-d"]
+
+
+def _seed_rotation_cell_state(state_dir: Path) -> None:
+    """Durably seed the max-b incumbent cell, its lease, its cmux lead
+    binding, and one submitted handoff for ``cell-demo``.
+
+    ``ProjectCellService`` rehydrates the profile pool from the
+    ``profile_leases`` table at construction, so the lease row is what
+    lets ``rotate`` find the incumbent affinity in the one-shot
+    rotate-lead command's freshly built pool.
+    """
+
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.handoffs import HandoffService
+    from tests.test_handoffs import valid_handoff
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) "
+                "VALUES ('cell-demo', 'demo', 'active', 'max-b', ?, ?, ?)",
+                ("11111111-1111-4111-8111-111111111111", now, now),
+            )
+            connection.execute(
+                "INSERT INTO profile_leases("
+                "profile_alias, project_key, state, acquired_at) "
+                "VALUES ('max-b', 'demo', 'active', ?)",
+                (now,),
+            )
+        CmuxSurfaceBindings(database=database, events=EventStore(database)).bind_lead(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id="11111111-1111-4111-8111-111111111111",
+            profile_alias="max-b",
+            ref=CmuxSurfaceRef(
+                workspace_uuid="22222222-2222-4222-8222-222222222222",
+                surface_uuid="33333333-3333-4333-8333-333333333333",
+            ),
+        )
+        HandoffService(database, handoff_ids=lambda: "handoff-1").submit(
+            valid_handoff()
+        )
+    finally:
+        database.close()
+
+
+def _seed_capacity_observation(
+    state_dir: Path,
+    alias: str,
+    state: str,
+    *,
+    observed_at: datetime,
+    resets_at: datetime | None = None,
+) -> None:
+    """Append one durable fable-capacity observation to the CLI's database."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO profile_capacity_observations("
+                "profile_alias, model, state, source, observed_at, resets_at"
+                ") VALUES (?, 'fable', ?, ?, ?, ?)",
+                (
+                    alias,
+                    state,
+                    (
+                        "provider_limit"
+                        if state == "capped"
+                        else "operator_attestation"
+                    ),
+                    observed_at.isoformat(),
+                    resets_at.isoformat() if resets_at is not None else None,
+                ),
+            )
+    finally:
+        database.close()
+
+
+def _install_rotation_process_and_probe_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Fake ONLY the rotate-lead seams that reach outside the process.
+
+    Everything else — ``_open_rotation_collaborators``'s real pool with
+    its database-backed capacity evidence, the real ``LeadRotation``,
+    ``ProjectCellService.rotate``, ``HandoffService``, and the durable
+    rows — runs for real. Faked seams: the profile auth probe (every
+    profile authenticated), the worktree gate (clean and pushed), the
+    lead process runner (confirms the replacement session and
+    acknowledges the handoff), and the cmux seat activation. Returns the
+    list of profile aliases the runner was asked to start a replacement
+    on, in order.
+    """
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.claude import ClaudeEvent
+    from hermes_orchestrator.profiles import ProfileHealth
+
+    def _eligible_check(self: object, alias: str) -> ProfileHealth:
+        return ProfileHealth(
+            profile_alias=alias,
+            eligible=True,
+            reason="eligible",
+            last_checked_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(cli_module.ClaudeProfileProbe, "check", _eligible_check)
+    monkeypatch.setattr(
+        cli_module,
+        "_worktree_state",
+        lambda path: cli_module.WorktreeState(
+            branch="main", head="a", origin_head="a", dirty=False
+        ),
+    )
+
+    started: list[str] = []
+
+    class _FakeLeadRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start_lead(self, request: object) -> object:
+            started.append(request.profile_alias)  # type: ignore[attr-defined]
+            session_id = request.session_id  # type: ignore[attr-defined]
+
+            async def _events():  # type: ignore[no-untyped-def]
+                yield ClaudeEvent(
+                    kind="session.started",
+                    original_type="system",
+                    session_id=session_id,
+                    parent_tool_use_id=None,
+                    timestamp="2026-08-30T00:00:00Z",
+                    usage={},
+                )
+                yield ClaudeEvent(
+                    kind="handoff.acknowledged",
+                    original_type="result",
+                    session_id=session_id,
+                    parent_tool_use_id=None,
+                    timestamp="2026-08-30T00:00:01Z",
+                    usage={},
+                    restated_next_action=(
+                        "Run the failing test and correct ENG-9."
+                    ),
+                )
+
+            return _events()
+
+        async def retire_session(self, session_id: object) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "ClaudeRunner", _FakeLeadRunner)
+
+    async def _fake_ensure(self: object, **kwargs: object) -> object:
+        return types.SimpleNamespace(binding_id="binding-rotated")
+
+    monkeypatch.setattr(cli_module.CmuxLeadSeater, "ensure", _fake_ensure)
+    return started
+
+
+def test_rotate_lead_skips_a_fable_capped_profile_and_rotates_to_the_next(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-205 regression 3 (and 4): max-a is authenticated but holds a
+    non-expired fable cap, max-b is the incumbent, max-c holds current
+    available evidence — the real rotate-lead path must select max-c,
+    complete the existing confirmation/transfer/seat sequence, and never
+    start a replacement process on the capped profile."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    now = datetime.now(UTC)
+    _seed_capacity_observation(
+        state_dir,
+        "max-a",
+        "capped",
+        observed_at=now - timedelta(hours=1),
+        resets_at=now + timedelta(hours=11),
+    )
+    _seed_capacity_observation(
+        state_dir, "max-c", "available", observed_at=now - timedelta(hours=1)
+    )
+    started = _install_rotation_process_and_probe_fakes(monkeypatch)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "complete"
+    assert payload["profile"] == "max-c"
+    assert payload["binding_id"] == "binding-rotated"
+    assert payload["failure"] is None
+    # Regression 4: the capped profile never saw a process launch — the
+    # only replacement start was on the selected healthy profile.
+    assert started == ["max-c"]
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT state, profile_alias, session_id FROM project_cells "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["state"]) == "active"
+        assert str(cell["profile_alias"]) == "max-c"
+        assert str(cell["session_id"]) == payload["replacement_session"]
+        handoff = database.execute(
+            "SELECT state, replacement_profile_alias FROM handoffs "
+            "WHERE handoff_id = 'handoff-1'"
+        ).fetchone()
+        assert str(handoff["state"]) == "acknowledged"
+        assert str(handoff["replacement_profile_alias"]) == "max-c"
+        lease = database.execute(
+            "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+        ).fetchone()
+        assert str(lease["profile_alias"]) == "max-c"
+    finally:
+        database.close()
+
+
+def test_rotate_lead_fails_closed_when_every_replacement_is_fable_capped(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-205 regression 5 (and 4): with every candidate fable-capped
+    the rotation refuses with ONE actionable reason naming the capacity
+    evidence, launches no replacement process, and leaves the incumbent
+    cell, handoff, lease, and cmux binding untouched."""
+
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    now = datetime.now(UTC)
+    for alias in ("max-a", "max-c", "max-d"):
+        _seed_capacity_observation(
+            state_dir,
+            alias,
+            "capped",
+            observed_at=now - timedelta(hours=1),
+            resets_at=now + timedelta(hours=11),
+        )
+    started = _install_rotation_process_and_probe_fakes(monkeypatch)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "transfer"
+    failure = payload["failure"]
+    # One actionable reason, and the capacity evidence is named in it.
+    assert failure.startswith("no different healthy profile is available: ")
+    assert "max-a: fable-capped until" in failure
+    assert "max-c: fable-capped until" in failure
+    assert "max-d: fable-capped until" in failure
+    # Regression 4: selection refusal precedes any runner start.
+    assert started == []
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT state, profile_alias, session_id FROM project_cells "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["state"]) == "active"
+        assert str(cell["profile_alias"]) == "max-b"
+        assert str(cell["session_id"]) == "11111111-1111-4111-8111-111111111111"
+        handoff = database.execute(
+            "SELECT state, replacement_session_id, replacement_profile_alias "
+            "FROM handoffs WHERE handoff_id = 'handoff-1'"
+        ).fetchone()
+        assert str(handoff["state"]) == "submitted"
+        assert handoff["replacement_session_id"] is None
+        assert handoff["replacement_profile_alias"] is None
+        lease = database.execute(
+            "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+        ).fetchone()
+        assert str(lease["profile_alias"]) == "max-b"
+        binding = CmuxSurfaceBindings(
+            database=database, events=EventStore(database)
+        ).active_lead("cell-demo")
+        assert binding is not None
+        assert binding.session_id == "11111111-1111-4111-8111-111111111111"
+    finally:
+        database.close()
 
 
 def test_migration_env_provision_plans_dry_by_default(tmp_path: Path) -> None:

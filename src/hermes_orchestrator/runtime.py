@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Protocol, TextIO
 
 from hermes_orchestrator.admission import AdmissionController, PressureClassifier
-from hermes_orchestrator.cells import DispatchResult, ProjectCellService
+from hermes_orchestrator.cells import (
+    DispatchResult,
+    ProfileCapacityEvidence,
+    ProjectCellService,
+)
 from hermes_orchestrator.channel_hub import (
     ChannelCapabilities,
     ChannelHub,
@@ -486,7 +490,12 @@ def open_runtime(
 
             environment = dict(os.environ if base_env is None else base_env)
             registry = ProfileRegistry.load(profile_path)
-            pool = ProfilePool(registry)
+            # INFRA-205: replacement selection consults the durable
+            # capacity observations, so a Fable-capped profile is never
+            # chosen on auth health alone.
+            pool = ProfilePool(
+                registry, capacity_evidence=ProfileCapacityEvidence(database)
+            )
             probe = ClaudeProfileProbe(
                 registry,
                 command=profile_command,

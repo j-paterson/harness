@@ -6,6 +6,7 @@ import json
 import shutil
 import tempfile
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -925,3 +926,189 @@ class TestResolveSidecarEntry:
             repo_root / "channels/hermes-control/dist/src/main.js"
         )
         assert not resolved.exists()
+
+
+class BedrockOnMaxDProfileCommand(JsonCommand):
+    """First-party auth everywhere except max-d, which probes as Bedrock."""
+
+    def run_json(
+        self,
+        command: list[str],
+        env: dict[str, str],
+    ) -> dict[str, object]:
+        assert command == ["claude", "auth", "status", "--json"]
+        bedrock = env["CLAUDE_CONFIG_DIR"].endswith("max-d")
+        return {
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "bedrock" if bedrock else "firstParty",
+            "subscriptionType": "max",
+        }
+
+
+def _insert_capacity_observation(
+    runtime: object,
+    alias: str,
+    state: str,
+    *,
+    observed_at: datetime,
+    resets_at: datetime | None = None,
+) -> None:
+    """Append one durable fable-capacity observation for the daemon pool."""
+
+    with runtime.database.transaction() as connection:  # type: ignore[attr-defined]
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES (?, 'fable', ?, ?, ?, ?)",
+            (
+                alias,
+                state,
+                "provider_limit" if state == "capped" else "operator_attestation",
+                observed_at.isoformat(),
+                resets_at.isoformat() if resets_at is not None else None,
+            ),
+        )
+
+
+def test_daemon_pool_refuses_a_replacement_with_a_current_fable_cap(
+    tmp_path: Path,
+) -> None:
+    """INFRA-205 regression 1: a non-expired capped observation makes an
+    authenticated (auth-eligible) profile ineligible for replacement
+    selection — the daemon runtime's own pool must read the durable
+    ``profile_capacity_observations`` rows, not auth health alone."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        now = datetime.now(UTC)
+        _insert_capacity_observation(
+            runtime,
+            "max-b",
+            "capped",
+            observed_at=now - timedelta(hours=1),
+            resets_at=now + timedelta(hours=11),
+        )
+        _insert_capacity_observation(
+            runtime, "max-c", "available", observed_at=now - timedelta(hours=1)
+        )
+        assert runtime.cells is not None
+        pool = runtime.cells._profiles
+        pool.restore("demo", "max-a", now)
+
+        replacement = pool.reserve_replacement("demo", "max-a")
+
+        # max-b is auth-eligible and first in registry order, but its
+        # unexpired fable cap must exclude it; selection lands on max-c.
+        assert replacement is not None
+        assert replacement.profile_alias == "max-c"
+    finally:
+        runtime.close()
+
+
+def test_daemon_pool_admits_a_profile_after_its_cap_reset_passed(
+    tmp_path: Path,
+) -> None:
+    """INFRA-205 regression 2: once ``resets_at`` has passed, the stale
+    cap no longer blocks that profile — the budget cycled and the same
+    observation evidences availability again."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        now = datetime.now(UTC)
+        _insert_capacity_observation(
+            runtime,
+            "max-b",
+            "capped",
+            observed_at=now - timedelta(days=3),
+            resets_at=now - timedelta(hours=1),
+        )
+        assert runtime.cells is not None
+        pool = runtime.cells._profiles
+        pool.restore("demo", "max-a", now)
+
+        replacement = pool.reserve_replacement("demo", "max-a")
+
+        assert replacement is not None
+        assert replacement.profile_alias == "max-b"
+    finally:
+        runtime.close()
+
+
+def test_daemon_pool_selects_deterministically_and_only_first_party_profiles(
+    tmp_path: Path,
+) -> None:
+    """INFRA-205 regression 6: selection among eligible profiles is
+    deterministic (first registry-ordered candidate passing every gate)
+    and a non-first-party (Bedrock) profile is never a candidate, even
+    when it holds current available capacity evidence."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=BedrockOnMaxDProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        by_alias = {
+            health.profile_alias: health for health in runtime.profile_health
+        }
+        assert by_alias["max-d"].eligible is False
+        assert by_alias["max-d"].reason == "not_first_party_subscription"
+
+        now = datetime.now(UTC)
+        for alias in ("max-b", "max-c", "max-d"):
+            _insert_capacity_observation(
+                runtime, alias, "available", observed_at=now - timedelta(hours=1)
+            )
+        assert runtime.cells is not None
+        pool = runtime.cells._profiles
+        pool.restore("demo", "max-a", now)
+
+        first = pool.reserve_replacement("demo", "max-a")
+        assert first is not None
+        # Deterministic: the first registry-ordered candidate that passes
+        # both the auth and the capacity gate.
+        assert first.profile_alias == "max-b"
+        pool.cancel_replacement("demo")
+
+        # Newer capped observations exclude every first-party candidate;
+        # Bedrock max-d still holds available evidence but must never be
+        # selected, so the reservation fails closed and the refusal names
+        # only real candidates.
+        for alias in ("max-b", "max-c"):
+            _insert_capacity_observation(
+                runtime,
+                alias,
+                "capped",
+                observed_at=now,
+                resets_at=now + timedelta(hours=11),
+            )
+        second = pool.reserve_replacement("demo", "max-a")
+
+        assert second is None
+        assert pool.last_refusal is not None
+        assert "max-b: fable-capped until" in pool.last_refusal
+        assert "max-c: fable-capped until" in pool.last_refusal
+        assert "max-d" not in pool.last_refusal
+    finally:
+        runtime.close()
