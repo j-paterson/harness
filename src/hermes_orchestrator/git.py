@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 from collections.abc import Mapping
@@ -13,6 +14,37 @@ _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 # Conservative allowlist for remotes, branches, and qualified refs: no
 # option-like leading dash, no whitespace or control bytes, no ".." ranges.
 _REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+# Only hunk location metadata is normalized before digesting a delta: the
+# leading "@@ -l,s +l,s @@" marker, never any trailing context text after
+# it, and never any other line (whitespace, mode lines, blob ids, binary
+# literals, additions/deletions, or paths all stay byte-for-byte).
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+# The pre-/post-image blob ids on an ``index`` line are file-identity
+# metadata, not content: the same patch applied over an advanced base that
+# touched the file elsewhere necessarily yields different blob ids while
+# every hunk stays byte-identical (live PR #39: README.md and cli.py).
+# Content is fully carried by the hunks (and by ``--binary`` literals for
+# binary files) and mode by the mode lines and the index line's trailing
+# mode token, which is kept verbatim.
+_INDEX_LINE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+")
+
+
+def _normalize_delta(text: str) -> str:
+    """Normalize only location and identity metadata in a diff.
+
+    Each hunk's location numbers become a bare ``@@`` marker and each
+    ``index <blob>..<blob>`` prefix becomes ``index`` (its trailing mode
+    token stays). Every other byte -- whitespace, old/new mode lines,
+    ``GIT binary patch`` literals, ``\\ No newline at end of file``,
+    additions/deletions, and paths -- is preserved verbatim.
+    """
+
+    normalized: list[str] = []
+    for line in text.splitlines(keepends=True):
+        line = _HUNK_HEADER.sub("@@", line, count=1)
+        line = _INDEX_LINE.sub("index", line, count=1)
+        normalized.append(line)
+    return "".join(normalized)
 
 
 class GitError(RuntimeError):
@@ -164,33 +196,38 @@ class GitVerifier:
         lines = [line for line in result.stdout.splitlines() if line]
         return tuple(sorted(lines))
 
-    def patch_id(self, repo_path: Path, base: str, head: str) -> str:
-        """Return the stable patch id of the diff between two commits."""
+    def delta_digest(self, repo_path: Path, base: str, head: str) -> str:
+        """Return a canonical sha256 digest of the diff between two commits.
+
+        Built from ``git diff --full-index --binary --no-renames <base>
+        <head>``: every byte is kept verbatim -- whitespace, old/new mode
+        lines, binary patch literals, additions/deletions, and paths --
+        except each hunk's location numbers (``@@ -l,s +l,s @@``) and the
+        ``index`` line's pre-/post-image blob ids, which are normalized so
+        the same patch applied over an advanced base still digests equal.
+        Unlike ``git patch-id --stable``, this digest
+        is sensitive to whitespace-only changes (indentation), file mode
+        changes, and binary content drift. An empty delta is never proof
+        and fails closed.
+        """
 
         _require_sha(base)
         _require_sha(head)
-        diff_result = self._runner.run(
-            ("git", "diff", "--full-index", base, head), repo_path
+        result = self._runner.run(
+            ("git", "diff", "--full-index", "--binary", "--no-renames", base, head),
+            repo_path,
         )
-        if diff_result.returncode != 0:
+        if result.returncode != 0:
             raise GitError(
-                f"git diff --full-index failed with exit code {diff_result.returncode}"
+                "git diff --full-index --binary failed with exit code "
+                f"{result.returncode}"
             )
-        patch_result = self._runner.run(
-            ("git", "patch-id", "--stable"), repo_path, input=diff_result.stdout
-        )
-        if patch_result.returncode != 0:
-            raise GitError(
-                f"git patch-id failed with exit code {patch_result.returncode}"
-            )
-        stdout = patch_result.stdout.strip()
-        if not stdout:
-            raise GitError("git patch-id returned no patch id for an empty diff")
-        first_line = stdout.splitlines()[0]
-        token = first_line.split(" ", 1)[0]
-        if _SHA_PATTERN.match(token) is None:
-            raise GitError("git patch-id returned a malformed patch id")
-        return token
+        if not result.stdout:
+            raise GitError("empty delta")
+        normalized = _normalize_delta(result.stdout)
+        return hashlib.sha256(
+            normalized.encode("utf-8", "surrogateescape")
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

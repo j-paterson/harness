@@ -78,7 +78,7 @@ class AncestryVerifier(Protocol):
         self, repo_path: Path, base: str, head: str
     ) -> tuple[str, ...]: ...
 
-    def patch_id(self, repo_path: Path, base: str, head: str) -> str: ...
+    def delta_digest(self, repo_path: Path, base: str, head: str) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,9 +90,9 @@ class ProvenMerge:
     (merge commit), ``reviewed_tree_equivalent`` (squash or rebase whose
     final tree is byte-identical to the reviewed tree), or
     ``patch_equivalent`` (squash or rebase onto an advanced base whose diff
-    from the recorded candidate base is identical, by changed paths and
-    stable patch id, to the merge's diff from its first parent). This
-    object is the only permit for a Linear Done projection.
+    from the recorded candidate base is identical, by changed paths and a
+    canonical delta digest, to the merge's diff from its first parent).
+    This object is the only permit for a Linear Done projection.
     """
 
     project_key: str
@@ -105,7 +105,7 @@ class ProvenMerge:
     relation: str
     base_sha: str | None = None
     merge_parent_sha: str | None = None
-    patch_id: str | None = None
+    delta_digest: str | None = None
     changed_paths: tuple[str, ...] = ()
 
 
@@ -121,7 +121,7 @@ class _Proof:
     relation: str
     base_sha: str | None = None
     merge_parent_sha: str | None = None
-    patch_id: str | None = None
+    delta_digest: str | None = None
     changed_paths: tuple[str, ...] = ()
 
 
@@ -196,7 +196,7 @@ class IntegrationMerge:
             relation=proof.relation,
             base_sha=proof.base_sha,
             merge_parent_sha=proof.merge_parent_sha,
-            patch_id=proof.patch_id,
+            delta_digest=proof.delta_digest,
             changed_paths=proof.changed_paths,
         )
 
@@ -238,7 +238,7 @@ class IntegrationMerge:
             relation=proof.relation,
             base_sha=proof.base_sha,
             merge_parent_sha=proof.merge_parent_sha,
-            patch_id=proof.patch_id,
+            delta_digest=proof.delta_digest,
             changed_paths=proof.changed_paths,
         )
 
@@ -304,11 +304,13 @@ class IntegrationMerge:
                     raise ReconciliationRequired(
                         "merge changed paths differ from the reviewed candidate"
                     )
-                candidate_patch = self._git.patch_id(
+                candidate_digest = self._git.delta_digest(
                     project.repo_path, base_sha, candidate_sha
                 )
-                merge_patch = self._git.patch_id(project.repo_path, parent, merge_sha)
-                if candidate_patch != merge_patch:
+                merge_digest = self._git.delta_digest(
+                    project.repo_path, parent, merge_sha
+                )
+                if candidate_digest != merge_digest:
                     raise ReconciliationRequired(
                         "merge content differs from the reviewed candidate"
                     )
@@ -316,7 +318,7 @@ class IntegrationMerge:
                     relation="patch_equivalent",
                     base_sha=base_sha,
                     merge_parent_sha=parent,
-                    patch_id=merge_patch,
+                    delta_digest=merge_digest,
                     changed_paths=merge_paths,
                 )
         except GitError as error:

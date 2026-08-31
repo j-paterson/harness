@@ -159,10 +159,10 @@ class FakeGit:
     calls: list[tuple[str, ...]] = field(default_factory=list)
     parents: dict[str, str] = field(default_factory=dict)
     paths: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
-    patch_ids: dict[tuple[str, str], str] = field(default_factory=dict)
+    delta_digests: dict[tuple[str, str], str] = field(default_factory=dict)
     first_parent_error: GitError | None = None
     changed_paths_error: GitError | None = None
-    patch_id_error: GitError | None = None
+    delta_digest_error: GitError | None = None
 
     def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
         self.calls.append(("fetch", str(repo_path), remote, branch))
@@ -191,11 +191,11 @@ class FakeGit:
             raise self.changed_paths_error
         return self.paths[(base, head)]
 
-    def patch_id(self, repo_path: Path, base: str, head: str) -> str:
-        self.calls.append(("patch_id", str(repo_path), base, head))
-        if self.patch_id_error is not None:
-            raise self.patch_id_error
-        return self.patch_ids[(base, head)]
+    def delta_digest(self, repo_path: Path, base: str, head: str) -> str:
+        self.calls.append(("delta_digest", str(repo_path), base, head))
+        if self.delta_digest_error is not None:
+            raise self.delta_digest_error
+        return self.delta_digests[(base, head)]
 
 
 @pytest.fixture
@@ -434,7 +434,7 @@ def _advanced_base_git(**overrides: Any) -> FakeGit:
             (BASE, CANDIDATE): CANDIDATE_PATHS,
             (PARENT, MERGE_SHA): CANDIDATE_PATHS,
         },
-        "patch_ids": {
+        "delta_digests": {
             (BASE, CANDIDATE): "8" * 40,
             (PARENT, MERGE_SHA): "8" * 40,
         },
@@ -459,7 +459,7 @@ def test_prove_landed_proves_advanced_base_patch_equivalence(
     assert outcome.relation == "patch_equivalent"
     assert outcome.base_sha == BASE
     assert outcome.merge_parent_sha == PARENT
-    assert outcome.patch_id == "8" * 40
+    assert outcome.delta_digest == "8" * 40
     assert outcome.changed_paths == CANDIDATE_PATHS
 
 
@@ -474,7 +474,7 @@ def test_merge_approved_proves_advanced_base_patch_equivalence(
     assert outcome.relation == "patch_equivalent"
     assert outcome.base_sha == BASE
     assert outcome.merge_parent_sha == PARENT
-    assert outcome.patch_id == "8" * 40
+    assert outcome.delta_digest == "8" * 40
     assert outcome.changed_paths == CANDIDATE_PATHS
 
 
@@ -484,7 +484,7 @@ def test_patch_equivalence_rejects_content_difference(
     """Same changed paths, different patch id: one changed hunk."""
 
     git = _advanced_base_git(
-        patch_ids={
+        delta_digests={
             (BASE, CANDIDATE): "8" * 40,
             (PARENT, MERGE_SHA): "9" * 40,
         }
@@ -551,7 +551,7 @@ def test_patch_equivalence_rejects_base_not_ancestor_of_parent(
             merge_sha=MERGE_SHA,
             base_sha=BASE,
         )
-    assert all(call[0] not in ("changed_paths", "patch_id") for call in git.calls)
+    assert all(call[0] not in ("changed_paths", "delta_digest") for call in git.calls)
 
 
 def test_patch_equivalence_not_attempted_without_base_sha(
@@ -570,7 +570,7 @@ def test_patch_equivalence_not_attempted_without_base_sha(
             merge_sha=MERGE_SHA,
         )
     assert all(
-        call[0] not in ("first_parent", "changed_paths", "patch_id")
+        call[0] not in ("first_parent", "changed_paths", "delta_digest")
         for call in git.calls
     )
 
@@ -591,14 +591,14 @@ def test_merge_method_merge_never_tries_patch_equivalence(
             base_sha=BASE,
         )
     assert all(
-        call[0] not in ("first_parent", "changed_paths", "patch_id")
+        call[0] not in ("first_parent", "changed_paths", "delta_digest")
         for call in git.calls
     )
 
 
 @pytest.mark.parametrize(
     "error_field",
-    ["first_parent_error", "changed_paths_error", "patch_id_error"],
+    ["first_parent_error", "changed_paths_error", "delta_digest_error"],
 )
 def test_git_error_in_patch_equivalence_primitive_requires_reconciliation(
     github: FakeGitHub, error_field: str
@@ -634,7 +634,7 @@ def test_existing_relations_win_before_patch_equivalence_is_tried(
     assert outcome.relation == "candidate_reachable"
     assert outcome.base_sha is None
     assert all(
-        call[0] not in ("first_parent", "changed_paths", "patch_id")
+        call[0] not in ("first_parent", "changed_paths", "delta_digest")
         for call in git.calls
     )
 

@@ -627,7 +627,7 @@ class ReviewService:
                             proven, "integration_branch", None
                         ),
                         "relation": getattr(proven, "relation", None),
-                        "patch_id": getattr(proven, "patch_id", None),
+                        "delta_digest": getattr(proven, "delta_digest", None),
                         "changed_paths": list(
                             getattr(proven, "changed_paths", ()) or ()
                         ),

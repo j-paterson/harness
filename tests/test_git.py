@@ -204,73 +204,168 @@ def test_changed_paths_requires_full_lowercase_commit_shas(
     assert runner.calls == []
 
 
-PATCH_ID = "d" * 40
+def _diff_argv(base: str, head: str) -> tuple[str, ...]:
+    return ("git", "diff", "--full-index", "--binary", "--no-renames", base, head)
 
 
-def test_patch_id_diffs_then_pipes_stdin_to_patch_id(
+def test_delta_digest_runs_full_index_binary_diff(
     verifier: GitVerifier, runner: FakeRunner
 ) -> None:
-    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
-    patch_argv = ("git", "patch-id", "--stable")
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
     runner.results[diff_argv] = GitResult(0, "diff --git a/x b/x\n", "")
-    runner.results[patch_argv] = GitResult(0, f"{PATCH_ID} {MERGE_SHA}\n", "")
-    assert verifier.patch_id(REPO, CANDIDATE, MERGE_SHA) == PATCH_ID
-    assert runner.calls == [
-        (diff_argv, REPO, None),
-        (patch_argv, REPO, "diff --git a/x b/x\n"),
-    ]
+    digest = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    assert isinstance(digest, str) and len(digest) == 64
+    assert runner.calls == [(diff_argv, REPO, None)]
 
 
-def test_patch_id_diff_failure_fails_closed(
+def test_delta_digest_diff_failure_fails_closed(
     verifier: GitVerifier, runner: FakeRunner
 ) -> None:
-    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
     runner.results[diff_argv] = GitResult(128, "", "fatal: bad revision")
     with pytest.raises(GitError, match="git diff"):
-        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+        verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
 
 
-def test_patch_id_command_failure_fails_closed(
+def test_delta_digest_empty_diff_raises_git_error(
     verifier: GitVerifier, runner: FakeRunner
 ) -> None:
-    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
-    patch_argv = ("git", "patch-id", "--stable")
-    runner.results[diff_argv] = GitResult(0, "diff --git a/x b/x\n", "")
-    runner.results[patch_argv] = GitResult(128, "", "fatal: broken")
-    with pytest.raises(GitError, match="git patch-id"):
-        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+    """An empty diff is never proof: fail closed rather than digest nothing."""
 
-
-def test_patch_id_empty_diff_raises_git_error(
-    verifier: GitVerifier, runner: FakeRunner
-) -> None:
-    """An empty diff yields no patch-id line: fail closed rather than guess."""
-
-    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
-    patch_argv = ("git", "patch-id", "--stable")
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
     runner.results[diff_argv] = GitResult(0, "", "")
-    runner.results[patch_argv] = GitResult(0, "", "")
-    with pytest.raises(GitError, match="patch id"):
-        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
+    with pytest.raises(GitError, match="empty delta"):
+        verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
 
 
-def test_patch_id_rejects_malformed_output(
-    verifier: GitVerifier, runner: FakeRunner
-) -> None:
-    diff_argv = ("git", "diff", "--full-index", CANDIDATE, MERGE_SHA)
-    patch_argv = ("git", "patch-id", "--stable")
-    runner.results[diff_argv] = GitResult(0, "diff --git a/x b/x\n", "")
-    runner.results[patch_argv] = GitResult(0, "not-a-patch-id\n", "")
-    with pytest.raises(GitError, match="malformed"):
-        verifier.patch_id(REPO, CANDIDATE, MERGE_SHA)
-
-
-def test_patch_id_requires_full_lowercase_commit_shas(
+def test_delta_digest_requires_full_lowercase_commit_shas(
     verifier: GitVerifier, runner: FakeRunner
 ) -> None:
     with pytest.raises(GitError):
-        verifier.patch_id(REPO, "HEAD", MERGE_SHA)
+        verifier.delta_digest(REPO, "HEAD", MERGE_SHA)
     assert runner.calls == []
+
+
+def test_delta_digest_is_deterministic(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(
+        0, "diff --git a/x b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n", ""
+    )
+    first = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    second = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    assert first == second
+
+
+def test_delta_digest_ignores_only_hunk_location_numbers(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    """Two diffs differing only in the ``@@ -l,s +l,s @@`` line numbers
+    (content shifted elsewhere in the file) digest equal."""
+
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
+    base_text = (
+        "diff --git a/x b/x\n"
+        "index 1111111111111111111111111111111111111111"
+        "..2222222222222222222222222222222222222222 100644\n"
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    shifted_text = base_text.replace("@@ -1,2 +1,2 @@", "@@ -40,2 +41,3 @@")
+    runner.results[diff_argv] = GitResult(0, base_text, "")
+    first = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(0, shifted_text, "")
+    second = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    assert first == second
+
+
+def test_delta_digest_is_sensitive_to_whitespace(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
+    four_spaces = (
+        "diff --git a/x b/x\n@@ -1,1 +1,1 @@\n-if True:\n+if True:\n    pass\n"
+    )
+    two_spaces = (
+        "diff --git a/x b/x\n@@ -1,1 +1,1 @@\n-if True:\n+if True:\n  pass\n"
+    )
+    runner.results[diff_argv] = GitResult(0, four_spaces, "")
+    first = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(0, two_spaces, "")
+    second = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    assert first != second
+
+
+def test_delta_digest_is_sensitive_to_mode_lines(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
+    unchanged_mode = "diff --git a/x b/x\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+    changed_mode = (
+        "diff --git a/x b/x\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "@@ -1,1 +1,1 @@\n-a\n+b\n"
+    )
+    runner.results[diff_argv] = GitResult(0, unchanged_mode, "")
+    first = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(0, changed_mode, "")
+    second = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    assert first != second
+
+
+def test_delta_digest_ignores_index_blob_ids_but_keeps_the_mode_token(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    """Pre-/post-image blob ids are file identity, not content: the same
+    patch applied over an advanced base that touched the file elsewhere
+    yields new blob ids with byte-identical hunks (live PR #39). The index
+    line's trailing mode token is content-bearing and stays sensitive."""
+
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
+    one = (
+        "diff --git a/x b/x\n"
+        "index 1111111111111111111111111111111111111111"
+        "..2222222222222222222222222222222222222222 100644\n"
+        "@@ -1,1 +1,1 @@\n-a\n+b\n"
+    )
+    other_blobs = (
+        "diff --git a/x b/x\n"
+        "index 3333333333333333333333333333333333333333"
+        "..4444444444444444444444444444444444444444 100644\n"
+        "@@ -1,1 +1,1 @@\n-a\n+b\n"
+    )
+    other_mode = one.replace(" 100644\n", " 100755\n")
+    runner.results[diff_argv] = GitResult(0, one, "")
+    first = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(0, other_blobs, "")
+    assert verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA) == first
+    runner.results[diff_argv] = GitResult(0, other_mode, "")
+    assert verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA) != first
+
+
+def test_delta_digest_is_sensitive_to_binary_literals(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    diff_argv = _diff_argv(CANDIDATE, MERGE_SHA)
+    one = (
+        "diff --git a/x.bin b/x.bin\n"
+        "index 1111111111111111111111111111111111111111"
+        "..2222222222222222222222222222222222222222 100644\n"
+        "GIT binary patch\n"
+        "literal 4\n"
+        "Lcmezz00000\n"
+    )
+    other = one.replace("Lcmezz00000", "Lcmeyy00000")
+    runner.results[diff_argv] = GitResult(0, one, "")
+    first = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    runner.results[diff_argv] = GitResult(0, other, "")
+    second = verifier.delta_digest(REPO, CANDIDATE, MERGE_SHA)
+    assert first != second
 
 
 @pytest.mark.parametrize(

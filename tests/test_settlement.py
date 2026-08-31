@@ -1143,7 +1143,7 @@ class TestDirectExactHeadMerge:
 
 PARENT_SHA = "7" * 40
 ADVANCED_PATHS = ("A\tsrc/new.py", "M\tsrc/app.py")
-STABLE_PATCH_ID = "8" * 40
+STABLE_DELTA_DIGEST = "8" * 40
 
 
 def _wire_patch_equivalence(
@@ -1162,8 +1162,8 @@ def _wire_patch_equivalence(
     acceptance.git.parents[merge_sha] = PARENT_SHA
     acceptance.git.paths[(base, candidate)] = ADVANCED_PATHS
     acceptance.git.paths[(PARENT_SHA, merge_sha)] = ADVANCED_PATHS
-    acceptance.git.patch_ids[(base, candidate)] = STABLE_PATCH_ID
-    acceptance.git.patch_ids[(PARENT_SHA, merge_sha)] = STABLE_PATCH_ID
+    acceptance.git.delta_digests[(base, candidate)] = STABLE_DELTA_DIGEST
+    acceptance.git.delta_digests[(PARENT_SHA, merge_sha)] = STABLE_DELTA_DIGEST
 
 
 def _manifest_for(acceptance: Any, event: Any) -> Any:
