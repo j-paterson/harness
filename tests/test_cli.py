@@ -2803,6 +2803,213 @@ def test_intake_poll_settles_a_maintenance_receipt_silently(
     assert str(state) == "acknowledged"
 
 
+# --- intake-poll idle-boundary dispatch (INFRA-199) ------------------------
+
+
+def _seed_idle_dispatch(
+    state_dir: Path,
+    *,
+    with_cell: bool = True,
+    with_issue: bool = True,
+    pressure: str | None = "green",
+    issue_priority: int = 1,
+    issue_state: str = "queued",
+    dependency_ready: int = 1,
+    operator_decision_pending: bool = False,
+    outstanding_child: bool = False,
+) -> None:
+    """Seed one live 'demo' cell/lease bound to SESSION plus, per flag,
+    one admitted issue, the latest resource sample, an operator
+    decision hold, or one outstanding background child."""
+
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import SESSION
+
+    state_dir.mkdir(exist_ok=True)
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            if with_cell:
+                connection.execute(
+                    "INSERT INTO project_cells("
+                    "cell_id, project_key, state, profile_alias, "
+                    "session_id, created_at, updated_at) VALUES "
+                    "('cell-demo', 'demo', 'active', 'max-a', ?, ?, ?)",
+                    (SESSION, now, now),
+                )
+                connection.execute(
+                    "INSERT INTO profile_leases("
+                    "profile_alias, project_key, state, acquired_at) "
+                    "VALUES ('max-a', 'demo', 'active', ?)",
+                    (now,),
+                )
+            if with_issue:
+                connection.execute(
+                    "INSERT INTO admitted_issues("
+                    "issue_id, project_key, priority, state, "
+                    "instruction_id, dependency_ready, overlap_risk, "
+                    "admitted_at, updated_at"
+                    ") VALUES ('INFRA-9', 'demo', ?, ?, 'instr-9', ?, 0, "
+                    "?, ?)",
+                    (issue_priority, issue_state, dependency_ready, now, now),
+                )
+            if pressure is not None:
+                connection.execute(
+                    "INSERT INTO resource_samples("
+                    "sample_id, sampled_at, pressure, "
+                    "available_memory_bytes, total_memory_bytes, "
+                    "swap_used_bytes, load_one, logical_cpus, disk_json, "
+                    "managed_rss_bytes"
+                    ") VALUES ('s', ?, ?, 1, 2, 0, 0.1, 1, '{}', 1)",
+                    (now, pressure),
+                )
+            if operator_decision_pending:
+                connection.execute(
+                    "INSERT INTO operator_decisions("
+                    "decision_id, issue_id, project_key, cell_id, "
+                    "session_id, actor, choice, status, recorded_at"
+                    ") VALUES ('dec-1', 'INFRA-9', 'demo', 'cell-demo', "
+                    "?, 'operator', 'hold', 'pending', ?)",
+                    (SESSION, now),
+                )
+            if outstanding_child:
+                connection.execute(
+                    "INSERT INTO lead_children("
+                    "session_id, child_id, state, started_at"
+                    ") VALUES (?, 'child-1', 'started', ?)",
+                    (SESSION, now),
+                )
+    finally:
+        database.close()
+
+
+def _poll_at_idle_boundary(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> CliResult:
+    from tests.test_lead_intake import SESSION
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(json.dumps({"session_id": SESSION, "hook_event_name": "Stop"})),
+    )
+    return invoke(["--state-dir", str(state_dir), "intake-poll"])
+
+
+def _idle_dispatch_counts(state_dir: Path) -> tuple[int, int, str | None]:
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        started = int(
+            database.scalar(
+                "SELECT count(*) FROM events WHERE event_type = 'issue.started'"
+            )
+        )
+        assigned = int(database.scalar("SELECT count(*) FROM lead_assignments"))
+        issue_state = database.scalar(
+            "SELECT state FROM admitted_issues WHERE issue_id = 'INFRA-9'"
+        )
+        return started, assigned, (
+            str(issue_state) if issue_state is not None else None
+        )
+    finally:
+        database.close()
+
+
+def test_intake_poll_dispatches_ready_work_at_the_idle_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    _seed_idle_dispatch(state_dir)
+
+    first = _poll_at_idle_boundary(state_dir, monkeypatch)
+    assert first.exit_code == 0
+    assert "HERMES_ASSIGNMENT_READY" in json.loads(first.stdout)["reason"]
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+
+    # A repeated Stop at the same (now non-runnable) idle boundary is a
+    # strict no-op: the CAS has already fired.
+    second = _poll_at_idle_boundary(state_dir, monkeypatch)
+    assert second.exit_code == 0
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+
+
+@pytest.mark.parametrize(
+    "kwargs, expect_silent",
+    [
+        pytest.param({"with_issue": False}, True, id="nothing-runnable"),
+        pytest.param({"dependency_ready": 0}, False, id="dependency-blocked"),
+        pytest.param({"issue_state": "paused"}, False, id="paused"),
+        pytest.param(
+            {"operator_decision_pending": True}, False, id="operator-decision"
+        ),
+        pytest.param(
+            {"pressure": "yellow", "issue_priority": 2},
+            False,
+            id="yellow-priority-too-high",
+        ),
+        pytest.param({"pressure": "red"}, False, id="red-sample"),
+        pytest.param({"pressure": None}, False, id="no-sample"),
+        pytest.param({"outstanding_child": True}, False, id="outstanding-children"),
+        pytest.param({"with_cell": False}, True, id="no-live-cell"),
+    ],
+)
+def test_intake_poll_never_dispatches_a_held_or_ineligible_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict,
+    expect_silent: bool,
+) -> None:
+    state_dir = tmp_path / "state"
+    _seed_idle_dispatch(state_dir, **kwargs)
+
+    result = _poll_at_idle_boundary(state_dir, monkeypatch)
+
+    assert result.exit_code == 0
+    if expect_silent:
+        assert result.stdout == ""
+    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
+    assert (started, assigned) == (0, 0)
+    if kwargs.get("with_issue", True) and kwargs.get("with_cell", True):
+        assert issue_state == kwargs.get("issue_state", "queued")
+
+
+def test_intake_poll_never_starts_a_second_issue_for_a_working_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One issue in development per project at a time: a runnable
+    queued lane is refused while another issue in the same project is
+    already ``in_development``."""
+
+    from hermes_orchestrator.db import Database
+
+    state_dir = tmp_path / "state"
+    _seed_idle_dispatch(state_dir)
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at"
+                ") VALUES ('INFRA-8', 'demo', 1, 'in_development', "
+                "'instr-8', 1, 0, ?, ?)",
+                (now, now),
+            )
+    finally:
+        database.close()
+
+    result = _poll_at_idle_boundary(state_dir, monkeypatch)
+
+    assert result.exit_code == 0
+    started, assigned, issue_state = _idle_dispatch_counts(state_dir)
+    assert (started, assigned) == (0, 0)
+    assert issue_state == "queued"
+
+
 # --- verify / verify-check (INFRA-186 P9: any-agent verifier CLI) ----------
 
 

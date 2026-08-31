@@ -16,6 +16,7 @@ from hermes_orchestrator.dashboard_sources import (
     CodexFact,
     ControlAttentionFact,
     DashboardSnapshot,
+    IdleFact,
     ProfileLeaseFact,
     ProfileUsage,
     ResourceFact,
@@ -245,6 +246,7 @@ def _frame_snapshot(
     transitions: tuple[TransitionFact, ...] = (),
     attention_control: ControlAttentionFact | None = None,
     tasks_observed_at: str | None = "2026-08-31T11:55:00+00:00",
+    idle: tuple[IdleFact, ...] = (),
 ) -> DashboardSnapshot:
     if capacity is None:
         capacity = tuple(_capacity_fact(alias) for alias in _ALIASES)
@@ -268,6 +270,7 @@ def _frame_snapshot(
         workers=workers,
         transitions=transitions,
         attention_control=attention_control,
+        idle=idle,
     )
 
 
@@ -318,6 +321,23 @@ def test_no_in_flight_work_is_shown_explicitly() -> None:
     snapshot = _frame_snapshot(tasks=())
     lines = render_frame(snapshot, width=60, height=20, now=_NOW)
     assert any("no in-flight work" in line for line in lines)
+
+
+def test_idle_project_shows_no_queued_work_line() -> None:
+    idle = (IdleFact(project_key="proj-a", hold="no queued work"),)
+    snapshot = _frame_snapshot(tasks=(), idle=idle)
+    lines = render_frame(snapshot, width=60, height=20, now=_NOW)
+    assert any("proj-a: no queued work" in line for line in lines)
+
+
+def test_idle_project_capacity_hold_shows_pressure_and_sample_age() -> None:
+    idle = (IdleFact(project_key="proj-a", hold="capacity limited"),)
+    resource = _resource_fact(pressure="yellow", sampled_at=_NOW.isoformat())
+    snapshot = _frame_snapshot(tasks=(_task(),), idle=idle, resource=resource)
+    lines = render_frame(snapshot, width=90, height=20, now=_NOW)
+    row = next(line for line in lines if "proj-a: capacity limited" in line)
+    assert "yellow" in row
+    assert "sample" in row
 
 
 def test_capacity_row_shows_unknown_for_no_observation_and_no_cache() -> None:

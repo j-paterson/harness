@@ -206,6 +206,17 @@ class ResourceFact:
 
 
 @dataclass(frozen=True, slots=True)
+class IdleFact:
+    """One live-lead project with nothing in development right now
+    (INFRA-199): either its queue truly holds no ready work, or the
+    concrete hold on its top-ranked lane.
+    """
+
+    project_key: str
+    hold: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerFact:
     """Active worker_leases, total and broken down by kind."""
 
@@ -246,6 +257,7 @@ class DashboardSnapshot:
     workers: WorkerFact = WorkerFact(active_total=0, active_by_kind=())
     transitions: tuple[TransitionFact, ...] = ()
     attention_control: ControlAttentionFact | None = None
+    idle: tuple[IdleFact, ...] = ()
 
 
 class UsageAggregator:
@@ -506,6 +518,60 @@ class TaskProvider:
                 completed += 1
             counts[session_id] = (total, completed)
         return counts
+
+    def idle_notes(self, resource: ResourceFact | None) -> tuple[IdleFact, ...]:
+        """Name why each live-lead, non-working project is idle
+        (INFRA-199): the top-ranked lane's concrete hold, or that the
+        queue simply holds no ready work.
+        """
+
+        from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
+        from hermes_orchestrator.operator_decisions import OperatorDecisions
+
+        working = {
+            str(row["project_key"])
+            for row in self._database.execute(
+                "SELECT DISTINCT project_key FROM admitted_issues "
+                "WHERE state = 'in_development'",
+            ).fetchall()
+        }
+        live = {
+            str(row["project_key"])
+            for row in self._database.execute(
+                "SELECT DISTINCT project_key FROM project_cells "
+                "WHERE state = 'active'",
+            ).fetchall()
+        }
+        if not (live - working):
+            return ()
+        max_priority = (
+            {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
+                resource.pressure
+            )
+            if resource is not None
+            else None
+        )
+        decisions = OperatorDecisions(self._database)
+        notes = []
+        for project_key in sorted(live - working):
+            hold = "no queued work"
+            top = self._database.execute(
+                "SELECT issue_id, priority, dependency_ready FROM "
+                "admitted_issues WHERE project_key = ? AND state IN "
+                "('queued', 'blocked') ORDER BY priority ASC, "
+                "dependency_ready DESC, admitted_at ASC, overlap_risk ASC, "
+                "issue_id ASC LIMIT 1",
+                (project_key,),
+            ).fetchone()
+            if top is not None:
+                if not top["dependency_ready"]:
+                    hold = "dependency-blocked"
+                elif decisions.pending_for_issue(str(top["issue_id"])):
+                    hold = "operator decision pending"
+                elif max_priority is None or int(top["priority"]) > max_priority:
+                    hold = "capacity limited"
+            notes.append(IdleFact(project_key=project_key, hold=hold))
+        return tuple(notes)
 
 
 class CapacityProvider:
@@ -902,6 +968,7 @@ class DashboardSources:
             for row in rows
         )
         codex = await self._codex.read(generated_at)
+        resource = self._resource.resource()
         return DashboardSnapshot(
             generated_at=generated_at,
             usage=self._usage.usage_for(aliases),
@@ -909,9 +976,10 @@ class DashboardSources:
             codex=codex,
             tasks=self._tasks.tasks(),
             capacity=self._capacity.capacity(windows_by_alias),
-            resource=self._resource.resource(),
+            resource=resource,
             tasks_observed_at=self._tasks.observed_at(),
             workers=self._workers.workers(),
             transitions=self._transitions.transitions(),
             attention_control=self._control_attention.latest(),
+            idle=self._tasks.idle_notes(resource),
         )

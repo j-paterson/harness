@@ -16,6 +16,7 @@ from hermes_orchestrator.dashboard_sources import (
     CapacityFact,
     CodexFact,
     DashboardSnapshot,
+    IdleFact,
     ProfileLeaseFact,
     ProfileUsage,
     ResourceFact,
@@ -265,7 +266,13 @@ def render_frame(
         remaining -= len(detail_block)
 
     work_lines = _work_block(
-        snapshot.tasks, snapshot.transitions, now, width, max(remaining, 0)
+        snapshot.tasks,
+        snapshot.idle,
+        snapshot.transitions,
+        snapshot.resource,
+        now,
+        width,
+        max(remaining, 0),
     )
 
     body = [header_line, *work_lines]
@@ -447,6 +454,13 @@ def _work_row(task: TaskFact) -> str:
     return " ".join(parts)
 
 
+def _idle_row(fact: IdleFact, resource: ResourceFact | None, now: datetime) -> str:
+    hold = fact.hold
+    if hold == "capacity limited" and resource is not None:
+        hold = f"{hold} ({resource.pressure}, sample {_age(resource.sampled_at, now)})"
+    return f"{fact.project_key}: {hold}"
+
+
 def _transition_rows(
     transition: TransitionFact, now: datetime, width: int, *, allow_wrap: bool
 ) -> list[str]:
@@ -472,7 +486,9 @@ def _transition_rows(
 
 def _work_block(
     tasks: tuple[TaskFact, ...],
+    idle: tuple[IdleFact, ...],
     transitions: tuple[TransitionFact, ...],
+    resource: ResourceFact | None,
     now: datetime,
     width: int,
     room: int,
@@ -485,6 +501,7 @@ def _work_block(
         return [divider]
 
     task_rows = [_work_row(task) for task in tasks]
+    task_rows.extend(_idle_row(fact, resource, now) for fact in idle)
     rows: list[str] = []
     trimmed = 0
 

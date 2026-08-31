@@ -2351,6 +2351,130 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     return 0
 
 
+def _dispatch_idle_lead(database: Database, session_id: str) -> None:
+    """At the calling lead's own genuine idle boundary, hand its live
+    cell one ready, non-conflicting, capacity-permitted assignment
+    (INFRA-199). Only the session's OWN active ``project_cells`` row
+    is ever resolved (mirrors ``LeadIntakePoll.next_offer``'s query).
+    The activation below mirrors ``ProjectCellService._activate_issue``
+    (cells.py) statement-for-statement: the active-profile-lease
+    guard, the ``admitted_issues`` CAS into ``in_development``, the
+    journaled ``issue.started`` event, and the durable assignment
+    packet, all in one transaction — so replaying an already-activated
+    idle boundary is a strict no-op.
+    """
+
+    from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
+    from hermes_orchestrator.events import EventInput
+    from hermes_orchestrator.lead_assignments import LeadAssignments
+    from hermes_orchestrator.queue import QueueService
+
+    cell = database.execute(
+        "SELECT cell_id, project_key, profile_alias FROM project_cells "
+        "WHERE session_id = ? AND state = 'active' "
+        "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if cell is None:
+        return
+    sample = database.execute(
+        "SELECT pressure FROM resource_samples ORDER BY sampled_at DESC LIMIT 1",
+    ).fetchone()
+    max_priority = (
+        {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
+            str(sample["pressure"])
+        )
+        if sample is not None
+        else None
+    )
+    if max_priority is None:
+        return
+    project_key = str(cell["project_key"])
+    # One issue in development per project at a time: a project already
+    # mid-flight on another issue never gets a second one started here.
+    already_working = database.execute(
+        "SELECT 1 FROM admitted_issues WHERE project_key = ? AND state = ? "
+        "LIMIT 1",
+        (project_key, IssueState.IN_DEVELOPMENT.value),
+    ).fetchone()
+    if already_working is not None:
+        return
+    decisions = OperatorDecisions(database)
+    events = EventStore(database)
+    ranked = QueueService(database, events, registered_projects=()).list_ranked(
+        datetime.now(UTC)
+    )
+    candidate = None
+    for issue in ranked:
+        if issue.project_key != project_key or not issue.dependency_ready:
+            continue
+        if issue.linear_priority > max_priority:
+            continue
+        if decisions.pending_for_issue(issue.issue_id):
+            continue
+        candidate = issue
+        break
+    if candidate is None:
+        return
+
+    now = datetime.now(UTC).isoformat()
+    assignments = LeadAssignments(database, events=events)
+    assignment = None
+    with database.transaction() as connection:
+        issue_row = connection.execute(
+            "SELECT state, instruction_id FROM admitted_issues "
+            "WHERE issue_id = ?",
+            (candidate.issue_id,),
+        ).fetchone()
+        if issue_row is None or str(issue_row["state"]) == IssueState.DONE.value:
+            return
+        prior_state = str(issue_row["state"])
+        activated = connection.execute(
+            "UPDATE project_cells SET state = 'active', updated_at = ? "
+            "WHERE cell_id = ? AND state IN ('starting', 'active') "
+            "AND EXISTS (SELECT 1 FROM profile_leases WHERE "
+            "project_key = ? AND profile_alias = ? AND state = 'active')",
+            (now, cell["cell_id"], project_key, cell["profile_alias"]),
+        )
+        if activated.rowcount == 0:
+            return
+        updated = connection.execute(
+            "UPDATE admitted_issues SET state = ?, updated_at = ? "
+            "WHERE issue_id = ? AND state != ?",
+            (
+                IssueState.IN_DEVELOPMENT.value,
+                now,
+                candidate.issue_id,
+                IssueState.DONE.value,
+            ),
+        )
+        if updated.rowcount == 0:
+            return
+        events.append(
+            connection,
+            EventInput(
+                event_type="issue.started",
+                aggregate_type="issue",
+                aggregate_id=candidate.issue_id,
+                payload={"cell_id": str(cell["cell_id"])},
+            ),
+        )
+        assignment = assignments.publish_in(
+            connection,
+            project_key=project_key,
+            issue_id=candidate.issue_id,
+            cell_id=str(cell["cell_id"]),
+            session_id=session_id,
+            profile_alias=str(cell["profile_alias"]),
+            instruction_id=str(issue_row["instruction_id"]),
+            queue_transition=(
+                f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
+            ),
+        )
+    if assignment is not None:
+        assignments.notify_committed(assignment)
+
+
 def _intake_poll(args: argparse.Namespace) -> int:
     """Lease the calling lead's next pending envelope, if any.
 
@@ -2380,19 +2504,30 @@ def _intake_poll(args: argparse.Namespace) -> int:
         if hook_event == "Stop":
             # A Stop with live background children records the durable
             # continuation the last child completion will reactivate;
-            # a Stop with none supersedes any stale promise.
+            # a Stop with none supersedes any stale promise and is
+            # this session's genuine idle boundary. An exception here
+            # leaves ``continuation`` truthy, so a hook error never
+            # risks treating an uncertain state as idle.
+            continuation: object = "unknown"
             with suppress(Exception):
                 from hermes_orchestrator.events import EventStore
                 from hermes_orchestrator.lead_children import (
                     LeadChildTracker,
                 )
 
-                LeadChildTracker(
+                continuation = LeadChildTracker(
                     database,
                     control=ControlOperations(
                         database, events=EventStore(database)
                     ),
                 ).record_turn_stop(str(session))
+            if continuation is None:
+                # INFRA-199: at the genuine idle boundary, offer the
+                # existing admitted queue one normal durable
+                # assignment before anything else, so a freshly
+                # published packet rides this same poll response.
+                with suppress(Exception):
+                    _dispatch_idle_lead(database, str(session))
         # INFRA-201: settle this session's maintenance receipts
         # silently before offering anything — no output either way,
         # for any hook event, so a wake never reaches the primary view
