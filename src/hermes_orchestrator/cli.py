@@ -10,6 +10,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -44,6 +45,7 @@ from hermes_orchestrator.cmux_surfaces import (
 from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.context import ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
+from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
@@ -72,6 +74,9 @@ from hermes_orchestrator.operator_decisions import (
     DecisionRefused,
     OperatorDecisions,
 )
+from hermes_orchestrator.orchestrator_workspace import (
+    OrchestratorWorkspaceOwner,
+)
 from hermes_orchestrator.packet_admission import PacketAdmission
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -90,8 +95,10 @@ from hermes_orchestrator.remote.auth import (
 from hermes_orchestrator.remote.serve import build_console_dependencies, run_console
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.runtime import (
+    DaemonAlreadyRunning,
     Dispatch,
     Runtime,
+    acquire_workspace_fence,
     build_linear_router,
     cmux_password_source,
     open_runtime,
@@ -163,6 +170,18 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument("--interval", type=_watch_interval, default=30)
     daemon.add_argument("--json", action="store_true")
 
+    dashboard = commands.add_parser(
+        "dashboard",
+        help=(
+            "render the Orchestrator dashboard in this terminal: "
+            "token-free, read-only, no daemon lock (the upper-pane "
+            "entry; the daemon stays the sole supervisor)"
+        ),
+    )
+    dashboard.add_argument("--once", action="store_true")
+    dashboard.add_argument("--interval", type=_watch_interval, default=30)
+    dashboard.add_argument("--json", action="store_true")
+
     cmux_focus = commands.add_parser(
         "cmux-focus",
         help="focus the cmux surface bound to a project's lead "
@@ -170,6 +189,48 @@ def _parser() -> argparse.ArgumentParser:
     )
     cmux_focus.add_argument("--project", default=None)
     cmux_focus.add_argument("--json", action="store_true")
+
+    orchestrator_ws = commands.add_parser(
+        "orchestrator-workspace",
+        help=(
+            "ensure or smoke-test the recoverable two-pane Orchestrator "
+            "workspace (upper supervisor/dashboard pane, lower Nous "
+            "Hermes classic durable session)"
+        ),
+    )
+    orchestrator_ws.add_argument("action", choices=("ensure", "smoke"))
+    orchestrator_ws.add_argument("--name", default="orchestrator")
+    orchestrator_ws.add_argument("--title", default="Orchestrator")
+    orchestrator_ws.add_argument(
+        "--session",
+        default=None,
+        help="Hermes durable session name (default: the workspace name)",
+    )
+    orchestrator_ws.add_argument(
+        "--interval", type=_watch_interval, default=30
+    )
+    orchestrator_ws.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=8.0,
+        help="smoke: seconds to let pane processes start before inspection",
+    )
+    orchestrator_ws.add_argument(
+        "--cmux-cli",
+        type=Path,
+        default=None,
+        help="cmux CLI path when config/cmux.yaml is absent",
+    )
+    orchestrator_ws.add_argument(
+        "--evidence-file",
+        type=Path,
+        default=None,
+        help=(
+            "smoke: write a sha256-digest-sealed evidence document "
+            "(source sha, exact invocation, full evidence) to this path"
+        ),
+    )
+    orchestrator_ws.add_argument("--json", action="store_true")
 
     candidate = commands.add_parser(
         "candidate-ready",
@@ -657,10 +718,22 @@ async def _run_daemon(
     control_operations: ControlOperations | None = None,
     fakechat_router: FakechatWakeRouter | None = None,
     activation: object | None = None,
+    dashboard_refresh: DashboardRefreshAction | None = None,
+    orchestrator_workspace: OrchestratorWorkspaceOwner | None = None,
 ) -> Supervisor:
     async def _maintenance() -> None:
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
+        if orchestrator_workspace is not None:
+            # The bounded reconciliation cadence for the two-pane
+            # Orchestrator workspace: the owner absorbs cmux failures
+            # and seated refusals itself, so the tick never raises.
+            await orchestrator_workspace.tick()
+        if dashboard_refresh is not None:
+            # tick() contains its own failures and the pane no-ops off
+            # a TTY, so the dashboard refresh rides the maintenance
+            # slot unconditionally.
+            await dashboard_refresh.tick()
         if lead_intake is not None:
             # Restart-safe by derivation: every tick re-routes any
             # durable pending correction or wake whose envelope has
@@ -690,6 +763,8 @@ async def _run_daemon(
                 cmux_hibernation is None
                 and lead_intake is None
                 and channel_hub is None
+                and dashboard_refresh is None
+                and orchestrator_workspace is None
             )
             else _maintenance
         ),
@@ -736,6 +811,19 @@ async def _run_daemon(
         # Deliver any envelope a crash separated from its published
         # packet before the first supervised tick.
         await lead_intake.tick()
+    if orchestrator_workspace is not None:
+        # The daemon ensures its two-pane Orchestrator workspace
+        # autonomously the moment it starts: create it, adopt a healthy
+        # survivor exactly once, or recover it — no manual CLI step.
+        # start() absorbs cmux failures, so visibility never blocks
+        # orchestration.
+        await orchestrator_workspace.start()
+    if dashboard_refresh is not None:
+        # Establish the dashboard pane the moment the daemon starts (and
+        # after any restart): the pane's idempotent fresh-writer
+        # establishment is the whole recovery story, and tick() never
+        # raises.
+        await dashboard_refresh.tick()
     if once:
         try:
             await supervisor.run_once()
@@ -1449,6 +1537,28 @@ def _snapshot_payload(snapshot: ResourceSnapshot) -> dict[str, Any]:
         "disk_free_bytes": snapshot.disk_free_bytes,
         "managed_rss_bytes": snapshot.managed_rss_bytes,
     }
+
+
+def _git_head_sha(repo_root: Path) -> str:
+    """The exact source revision a smoke run executed from.
+
+    Falls back to ``unknown`` when the repo root is not a git checkout
+    (unit fixtures): the evidence document still validates, and a live
+    run always records the real candidate sha.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    sha = completed.stdout.strip()
+    return sha if completed.returncode == 0 and sha else "unknown"
 
 
 def _print(payload: Any, *, json_output: bool, human: str) -> None:
@@ -2458,6 +2568,157 @@ def _migration_env(
     return 0 if report.completed else 1
 
 
+class _ReadOnlyDashboardDatabase:
+    """Exactly the query surface DashboardSources consumes, read-only.
+
+    Sol L3: one long-lived ``mode=ro`` SQLite connection backs BOTH
+    the schema-compatibility probe and every dashboard read — there is
+    no second open, so no schema transition can slip between probe and
+    reads, and nothing on this path can write: no WAL pragma, no
+    migrations, no mkdir, no transactions. ``execute`` is the single
+    method DashboardSources calls (SELECT + fetchall); nothing else is
+    exposed.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def execute(
+        self, sql: str, parameters: tuple[object, ...] = ()
+    ) -> sqlite3.Cursor:
+        return self._connection.execute(sql, parameters)
+
+
+def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
+    """Run the lock-free read-only dashboard loop (the upper pane).
+
+    Sol K1/L3: this entry is deliberately NOT the daemon — it takes no
+    daemon lock and cannot collide with the one lock-holding
+    supervisor — and it is genuinely read-only: a single ``mode=ro``
+    SQLite connection (never ``Database.open``: no migrations, no WAL
+    pragma, no directory creation) serves the schema-generation check
+    and all reads for the process lifetime, so it works even when the
+    filesystem forbids writes, and a mismatched checkout refuses
+    before anything renders. It ticks the existing dashboard
+    sources/renderer/pane machinery unchanged.
+    """
+
+    from hermes_orchestrator import db as db_module
+    from hermes_orchestrator.profiles import ProfileRegistry
+
+    state_db = settings.state_dir / "state.db"
+    if not state_db.exists():
+        _print(
+            {"error": "state database does not exist"},
+            json_output=args.json,
+            human=f"no state database at {state_db}.",
+        )
+        return 1
+    migrations_dir = Path(db_module.__file__).with_name("migrations")
+    runtime_generation = max(
+        (
+            int(found.name.split("_", maxsplit=1)[0])
+            for found in migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql")
+        ),
+        default=0,
+    )
+    probe_sql = (
+        "SELECT coalesce(max(version), 0) FROM schema_migrations"
+    )
+    # Sol M2: ordinary COORDINATED mode=ro access only. SQLite's
+    # immutable=1 skips locking and change detection entirely, so
+    # under the concurrently writing daemon it can serve stale or
+    # corrupt reads — a write-forbidding view of this filesystem does
+    # not prove the daemon is not writing the same file through
+    # another mount or view. When the coordinated open or probe fails
+    # (for a WAL database that usually means the reader cannot map a
+    # writable -shm index), the dashboard refuses outright: there is
+    # no unlocked fallback of any kind. The one surviving connection
+    # serves the schema probe AND every read: no probe-to-open window.
+    connection: sqlite3.Connection | None = None
+    applied: int | None = None
+    try:
+        connection = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        connection = None
+    if connection is not None:
+        connection.row_factory = sqlite3.Row
+        try:
+            applied = int(connection.execute(probe_sql).fetchone()[0])
+        except sqlite3.Error:
+            connection.close()
+            connection = None
+    if connection is None or applied is None:
+        _print(
+            {"error": "read-only probe failed"},
+            json_output=args.json,
+            human=(
+                "coordinated read-only access to the state database "
+                "failed; refusing — a daemon may be writing it and no "
+                "unlocked fallback exists."
+            ),
+        )
+        return 1
+    try:
+        if applied != runtime_generation:
+            _print(
+                {
+                    "error": "schema generation mismatch",
+                    "runtime_generation": runtime_generation,
+                    "database_schema": applied,
+                },
+                json_output=args.json,
+                human=(
+                    "refusing: this checkout's migration generation "
+                    f"({runtime_generation}) does not match the database "
+                    f"schema ({applied}); the dashboard never migrates."
+                ),
+            )
+            return 1
+        profiles_path = settings.repo_root / "config" / "profiles.yaml"
+        if not profiles_path.exists():
+            _print(
+                {"error": "config/profiles.yaml is required"},
+                json_output=args.json,
+                human="the dashboard requires config/profiles.yaml.",
+            )
+            return 1
+        action = DashboardRefreshAction(
+            database=_ReadOnlyDashboardDatabase(connection),
+            registry=ProfileRegistry.load(profiles_path),
+        )
+
+        async def _loop() -> int:
+            await action.tick()
+            if args.once:
+                return 1
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with suppress(NotImplementedError, ValueError):
+                    loop.add_signal_handler(signum, stop.set)
+            ticks = 1
+            while not stop.is_set():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        stop.wait(), timeout=args.interval
+                    )
+                    break
+                await action.tick()
+                ticks += 1
+            return ticks
+
+        ticks = asyncio.run(_loop())
+    finally:
+        connection.close()
+    _print(
+        {"ticks": ticks, "read_only": True, "daemon_lock": False},
+        json_output=args.json,
+        human=f"dashboard stopped after {ticks} tick(s).",
+    )
+    return 0
+
+
 def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
     """Serve the operations console over the durable state database.
 
@@ -2542,6 +2803,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if args.command == "runtime-exec":
         return _runtime_exec(args)
     settings = load_settings(args.repo_root, args.state_dir)
+    if args.command == "dashboard":
+        return _dashboard(args, settings)
     if args.command == "serve-console":
         return _serve_console(args, settings)
     if args.command == "hooks-install":
@@ -3033,6 +3296,142 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "orchestrator-workspace":
+            from hermes_orchestrator.orchestrator_workspace import (
+                SEAT_ENV,
+                OrchestratorWorkspaceLifecycle,
+                WorkspaceRefused,
+                evidence_document,
+                file_sha256,
+                run_smoke,
+            )
+
+            inside_marked_pane = bool(os.environ.get(SEAT_ENV))
+            cmux_cli = (
+                [str(args.cmux_cli)]
+                if args.cmux_cli is not None
+                else (settings.cmux.cli if settings.cmux else None)
+            )
+            if cmux_cli is None or runtime.cmux_bindings is None:
+                _print(
+                    {"error": "cmux is not configured"},
+                    json_output=args.json,
+                    human=(
+                        "cmux is not configured "
+                        "(config/cmux.yaml or --cmux-cli)."
+                    ),
+                )
+                return 1
+            # Sol L2: ONE exclusive ownership fence for every
+            # workspace-mutating entry. The manual CLI takes the same
+            # non-blocking flock the production daemon holds under this
+            # state directory: refused means the daemon (or another
+            # manual mutator) owns the lifecycle, and this entry exits
+            # with zero binding/cmux effects. A smoke pointed at its
+            # own isolated --state-dir takes that directory's own
+            # fence, so temp-state smokes stay permitted.
+            try:
+                fence = acquire_workspace_fence(settings.state_dir)
+            except DaemonAlreadyRunning:
+                _print(
+                    {
+                        "error": "workspace lifecycle fence is held",
+                        "state_dir": str(settings.state_dir),
+                    },
+                    json_output=args.json,
+                    human=(
+                        "refusing: the production daemon (or another "
+                        "mutator) owns the workspace lifecycle for "
+                        f"{settings.state_dir}; stop it or use an "
+                        "isolated --state-dir."
+                    ),
+                )
+                return 1
+            try:
+                port = CmuxCliAdapter(
+                    cmux_cli,
+                    base_env=os.environ,
+                    password_source=cmux_password_source(Keychain()),
+                )
+                try:
+                    lifecycle = OrchestratorWorkspaceLifecycle(
+                        port=port,
+                        bindings=runtime.cmux_bindings,
+                        repo_root=settings.repo_root,
+                        state_dir=settings.state_dir,
+                        name=args.name,
+                        title=args.title,
+                        interval=args.interval,
+                        session_name=args.session,
+                        inside_marked_pane=inside_marked_pane,
+                    )
+                    if args.action == "ensure":
+                        state = asyncio.run(lifecycle.ensure())
+                        payload = state.payload()
+                        human = (
+                            f"Orchestrator workspace {state.outcome}: "
+                            f"{state.workspace_uuid}"
+                        )
+                        _print(payload, json_output=args.json, human=human)
+                        return 0
+                    # The smoke drives the production ownership topology:
+                    # the same owner start/tick reconciliation the daemon
+                    # runs — never a standalone lifecycle path (Sol K1).
+                    owner = OrchestratorWorkspaceOwner(lifecycle)
+                    evidence = asyncio.run(
+                        run_smoke(
+                            owner,
+                            settle_seconds=args.settle_seconds,
+                        )
+                    )
+                except (WorkspaceRefused, CmuxError) as error:
+                    _print(
+                        {"error": f"{type(error).__name__}: {error}"},
+                        json_output=args.json,
+                        human=f"orchestrator workspace failed: {error}",
+                    )
+                    return 1
+                if args.evidence_file is not None:
+                    # Digest-sealed receipt of this exact run: source sha,
+                    # exact invocation, complete evidence. Revalidate with
+                    # verify_evidence_document().
+                    document = evidence_document(
+                        evidence,
+                        source_sha=_git_head_sha(settings.repo_root),
+                        invocation=[
+                            "hermes-orchestrator",
+                            *(
+                                list(arguments)
+                                if arguments is not None
+                                else sys.argv[1:]
+                            ),
+                        ],
+                        captured_at=datetime.now(UTC).isoformat(),
+                    )
+                    evidence_path = args.evidence_file.expanduser()
+                    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                    evidence_path.write_text(
+                        json.dumps(document, indent=1, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    evidence = dict(evidence)
+                    evidence["evidence_file"] = str(evidence_path)
+                    # Both digests, distinguished (Sol K3): the canonical
+                    # payload seal inside the receipt, and the byte hash
+                    # of the written file (which cannot contain itself).
+                    evidence["self_digest"] = document["self_digest"]
+                    evidence["self_digest_kind"] = document["self_digest_kind"]
+                    evidence["file_sha256"] = file_sha256(evidence_path)
+                    evidence["source_sha"] = document["source_sha"]
+                _print(
+                    evidence,
+                    json_output=args.json,
+                    human=json.dumps(evidence, indent=2),
+                )
+                return 0 if evidence["passed"] else 1
+            finally:
+                fence.release()
+
         if args.command == "cmux-focus":
             if settings.cmux is None or runtime.cmux_bindings is None:
                 _print(
@@ -3181,6 +3580,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     lead_intake=runtime.lead_intake,
                     channel_hub=runtime.channel_hub,
                     control_operations=runtime.control_operations,
+                    dashboard_refresh=runtime.dashboard_refresh,
+                    orchestrator_workspace=runtime.orchestrator_workspace,
                     fakechat_router=runtime.fakechat_router,
                 )
             )

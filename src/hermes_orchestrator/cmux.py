@@ -20,6 +20,7 @@ never appears in argv, exceptions, logs, or durable payloads.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
@@ -58,11 +59,23 @@ INTAKE_SIGNAL_PATTERN = re.compile(
 # workspace/surface lifecycle or sanitized metadata display. Screen and
 # input commands (read-screen, capture-pane, send, send-key, pipe-pane)
 # are deliberately absent: cmux output can never become orchestration
-# input, so screen content cannot advance issue state.
+# input, so screen content cannot advance issue state. INFRA-191 adds
+# exactly two verbs, characterized against the live CLI: ``respawn-pane``
+# (restart a validated command in an existing materialized terminal, the
+# same trust level as ``new-workspace --command``) and ``top``
+# (structured JSON process metadata per pane/surface — never screen
+# content). The stale "no pane-split verb" premise is retired: cmux
+# exposes ``new-split``/``new-pane``, but a split pane in an unfocused
+# workspace never materializes its terminal (characterized live:
+# "Surface is not a terminal", and the pane is dropped), so the
+# two-pane lifecycle speaks the eager ``new-workspace --layout`` form
+# of the already-allowed create verb instead.
 _ALLOWED_COMMANDS = frozenset(
     {
         "ping",
         "new-workspace",
+        "respawn-pane",
+        "top",
         "list-workspaces",
         "list-pane-surfaces",
         "close-workspace",
@@ -77,6 +90,16 @@ _ALLOWED_COMMANDS = frozenset(
         "agent-hibernation",
     }
 )
+
+# A pane command is one printable-ASCII line: no newlines, control
+# characters, or unbounded length, so a single validated command — and
+# nothing more — reaches a surface's shell.
+_RESPAWN_COMMAND = re.compile(r"^[ -~]{1,500}$")
+
+# How long the adapter waits for a layout-created workspace to report
+# both panes in the structured listing before failing closed.
+_PANE_POLL_ATTEMPTS = 10
+_PANE_POLL_DELAY_SECONDS = 0.5
 
 
 class CmuxError(RuntimeError):
@@ -103,6 +126,27 @@ class CmuxSurfaceRef:
     surface_uuid: str
 
 
+@dataclass(frozen=True, slots=True)
+class CmuxSurfaceProcesses:
+    """Process metadata for one surface, from cmux's structured listing.
+
+    ``process_names`` and ``process_ids`` are parallel, in tree order:
+    the surface's attributed process names and their PIDs (macOS
+    process accounting via ``top --json``, whose process nodes carry
+    ``name``/``pid``/``ppid``) — exact identities only, never screen
+    content or command output. The PIDs give every consumer a stable
+    surface-scoped process identity, so argv lineage can be correlated
+    strictly to THIS surface's processes and their descendants instead
+    of anything else on the host (Sol L1). A node cmux reports without
+    a usable pid carries ``0`` and is ignored by correlation.
+    """
+
+    pane_uuid: str
+    surface_uuid: str
+    process_names: tuple[str, ...]
+    process_ids: tuple[int, ...]
+
+
 class CmuxControlPort(Protocol):
     """Metadata-only cmux operations consumed by orchestration services."""
 
@@ -125,6 +169,25 @@ class CmuxControlPort(Protocol):
     ) -> frozenset[str]: ...
 
     async def surface_alive(self, ref: CmuxSurfaceRef) -> bool: ...
+
+    async def create_two_pane_workspace(
+        self,
+        *,
+        title: str,
+        cwd: Path,
+        upper_command: str,
+        lower_command: str,
+        env: Mapping[str, str] | None = None,
+        resolve_marker: str | None = None,
+    ) -> tuple[CmuxSurfaceRef, CmuxSurfaceRef]: ...
+
+    async def respawn_surface(
+        self, ref: CmuxSurfaceRef, command: str
+    ) -> None: ...
+
+    async def workspace_processes(
+        self, workspace_uuid: str
+    ) -> tuple[CmuxSurfaceProcesses, ...]: ...
 
     async def close_workspace(self, workspace_uuid: str) -> None: ...
 
@@ -318,6 +381,190 @@ class CmuxCliAdapter:
             "list-pane-surfaces", "--workspace", ref.workspace_uuid
         )
         return ref.surface_uuid in set(_UUID_PATTERN.findall(listed))
+
+    async def create_two_pane_workspace(
+        self,
+        *,
+        title: str,
+        cwd: Path,
+        upper_command: str,
+        lower_command: str,
+        env: Mapping[str, str] | None = None,
+        resolve_marker: str | None = None,
+    ) -> tuple[CmuxSurfaceRef, CmuxSurfaceRef]:
+        """Create one workspace with two vertically stacked terminal
+        panes, each eagerly running its validated command.
+
+        Characterized live against cmux 0.64.22: a pane added to an
+        unfocused workspace with ``new-split``/``new-pane`` never
+        materializes its terminal ("Surface is not a terminal"), while
+        layout surfaces created through ``new-workspace --layout``
+        spawn real ttys and their commands immediately, focused or
+        not. The layout JSON is a fixed vertical two-terminal template
+        built here — only the two bounded single-line commands are
+        caller data, validated before any subprocess exists — so no
+        caller can express a different geometry or surface type. The
+        workspace identity resolves like :meth:`create_workspace`
+        (UUID or short-ack via the durable marker); both pane/surface
+        identities come from the structured process listing, which
+        must report exactly two panes (upper first, matching layout
+        child order) within a bounded readiness window.
+        """
+
+        for command in (upper_command, lower_command):
+            if _RESPAWN_COMMAND.fullmatch(command) is None:
+                raise ValueError(
+                    "a pane command must be one bounded printable line"
+                )
+        layout = json.dumps(
+            {
+                "direction": "vertical",
+                "split": 0.5,
+                "children": [
+                    {
+                        "pane": {
+                            "surfaces": [
+                                {
+                                    "type": "terminal",
+                                    "command": upper_command,
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "pane": {
+                            "surfaces": [
+                                {
+                                    "type": "terminal",
+                                    "command": lower_command,
+                                }
+                            ]
+                        }
+                    },
+                ],
+            }
+        )
+        arguments = [
+            "new-workspace",
+            "--name",
+            title,
+            "--cwd",
+            str(cwd),
+            "--focus",
+            "false",
+            "--layout",
+            layout,
+        ]
+        for key, value in sorted((env or {}).items()):
+            arguments.extend(["--env", f"{key}={value}"])
+        created = await self._run(*arguments)
+        workspace_uuid = _first_uuid(created)
+        if workspace_uuid is None:
+            workspace_uuid = await self._resolve_short_ack(
+                created, resolve_marker
+            )
+        rows: tuple[CmuxSurfaceProcesses, ...] = ()
+        for attempt in range(_PANE_POLL_ATTEMPTS):
+            rows = await self.workspace_processes(workspace_uuid)
+            if len(rows) == 2:
+                break
+            if attempt + 1 < _PANE_POLL_ATTEMPTS:
+                await asyncio.sleep(_PANE_POLL_DELAY_SECONDS)
+        if (
+            len(rows) != 2
+            or not rows[0].surface_uuid
+            or not rows[1].surface_uuid
+            or rows[0].pane_uuid.lower() == rows[1].pane_uuid.lower()
+        ):
+            raise CmuxProtocolError(
+                "the layout create did not yield two stacked panes with "
+                "typed identities"
+            )
+        return (
+            CmuxSurfaceRef(
+                workspace_uuid=workspace_uuid,
+                surface_uuid=rows[0].surface_uuid,
+            ),
+            CmuxSurfaceRef(
+                workspace_uuid=workspace_uuid,
+                surface_uuid=rows[1].surface_uuid,
+            ),
+        )
+
+    async def respawn_surface(
+        self, ref: CmuxSurfaceRef, command: str
+    ) -> None:
+        """Start one validated command in one exact existing surface.
+
+        ``respawn-pane --command`` is the CLI's sanctioned way to hand
+        a surface's shell a command — the same trust level as
+        ``new-workspace --command``, which the vocabulary already
+        speaks. The command must be a single bounded printable-ASCII
+        line (no newlines or control characters), validated before any
+        subprocess exists, so exactly one caller-validated command and
+        nothing else reaches the terminal.
+        """
+
+        if _RESPAWN_COMMAND.fullmatch(command) is None:
+            raise ValueError(
+                "a respawn command must be one bounded printable line"
+            )
+        await self._run(
+            "respawn-pane",
+            "--workspace",
+            ref.workspace_uuid,
+            "--surface",
+            ref.surface_uuid,
+            "--command",
+            command,
+        )
+
+    async def workspace_processes(
+        self, workspace_uuid: str
+    ) -> tuple[CmuxSurfaceProcesses, ...]:
+        """Typed pane/surface/process metadata for one workspace.
+
+        Speaks ``top --processes --json`` (characterized against cmux
+        0.64.22: windows → workspaces → panes → surfaces → process
+        trees with names and pids) and returns only typed identities
+        and process names. This is metadata from macOS process
+        accounting — never terminal screen content.
+        """
+
+        output = await self._run(
+            "top",
+            "--workspace",
+            workspace_uuid,
+            "--processes",
+            "--json",
+        )
+        try:
+            document = json.loads(output)
+        except json.JSONDecodeError:
+            raise CmuxProtocolError(
+                "cmux top did not return structured process metadata"
+            ) from None
+        rows: list[CmuxSurfaceProcesses] = []
+        windows = document.get("windows")
+        for window in windows if isinstance(windows, list) else []:
+            for workspace in window.get("workspaces") or []:
+                identity = str(workspace.get("id", ""))
+                if identity.lower() != workspace_uuid.lower():
+                    continue
+                for pane in workspace.get("panes") or []:
+                    for surface in pane.get("surfaces") or []:
+                        names, pids = _process_entries(
+                            surface.get("processes")
+                        )
+                        rows.append(
+                            CmuxSurfaceProcesses(
+                                pane_uuid=str(pane.get("id", "")),
+                                surface_uuid=str(surface.get("id", "")),
+                                process_names=names,
+                                process_ids=pids,
+                            )
+                        )
+        return tuple(rows)
 
     async def close_workspace(self, workspace_uuid: str) -> None:
         await self._run("close-workspace", "--workspace", workspace_uuid)
@@ -534,3 +781,33 @@ class CmuxCliAdapter:
 def _first_uuid(output: str) -> str | None:
     found = _UUID_PATTERN.search(output)
     return None if found is None else found.group(0)
+
+
+def _process_entries(
+    processes: object,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Flatten a cmux process tree to parallel names and PIDs.
+
+    Tree order is preserved. A node without a name is skipped; a node
+    whose pid is missing or malformed keeps its name with pid ``0`` so
+    the parallel arrays never drift.
+    """
+
+    names: list[str] = []
+    pids: list[int] = []
+    stack: list[object] = (
+        list(reversed(processes)) if isinstance(processes, list) else []
+    )
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        name = node.get("name")
+        if name:
+            names.append(str(name))
+            raw_pid = node.get("pid")
+            pids.append(raw_pid if isinstance(raw_pid, int) else 0)
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(reversed(children))
+    return tuple(names), tuple(pids)

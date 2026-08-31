@@ -43,6 +43,7 @@ from hermes_orchestrator.cmux_surfaces import (
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
+from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
@@ -74,6 +75,12 @@ from hermes_orchestrator.merge_flow import (
     build_merge_flow,
 )
 from hermes_orchestrator.operator_decisions import OperatorDecisions
+from hermes_orchestrator.orchestrator_workspace import (
+    SEAT_ENV,
+    OrchestratorWorkspaceLifecycle,
+    OrchestratorWorkspaceOwner,
+    WorkspaceRefused,
+)
 from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.profiles import (
     ClaudeProfileProbe,
@@ -135,6 +142,26 @@ class _DaemonLock:
             handle.close()
 
 
+def acquire_workspace_fence(state_dir: Path) -> _DaemonLock:
+    """Take the ONE exclusive ownership fence for this state directory.
+
+    Sol L2: every workspace-mutating entry — the daemon's lifecycle
+    owner and the manual ``orchestrator-workspace ensure``/``smoke``
+    CLI paths — serializes through the same flock the daemon holds
+    (``<state-dir>/daemon.lock``). Non-blocking: if the production
+    daemon (or any other mutator) owns it, :class:`DaemonAlreadyRunning`
+    is raised and the caller must refuse with zero binding/cmux
+    effects. A smoke against its own isolated state directory takes
+    that directory's own fence, so temp-state smokes stay permitted.
+    flock releases on process death, so a crashed owner transfers the
+    fence deterministically to the next acquirer.
+    """
+
+    lock = _DaemonLock(state_dir / "daemon.lock")
+    lock.acquire()
+    return lock
+
+
 class KeychainReader(Protocol):
     """Narrow credential boundary used during live assembly."""
 
@@ -179,10 +206,12 @@ class Runtime:
     cmux_bindings: CmuxSurfaceBindings | None = None
     cmux_reconciler: CmuxSurfaceReconciler | None = None
     cmux_hibernation: CmuxHibernationDriver | None = None
+    orchestrator_workspace: OrchestratorWorkspaceOwner | None = None
     lead_intake: LeadIntakeRouter | None = None
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
     control_operations: ControlOperations | None = None
+    dashboard_refresh: DashboardRefreshAction | None = None
     # Sol correction b4b545f3 (v5): production composition no longer
     # builds a fakechat wake plane, so this is always None from
     # open_runtime; the field survives only because the CLI supervisor
@@ -441,9 +470,11 @@ def open_runtime(
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
+        orchestrator_workspace: OrchestratorWorkspaceOwner | None = None
         lead_intake: LeadIntakeRouter | None = None
         channel_hub: ChannelHub | None = None
         channel_capabilities: ChannelCapabilities | None = None
+        dashboard_refresh: DashboardRefreshAction | None = None
 
         if enable_live:
             assert reader is not None
@@ -467,6 +498,14 @@ def open_runtime(
                 pool.record_health(health)
                 checked.append(health)
             profile_health = tuple(checked)
+
+            # The dashboard reads only durable rows and the loaded
+            # registry; every other collaborator stays defaulted per the
+            # Optional=None convention. Without a registry (observe
+            # mode) the field stays None: no dashboard, never a crash.
+            dashboard_refresh = DashboardRefreshAction(
+                database=database, registry=registry
+            )
 
             linear = build_linear_router(
                 settings, database=database, queue=queue, keychain=reader
@@ -615,6 +654,29 @@ def open_runtime(
                         port=cmux_port,
                     ),
                 )
+                # INFRA-191 (Sol K1): the one lock-holding daemon owns
+                # the two-pane Orchestrator workspace autonomously;
+                # the upper pane runs the lock-free read-only
+                # `dashboard` entry, never a second daemon. A daemon
+                # somehow launched inside a marked pane composes a
+                # lifecycle that refuses everything, fail closed. An
+                # unconfigurable repo/state path refuses composition
+                # instead of crashing live startup: cmux visibility
+                # stays optional.
+                try:
+                    orchestrator_workspace = OrchestratorWorkspaceOwner(
+                        OrchestratorWorkspaceLifecycle(
+                            port=cmux_port,
+                            bindings=cmux_bindings,
+                            repo_root=settings.repo_root,
+                            state_dir=settings.state_dir,
+                            inside_marked_pane=bool(
+                                environment.get(SEAT_ENV)
+                            ),
+                        )
+                    )
+                except WorkspaceRefused:
+                    orchestrator_workspace = None
 
             cells = ProjectCellService(
                 database=database,
@@ -694,10 +756,12 @@ def open_runtime(
             cmux_bindings=cmux_bindings,
             cmux_reconciler=cmux_reconciler,
             cmux_hibernation=cmux_hibernation,
+            orchestrator_workspace=orchestrator_workspace,
             lead_intake=lead_intake,
             channel_hub=channel_hub,
             channel_capabilities=channel_capabilities,
             control_operations=control_operations,
+            dashboard_refresh=dashboard_refresh,
             fakechat_router=None,
             _daemon_lock=daemon_lock,
         )

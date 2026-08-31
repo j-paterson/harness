@@ -946,3 +946,403 @@ async def test_channel_launch_is_the_primary_classic_seat_path(
     )
     assert "fakechat" not in str(created["command"])
     assert created["env"] == {"CLAUDE_CONFIG_DIR": "/profiles/max-a"}
+
+
+
+# ---------------------------------------------------------------------------
+# INFRA-191 W3: the two-pane create / respawn / process-metadata vocabulary
+# for the real two-pane Orchestrator workspace. respawn-pane and top join
+# the closed vocabulary as bounded validated methods, the layout form of
+# new-workspace creates both stacked panes eagerly, and every input
+# command and screen read stays structurally rejected.
+# ---------------------------------------------------------------------------
+
+LOWER_SURFACE = "12121212-3434-4545-8666-787878787878"
+UPPER_PANE = "aaaa1111-0000-4000-8000-000000000001"
+LOWER_PANE = "aaaa1111-0000-4000-8000-000000000002"
+
+
+def test_the_complete_vocabulary_is_pinned() -> None:
+    # The whole closed vocabulary, verbatim: any extension must land
+    # here deliberately. Screen and input verbs remain absent from the
+    # general surface, and new-split/new-pane stay out — characterized
+    # live, a split pane in an unfocused workspace never materializes
+    # its terminal, so the lifecycle speaks new-workspace --layout.
+    from hermes_orchestrator.cmux import _ALLOWED_COMMANDS
+
+    assert frozenset(
+        {
+            "ping",
+            "new-workspace",
+            "respawn-pane",
+            "top",
+            "list-workspaces",
+            "list-pane-surfaces",
+            "close-workspace",
+            "rename-workspace",
+            "select-workspace",
+            "surface",
+            "set-status",
+            "clear-status",
+            "set-progress",
+            "clear-progress",
+            "notify",
+            "agent-hibernation",
+        }
+    ) == _ALLOWED_COMMANDS
+
+
+def _pane_snapshot(*surface_processes: tuple[str, str, list[str]]) -> bytes:
+    """A structured process snapshot in the live-characterized shape."""
+
+    import json as json_module
+
+    return json_module.dumps(
+        {
+            "windows": [
+                {
+                    "workspaces": [
+                        {
+                            "id": WORKSPACE,
+                            "panes": [
+                                {
+                                    "id": pane,
+                                    "surfaces": [
+                                        {
+                                            "id": surface,
+                                            "processes": [
+                                                {"name": name}
+                                                for name in names
+                                            ],
+                                        }
+                                    ],
+                                }
+                                for pane, surface, names in surface_processes
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_two_pane_create_builds_the_fixed_vertical_layout() -> None:
+    import json as json_module
+
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=b"OK workspace:11\n"),
+            FakeProcess(
+                stdout=f"{WORKSPACE} Orchestrator {MARKER}\n".encode()
+            ),
+            FakeProcess(
+                stdout=_pane_snapshot(
+                    (UPPER_PANE, SURFACE, ["zsh", "uv"]),
+                    (LOWER_PANE, LOWER_SURFACE, ["zsh", "hermes"]),
+                )
+            ),
+        ]
+    )
+    port = adapter(factory)
+
+    upper, lower = await port.create_two_pane_workspace(
+        title=f"Orchestrator {MARKER}",
+        cwd=Path("/repos/demo"),
+        upper_command="uv run hermes-orchestrator daemon",
+        lower_command="hermes chat --continue orch --create-if-missing",
+        resolve_marker=MARKER,
+    )
+
+    assert upper == CmuxSurfaceRef(
+        workspace_uuid=WORKSPACE, surface_uuid=SURFACE
+    )
+    assert lower == CmuxSurfaceRef(
+        workspace_uuid=WORKSPACE, surface_uuid=LOWER_SURFACE
+    )
+    create_argv = factory.calls[0][0]
+    assert create_argv[3] == "new-workspace"
+    focus_at = create_argv.index("--focus")
+    assert create_argv[focus_at + 1] == "false"
+    layout = json_module.loads(create_argv[create_argv.index("--layout") + 1])
+    assert layout["direction"] == "vertical"
+    children = layout["children"]
+    assert [
+        child["pane"]["surfaces"][0]["type"] for child in children
+    ] == ["terminal", "terminal"]
+    assert children[0]["pane"]["surfaces"][0]["command"] == (
+        "uv run hermes-orchestrator daemon"
+    )
+    assert children[1]["pane"]["surfaces"][0]["command"] == (
+        "hermes chat --continue orch --create-if-missing"
+    )
+    # Identity resolution: short ack -> durable marker -> structured
+    # process listing for both panes.
+    commands = [call[0][3] for call in factory.calls]
+    assert commands == ["new-workspace", "list-workspaces", "top"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command", ["", "run\nrun", "beep\x07", "x" * 501]
+)
+async def test_two_pane_create_refuses_unbounded_commands(
+    command: str,
+) -> None:
+    factory = FakeFactory()
+    port = adapter(factory)
+
+    with pytest.raises(ValueError, match="bounded printable line"):
+        await port.create_two_pane_workspace(
+            title="Orchestrator",
+            cwd=Path("/repos/demo"),
+            upper_command=command,
+            lower_command="hermes chat --continue orch --create-if-missing",
+        )
+    with pytest.raises(ValueError, match="bounded printable line"):
+        await port.create_two_pane_workspace(
+            title="Orchestrator",
+            cwd=Path("/repos/demo"),
+            upper_command="uv run hermes-orchestrator daemon",
+            lower_command=command,
+        )
+
+    assert factory.calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_pane_create_waits_for_both_panes_to_report() -> None:
+    import hermes_orchestrator.cmux as cmux_module
+
+    factory = FakeFactory(
+        results=[
+            FakeProcess(stdout=f"workspace {WORKSPACE}\n".encode()),
+            FakeProcess(stdout=_pane_snapshot()),
+            FakeProcess(
+                stdout=_pane_snapshot(
+                    (UPPER_PANE, SURFACE, ["zsh"]),
+                    (LOWER_PANE, LOWER_SURFACE, ["zsh"]),
+                )
+            ),
+        ]
+    )
+    port = adapter(factory)
+    original = cmux_module._PANE_POLL_DELAY_SECONDS
+    cmux_module._PANE_POLL_DELAY_SECONDS = 0.0
+    try:
+        upper, lower = await port.create_two_pane_workspace(
+            title="Orchestrator",
+            cwd=Path("/repos/demo"),
+            upper_command="uv run hermes-orchestrator daemon",
+            lower_command="hermes chat --continue orch --create-if-missing",
+        )
+    finally:
+        cmux_module._PANE_POLL_DELAY_SECONDS = original
+
+    assert upper.surface_uuid == SURFACE
+    assert lower.surface_uuid == LOWER_SURFACE
+
+
+@pytest.mark.asyncio
+async def test_two_pane_create_fails_closed_without_two_distinct_panes() -> (
+    None
+):
+    import hermes_orchestrator.cmux as cmux_module
+
+    factory = FakeFactory(
+        results=[FakeProcess(stdout=f"workspace {WORKSPACE}\n".encode())]
+        + [
+            FakeProcess(
+                stdout=_pane_snapshot(
+                    (UPPER_PANE, SURFACE, ["zsh"]),
+                    (UPPER_PANE, LOWER_SURFACE, ["zsh"]),
+                )
+            )
+            for _ in range(cmux_module._PANE_POLL_ATTEMPTS)
+        ]
+    )
+    port = adapter(factory)
+    original = cmux_module._PANE_POLL_DELAY_SECONDS
+    cmux_module._PANE_POLL_DELAY_SECONDS = 0.0
+    try:
+        with pytest.raises(
+            CmuxProtocolError, match="two stacked panes"
+        ):
+            await port.create_two_pane_workspace(
+                title="Orchestrator",
+                cwd=Path("/repos/demo"),
+                upper_command="uv run hermes-orchestrator daemon",
+                lower_command=(
+                    "hermes chat --continue orch --create-if-missing"
+                ),
+            )
+    finally:
+        cmux_module._PANE_POLL_DELAY_SECONDS = original
+
+
+@pytest.mark.asyncio
+async def test_respawn_surface_builds_exact_argv() -> None:
+    factory = FakeFactory(results=[FakeProcess()])
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    await port.respawn_surface(
+        ref, "hermes chat --continue orchestrator --create-if-missing"
+    )
+
+    argv = factory.calls[0][0]
+    assert argv[3:] == (
+        "respawn-pane",
+        "--workspace",
+        WORKSPACE,
+        "--surface",
+        SURFACE,
+        "--command",
+        "hermes chat --continue orchestrator --create-if-missing",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    ["", "run\nrun", "beep\x07", "tab\tsplit", "x" * 501],
+)
+async def test_respawn_refuses_unbounded_or_multiline_commands(
+    command: str,
+) -> None:
+    factory = FakeFactory()
+    port = adapter(factory)
+    ref = CmuxSurfaceRef(workspace_uuid=WORKSPACE, surface_uuid=SURFACE)
+
+    with pytest.raises(ValueError, match="bounded printable line"):
+        await port.respawn_surface(ref, command)
+
+    assert factory.calls == []
+
+
+def _top_document() -> bytes:
+    import json as json_module
+
+    return json_module.dumps(
+        {
+            "windows": [
+                {
+                    "kind": "window",
+                    "id": "feedface-0000-4000-8000-000000000000",
+                    "workspaces": [
+                        {
+                            "kind": "workspace",
+                            "id": WORKSPACE,
+                            "title": "Orchestrator",
+                            "panes": [
+                                {
+                                    "kind": "pane",
+                                    "id": UPPER_PANE,
+                                    "surfaces": [
+                                        {
+                                            "kind": "surface",
+                                            "id": SURFACE,
+                                            "processes": [
+                                                {
+                                                    "kind": "process",
+                                                    "name": "zsh",
+                                                    "pid": 10,
+                                                    "children": [
+                                                        {
+                                                            "kind": "process",
+                                                            "name": "uv",
+                                                            "pid": 11,
+                                                            "children": [
+                                                                {
+                                                                    "name": (
+                                                                        "python3.13"
+                                                                    ),
+                                                                    "pid": 12,
+                                                                }
+                                                            ],
+                                                        }
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "kind": "pane",
+                                    "id": LOWER_PANE,
+                                    "surfaces": [
+                                        {
+                                            "kind": "surface",
+                                            "id": LOWER_SURFACE,
+                                            "processes": [
+                                                {"name": "zsh", "pid": 20},
+                                                {"name": "hermes", "pid": 21},
+                                            ],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "kind": "workspace",
+                            "id": "0badc0de-0000-4000-8000-000000000000",
+                            "panes": [
+                                {
+                                    "kind": "pane",
+                                    "id": "ffff0000-0000-4000-8000-000000000009",
+                                    "surfaces": [
+                                        {
+                                            "id": (
+                                                "ffff0000-0000-4000-8000-"
+                                                "00000000000a"
+                                            ),
+                                            "processes": [
+                                                {"name": "vim", "pid": 30}
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_workspace_processes_returns_typed_metadata_only() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=_top_document())])
+    port = adapter(factory)
+
+    rows = await port.workspace_processes(WORKSPACE.lower())
+
+    argv = factory.calls[0][0]
+    assert argv[3:] == (
+        "top",
+        "--workspace",
+        WORKSPACE.lower(),
+        "--processes",
+        "--json",
+    )
+    assert [
+        (row.pane_uuid, row.surface_uuid, row.process_names) for row in rows
+    ] == [
+        (UPPER_PANE, SURFACE, ("zsh", "uv", "python3.13")),
+        (LOWER_PANE, LOWER_SURFACE, ("zsh", "hermes")),
+    ]
+    # Sol L1: the adapter exposes the PIDs the top tree already
+    # carries, parallel to the names, so lineage can be correlated to
+    # exactly this surface's processes and their descendants.
+    assert [row.process_ids for row in rows] == [(10, 11, 12), (20, 21)]
+
+
+@pytest.mark.asyncio
+async def test_workspace_processes_refuses_unstructured_output() -> None:
+    factory = FakeFactory(results=[FakeProcess(stdout=b"not json at all")])
+    port = adapter(factory)
+
+    with pytest.raises(CmuxProtocolError, match="structured process"):
+        await port.workspace_processes(WORKSPACE)
