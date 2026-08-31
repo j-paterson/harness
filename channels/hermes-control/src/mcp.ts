@@ -34,22 +34,43 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Bound on how many pre-initialize notifications are held in memory.
+// The event stays durably unacknowledged on the hub either way (the
+// sidecar never auto-acks), so overflowing this only delays delivery
+// via the hub's own replay/resend — it never loses the event.
+const MAX_QUEUED_NOTIFICATIONS = 256;
+
 export class McpServer {
   private readonly hub: HubClient;
   private readonly onLog: (message: string) => void;
   private readonly writeLine: (line: string) => void;
   private rl: readline.Interface | null = null;
+  // Whether `initialize` has been answered yet. Until it has, the
+  // host has not registered its `notifications/claude/channel`
+  // handler, so a notification written to stdout early is a
+  // client-side ProtocolError observed live — instead it is queued
+  // (see `pendingNotifications`) and flushed once initialize is
+  // answered.
+  private initialized: boolean;
+  private readonly pendingNotifications: unknown[] = [];
 
   constructor(
     hub: HubClient,
     onLog: (message: string) => void,
     writeLine: (line: string) => void = (line) => {
       process.stdout.write(line);
-    }
+    },
+    // Not part of the wire/MCP protocol and undocumented in
+    // PROTOCOL.md: lets tests that drive McpServer directly
+    // in-process (containment.test.ts), without a real
+    // JSON-RPC `initialize` round-trip, skip the pre-initialize
+    // queue.
+    startInitialized = false
   ) {
     this.hub = hub;
     this.onLog = onLog;
     this.writeLine = writeLine;
+    this.initialized = startInitialized;
   }
 
   start(onStdioClosed: () => void): void {
@@ -96,7 +117,7 @@ export class McpServer {
         return;
       }
 
-      this.writeMessage({
+      const message = {
         jsonrpc: "2.0",
         method: "notifications/claude/channel",
         params: {
@@ -107,7 +128,30 @@ export class McpServer {
             event_id: eventId,
           },
         },
-      });
+      };
+
+      if (!this.initialized) {
+        // The host has not answered `initialize` yet, so it has not
+        // registered its channel notification handler: writing now
+        // would be a live-observed client-side ProtocolError. Queue
+        // it instead — flushed in order, each exactly once,
+        // immediately after the initialize result is written (see
+        // `handleInitialize`). The event stays unacknowledged on the
+        // hub in the meantime, so nothing is lost even if it never
+        // gets flushed (process exit, etc.).
+        this.pendingNotifications.push(message);
+        if (this.pendingNotifications.length > MAX_QUEUED_NOTIFICATIONS) {
+          this.pendingNotifications.shift();
+          this.safeLog(
+            `hermes-control: dropped oldest queued pre-initialize channel notification ` +
+              `(queue exceeded ${MAX_QUEUED_NOTIFICATIONS} entries); it remains ` +
+              `unacknowledged on the hub and will be replayed later`
+          );
+        }
+        return;
+      }
+
+      this.writeMessage(message);
     } catch (err) {
       this.safeLog(
         `hermes-control: internal error sending channel notification for event ${eventId}: ${String(err)}`
@@ -205,6 +249,18 @@ export class McpServer {
       },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
     });
+
+    this.initialized = true;
+    this.flushPendingNotifications();
+  }
+
+  /** Writes every notification queued before `initialize` was
+   * answered, in order, each exactly once. */
+  private flushPendingNotifications(): void {
+    const queued = this.pendingNotifications.splice(0, this.pendingNotifications.length);
+    for (const message of queued) {
+      this.writeMessage(message);
+    }
   }
 
   private handleToolsCall(id: unknown, hasId: boolean, params: unknown): void {

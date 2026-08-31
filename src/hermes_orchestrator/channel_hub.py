@@ -41,6 +41,7 @@ from pathlib import Path
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.control_operations import (
     CONTROL_READY,
+    MAINTENANCE_CONTROL_KINDS,
     ControlOperations,
 )
 from hermes_orchestrator.db import Database
@@ -476,16 +477,27 @@ class ChannelHub:
             )
             if status == "published":
                 published.append(f"{ASSIGNMENT_READY} {row['assignment_id']}")
+        # INFRA-201: only lead-actionable kinds are derived into a
+        # channel event here — maintenance receipts stay durable and
+        # recorded but reach the lead through
+        # ``settle_maintenance_for_session`` at the lead's own Stop
+        # hook instead of a visible wake.
+        maintenance_placeholders = ",".join(
+            "?" * len(MAINTENANCE_CONTROL_KINDS)
+        )
         operations = self._database.execute(
             "SELECT o.operation_id, o.cell_id, o.session_id "
             "FROM control_operations AS o "
-            "WHERE o.state = 'published' AND NOT EXISTS ("
+            "WHERE o.state = 'published' "
+            f"AND o.kind NOT IN ({maintenance_placeholders}) "
+            "AND NOT EXISTS ("
             "SELECT 1 FROM channel_events AS e "
             "WHERE e.kind = 'HERMES_CONTROL_READY' "
             "AND e.packet_id = o.operation_id "
             "AND e.session_id = o.session_id "
             "AND e.state IN ('acked', 'superseded')"
-            ") ORDER BY o.created_at ASC, o.rowid ASC"
+            ") ORDER BY o.created_at ASC, o.rowid ASC",
+            tuple(MAINTENANCE_CONTROL_KINDS),
         ).fetchall()
         for row in operations:
             status = await self.publish(

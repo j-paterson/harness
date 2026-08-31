@@ -2353,6 +2353,57 @@ def test_intake_poll_offers_and_only_explicit_ack_delivers(
     assert duplicate.exit_code == 1
 
 
+def test_intake_poll_settles_a_maintenance_receipt_silently(
+    tmp_path: Path,
+) -> None:
+    """INFRA-201: a maintenance receipt is settled by the poll's own
+    Stop-hook call — silently, with no printed offer — instead of
+    reaching the primary view as a wake."""
+
+    from datetime import UTC, datetime
+
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import SESSION, seed_active_cell
+
+    now = datetime(2026, 8, 30, 12, tzinfo=UTC).isoformat()
+    operation_id = "9" * 32
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    database = Database.open(state_dir / "state.db")
+    try:
+        seed_active_cell(database)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO control_operations("
+                "operation_id, schema_version, kind, project_key, "
+                "cell_id, session_id, dedup_key, result_json, reason, "
+                "state, created_at, updated_at, acknowledged_at) VALUES "
+                "(?, 1, 'daemon.restarted', 'demo', 'cell-demo', ?, "
+                "'daemon.restarted:' || ?, '{\"interval_seconds\": 30}', "
+                "NULL, 'published', ?, ?, NULL)",
+                (operation_id, SESSION, SESSION, now, now),
+            )
+    finally:
+        database.close()
+
+    result = invoke(
+        ["--state-dir", str(state_dir), "intake-poll", "--session", SESSION]
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        state = database.scalar(
+            "SELECT state FROM control_operations WHERE operation_id = ?",
+            (operation_id,),
+        )
+    finally:
+        database.close()
+    assert str(state) == "acknowledged"
+
+
 # --- verify / verify-check (INFRA-186 P9: any-agent verifier CLI) ----------
 
 

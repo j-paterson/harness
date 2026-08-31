@@ -8,6 +8,7 @@ import pytest
 
 from hermes_orchestrator.cmux import CmuxSurfaceRef, CmuxUnavailable
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.lead_intake import (
@@ -322,8 +323,8 @@ def test_the_poll_offers_a_control_operation_and_ack_settles_it(
             "operation_id, schema_version, kind, project_key, cell_id, "
             "session_id, dedup_key, result_json, reason, state, "
             "created_at, updated_at, acknowledged_at) VALUES "
-            "(?, 1, 'channel.replayed', 'demo', 'cell-demo', ?, "
-            "'channel.replayed:' || ?, '{\"replay_count\": 0}', NULL, "
+            "(?, 1, 'children.completed', 'demo', 'cell-demo', ?, "
+            "'children.completed:' || ?, '{\"issue_id\": \"ENG-9\"}', NULL, "
             "'published', ?, ?, NULL)",
             (OPERATION_ID, SESSION, SESSION, NOW.isoformat(), NOW.isoformat()),
         )
@@ -346,6 +347,40 @@ def test_the_poll_offers_a_control_operation_and_ack_settles_it(
     assert poll.next_offer(SESSION) is None
 
 
+def test_the_poll_never_offers_a_maintenance_receipt(
+    database: Database,
+) -> None:
+    """INFRA-201: a maintenance receipt is never offered through the
+    Stop-hook poll; it is settled silently by
+    ``settle_maintenance_for_session`` instead."""
+
+    seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, reason, state, "
+            "created_at, updated_at, acknowledged_at) VALUES "
+            "(?, 1, 'channel.replayed', 'demo', 'cell-demo', ?, "
+            "'channel.replayed:' || ?, '{\"replay_count\": 0}', NULL, "
+            "'published', ?, ?, NULL)",
+            (OPERATION_ID, SESSION, SESSION, NOW.isoformat(), NOW.isoformat()),
+        )
+    poll = LeadIntakePoll(database=database)
+
+    assert poll.next_offer(SESSION) is None
+
+    operations = ControlOperations(database, events=EventStore(database))
+    settled = operations.settle_maintenance_for_session(SESSION)
+
+    assert settled == (OPERATION_ID,)
+    state = database.scalar(
+        "SELECT state FROM control_operations WHERE operation_id = ?",
+        (OPERATION_ID,),
+    )
+    assert str(state) == "acknowledged"
+
+
 @pytest.mark.asyncio
 async def test_the_router_announces_a_published_assignment_once(
     database: Database, bindings: CmuxSurfaceBindings
@@ -362,6 +397,61 @@ async def test_the_router_announces_a_published_assignment_once(
 
     assert ASSIGNMENT_ID in announced
     assert ASSIGNMENT_ID not in await router.tick()
+
+
+@pytest.mark.asyncio
+async def test_the_router_never_announces_a_maintenance_receipt(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """INFRA-201: a maintenance receipt is never announced on the
+    seat while an actionable one is."""
+
+    seed_active_cell(database)
+    seat(bindings)
+    maintenance_id = "e" * 32
+    actionable_id = "f" * 32
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, reason, state, "
+            "created_at, updated_at, acknowledged_at) VALUES "
+            "(?, 1, 'daemon.restarted', 'demo', 'cell-demo', ?, "
+            "'daemon.restarted:' || ?, '{\"interval_seconds\": 30}', "
+            "NULL, 'published', ?, ?, NULL)",
+            (
+                maintenance_id,
+                SESSION,
+                SESSION,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, reason, state, "
+            "created_at, updated_at, acknowledged_at) VALUES "
+            "(?, 1, 'children.completed', 'demo', 'cell-demo', ?, "
+            "'children.completed:' || ?, '{\"issue_id\": \"ENG-9\"}', "
+            "NULL, 'published', ?, ?, NULL)",
+            (
+                actionable_id,
+                SESSION,
+                SESSION,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+    port = RecordingPort()
+    router = LeadIntakeRouter(
+        database=database, transport=transport(database, bindings, port)
+    )
+
+    announced = await router.tick()
+
+    assert actionable_id in announced
+    assert maintenance_id not in announced
 
 
 @pytest.mark.asyncio

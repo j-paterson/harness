@@ -1290,7 +1290,7 @@ def _assert_refused(
     operation = control.get(result.receipt_operation_id)
     assert operation.kind == "channel.approval_required"
     assert operation.reason is not None
-    assert operation.reason.startswith("CHANNEL APPROVAL REQUIRED")
+    assert operation.reason.startswith("CHANNEL CONFIRMATION REQUIRED")
     assert operation.result["first_failure"] == first_failure
 
 
@@ -1766,7 +1766,7 @@ def test_gate_claim_record_failure_presses_nothing(
     operation = failing.get(result.receipt_operation_id)
     assert operation.kind == "channel.approval_required"
     assert operation.reason is not None
-    assert operation.reason.startswith("CHANNEL APPROVAL REQUIRED")
+    assert operation.reason.startswith("CHANNEL CONFIRMATION REQUIRED")
 
 
 def test_gate_live_claim_for_this_launch_refuses_without_enter(

@@ -86,6 +86,14 @@ each of that session's events not yet acknowledged. The sidecar and
 lead must treat a replayed event as the same delivery: the packet is
 deduplicated by packet/event plus session identity downstream.
 
+The hub's replay semantics above are unchanged. What the sidecar does
+with a replay is a presentation-layer concern only: it presents each
+still-unacknowledged event to Claude at most once per bounded window
+(default 15 minutes, configurable) across any number of reconnects
+and hub re-sends, and it holds any notification until the host has
+answered `initialize`, flushing queued ones in order immediately
+afterward.
+
 ## Sidecar configuration (environment only)
 
 - `HERMES_CONTROL_SOCKET` — absolute path of the hub's Unix socket.

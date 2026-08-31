@@ -1085,24 +1085,24 @@ class TestControlOperationEvents:
         try:
             seat(bindings)
             recorded = operations.record(
-                kind="daemon.restarted",
+                kind="children.completed",
                 project_key="demo",
                 cell_id="cell-demo",
                 session_id=SESSION,
-                result={"interval_seconds": 30},
+                result={"issue_id": "ENG-9"},
             )
             assert recorded is not None
             sidecar = await registered_sidecar(hub, capabilities)
             await hub.publish_pending()
-            # Two receipts ride the channel: the seeded restart and the
-            # replay receipt the registration itself produced.
-            events = [await sidecar.receive(), await sidecar.receive()]
-            target = next(
-                event
-                for event in events
-                if event["packet_id"] == recorded.operation_id
-            )
+            # INFRA-201: exactly one event rides the channel — the
+            # seeded actionable receipt. The registration itself also
+            # produced a durable `channel.replayed` maintenance
+            # receipt, but that no longer rides the channel.
+            target = await sidecar.receive()
+            assert target["packet_id"] == recorded.operation_id
             assert target["kind"] == "HERMES_CONTROL_READY"
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(sidecar.reader.readline(), timeout=0.3)
             await sidecar.send(
                 {
                     "op": "ack",
@@ -1118,6 +1118,62 @@ class TestControlOperationEvents:
             await hub.stop()
 
         assert operations.get(recorded.operation_id).state == "acknowledged"
+
+    async def test_maintenance_receipts_never_derive_a_channel_event(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        """INFRA-201: only lead-actionable facts reach the channel;
+        maintenance receipts — including the `channel.replayed`
+        receipt registration itself produces — stay durable but never
+        ride it."""
+
+        operations = ControlOperations(database, events=EventStore(database))
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            control=operations,
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            seed_active_cell(database)
+            sidecar = await registered_sidecar(hub, capabilities)
+            actionable = operations.record(
+                kind="children.completed",
+                project_key="demo",
+                cell_id="cell-demo",
+                session_id=SESSION,
+                result={"issue_id": "ENG-9"},
+            )
+            assert actionable is not None
+
+            await hub.publish_pending()
+
+            target = await sidecar.receive()
+            assert target["packet_id"] == actionable.operation_id
+            assert target["kind"] == "HERMES_CONTROL_READY"
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(sidecar.reader.readline(), timeout=0.3)
+            await sidecar.close()
+        finally:
+            await hub.stop()
+
+        [replayed] = [
+            receipt
+            for receipt in operations.pending_for_session(SESSION)
+            if receipt.kind == "channel.replayed"
+        ]
+        maintenance_event = database.scalar(
+            "SELECT COUNT(*) FROM channel_events WHERE packet_id = ?",
+            (replayed.operation_id,),
+        )
+        assert int(maintenance_event) == 0
 
 
 @pytest.mark.asyncio

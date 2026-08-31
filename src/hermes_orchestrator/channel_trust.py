@@ -37,7 +37,7 @@ while the retained claim prevents any blind retry. Any mismatch,
 drift, ambiguity, missing anchor,
 refused claim, or measurement exception fails closed with a durable
 ``channel.approval_required`` receipt whose reason starts with
-``CHANNEL APPROVAL REQUIRED`` and never calls ``confirm``. There is no
+``CHANNEL CONFIRMATION REQUIRED`` and never calls ``confirm``. There is no
 generic keystroke or prompt-approval capability here: ``confirm`` and
 ``read_screen`` are opaque callables the caller (the lead, at wiring
 time) binds to the exact validated surface — this module never chooses
@@ -1242,7 +1242,7 @@ class ChannelTrustGate:
                 session_id=session_id,
                 result={"first_failure": first_failure},
                 reason=(
-                    f"CHANNEL APPROVAL REQUIRED: {first_failure} check "
+                    f"CHANNEL CONFIRMATION REQUIRED: {first_failure} check "
                     "did not match the trusted anchor"
                 ),
             )
