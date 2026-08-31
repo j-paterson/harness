@@ -2625,38 +2625,37 @@ def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
     probe_sql = (
         "SELECT coalesce(max(version), 0) FROM schema_migrations"
     )
+    # Sol M2: ordinary COORDINATED mode=ro access only. SQLite's
+    # immutable=1 skips locking and change detection entirely, so
+    # under the concurrently writing daemon it can serve stale or
+    # corrupt reads — a write-forbidding view of this filesystem does
+    # not prove the daemon is not writing the same file through
+    # another mount or view. When the coordinated open or probe fails
+    # (for a WAL database that usually means the reader cannot map a
+    # writable -shm index), the dashboard refuses outright: there is
+    # no unlocked fallback of any kind. The one surviving connection
+    # serves the schema probe AND every read: no probe-to-open window.
     connection: sqlite3.Connection | None = None
     applied: int | None = None
-    # The database persists journal_mode=WAL, whose readers need a
-    # writable -shm index; on a filesystem that forbids writes the
-    # plain ro open cannot read. That same prohibition guarantees no
-    # concurrent writer exists, which is exactly the precondition for
-    # SQLite's immutable=1 — so the fallback is safe precisely when it
-    # is needed. Either way exactly one connection survives and serves
-    # the schema probe AND every read: no probe-to-open window.
-    for uri in (
-        f"file:{state_db}?mode=ro",
-        f"file:{state_db}?mode=ro&immutable=1",
-    ):
+    try:
+        connection = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        connection = None
+    if connection is not None:
+        connection.row_factory = sqlite3.Row
         try:
-            candidate = sqlite3.connect(uri, uri=True)
+            applied = int(connection.execute(probe_sql).fetchone()[0])
         except sqlite3.Error:
-            continue
-        candidate.row_factory = sqlite3.Row
-        try:
-            applied = int(candidate.execute(probe_sql).fetchone()[0])
-        except sqlite3.Error:
-            candidate.close()
-            continue
-        connection = candidate
-        break
+            connection.close()
+            connection = None
     if connection is None or applied is None:
         _print(
             {"error": "read-only probe failed"},
             json_output=args.json,
             human=(
-                "the state database could not be opened and probed "
-                "read-only."
+                "coordinated read-only access to the state database "
+                "failed; refusing — a daemon may be writing it and no "
+                "unlocked fallback exists."
             ),
         )
         return 1

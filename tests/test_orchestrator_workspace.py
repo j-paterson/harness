@@ -1198,40 +1198,101 @@ def test_cli_smoke_writes_a_digest_sealed_evidence_file(
 # ---------------------------------------------------------------------------
 
 from hermes_orchestrator.orchestrator_workspace import (  # noqa: E402
+    RoleExpectation,
     file_sha256,
     lineage_matches,
 )
 
+LOWER_EXPECT = RoleExpectation(
+    executable="hermes",
+    arguments=("chat", "--continue", "orch", "--create-if-missing"),
+)
+UPPER_EXPECT = RoleExpectation(
+    executable="hermes-orchestrator",
+    arguments=tuple(UPPER_MARKER.split()[1:]),
+)
 
-def test_lineage_matches_through_legitimate_wrappers() -> None:
-    # The bash launcher execs the hermes venv python with the script
-    # path; the console script runs under the project venv python; uv
-    # keeps the typed argv. All carry the exact expected command.
-    assert lineage_matches([LOWER_WRAPPED], HERMES_COMMAND) == (
+
+def test_lineage_accepts_only_legitimate_wrapper_chains() -> None:
+    # Sol M1: the bash launcher execs interpreter + hermes script; the
+    # console script runs under the venv python; uv keeps the typed
+    # argv. Each is an explicitly bounded chain with the expected
+    # identity at the executable position and exact argument tokens.
+    assert lineage_matches([LOWER_WRAPPED], LOWER_EXPECT) == (
         LOWER_WRAPPED,
     )
-    assert lineage_matches([UPPER_WRAPPED], UPPER_MARKER) == (
+    assert lineage_matches([HERMES_COMMAND], LOWER_EXPECT) == (
+        HERMES_COMMAND,
+    )
+    assert lineage_matches([UPPER_WRAPPED], UPPER_EXPECT) == (
         UPPER_WRAPPED,
     )
-    assert lineage_matches([DASHBOARD_COMMAND], UPPER_MARKER) == (
+    assert lineage_matches([DASHBOARD_COMMAND], UPPER_EXPECT) == (
         DASHBOARD_COMMAND,
     )
 
 
-def test_lineage_rejects_wrong_and_superstring_sessions() -> None:
-    wrong = "hermes chat --continue other-session --create-if-missing"
-    superstring = (
-        "/x/venv/bin/python /x/hermes chat --continue orch2 "
-        "--create-if-missing"
-    )
-    prefixed = "notreallyhermes chat --continue orch --create-if-missing"
-    assert lineage_matches([wrong], HERMES_COMMAND) == ()
-    assert lineage_matches([superstring], HERMES_COMMAND) == ()
-    assert lineage_matches([prefixed], HERMES_COMMAND) == ()
-    assert (
-        lineage_matches(["uv run some-other-tool serve --json"], UPPER_MARKER)
-        == ()
-    )
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Sol's counterexample: a python -c payload carrying the exact
+        # Hermes command text is never at an executable position.
+        (
+            "/usr/bin/python3 -c 'import os; os.system("
+            '"hermes chat --continue orch --create-if-missing")\''
+        ),
+        # Exact text as a later argument of an unrelated command.
+        (
+            'logger --note "hermes chat --continue orch '
+            '--create-if-missing"'
+        ),
+        # Quoted text / comment forms.
+        "echo 'hermes chat --continue orch --create-if-missing'",
+        "# hermes chat --continue orch --create-if-missing",
+        (
+            "env NOTE='hermes chat --continue orch --create-if-missing' "
+            "sleep 60"
+        ),
+        # Wrong or superstring sessions, wrong executables, extras.
+        "hermes chat --continue other-session --create-if-missing",
+        (
+            "/x/venv/bin/python /x/hermes chat --continue orch2 "
+            "--create-if-missing"
+        ),
+        "notreallyhermes chat --continue orch --create-if-missing",
+        "hermes chat --continue orch --create-if-missing --and-more",
+        "hermes send --continue orch --create-if-missing",
+        # Untokenizable argv fails closed.
+        "hermes chat --continue orch --create-if-missing '",
+    ],
+)
+def test_lineage_rejects_non_executable_occurrences(line: str) -> None:
+    assert lineage_matches([line], LOWER_EXPECT) == ()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Unrelated uv/python carrying the dashboard text as a later
+        # argument (Sol's counterexample).
+        f'uv run some-other-tool --banner "{UPPER_MARKER}"',
+        f"/x/.venv/bin/python3 /x/bin/other-tool {UPPER_MARKER}",
+        "uv run some-other-tool serve --json",
+        # Wrong executable, subcommand, state dir, interval each fail.
+        UPPER_WRAPPED.replace("hermes-orchestrator", "hermes-thing"),
+        DASHBOARD_COMMAND.replace(" dashboard ", " daemon "),
+        DASHBOARD_COMMAND.replace(
+            "/state/orchestrator", "/state/other"
+        ),
+        DASHBOARD_COMMAND.replace("--interval 30", "--interval 31"),
+        # uv without the literal run token.
+        DASHBOARD_COMMAND.replace("uv run ", "uv "),
+    ],
+)
+def test_dashboard_lineage_rejects_wrong_chain_or_arguments(
+    line: str,
+) -> None:
+    assert lineage_matches([line], UPPER_EXPECT) == ()
 
 
 @pytest.mark.asyncio

@@ -537,14 +537,32 @@ import stat  # noqa: E402
 from hermes_orchestrator.cli import _ReadOnlyDashboardDatabase  # noqa: E402
 
 
-def test_dashboard_works_when_the_filesystem_forbids_writes(
-    tmp_path: Path,
+def _recording_connect(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every sqlite URI/path the CLI opens, passing through."""
+
+    recorded: list[str] = []
+    real_connect = sqlite3.connect
+
+    def recorder(target, *args, **kwargs):  # type: ignore[no-untyped-def]
+        recorded.append(str(target))
+        return real_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", recorder)
+    return recorded
+
+
+def test_write_forbidden_filesystem_fails_closed_no_immutable_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Sol M2: a WAL reader that cannot map its -shm index must refuse.
+    # A write-forbidding view of the filesystem does not prove the
+    # daemon is not writing the same file through another view, so an
+    # unlocked immutable=1 retry is forbidden — the entry fails closed.
     repo_root, state_dir = active_repo(tmp_path)
     Database.open(state_dir / "state.db").close()
-    read_only = stat.S_IRUSR | stat.S_IXUSR
+    recorded = _recording_connect(monkeypatch)
     os.chmod(state_dir / "state.db", stat.S_IRUSR)
-    os.chmod(state_dir, read_only)
+    os.chmod(state_dir, stat.S_IRUSR | stat.S_IXUSR)
     try:
         exit_code, output = _invoke(
             [
@@ -561,8 +579,80 @@ def test_dashboard_works_when_the_filesystem_forbids_writes(
         os.chmod(state_dir, stat.S_IRWXU)
         os.chmod(state_dir / "state.db", stat.S_IRUSR | stat.S_IWUSR)
 
-    assert exit_code == 0
-    assert json.loads(output)["read_only"] is True
+    assert exit_code == 1
+    assert json.loads(output)["error"] == "read-only probe failed"
+    ro_attempts = [uri for uri in recorded if "mode=ro" in uri]
+    assert len(ro_attempts) == 1
+    assert all("immutable" not in uri for uri in recorded)
+
+
+def test_transient_probe_error_never_downgrades_to_immutable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A database whose probe errors (no schema_migrations table here)
+    # refuses; it must never be retried through an unlocked
+    # immutable=1 connection.
+    repo_root, state_dir = active_repo(tmp_path)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    bogus = sqlite3.connect(state_dir / "state.db")
+    bogus.execute("CREATE TABLE unrelated (x INTEGER)")
+    bogus.commit()
+    bogus.close()
+    recorded = _recording_connect(monkeypatch)
+
+    exit_code, output = _invoke(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--state-dir",
+            str(state_dir),
+            "dashboard",
+            "--once",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 1
+    assert json.loads(output)["error"] == "read-only probe failed"
+    assert all("immutable" not in uri for uri in recorded)
+
+
+def test_concurrent_daemon_commits_are_visible_without_reopening(
+    tmp_path: Path,
+) -> None:
+    # Coordinated mode=ro WAL reads observe the writing daemon's
+    # commits on the SAME long-lived connection — the property the
+    # immutable contract would forfeit.
+    writer = Database.open(tmp_path / "state.db")
+    try:
+        connection = sqlite3.connect(
+            f"file:{tmp_path / 'state.db'}?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            wrapper = _ReadOnlyDashboardDatabase(connection)
+            count_sql = "SELECT count(*) FROM profile_leases"
+            assert wrapper.execute(count_sql).fetchone()[0] == 0
+
+            with writer.transaction() as writing:
+                writing.execute(
+                    "INSERT INTO profile_leases("
+                    "profile_alias, project_key, state, acquired_at, "
+                    "cooldown_until) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "max-b",
+                        "demo",
+                        "active",
+                        "2026-08-31T00:00:00+00:00",
+                        None,
+                    ),
+                )
+
+            assert wrapper.execute(count_sql).fetchone()[0] == 1
+        finally:
+            connection.close()
+    finally:
+        writer.close()
 
 
 def test_dashboard_leaves_the_database_and_fence_untouched(

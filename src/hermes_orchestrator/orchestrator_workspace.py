@@ -57,6 +57,7 @@ import asyncio
 import hashlib
 import json
 import re
+import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -403,24 +404,89 @@ def correlate_surface(
     )
 
 
-def lineage_matches(
-    commands: Sequence[str], expected_marker: str
-) -> tuple[str, ...]:
-    """The observed command lines carrying the exact expected lineage.
+@dataclass(frozen=True, slots=True)
+class RoleExpectation:
+    """The exact executable identity and argument tokens a role runs.
 
-    The marker must appear as a whole token run — preceded by nothing,
-    whitespace, or a path separator (the hermes launcher execs
-    ``…/hermes-agent/hermes chat …``, the console script runs as
-    ``…/bin/hermes-orchestrator …``) and followed by nothing or
-    whitespace — so ``--continue other-session`` or a superstring
-    session name can never satisfy it.
+    ``executable`` is the required basename at the argv executable
+    position (``hermes-orchestrator`` console script, or the installed
+    ``hermes`` script); ``arguments`` are the exact tokens that must
+    follow it, compared by token equality — never containment.
     """
 
-    pattern = re.compile(
-        r"(?:^|[\s/])" + re.escape(expected_marker) + r"(?:$|\s)"
-    )
+    executable: str
+    arguments: tuple[str, ...]
+
+    @property
+    def display(self) -> str:
+        return " ".join((self.executable, *self.arguments))
+
+
+# The only interpreter names accepted as a wrapper before the expected
+# script: python in its platform spellings (Python, python3, python3.13).
+_INTERPRETER_NAME = re.compile(r"^python(\d+(\.\d+)*)?$")
+
+
+def _token_basename(token: str) -> str:
+    return token.rsplit("/", 1)[-1]
+
+
+def argv_matches_expectation(
+    command_line: str, expectation: RoleExpectation
+) -> bool:
+    """Whether one observed argv line IS the expected command (Sol M1).
+
+    The line is shlex-tokenized (an untokenizable line fails closed —
+    it matches nothing), then exactly one optional, explicitly bounded
+    wrapper form is consumed:
+
+    * ``uv run`` — argv0 basename ``uv`` followed by the literal token
+      ``run`` (how the typed dashboard command appears at uv itself);
+    * one python interpreter (``Python``/``python3``/``python3.13``…)
+      immediately followed by the expected script at the executable
+      position (how the hermes bash launcher and console scripts
+      actually exec: interpreter + script path + args, characterized
+      live).
+
+    The token at the executable position must have exactly the
+    expected basename, and every remaining token must equal the
+    expected argument sequence — full consumption, token equality.
+    Occurrences inside ``-c`` payloads, quoted text, comments,
+    environment values, or later arguments of an unrelated command
+    can therefore never match: they are never at the executable
+    position of an accepted chain.
+    """
+
+    try:
+        tokens = shlex.split(command_line)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    index = 0
+    head = _token_basename(tokens[0]).lstrip("-").lower()
+    if head == "uv":
+        if len(tokens) < 2 or tokens[1] != "run":
+            return False
+        index = 2
+    elif _INTERPRETER_NAME.fullmatch(head):
+        index = 1
+    if index >= len(tokens):
+        return False
+    if _token_basename(tokens[index]) != expectation.executable:
+        return False
+    return tuple(tokens[index + 1 :]) == expectation.arguments
+
+
+def lineage_matches(
+    commands: Sequence[str], expectation: RoleExpectation
+) -> tuple[str, ...]:
+    """The observed command lines that ARE the expected command."""
+
     return tuple(
-        command for command in commands if pattern.search(command)
+        command
+        for command in commands
+        if argv_matches_expectation(command, expectation)
     )
 
 
@@ -543,16 +609,28 @@ class OrchestratorWorkspaceLifecycle:
         return self._hermes_command
 
     @property
-    def upper_lineage_marker(self) -> str:
-        """The exact upper-role command lineage the role proof demands."""
+    def upper_expectation(self) -> RoleExpectation:
+        """The exact upper-role argv the role proof demands.
 
-        return self._dashboard_command.removeprefix("uv run ")
+        Derived from the composed (grammar-validated, single-spaced)
+        dashboard command: ``uv run`` stripped, the console-script
+        identity at the executable position, every argument token
+        exact.
+        """
+
+        tokens = self._dashboard_command.split()
+        return RoleExpectation(
+            executable=tokens[2], arguments=tuple(tokens[3:])
+        )
 
     @property
-    def lower_lineage_marker(self) -> str:
-        """The exact lower-role command lineage the role proof demands."""
+    def lower_expectation(self) -> RoleExpectation:
+        """The exact lower-role argv the role proof demands."""
 
-        return self._hermes_command
+        tokens = self._hermes_command.split()
+        return RoleExpectation(
+            executable=tokens[0], arguments=tuple(tokens[1:])
+        )
 
     def observed_table(self) -> tuple[ProcessRecord, ...]:
         return self._lineage.process_table()
@@ -574,23 +652,25 @@ class OrchestratorWorkspaceLifecycle:
         """
 
         shape = ROLE_SHAPES.get(role)
-        marker = (
-            self.upper_lineage_marker
+        expectation = (
+            self.upper_expectation
             if role == UPPER_ROLE
-            else self.lower_lineage_marker
+            else self.lower_expectation
             if role == LOWER_ROLE
             else None
         )
         shape_ok = shape is not None and shape(surface.process_names)
         correlation = correlate_surface(surface, table)
         matched = (
-            lineage_matches(correlation.commands, marker)
-            if marker is not None and correlation.status == "ok"
+            lineage_matches(correlation.commands, expectation)
+            if expectation is not None and correlation.status == "ok"
             else ()
         )
         return {
             "shape_ok": shape_ok,
-            "expected_lineage": marker,
+            "expected_lineage": (
+                expectation.display if expectation is not None else None
+            ),
             "correlation": correlation.status,
             "surface_pids": list(correlation.pids),
             "lineage_matches": [line[:200] for line in matched],
@@ -910,8 +990,8 @@ async def run_smoke(
         "dashboard_command": lifecycle.dashboard_command,
         "hermes_command": lifecycle.hermes_command,
         "role_expectations": {
-            UPPER_ROLE: lifecycle.upper_lineage_marker,
-            LOWER_ROLE: lifecycle.lower_lineage_marker,
+            UPPER_ROLE: lifecycle.upper_expectation.display,
+            LOWER_ROLE: lifecycle.lower_expectation.display,
         },
         "first_ensure": first.payload(),
         "inspection": inspection,
