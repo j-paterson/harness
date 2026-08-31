@@ -108,6 +108,11 @@ async def test_explicit_queue_to_one_lead_and_linear_projection(tmp_path: Path) 
 
         assert restarted_profiles.acquire("demo").profile_alias == "max-a"
         resumed_actions = restarted_scheduler.plan(GreenSnapshot())
+        # INFRA-199: a distinct queued issue never starts while another
+        # issue of the project is still in development.
+        busy = await restarted_cells.dispatch(resumed_actions[0].issue_id)
+        assert busy.status == "project_busy"
+        queue.complete("ENG-9", reason="merged", evidence="integration test")
         resumed = await restarted_cells.dispatch(resumed_actions[0].issue_id)
 
         assert second.code == "queued"
