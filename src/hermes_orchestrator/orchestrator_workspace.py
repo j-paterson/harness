@@ -2,20 +2,29 @@
 
 INFRA-191 W3 (Hermes directive channel.blocked 2833d6d0, Sol packets
 575fe76c and a6bc7ca2): the Orchestrator becomes one real cmux
-workspace with two stacked normal terminal panes.
+workspace with two normal terminal panes side by side.
+
+INFRA-209: the layout direction is horizontal, so "upper" is the
+first layout child — now the compact LEFT status pane — and "lower"
+is the second layout child — the RIGHT Hermes chat pane. The
+``UPPER_ROLE``/``LOWER_ROLE`` identifiers and every durable
+binding/evidence key built on them (``upper_surface_uuid``,
+``lower_surface_uuid``, etc.) are kept unchanged as durable vocabulary
+across the rename; only the geometry they describe moved from
+stacked to side by side.
 
 Ownership topology (Sol K1, explicit): production has exactly one
 effective supervisor of the durable state — the single lock-holding
 ``hermes-orchestrator daemon`` process (launchd), which is never
 inside a pane. It composes the one
 :class:`OrchestratorWorkspaceOwner` and drives this lifecycle from
-startup and its bounded maintenance slot. The upper pane runs the
-distinct, deliberately non-supervising ``hermes-orchestrator
+startup and its bounded maintenance slot. The left (upper) pane runs
+the distinct, deliberately non-supervising ``hermes-orchestrator
 dashboard`` entry: token-free, read-only over the same durable
 database, no daemon lock — so it can never collide with the daemon's
 exclusive state-directory lock (the DaemonAlreadyRunning respawn loop
-Sol evidenced is structurally impossible). The lower pane runs the
-installed Nous Hermes classic durable session (``hermes chat
+Sol evidenced is structurally impossible). The right (lower) pane runs
+the installed Nous Hermes classic durable session (``hermes chat
 --continue <name> --create-if-missing``: the same named session is
 reattached on every recovery, never duplicated). The stale
 single-surface ANSI-region design in ``dashboard_pane.py`` is not
@@ -70,9 +79,10 @@ from hermes_orchestrator.cmux import (
 )
 from hermes_orchestrator.cmux_surfaces import CmuxBinding, CmuxSurfaceBindings
 
-#: The only geometry this lifecycle creates: two vertically stacked
-#: normal terminal panes — supervisor above, Hermes below.
-STACK_DIRECTION = "vertical"
+#: The only geometry this lifecycle creates: two normal terminal panes
+#: side by side — supervisor (status) on the left, Hermes on the
+#: right.
+STACK_DIRECTION = "horizontal"
 
 UPPER_ROLE = "dashboard"
 LOWER_ROLE = "hermes"
@@ -618,7 +628,7 @@ class OrchestratorWorkspaceLifecycle:
         state_dir: Path,
         name: str = "orchestrator",
         title: str = "Orchestrator",
-        interval: int = 30,
+        interval: int = 10,
         session_name: str | None = None,
         lineage: ProcessLineage | None = None,
         inside_marked_pane: bool = False,
@@ -864,7 +874,7 @@ class OrchestratorWorkspaceLifecycle:
             return None
         if surfaces[0].pane_uuid.lower() == surfaces[1].pane_uuid.lower():
             # Two surfaces sharing one pane is a tabbed layout, not the
-            # required two stacked panes.
+            # required two side-by-side panes.
             return None
         upper_key = binding.surface_uuid.lower()
         upper = next(
@@ -1061,7 +1071,7 @@ async def run_smoke(
     Sol K1: the smoke exercises the exact path production runs — the
     owner's ``start()``/``tick()`` reconciliation, not a standalone
     lifecycle call — so the evidence proves the owner-driven topology:
-    start → verify both stacked panes with command-specific role proof
+    start → verify both side-by-side panes with command-specific role proof
     (typed metadata twice for identity stability, plus read-only
     screen evidence) → restart-recovery (close the workspace
     externally, tick again) → teardown through the owner. An owner
@@ -1159,7 +1169,7 @@ async def run_smoke(
 def smoke_passed(evidence: dict[str, Any]) -> bool:
     """The complete smoke pass condition (Sol packet 3).
 
-    Every clause is mandatory: both stacked panes with both role
+    Every clause is mandatory: both side-by-side panes with both role
     identities proven on the first ensure AND after restart recovery,
     stable identities across inspections, an actual workspace
     replacement with an advanced binding generation, a confirmed

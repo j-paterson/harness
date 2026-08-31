@@ -392,23 +392,24 @@ class CmuxCliAdapter:
         env: Mapping[str, str] | None = None,
         resolve_marker: str | None = None,
     ) -> tuple[CmuxSurfaceRef, CmuxSurfaceRef]:
-        """Create one workspace with two vertically stacked terminal
-        panes, each eagerly running its validated command.
+        """Create one workspace with two side-by-side terminal panes,
+        each eagerly running its validated command.
 
         Characterized live against cmux 0.64.22: a pane added to an
         unfocused workspace with ``new-split``/``new-pane`` never
         materializes its terminal ("Surface is not a terminal"), while
         layout surfaces created through ``new-workspace --layout``
         spawn real ttys and their commands immediately, focused or
-        not. The layout JSON is a fixed vertical two-terminal template
-        built here — only the two bounded single-line commands are
-        caller data, validated before any subprocess exists — so no
-        caller can express a different geometry or surface type. The
-        workspace identity resolves like :meth:`create_workspace`
-        (UUID or short-ack via the durable marker); both pane/surface
-        identities come from the structured process listing, which
-        must report exactly two panes (upper first, matching layout
-        child order) within a bounded readiness window.
+        not. The layout JSON is a fixed horizontal two-terminal
+        template built here — only the two bounded single-line
+        commands are caller data, validated before any subprocess
+        exists — so no caller can express a different geometry or
+        surface type. The workspace identity resolves like
+        :meth:`create_workspace` (UUID or short-ack via the durable
+        marker); both pane/surface identities come from the structured
+        process listing, which must report exactly two panes (upper
+        first, matching layout child order) within a bounded readiness
+        window.
         """
 
         for command in (upper_command, lower_command):
@@ -418,8 +419,8 @@ class CmuxCliAdapter:
                 )
         layout = json.dumps(
             {
-                "direction": "vertical",
-                "split": 0.5,
+                "direction": "horizontal",
+                "split": 0.38,
                 "children": [
                     {
                         "pane": {
@@ -477,8 +478,8 @@ class CmuxCliAdapter:
             or rows[0].pane_uuid.lower() == rows[1].pane_uuid.lower()
         ):
             raise CmuxProtocolError(
-                "the layout create did not yield two stacked panes with "
-                "typed identities"
+                "the layout create did not yield two side-by-side panes "
+                "with typed identities"
             )
         return (
             CmuxSurfaceRef(

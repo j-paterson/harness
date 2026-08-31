@@ -21,7 +21,11 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from hermes_orchestrator.dashboard_pane import DashboardPane
-from hermes_orchestrator.dashboard_render import TickFailure, render_dashboard
+from hermes_orchestrator.dashboard_render import (
+    TickFailure,
+    render_dashboard,
+    render_frame,
+)
 from hermes_orchestrator.dashboard_sources import (
     CodexRateLimitReader,
     DashboardSnapshot,
@@ -61,7 +65,11 @@ class DashboardRefreshAction:
         sources: SnapshotSources | None = None,
         pane: PaneWriter | None = None,
         now: Callable[[], datetime] | None = None,
-        width: int = 80,
+        width: int | Callable[[], int] = 80,
+        height: int | Callable[[], int] | None = None,
+        frame: bool = False,
+        color: bool = False,
+        detail: bool = False,
     ) -> None:
         if sources is None:
             if database is None or registry is None:
@@ -77,6 +85,10 @@ class DashboardRefreshAction:
         self._pane = pane if pane is not None else DashboardPane()
         self._now = now or _utc_now
         self._width = width
+        self._height = height
+        self._frame = frame
+        self._color = color
+        self._detail = detail
         self._failure: TickFailure | None = None
 
     async def tick(self) -> None:
@@ -84,17 +96,31 @@ class DashboardRefreshAction:
 
         A failing tick draws nothing and raises nothing; the recorded
         failure appears in the block rendered by the next successful
-        tick. The pane re-establishes its scroll region on demand, so
-        repeated ticks after any interruption recover the surface.
+        tick. The pane re-establishes itself on demand, so repeated
+        ticks after any interruption recover the surface.
         """
 
         try:
-            snapshot = await self._sources.collect(self._now())
-            lines = render_dashboard(
-                snapshot,
-                width=self._width,
-                failure=self._failure,
-            )
+            now = self._now()
+            snapshot = await self._sources.collect(now)
+            width = _resolve(self._width)
+            if self._frame:
+                height = _resolve(self._height) if self._height is not None else 24
+                lines = render_frame(
+                    snapshot,
+                    width=width,
+                    height=height,
+                    now=now,
+                    failure=self._failure,
+                    color=self._color,
+                    detail=self._detail,
+                )
+            else:
+                lines = render_dashboard(
+                    snapshot,
+                    width=width,
+                    failure=self._failure,
+                )
             self._pane.draw(lines)
         except Exception as error:
             self._failure = TickFailure(
@@ -103,3 +129,7 @@ class DashboardRefreshAction:
             )
             return
         self._failure = None
+
+
+def _resolve(value: int | Callable[[], int]) -> int:
+    return value() if callable(value) else value
