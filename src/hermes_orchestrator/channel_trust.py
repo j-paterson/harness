@@ -470,6 +470,230 @@ class ChannelTrustAnchors:
             )
         return self.get(anchor_id)
 
+    def rebind(
+        self,
+        *,
+        cell_id: str,
+        profile_alias: str,
+        entry_path: Path,
+        package_root: Path,
+        channel_entry: str,
+        launch_argv_template: Sequence[str],
+        workspace_uuid: str,
+        surface_uuid: str,
+        session_id: str,
+    ) -> ChannelTrustAnchor:
+        """Carry an already-proven anchor forward across a managed
+        rotation that changes only the seat's identity/location facts
+        (session, surface, workspace, and — on a generation bump — the
+        canonical entry path) — never the packaged CONTENT the
+        operator's one manual trust event proved true.
+
+        Unlike :meth:`capture`, ``prompt_pattern`` is never a caller
+        argument here: the retiring anchor's own bound prompt evidence
+        is the only thing that can ever be carried forward, so a
+        predecessor whose prompt evidence is still pending
+        (``prompt_pattern is None``) refuses outright — there is
+        nothing proven to carry.
+
+        Every CONTENT fact re-measured at the new ``entry_path`` /
+        ``package_root`` (symlink guard, owner uid, entry sha256,
+        dist-tree sha256, manifest name/version, ``channel_entry``)
+        must equal the retiring anchor's exactly; any difference is a
+        genuinely new trust decision, refused here with zero database
+        mutation so the caller's existing manual-dialog fallback is
+        the only path forward. ``canonical_entry_path`` and
+        ``build_mtime`` are taken from this fresh measurement, never
+        the predecessor's.
+
+        The operator-trusted profile and launch composition are CONTENT
+        facts too (Sol correction f7f6471c): ``profile_alias`` must
+        equal the predecessor's, and ``launch_argv_template`` — the
+        replacement seat's live argv — must match the predecessor's
+        trusted template under exactly the two bounded substitutions
+        the gate itself permits (the session-UUID slot and the
+        session-scoped MCP config-path slot, both for ``session_id``).
+        The successor persists the PREDECESSOR's template verbatim, so
+        the trusted launch baseline never drifts across any number of
+        rotations; any other profile or argv difference is refused
+        with zero database mutation and the predecessor stays active.
+
+        Idempotent no-op: when the active anchor already binds this
+        exact session/surface/workspace/path, it is returned unchanged
+        — re-ensuring an unrotated seat is never a new trust decision.
+
+        On success, the predecessor is retired and the successor
+        captured atomically in one transaction — a concurrent rebind
+        or retire of the same predecessor fails closed, exactly as
+        :meth:`capture`'s own live double-check does.
+        """
+
+        if channel_entry != CHANNEL_ENTRY:
+            raise TrustRefused(
+                f"channel_entry must be exactly {CHANNEL_ENTRY!r}"
+            )
+        canonical_session = str(uuid.UUID(str(session_id)))
+        entry_path = Path(entry_path)
+        package_root = Path(package_root)
+        if not entry_path.is_absolute():
+            raise TrustRefused("entry_path must be absolute")
+        _require_no_symlinks(entry_path, package_root)
+
+        predecessor = self.active_for_cell(cell_id)
+        if predecessor is None:
+            raise TrustRefused(
+                f"cell {cell_id!r} has no active channel trust anchor to "
+                "rebind"
+            )
+        if predecessor.prompt_pattern is None:
+            raise TrustRefused(
+                f"anchor {predecessor.anchor_id!r} has no bound "
+                "prompt_pattern; trust is not yet fully proven and cannot "
+                "be carried forward"
+            )
+
+        # Sol correction f7f6471c: profile and launch composition are
+        # never rebound from caller input. The replacement must run
+        # under the predecessor's trusted profile, and its argv must
+        # equal the predecessor's trusted template token for token
+        # except at the existing bounded session-UUID and session-
+        # scoped MCP config-path slots — otherwise drift would become
+        # the trusted baseline the gate below compares against.
+        if profile_alias != predecessor.profile_alias:
+            raise TrustRefused(
+                f"profile_alias {profile_alias!r} does not match the "
+                f"retiring anchor {predecessor.anchor_id!r}'s trusted "
+                "profile; this is a new trust decision, not a rotation "
+                "carry-forward"
+            )
+        replacement_argv = tuple(str(token) for token in launch_argv_template)
+        if not _argv_matches_template(
+            replacement_argv,
+            predecessor.launch_argv_template,
+            session_id=canonical_session,
+        ):
+            raise TrustRefused(
+                "the replacement launch argv does not match the retiring "
+                f"anchor {predecessor.anchor_id!r}'s trusted launch "
+                "template (only the session UUID and the session-scoped "
+                "MCP config path may differ); this is a new trust "
+                "decision, not a rotation carry-forward"
+            )
+
+        if (
+            predecessor.session_id == canonical_session
+            and predecessor.surface_uuid == surface_uuid
+            and predecessor.workspace_uuid == workspace_uuid
+            and predecessor.canonical_entry_path == str(entry_path)
+        ):
+            return predecessor
+
+        stat = entry_path.stat()
+        entry_owner_uid = int(stat.st_uid)
+        entry_sha256 = hashlib.sha256(entry_path.read_bytes()).hexdigest()
+        dist_tree_sha256 = _dist_tree_sha256(package_root)
+        manifest_name, manifest_version = _read_manifest(package_root)
+        build_mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
+
+        if (
+            entry_sha256 != predecessor.entry_sha256
+            or dist_tree_sha256 != predecessor.dist_tree_sha256
+            or manifest_name != predecessor.manifest_name
+            or manifest_version != predecessor.manifest_version
+            or entry_owner_uid != predecessor.entry_owner_uid
+            or channel_entry != predecessor.channel_entry
+        ):
+            raise TrustRefused(
+                "the content re-measured at the new entry path does not "
+                f"match the retiring anchor {predecessor.anchor_id!r}; "
+                "this is a new trust decision, not a rotation "
+                "carry-forward"
+            )
+
+        anchor_id = self._ids()
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            # The same live double-check pattern capture() uses: a
+            # concurrent retire or rebind of this exact predecessor
+            # between the read above and this transaction fails closed
+            # rather than silently retiring the wrong row.
+            live = connection.execute(
+                "SELECT anchor_id FROM channel_trust_anchors "
+                "WHERE cell_id = ? AND state = 'active'",
+                (cell_id,),
+            ).fetchone()
+            if live is None or str(live["anchor_id"]) != predecessor.anchor_id:
+                raise TrustRefused(
+                    f"cell {cell_id!r}'s active anchor changed "
+                    "concurrently; refusing to rebind"
+                )
+            cursor = connection.execute(
+                "UPDATE channel_trust_anchors SET state = 'retired', "
+                "retired_at = ? WHERE anchor_id = ? AND state = 'active'",
+                (stamp, predecessor.anchor_id),
+            )
+            if cursor.rowcount != 1:
+                raise TrustRefused(
+                    f"anchor {predecessor.anchor_id!r} is not retireable"
+                )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="channel_trust_anchor.retired",
+                    aggregate_type="channel_trust_anchor",
+                    aggregate_id=predecessor.anchor_id,
+                    payload={},
+                ),
+            )
+            connection.execute(
+                "INSERT INTO channel_trust_anchors("
+                "anchor_id, cell_id, profile_alias, canonical_entry_path, "
+                "entry_owner_uid, entry_sha256, dist_tree_sha256, "
+                "manifest_name, manifest_version, channel_entry, "
+                "build_mtime, launch_argv_template_json, workspace_uuid, "
+                "surface_uuid, session_id, prompt_pattern, state, "
+                "created_at, retired_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'active', ?, NULL)",
+                (
+                    anchor_id,
+                    cell_id,
+                    profile_alias,
+                    str(entry_path),
+                    entry_owner_uid,
+                    entry_sha256,
+                    dist_tree_sha256,
+                    manifest_name,
+                    manifest_version,
+                    channel_entry,
+                    build_mtime,
+                    json.dumps(
+                        list(predecessor.launch_argv_template), sort_keys=True
+                    ),
+                    workspace_uuid,
+                    surface_uuid,
+                    canonical_session,
+                    predecessor.prompt_pattern,
+                    stamp,
+                ),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="channel_trust_anchor.rebound",
+                    aggregate_type="channel_trust_anchor",
+                    aggregate_id=anchor_id,
+                    payload={
+                        "cell_id": cell_id,
+                        "profile_alias": profile_alias,
+                        "canonical_entry_path": str(entry_path),
+                        "session_id": canonical_session,
+                        "predecessor_anchor_id": predecessor.anchor_id,
+                    },
+                ),
+            )
+        return self.get(anchor_id)
+
     def retire(self, anchor_id: str) -> ChannelTrustAnchor:
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:

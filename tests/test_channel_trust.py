@@ -37,6 +37,12 @@ WORKSPACE = "11111111-1111-4111-8111-111111111111"
 SURFACE = "22222222-2222-4222-8222-222222222222"
 SESSION = "33333333-3333-4333-8333-333333333333"
 OTHER_UUID = "44444444-4444-4444-8444-444444444444"
+# A second seat identity — the live coordinates a managed rotation
+# leaves the successor bound to.
+WORKSPACE_2 = "55555555-5555-4555-8555-555555555555"
+SURFACE_2 = "66666666-6666-4666-8666-666666666666"
+SESSION_2 = "77777777-7777-4777-8777-777777777777"
+CONFIG_PATH_2 = f"/state/mcp/{SESSION_2}.mcp.json"
 CONFIG_PATH = f"/state/mcp/{SESSION}.mcp.json"
 
 # The approved fixed normalized prompt matcher: the code-owned
@@ -133,9 +139,13 @@ def anchors(database: Database, events: EventStore) -> ChannelTrustAnchors:
     return ChannelTrustAnchors(database, events=events, now=lambda: NOW)
 
 
-@pytest.fixture
-def package(tmp_path: Path) -> tuple[Path, Path]:
-    package_root = tmp_path / "channel-pkg"
+def _write_package(package_root: Path) -> tuple[Path, Path]:
+    """Lay out one channel package (manifest, entry, and one extra
+    dist file) under ``package_root``; every call with byte-identical
+    file contents produces byte-identical entry/dist-tree digests
+    regardless of the path — the content that ``rebind`` requires
+    equal is never the path."""
+
     dist = package_root / "dist"
     (dist / "lib").mkdir(parents=True)
     (package_root / "package.json").write_text(
@@ -146,6 +156,11 @@ def package(tmp_path: Path) -> tuple[Path, Path]:
     entry_path.write_text("console.log('hermes-control');\n", encoding="utf-8")
     (dist / "lib" / "util.js").write_text("module.exports = {};\n", encoding="utf-8")
     return package_root, entry_path
+
+
+@pytest.fixture
+def package(tmp_path: Path) -> tuple[Path, Path]:
+    return _write_package(tmp_path / "channel-pkg")
 
 
 def _capture(
@@ -393,6 +408,559 @@ def test_complete_prompt_refuses_a_non_fixed_matcher(
 
     with pytest.raises(TrustRefused, match="fixed normalized"):
         anchors.complete_prompt(anchor.anchor_id, "(unterminated[")
+
+
+# --------------------------------------------------------------------
+# ChannelTrustAnchors.rebind
+# --------------------------------------------------------------------
+
+
+def test_rebind_retires_predecessor_and_captures_successor_atomically(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+
+    # A rotation that also bumped the runtime generation: a new
+    # canonical path, byte-identical content.
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+
+    successor = anchors.rebind(
+        cell_id=CELL,
+        profile_alias=PROFILE,
+        entry_path=rotated_entry,
+        package_root=rotated_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        session_id=SESSION_2,
+    )
+
+    assert successor.anchor_id != predecessor.anchor_id
+    # The predecessor's prompt evidence is carried forward exactly —
+    # rebind never re-proves the prompt shape.
+    assert successor.prompt_pattern == predecessor.prompt_pattern
+    # Identity/location facts are all rebound to the live seat.
+    assert successor.canonical_entry_path == str(rotated_entry)
+    assert successor.build_mtime == datetime.fromtimestamp(
+        rotated_entry.stat().st_mtime, tz=UTC
+    ).isoformat()
+    assert successor.session_id == SESSION_2
+    assert successor.workspace_uuid == WORKSPACE_2
+    assert successor.surface_uuid == SURFACE_2
+    # The trusted launch template is carried forward verbatim (Sol
+    # correction f7f6471c): the replacement's argv only had to MATCH
+    # it under the bounded session substitutions — it never becomes
+    # the baseline.
+    assert successor.launch_argv_template == predecessor.launch_argv_template
+    assert successor.launch_argv_template == tuple(_argv())
+    assert successor.profile_alias == predecessor.profile_alias
+    # Content facts are unchanged — that equality is what authorized
+    # the carry-forward.
+    assert successor.entry_sha256 == predecessor.entry_sha256
+    assert successor.dist_tree_sha256 == predecessor.dist_tree_sha256
+    assert successor.manifest_name == predecessor.manifest_name
+    assert successor.manifest_version == predecessor.manifest_version
+    assert successor.entry_owner_uid == predecessor.entry_owner_uid
+    assert successor.state == "active"
+
+    assert anchors.get(predecessor.anchor_id).state == "retired"
+    assert anchors.active_for_cell(CELL) == successor
+
+    rows = database.execute(
+        "SELECT event_type, aggregate_id, payload_json FROM events "
+        "WHERE aggregate_type = 'channel_trust_anchor' ORDER BY sequence"
+    ).fetchall()
+    assert [str(row["event_type"]) for row in rows] == [
+        "channel_trust_anchor.captured",
+        "channel_trust_anchor.retired",
+        "channel_trust_anchor.rebound",
+    ]
+    assert str(rows[1]["aggregate_id"]) == predecessor.anchor_id
+    rebound_payload = json.loads(str(rows[2]["payload_json"]))
+    assert rebound_payload["predecessor_anchor_id"] == predecessor.anchor_id
+    assert rebound_payload["cell_id"] == CELL
+    assert rebound_payload["profile_alias"] == PROFILE
+    assert rebound_payload["canonical_entry_path"] == str(rotated_entry)
+    assert rebound_payload["session_id"] == SESSION_2
+
+
+def test_rebind_refuses_on_content_digest_mismatch_with_zero_mutation(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+
+    drifted_root, drifted_entry = _write_package(tmp_path / "channel-pkg-drifted")
+    # A genuinely different build at the new location — not the same
+    # content the operator trusted.
+    drifted_entry.write_text("console.log('different!');\n", encoding="utf-8")
+
+    before = database.execute(
+        "SELECT anchor_id, state FROM channel_trust_anchors ORDER BY anchor_id"
+    ).fetchall()
+
+    with pytest.raises(TrustRefused, match="new trust decision"):
+        anchors.rebind(
+            cell_id=CELL,
+            profile_alias=PROFILE,
+            entry_path=drifted_entry,
+            package_root=drifted_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+
+    after = database.execute(
+        "SELECT anchor_id, state FROM channel_trust_anchors ORDER BY anchor_id"
+    ).fetchall()
+    assert [(str(row["anchor_id"]), str(row["state"])) for row in before] == [
+        (str(row["anchor_id"]), str(row["state"])) for row in after
+    ]
+    assert anchors.get(predecessor.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == predecessor
+
+
+def test_rebind_refuses_with_no_active_anchor(
+    anchors: ChannelTrustAnchors, package: tuple[Path, Path]
+) -> None:
+    package_root, entry_path = package
+
+    with pytest.raises(TrustRefused, match="no active channel trust anchor"):
+        anchors.rebind(
+            cell_id=CELL,
+            profile_alias=PROFILE,
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+
+
+def test_rebind_refuses_a_predecessor_with_prompt_evidence_pending(
+    anchors: ChannelTrustAnchors, package: tuple[Path, Path]
+) -> None:
+    package_root, entry_path = package
+    _capture(
+        anchors, package_root=package_root, entry_path=entry_path, prompt_pattern=None
+    )
+
+    with pytest.raises(TrustRefused, match="not yet fully proven"):
+        anchors.rebind(
+            cell_id=CELL,
+            profile_alias=PROFILE,
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+
+
+def test_rebind_is_idempotent_for_an_already_matching_active_anchor(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    package_root, entry_path = package
+    anchor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+
+    returned = anchors.rebind(
+        cell_id=CELL,
+        profile_alias=PROFILE,
+        entry_path=entry_path,
+        package_root=package_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=_argv(),
+        workspace_uuid=WORKSPACE,
+        surface_uuid=SURFACE,
+        session_id=SESSION,
+    )
+
+    assert returned == anchor
+    assert anchors.get(anchor.anchor_id).state == "active"
+    rows = database.execute(
+        "SELECT event_type FROM events "
+        "WHERE aggregate_type = 'channel_trust_anchor' ORDER BY sequence"
+    ).fetchall()
+    # No extra events — an already-matching call is not a new trust
+    # decision.
+    assert [str(row["event_type"]) for row in rows] == [
+        "channel_trust_anchor.captured"
+    ]
+
+
+# --------------------------------------------------------------------
+# ChannelTrustAnchors.rebind — profile / launch-template continuity
+# (Sol correction f7f6471c)
+# --------------------------------------------------------------------
+
+# A third seat identity for chained-rotation and drift cases.
+SESSION_3 = "88888888-8888-4888-8888-888888888888"
+CONFIG_PATH_3 = f"/state/mcp/{SESSION_3}.mcp.json"
+
+
+def _anchor_rows(database: Database) -> list[tuple[str, str, str, str]]:
+    rows = database.execute(
+        "SELECT anchor_id, state, profile_alias, launch_argv_template_json "
+        "FROM channel_trust_anchors ORDER BY anchor_id"
+    ).fetchall()
+    return [
+        (
+            str(row["anchor_id"]),
+            str(row["state"]),
+            str(row["profile_alias"]),
+            str(row["launch_argv_template_json"]),
+        )
+        for row in rows
+    ]
+
+
+def _anchor_event_types(database: Database) -> list[str]:
+    rows = database.execute(
+        "SELECT event_type FROM events "
+        "WHERE aggregate_type = 'channel_trust_anchor' ORDER BY sequence"
+    ).fetchall()
+    return [str(row["event_type"]) for row in rows]
+
+
+def _rebind_rotated(
+    anchors: ChannelTrustAnchors,
+    *,
+    package_root: Path,
+    entry_path: Path,
+    profile_alias: str = PROFILE,
+    launch_argv_template: list[str] | None = None,
+    session_id: str = SESSION_2,
+):
+    return anchors.rebind(
+        cell_id=CELL,
+        profile_alias=profile_alias,
+        entry_path=entry_path,
+        package_root=package_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=(
+            _argv(SESSION_2, CONFIG_PATH_2)
+            if launch_argv_template is None
+            else launch_argv_template
+        ),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        session_id=session_id,
+    )
+
+
+def test_rebind_refuses_a_profile_mismatch_with_zero_mutation(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    """Byte-identical content at the new path, a well-formed rotated
+    argv — but a different profile alias. The operator trusted ONE
+    profile; a rotation may not silently re-home trust to another."""
+
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="trusted profile"):
+        _rebind_rotated(
+            anchors,
+            package_root=rotated_root,
+            entry_path=rotated_entry,
+            profile_alias="max-z",
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.get(predecessor.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == predecessor
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+def _drift_argv(mutate) -> list[str]:
+    argv = _argv(SESSION_2, CONFIG_PATH_2)
+    return mutate(argv)
+
+
+@pytest.mark.parametrize(
+    "drifted_argv",
+    [
+        pytest.param(
+            _drift_argv(lambda a: [*a, "--verbose"]),
+            id="extra-flag-appended",
+        ),
+        pytest.param(
+            _drift_argv(lambda a: [*a[:3], "--add-dir", "/", *a[3:]]),
+            id="extra-flag-inserted",
+        ),
+        pytest.param(
+            _drift_argv(
+                lambda a: [t for t in a if t != "--dangerously-skip-permissions"]
+            ),
+            id="fixed-flag-dropped",
+        ),
+        pytest.param(
+            _drift_argv(lambda a: [*a[:3], "--permission-mode=bypass", *a[4:]]),
+            id="fixed-flag-substituted",
+        ),
+        pytest.param(
+            _drift_argv(lambda a: ["/usr/local/bin/claude", *a[1:]]),
+            id="executable-token-changed",
+        ),
+        pytest.param(
+            _argv(SESSION_3, CONFIG_PATH_2),
+            id="session-uuid-slot-is-another-session",
+        ),
+        pytest.param(
+            _argv(SESSION_2, CONFIG_PATH_3),
+            id="config-path-is-another-sessions",
+        ),
+        pytest.param(
+            _argv(SESSION_2, f"/state/mcp/{SESSION_2}.json"),
+            id="config-path-not-mcp-json",
+        ),
+        pytest.param(
+            _argv(SESSION_2, f"/state/mcp/$(x)/{SESSION_2}.mcp.json"),
+            id="config-path-with-metacharacter",
+        ),
+        pytest.param(
+            _argv(SESSION_2, f"state/mcp/{SESSION_2}.mcp.json"),
+            id="config-path-relative",
+        ),
+        pytest.param(
+            _drift_argv(
+                lambda a: [*a, "--dangerously-load-development-channels", CHANNEL_ENTRY]
+            ),
+            id="second-channel-entry",
+        ),
+        pytest.param([], id="empty-argv"),
+    ],
+)
+def test_rebind_refuses_arbitrary_launch_argument_drift_with_zero_mutation(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+    drifted_argv: list[str],
+) -> None:
+    """Same profile, byte-identical content — but the replacement's
+    argv differs from the trusted template somewhere OTHER than the two
+    bounded session slots. Refused before anything is measured or
+    retired: the predecessor stays active and no row or event moves."""
+
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="trusted launch template"):
+        _rebind_rotated(
+            anchors,
+            package_root=rotated_root,
+            entry_path=rotated_entry,
+            launch_argv_template=drifted_argv,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.get(predecessor.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == predecessor
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+def test_rebind_refuses_drift_before_the_idempotent_no_op(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """Even a call that names the anchor's OWN seat exactly is refused
+    when it arrives with a different profile or launch composition —
+    drift is never a no-op, it is a refusal with zero mutation."""
+
+    package_root, entry_path = package
+    anchor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="trusted profile"):
+        anchors.rebind(
+            cell_id=CELL,
+            profile_alias="max-z",
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=_argv(),
+            workspace_uuid=WORKSPACE,
+            surface_uuid=SURFACE,
+            session_id=SESSION,
+        )
+    with pytest.raises(TrustRefused, match="trusted launch template"):
+        anchors.rebind(
+            cell_id=CELL,
+            profile_alias=PROFILE,
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=[*_argv(), "--verbose"],
+            workspace_uuid=WORKSPACE,
+            surface_uuid=SURFACE,
+            session_id=SESSION,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(CELL) == anchor
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+def test_rebind_succeeds_only_under_the_bounded_session_substitutions(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+    tmp_path: Path,
+) -> None:
+    """The one shape that carries forward: the replacement argv equals
+    the trusted template except for the session-UUID slot and the
+    session-scoped MCP config path (here even in a different, still
+    well-formed directory). The successor persists the PREDECESSOR's
+    template verbatim — so the config directory the replacement chose
+    does not become the baseline — and a further rotation from that
+    successor matches against the same original template. The gate
+    then auto-confirms each rotated seat's live argv."""
+
+    package_root, entry_path = package
+    predecessor = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+    relocated_config = f"/var/run/hermes/{SESSION_2}.mcp.json"
+
+    successor = _rebind_rotated(
+        anchors,
+        package_root=rotated_root,
+        entry_path=rotated_entry,
+        launch_argv_template=_argv(SESSION_2, relocated_config),
+    )
+
+    assert successor.session_id == SESSION_2
+    assert successor.profile_alias == PROFILE
+    assert successor.launch_argv_template == predecessor.launch_argv_template
+    assert relocated_config not in successor.launch_argv_template
+    assert anchors.get(predecessor.anchor_id).state == "retired"
+
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
+    result = _evaluate(
+        gate,
+        entry_path=rotated_entry,
+        package_root=rotated_root,
+        session_id=SESSION_2,
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        argv=_argv(SESSION_2, relocated_config),
+        screen_text=screen_text,
+    )
+    assert result.confirmed is True
+    assert result.anchor_id == successor.anchor_id
+    assert confirm.calls == 1
+
+    # A second managed rotation from the successor: still measured
+    # against the ORIGINAL trusted template, so the same bounded
+    # substitutions for the third session are the only thing accepted.
+    third = anchors.rebind(
+        cell_id=CELL,
+        profile_alias=PROFILE,
+        entry_path=rotated_entry,
+        package_root=rotated_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=_argv(SESSION_3, CONFIG_PATH_3),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE,
+        session_id=SESSION_3,
+    )
+    assert third.launch_argv_template == predecessor.launch_argv_template
+    assert third.session_id == SESSION_3
+    assert anchors.get(successor.anchor_id).state == "retired"
+
+    with pytest.raises(TrustRefused, match="trusted launch template"):
+        anchors.rebind(
+            cell_id=CELL,
+            profile_alias=PROFILE,
+            entry_path=rotated_entry,
+            package_root=rotated_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=[*_argv(SESSION_2, CONFIG_PATH_2), "--verbose"],
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+    assert anchors.active_for_cell(CELL) == third
+
+
+def test_gate_auto_confirms_a_rebound_anchor_for_the_new_identity(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+    tmp_path: Path,
+) -> None:
+    """End-to-end mirror of the existing full-match gate tests: after a
+    rebind, the gate auto-confirms against the successor at the new
+    seat identity — the rebind is not merely a database row, it is the
+    thing that lets the fail-closed gate below it keep working."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    rotated_root, rotated_entry = _write_package(tmp_path / "channel-pkg-gen2")
+
+    successor = anchors.rebind(
+        cell_id=CELL,
+        profile_alias=PROFILE,
+        entry_path=rotated_entry,
+        package_root=rotated_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        session_id=SESSION_2,
+    )
+
+    screen_text = f"...\n{DIALOG_TEXT}\n"
+    gate, confirm, _ = _make_gate(
+        database, events, anchors, control, screen_text=screen_text
+    )
+    result = _evaluate(
+        gate,
+        entry_path=rotated_entry,
+        package_root=rotated_root,
+        session_id=SESSION_2,
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        argv=_argv(SESSION_2, CONFIG_PATH_2),
+        screen_text=screen_text,
+    )
+
+    assert result.confirmed is True
+    assert result.anchor_id == successor.anchor_id
+    assert confirm.calls == 1
 
 
 # --------------------------------------------------------------------

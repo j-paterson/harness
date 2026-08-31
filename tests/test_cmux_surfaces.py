@@ -2010,19 +2010,72 @@ class TestChannelTrustLifecycle:
         ]
 
     @pytest.mark.asyncio
-    async def test_identity_drift_sends_zero_keys(
+    async def test_surface_drift_with_matching_content_rebinds_and_confirms(
         self,
         database: Database,
         bindings: CmuxSurfaceBindings,
         tmp_path: Path,
     ) -> None:
+        """INFRA-208: before the rebind trigger existed, an anchor bound
+        to a different surface than the live seat could only refuse —
+        this is exactly the shape a managed rotation leaves behind. The
+        content re-measured at the (unchanged) entry path is
+        byte-identical to what the anchor already proved, so
+        ``confirm_seat`` now carries the anchor forward to the live
+        surface itself, and the gate then matches fully and presses the
+        one Enter — zero manual dialog clicks."""
+
         seed_cell(database)
         entry = trust_package(tmp_path)
         # The anchor was trusted for a different surface than the one
-        # this seat is bound to.
-        capture_trust_anchor(
+        # this seat is bound to — the live identity a rotation leaves.
+        predecessor = capture_trust_anchor(
             database, entry, surface_uuid=THIRD.surface_uuid
         )
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == [LEAD]
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+        successor = ChannelTrustAnchors(
+            database, events=EventStore(database)
+        ).active_for_cell("cell-demo")
+        assert successor is not None
+        assert successor.anchor_id != predecessor.anchor_id
+        assert successor.surface_uuid == LEAD.surface_uuid
+        assert successor.prompt_pattern == predecessor.prompt_pattern
+
+    @pytest.mark.asyncio
+    async def test_a_rebind_refusal_records_a_receipt_and_still_reaches_approval(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """A rebind attempt can itself refuse — here, the build at the
+        live entry path changed after the anchor was trusted, so the
+        content re-measured no longer matches: a genuinely new trust
+        decision, not a rotation. That refusal is recorded durably as
+        ``channel.rebind_refused``, and the seat still falls through to
+        the gate's own existing approval-required path exactly as it
+        did before INFRA-208 — the dialog path and its receipts are
+        unchanged."""
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        capture_trust_anchor(database, entry, surface_uuid=THIRD.surface_uuid)
+        # The build at this same path changed after the anchor was
+        # trusted.
+        entry.write_text("console.log('a different build');\n", encoding="utf-8")
         control = ControlOperations(database, events=EventStore(database))
         port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
         binding = bind_demo_lead(bindings)
@@ -2033,7 +2086,61 @@ class TestChannelTrustLifecycle:
         assert port.confirmed == []
         assert verdict is not None
         assert verdict.confirmed is False
-        assert verdict.first_failure == "surface_uuid"
+        assert control_operation_kinds(database) == [
+            "channel.rebind_refused",
+            "channel.approval_required",
+        ]
+        row = database.execute(
+            "SELECT reason, result_json FROM control_operations "
+            "WHERE kind = 'channel.rebind_refused'"
+        ).fetchone()
+        assert row is not None
+        assert "REBIND REFUSED" in str(row["reason"])
+        assert "error" in json.loads(str(row["result_json"]))
+        # The predecessor anchor is untouched by the refused rebind —
+        # the gate below evaluates against it directly.
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        anchor = anchors.active_for_cell("cell-demo")
+        assert anchor is not None
+        assert anchor.surface_uuid == THIRD.surface_uuid
+
+    @pytest.mark.asyncio
+    async def test_a_same_session_and_surface_re_ensure_never_rebinds(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """No rotation happened — the active anchor already binds this
+        exact session and surface — so ``confirm_seat`` never attempts
+        a rebind at all: no predecessor is retired, no successor is
+        minted, and the single anchor captured for this seat is the
+        exact one the gate matches against."""
+
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        original = capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_demo_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is not None
+        assert verdict.confirmed is True
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        active = anchors.active_for_cell("cell-demo")
+        assert active is not None
+        assert active.anchor_id == original.anchor_id
+        rows = database.execute(
+            "SELECT event_type FROM events "
+            "WHERE event_type LIKE 'channel_trust_anchor.%' ORDER BY sequence"
+        ).fetchall()
+        assert [str(row["event_type"]) for row in rows] == [
+            "channel_trust_anchor.captured"
+        ]
+        assert "channel.rebind_refused" not in control_operation_kinds(database)
 
     @pytest.mark.asyncio
     async def test_watcher_timeout_sends_zero_keys_and_no_receipt(

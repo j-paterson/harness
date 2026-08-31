@@ -1411,6 +1411,55 @@ class ChannelTrustConfirmer:
         entry_path = self._entry_resolver()
         launch_argv = self._live_argv(session_id)
 
+        # INFRA-208: a managed rotation seats the replacement lead with
+        # a new session/surface (and, on a generation bump, a new
+        # canonical entry path) — the exact facts the gate below
+        # requires to match the anchor exactly. Carry an already-proven
+        # anchor forward to this seat's live identity BEFORE the gate
+        # runs, so the rotated seat can still auto-confirm; a rotation
+        # this trigger never sees (no anchor, or one that already
+        # matches) never attempts a rebind. Any refusal — content
+        # drift, a still-pending predecessor's prompt evidence, or a
+        # concurrent change — is a genuinely new trust decision, not a
+        # rotation carry-forward: it is recorded and this call falls
+        # through to evaluate() unchanged, so the existing manual-
+        # dialog fallback and its receipts stay exactly as they are.
+        anchors = ChannelTrustAnchors(self._database, events=self._events)
+        canonical_session = str(uuid.UUID(session_id))
+        active_anchor = anchors.active_for_cell(str(binding.cell_id))
+        if active_anchor is not None and (
+            active_anchor.session_id != canonical_session
+            or active_anchor.surface_uuid != binding.surface_uuid
+        ):
+            try:
+                anchors.rebind(
+                    cell_id=str(binding.cell_id),
+                    profile_alias=str(binding.profile_alias),
+                    entry_path=entry_path,
+                    package_root=entry_path.parents[2],
+                    channel_entry=CHANNEL_ENTRY,
+                    launch_argv_template=launch_argv,
+                    workspace_uuid=binding.workspace_uuid,
+                    surface_uuid=binding.surface_uuid,
+                    session_id=session_id,
+                )
+            except Exception as error:
+                with suppress(Exception):
+                    self._control.record(
+                        kind="channel.rebind_refused",
+                        project_key=binding.project_key or "",
+                        cell_id=str(binding.cell_id),
+                        session_id=session_id,
+                        result={"error": str(error)[:200]},
+                        reason=(
+                            "CHANNEL REBIND REFUSED: the rotated seat's "
+                            "trust anchor could not be carried forward "
+                            "automatically; the operator must confirm the "
+                            "development-channel dialog manually for this "
+                            "seat"
+                        ),
+                    )
+
         def _run_bounded(operation: Callable[[], Awaitable[Any]]) -> Any:
             # The gate calls its collaborators synchronously between
             # its durable claim and its completion receipt, while this
@@ -1453,7 +1502,7 @@ class ChannelTrustConfirmer:
         gate = ChannelTrustGate(
             self._database,
             self._events,
-            ChannelTrustAnchors(self._database, events=self._events),
+            anchors,
             self._control,
             _read_live,
             _press,
