@@ -48,16 +48,26 @@ exact same surface (no duplication); a dead or partial workspace is
 closed and rebuilt under the binding's successor generation.
 
 Role proof (Sol K2) combines two typed observations and no screen
-content: the pane's cmux process-name tree must have the role's
-expected interpreter/wrapper shape, AND the exact expected command
-lineage must be observed running via local process argv (``ps``),
-which carries the full command line through legitimate wrappers —
-``…/hermes-agent/venv/bin/python …/hermes-agent/hermes chat
---continue <session> --create-if-missing`` for the lower role and
-``uv run hermes-orchestrator --repo-root … --state-dir … dashboard``
-(plus its console-script child) for the upper. A bare interpreter
-name proves nothing; a wrong session name or an unrelated
-python/uv+python fails the role and fails closed.
+content: the exact expected command lineage must be observed running
+via local process argv (``ps``), which carries the full command line
+through legitimate wrappers — ``…/hermes-agent/venv/bin/python
+…/hermes-agent/hermes chat --continue <session> --create-if-missing``
+for the lower role and ``uv run hermes-orchestrator --repo-root …
+--state-dir … dashboard`` (plus its console-script child, or —
+INFRA-216 W1 — the active-runtime launcher's own child chain) for the
+upper. A bare interpreter name proves nothing; a wrong session name or
+an unrelated python/uv+python fails the role and fails closed. For the
+UPPER role the pane's cmux process-name tree must ALSO have the
+role's expected interpreter/wrapper shape (Sol K2, unchanged): that
+single-purpose entry must never accrue children. INFRA-216 W1: the
+LOWER role does not additionally require the shape — a live durable
+Hermes session legitimately launches its own tool children (the
+reproduced defect: a chat-launched ``uv run hermes-orchestrator
+dashboard``), which the shape check cannot distinguish from an
+occupied pane by process name alone, so for LOWER the exact live
+lineage on the surface's own correlated tree is sufficient by itself;
+absent lineage, and a failed or ambiguous correlation, still fail
+closed exactly as before.
 """
 
 from __future__ import annotations
@@ -136,6 +146,20 @@ def dashboard_pane_command(
     sources/renderer/pane machinery. Both paths must be absolute and
     metacharacter-free and the interval bounded, so exactly this
     command shape and nothing else can be composed.
+
+    INFRA-216 W1: plain ``uv run hermes-orchestrator …`` runs from the
+    MUTABLE config checkout at ``repo_root`` — observed live to fall
+    behind the active runtime's migration generation, killing the
+    respawned dashboard and leaving a rebuild with only the chat pane.
+    The deployment renders an active-runtime launcher at
+    ``<state_dir>/bin/hermes-orchestrator`` (a ``/bin/sh`` shim that
+    ``exec``s ``uv run --project $ACTIVE hermes-orchestrator "$@"``
+    from the live runtime). When that file exists this composes
+    through it instead; the launcher path is re-validated against the
+    same absolute, metacharacter-free grammar and refused otherwise
+    (fail closed). Isolated/dev state dirs and temp-state smokes carry
+    no rendered launcher, so they keep the plain ``uv run``
+    composition unchanged.
     """
 
     root = str(repo_root)
@@ -153,6 +177,18 @@ def dashboard_pane_command(
     if not 5 <= int(interval) <= 86400:
         raise WorkspaceRefused(
             "the dashboard interval must be between 5 and 86400 seconds"
+        )
+    launcher = state_dir / "bin" / "hermes-orchestrator"
+    if launcher.exists():
+        launcher_path = str(launcher)
+        if _SAFE_PATH.fullmatch(launcher_path) is None:
+            raise WorkspaceRefused(
+                "the active-runtime launcher path must be an absolute "
+                "metacharacter-free path"
+            )
+        return (
+            f"{launcher_path} --repo-root {root} "
+            f"--state-dir {state} dashboard --interval {int(interval)}"
         )
     return (
         f"uv run hermes-orchestrator --repo-root {root} "
@@ -278,6 +314,17 @@ def hermes_process_shape(processes: Sequence[str]) -> bool:
     installed ``hermes`` entry is a python script, so the tree shows a
     python interpreter (or a ``hermes`` binary name), optionally with
     ``node`` tool children, plus wrappers.
+
+    INFRA-216 W1: a live chat session also legitimately launches other
+    tool children (observed: a chat-launched ``uv run
+    hermes-orchestrator dashboard``) that this name-only shape cannot
+    tell apart from an occupied pane. :meth:`OrchestratorWorkspaceLifecycle.role_proof`
+    no longer gates the LOWER role's proof on this function's verdict
+    — only on the exact live command lineage — so this remains a
+    reported diagnostic for the lower role rather than a veto. It is
+    unchanged and still load-bearing for every other use (dashboard
+    shape stays a strict AND, and this function is still exercised
+    directly by its own unit tests below).
     """
 
     meaningful = _meaningful(processes)
@@ -695,14 +742,24 @@ class OrchestratorWorkspaceLifecycle:
         """The exact upper-role argv the role proof demands.
 
         Derived from the composed (grammar-validated, single-spaced)
-        dashboard command: ``uv run`` stripped, the console-script
-        identity at the executable position, every argument token
-        exact.
+        dashboard command, whichever of the two grammars
+        :func:`dashboard_pane_command` chose: ``uv run`` stripped down
+        to the console-script identity, OR (INFRA-216 W1) the
+        active-runtime launcher's own path reduced to its basename —
+        either way the trailing argument tokens are identical (uv
+        never forwards ``--project`` into the script's own argv), so
+        both compositions demand the exact same expected command.
         """
 
         tokens = self._dashboard_command.split()
+        if _token_basename(tokens[0]) == "uv" and tokens[1] == "run":
+            return RoleExpectation(
+                executable=_token_basename(tokens[2]),
+                arguments=tuple(tokens[3:]),
+            )
         return RoleExpectation(
-            executable=tokens[2], arguments=tuple(tokens[3:])
+            executable=_token_basename(tokens[0]),
+            arguments=tuple(tokens[1:]),
         )
 
     @property
@@ -731,6 +788,23 @@ class OrchestratorWorkspaceLifecycle:
         their descendants. A matching command running anywhere else on
         the host proves nothing. A failed correlation proves nothing
         either and is reported for the caller to fail closed on.
+
+        INFRA-216 W1: the UPPER (dashboard) role stays the strict Sol
+        K2 conjunction — shape AND exact lineage — because that entry
+        is single-purpose and must never accrue children. The LOWER
+        (chat) role does not: a durable Hermes session legitimately
+        launches its own tool children (the reproduced defect: a
+        chat-launched ``uv run hermes-orchestrator dashboard``), which
+        ``hermes_process_shape`` correctly cannot tell apart from an
+        occupied pane by name alone. So for LOWER, the exact live
+        command lineage — proven on this surface's own correlated
+        tree, correlation status "ok" — is sufficient by itself;
+        ``shape_ok`` is still computed and reported (useful
+        diagnostic, and still gates every other role) but never vetoes
+        a proven lower lineage. Absent lineage, or a failed/ambiguous
+        correlation, are unchanged: nothing is proven, and a failed
+        correlation is reported for the caller to fail closed on, same
+        as before.
         """
 
         shape = ROLE_SHAPES.get(role)
@@ -748,6 +822,12 @@ class OrchestratorWorkspaceLifecycle:
             if expectation is not None and correlation.status == "ok"
             else ()
         )
+        lineage_proven = correlation.status == "ok" and bool(matched)
+        role_proven = (
+            lineage_proven
+            if role == LOWER_ROLE
+            else shape_ok and lineage_proven
+        )
         return {
             "shape_ok": shape_ok,
             "expected_lineage": (
@@ -756,11 +836,7 @@ class OrchestratorWorkspaceLifecycle:
             "correlation": correlation.status,
             "surface_pids": list(correlation.pids),
             "lineage_matches": [line[:200] for line in matched],
-            "role_proven": (
-                shape_ok
-                and correlation.status == "ok"
-                and bool(matched)
-            ),
+            "role_proven": role_proven,
         }
 
     async def ensure(self) -> OrchestratorWorkspaceState:

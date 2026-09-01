@@ -23,6 +23,10 @@ from hermes_orchestrator.channel_hub import (
     ChannelPacketRouter,
     hub_socket_path,
 )
+from hermes_orchestrator.chat_resume import (
+    ChatResumeService,
+    ObservingOrchestratorWorkspaceOwner,
+)
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.circleci import (
     CircleCiClient,
@@ -767,7 +771,13 @@ def open_runtime(
                 # instead of crashing live startup: cmux visibility
                 # stays optional.
                 try:
-                    orchestrator_workspace = OrchestratorWorkspaceOwner(
+                    # INFRA-216 packet W2: every start()/tick() result the
+                    # owner returns also feeds ChatResumeService.observe,
+                    # so an ACTUAL recovery (see chat_resume.py) delivers
+                    # exactly one durable resume wake to the same fixed
+                    # "orchestrator" session name the lifecycle above
+                    # composes into the lower pane's command by default.
+                    orchestrator_workspace = ObservingOrchestratorWorkspaceOwner(
                         OrchestratorWorkspaceLifecycle(
                             port=cmux_port,
                             bindings=cmux_bindings,
@@ -776,7 +786,12 @@ def open_runtime(
                             inside_marked_pane=bool(
                                 environment.get(SEAT_ENV)
                             ),
-                        )
+                        ),
+                        ChatResumeService(
+                            database=database,
+                            events=events,
+                            session_name="orchestrator",
+                        ),
                     )
                 except WorkspaceRefused:
                     orchestrator_workspace = None
