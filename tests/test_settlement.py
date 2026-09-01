@@ -1520,6 +1520,71 @@ class TestAcceptanceGatedSettlement:
         assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
         self._assert_held_exactly_once(acceptance)
 
+    async def test_an_acknowledged_hold_survives_the_pre_settle_crash(
+        self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Sol Critical a626cf1f: the settlement's ``mark_merged`` durably
+        # persists (state 'merged'), the lead ACKNOWLEDGES the dispatched
+        # acceptance assignment, and only then does the process crash
+        # before ``mark_settled``. On resume, ``merge_approved`` re-claims
+        # the 'merged' row and ``_drive_merge`` takes the already-merged
+        # replay branch straight into ``_project_after_merge`` ->
+        # ``_hold_for_acceptance`` -> ``_dispatch_acceptance_assignment``
+        # — which must dedup against the acknowledged row instead of
+        # opening a fresh dispatch epoch that supersedes it.
+        self._gate(acceptance)
+        original_mark_settled = acceptance.settlements.mark_settled
+        calls = {"count": 0}
+
+        def crash_after_ack(settlement_id: str, *, token: str) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                [published] = self._assignments(acceptance)
+                assert published["state"] == "published"
+                assert acceptance.assignments.acknowledge(
+                    str(published["assignment_id"]),
+                    session_id="11111111-1111-4111-8111-111111111111",
+                )
+                raise RuntimeError("simulated crash before mark_settled")
+            original_mark_settled(settlement_id, token=token)
+
+        monkeypatch.setattr(
+            acceptance.settlements, "mark_settled", crash_after_ack
+        )
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await acceptance.submit("ENG-9", GOOD)
+
+        assert acceptance.settlements.get("review:demo:evt-1").state == "merged"
+        [acknowledged] = self._assignments(acceptance)
+        assert acknowledged["state"] == "acknowledged"
+
+        [first] = await acceptance.service.resume_settlements("demo")
+        assert first.state == "merged"
+        assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
+        for _ in range(2):
+            # Now terminal: further resumes find nothing to drive and
+            # change nothing.
+            assert await acceptance.service.resume_settlements("demo") == ()
+        rows = self._assignments(acceptance)
+        assert len(rows) == 1
+        assert rows[0]["assignment_id"] == acknowledged["assignment_id"]
+        assert rows[0]["state"] == "acknowledged"
+        assert int(
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM events "
+                "WHERE event_type = 'assignment.superseded'"
+            )
+        ) == 0
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert acceptance.linear.targets == [
+            ("ENG-9", "Review", "operator"),
+            ("ENG-9", "In Development", "operator"),
+        ]
+        assert self._hold_transitions(acceptance) == 1
+
     async def test_a_crash_inside_the_hold_projection_replays_exactly_once(
         self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:

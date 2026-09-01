@@ -637,7 +637,16 @@ class ReviewService:
 
         record = self._get(review_id)
         if record.state == "merged":
-            await self._project_after_merge(record)
+            # Replay, not a fresh merge (Sol Critical a626cf1f): the
+            # review already recorded "merged" on a prior pass — this
+            # call is a resumed settlement (crashed between
+            # ``mark_merged`` and ``mark_settled``) or a settled replay
+            # — never the merge that just happened. The acceptance hold
+            # this re-derives must dedup against a live (published or
+            # acknowledged) assignment instead of opening a fresh
+            # dispatch epoch that supersedes one the lead already
+            # acknowledged.
+            await self._project_after_merge(record, reconciling=True)
             return _outcome(record, reason=record.reason or "merged")
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
@@ -1024,7 +1033,14 @@ class ReviewService:
             },
         )
         if record.state == "merged":
-            await self._project_after_merge(record)
+            # Same replay character as ``_drive_merge``'s already-merged
+            # branch (Sol Critical a626cf1f): reaching here with the
+            # review already ``merged`` means a prior pass completed
+            # ``_settle_proven`` and crashed before this method's own
+            # ``mark_merged``/``mark_settled`` tail below, so this is a
+            # resumed reconciliation, never the merge that just
+            # happened. Dedup against a live assignment instead.
+            await self._project_after_merge(record, reconciling=True)
             outcome = _outcome(record, reason=record.reason or "merged")
         else:
             outcome = await self._settle_proven(
@@ -1238,11 +1254,28 @@ class ReviewService:
             effect_id=effect_id,
         )
 
-    async def _project_after_merge(self, record: ReviewRecord) -> None:
+    async def _project_after_merge(
+        self, record: ReviewRecord, *, reconciling: bool = False
+    ) -> None:
+        """Project a merged review onward; ``reconciling`` marks a replay.
+
+        ``reconciling`` is threaded to :meth:`_hold_for_acceptance` (and
+        from there to ``_dispatch_acceptance_assignment``) so that every
+        caller re-deriving this projection for a review that was
+        already ``merged`` on a prior pass — not the fresh merge that
+        just happened — dedups against a live acceptance assignment
+        instead of opening a fresh dispatch epoch over one the lead may
+        have already acknowledged. The one FRESH caller is
+        ``_settle_proven``, right after ``_transition`` first marks the
+        review ``merged``; every REPLAY caller (``_drive_merge``'s
+        already-merged branch, and ``reconcile_external_merge``'s) must
+        pass ``reconciling=True``.
+        """
+
         if self._acceptance is not None and self._acceptance.pending(
             record.issue_id
         ):
-            await self._hold_for_acceptance(record)
+            await self._hold_for_acceptance(record, reconciling=reconciling)
             return
         projection = record.projection
         if projection is None:
@@ -1273,9 +1306,12 @@ class ReviewService:
         produces one queue transition, one durable assignment, and one
         Linear effect. Once the gate is satisfied (or absent), replays
         of this projection complete the issue exactly as before.
-        ``reconciling`` marks the recovery replay (Sol 04d013b0 finding
-        1): dispatch then dedups against any live assignment instead of
-        opening a fresh dispatch epoch over an acknowledged one.
+        ``reconciling`` marks a recovery replay of an already-projected
+        merge (Sol 04d013b0 finding 1; scope widened by Sol Critical
+        a626cf1f to every replay caller of ``_project_after_merge``, not
+        only the ``reconcile_acceptance`` pass): dispatch then dedups
+        against any live assignment instead of opening a fresh dispatch
+        epoch over an acknowledged one.
         """
 
         assert self._acceptance is not None
@@ -1323,11 +1359,15 @@ class ReviewService:
         row as a consumed dispatch epoch and supersedes it with a fresh
         packet — right for a genuine re-queue, wrong for recovery, which
         must repair a MISSING dispatch, never replace a delivered one.
-        On the RECONCILIATION path a gate-scoped durable dedup runs in
-        the same transaction first: any non-superseded assignment for
-        this issue and instruction (``published`` OR ``acknowledged``)
-        proves the action already dispatched, and the replay does
-        nothing. The merge-time dispatch keeps its epoch semantics.
+        On any REPLAY path — the ``reconcile_acceptance`` pass, or a
+        resumed settlement/external-merge reconciliation whose review
+        was already ``merged`` on a prior pass (Sol Critical a626cf1f)
+        — a gate-scoped durable dedup runs in the same transaction
+        first: any non-superseded assignment for this issue and
+        instruction (``published`` OR ``acknowledged``) proves the
+        action already dispatched, and the replay does nothing. Only
+        the genuine merge-time dispatch (a review transitioning to
+        ``merged`` for the first time) keeps its epoch semantics.
         """
 
         if self._assignments is None:
