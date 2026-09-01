@@ -140,6 +140,11 @@ def _retry_handler(queue: QueueService) -> Callable[[BaseModel], dict[str, Any]]
         # Not in a retryable state now — but a PREVIOUS requeue may already
         # have landed the row as queued-and-not-ready with no supported way
         # out. Retry is that way out: repair it through this same command.
+        # The queued+not-ready shape alone does NOT authorize that, since
+        # admission permits exactly it for a legitimately dependency-gated
+        # issue; restore_readiness_after_requeue additionally requires
+        # durable provenance of a prior journaled requeue, and returns None
+        # (leaving the row untouched) without it.
         repaired = queue.restore_readiness_after_requeue(
             command.issue_id,
             actor="remote-operator",
