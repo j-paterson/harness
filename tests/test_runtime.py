@@ -1245,3 +1245,62 @@ def test_daemon_pool_selects_deterministically_and_only_first_party_profiles(
         assert "max-d" not in pool.last_refusal
     finally:
         runtime.close()
+
+
+def test_resolve_prompt_file_prefers_the_activated_runtime(
+    tmp_path: Path,
+) -> None:
+    """INFRA-214 (observed live 2026-09-01): the harness launch failed
+    because the prompt resolved from the stale PRIMARY checkout, which
+    does not carry the merged ``claude-harness.md``. Assets must come
+    from the activated runtime so they are version-matched to the code
+    actually running."""
+
+    from hermes_orchestrator.runtime import resolve_prompt_file
+
+    repo_root = tmp_path / "checkout"
+    (repo_root / "prompts").mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    runtime_root = state_dir / "runtimes" / "abc123"
+    (runtime_root / "prompts").mkdir(parents=True)
+    (runtime_root / "prompts" / "claude-harness.md").write_text("x")
+    (state_dir / "runtimes" / "ACTIVE").write_text(str(runtime_root))
+
+    resolved = resolve_prompt_file(
+        "claude-harness.md", repo_root=repo_root, state_dir=state_dir
+    )
+
+    assert resolved == runtime_root / "prompts" / "claude-harness.md"
+    assert resolved.is_file()
+    # The stale checkout is never consulted while an ACTIVE runtime exists.
+    assert not (repo_root / "prompts" / "claude-harness.md").exists()
+
+
+def test_resolve_prompt_file_falls_back_only_before_activation(
+    tmp_path: Path,
+) -> None:
+    """With no ACTIVE pointer recorded the documented pre-activation
+    fallback applies; an empty pointer is treated the same way."""
+
+    from hermes_orchestrator.runtime import resolve_prompt_file
+
+    repo_root = tmp_path / "checkout"
+    (repo_root / "prompts").mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    (state_dir / "runtimes").mkdir(parents=True)
+
+    expected = repo_root / "prompts" / "claude-lead.md"
+    assert (
+        resolve_prompt_file(
+            "claude-lead.md", repo_root=repo_root, state_dir=state_dir
+        )
+        == expected
+    )
+
+    (state_dir / "runtimes" / "ACTIVE").write_text("   ")
+    assert (
+        resolve_prompt_file(
+            "claude-lead.md", repo_root=repo_root, state_dir=state_dir
+        )
+        == expected
+    )

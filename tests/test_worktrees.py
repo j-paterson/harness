@@ -1136,3 +1136,188 @@ def test_inspect_reports_status_head_and_bound_processes(
     assert inspection.branch == "feature/eng-431"
     assert inspection.ahead == 2
     assert inspection.process_lease_ids == ("proc-1",)
+
+
+class _RecordingWorktreeGit:
+    """Records dedicated-worktree creation without touching a real repo."""
+
+    def __init__(self) -> None:
+        self.added: list[tuple[Path, Path, str]] = []
+        self.created: list[tuple[Path, str, str]] = []
+        self.fetched: list[tuple[str, str]] = []
+        self.existing_branches: set[str] = set()
+
+    def worktree_add_branch(
+        self, repo_path: Path, path: Path, branch: str
+    ) -> None:
+        self.added.append((repo_path, path, branch))
+        path.mkdir(parents=True, exist_ok=True)
+
+    def local_branch_exists(self, repo_path: Path, branch: str) -> bool:
+        return branch in self.existing_branches
+
+    def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
+        self.fetched.append((remote, branch))
+
+    def worktree_add_new_branch(
+        self, repo_path: Path, path: Path, branch: str, start_point: str
+    ) -> None:
+        self.created.append((path, branch, start_point))
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def test_two_admitted_issues_resolve_distinct_bound_paths(
+    leases: WorktreeLeases, tmp_path: Path
+) -> None:
+    """The decisive regression for reopened INFRA-219.
+
+    Publication resolves ONE exact issue checkout per admitted lane. A
+    shared checkout could not: ``worktree_leases_live_path_idx`` is
+    UNIQUE on live ``path``, so two issues sharing one path is not even
+    representable, and every lane that did resolve would return the same
+    checkout — the wrong-head hazard the guard exists to prevent.
+    """
+
+    from hermes_orchestrator.emission import resolve_lane
+    from hermes_orchestrator.worktrees import bind_issue_worktree
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    git = _RecordingWorktreeGit()
+    for issue, branch in (("INFRA-1", "feature/one"), ("INFRA-2", "feature/two")):
+        bind_issue_worktree(
+            leases,
+            git,
+            project_key="demo",
+            issue_id=issue,
+            repo_path=repo,
+            branch=branch,
+        )
+
+    first = resolve_lane(leases, "demo", "INFRA-1")
+    second = resolve_lane(leases, "demo", "INFRA-2")
+
+    assert first.path != second.path
+    assert first.branch == "feature/one"
+    assert second.branch == "feature/two"
+    # First assignment: no local branch, so each lane is CREATED from
+    # the fetched integration head rather than reusing a stale branch.
+    assert len(git.created) == 2
+    assert git.fetched == [("origin", "main"), ("origin", "main")]
+
+
+def test_bind_issue_worktree_is_idempotent(
+    leases: WorktreeLeases, tmp_path: Path
+) -> None:
+    """``resolve_lane`` refuses zero live leases AND refuses more than
+    one, so a repeated bind must add neither a second lease nor a second
+    worktree — otherwise publication breaks exactly as hard as before."""
+
+    from hermes_orchestrator.emission import resolve_lane
+    from hermes_orchestrator.worktrees import bind_issue_worktree
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    git = _RecordingWorktreeGit()
+    first = bind_issue_worktree(
+        leases, git, project_key="demo", issue_id="INFRA-1",
+        repo_path=repo, branch="feature/one",
+    )
+    again = bind_issue_worktree(
+        leases, git, project_key="demo", issue_id="INFRA-1",
+        repo_path=repo, branch="feature/one",
+    )
+
+    assert again.lease_id == first.lease_id
+    assert len(git.created) == 1
+    assert str(resolve_lane(leases, "demo", "INFRA-1").path) == first.path
+
+
+def test_forbidden_checkouts_are_refused_fail_closed(
+    leases: WorktreeLeases, tmp_path: Path
+) -> None:
+    """The coordinator CWD, the harness checkout and the primary
+    checkout are never leaseable, and a branchless checkout is refused
+    before any git call — refusals write nothing (INFRA-214)."""
+
+    from hermes_orchestrator.worktrees import (
+        IssueWorktreeRefused,
+        bind_issue_worktree,
+        dedicated_issue_path,
+    )
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    git = _RecordingWorktreeGit()
+
+    with pytest.raises(IssueWorktreeRefused, match="no branch"):
+        bind_issue_worktree(
+            leases, git, project_key="demo", issue_id="INFRA-1",
+            repo_path=repo, branch="   ",
+        )
+
+    # The derived path can never equal a forbidden checkout, so the
+    # explicit refusal is belt-and-braces: prove it still fires.
+    derived = dedicated_issue_path(repo, "INFRA-1")
+    with pytest.raises(IssueWorktreeRefused, match="not leaseable"):
+        bind_issue_worktree(
+            leases, git, project_key="demo", issue_id="INFRA-1",
+            repo_path=repo, branch="feature/one", forbidden=(derived,),
+        )
+
+    assert git.added == [] and git.created == []
+    assert leases.active("demo") == ()
+
+
+def test_first_assignment_creates_the_branch_from_the_fetched_head(
+    leases: WorktreeLeases, tmp_path: Path
+) -> None:
+    """INFRA-214 live-path requirement: a newly admitted issue has NO
+    local feature branch, so a worktree add that assumes one fails. The
+    lane's branch is created from the project's FETCHED
+    ``origin/<integration_branch>`` — never a stale local main, which
+    may lag the remote by many merges and would silently base the lane
+    on an old head."""
+
+    from hermes_orchestrator.worktrees import bind_issue_worktree
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    git = _RecordingWorktreeGit()
+
+    bind_issue_worktree(
+        leases, git, project_key="demo", issue_id="INFRA-1",
+        repo_path=repo, branch="feature/infra-1",
+        integration_branch="release",
+    )
+
+    assert git.added == []
+    assert git.fetched == [("origin", "release")]
+    [(path, branch, start_point)] = git.created
+    assert branch == "feature/infra-1"
+    assert start_point == "origin/release"
+    assert path.name == "project-issue-INFRA-1"
+
+
+def test_an_existing_issue_branch_is_reused_not_recreated(
+    leases: WorktreeLeases, tmp_path: Path
+) -> None:
+    """Only a validated EXISTING issue branch is reused; reuse must not
+    fetch or re-create it (INFRA-214)."""
+
+    from hermes_orchestrator.worktrees import bind_issue_worktree
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    git = _RecordingWorktreeGit()
+    git.existing_branches.add("feature/infra-1")
+
+    bind_issue_worktree(
+        leases, git, project_key="demo", issue_id="INFRA-1",
+        repo_path=repo, branch="feature/infra-1",
+    )
+
+    assert git.created == []
+    assert git.fetched == []
+    [(_repo, _path, branch)] = git.added
+    assert branch == "feature/infra-1"

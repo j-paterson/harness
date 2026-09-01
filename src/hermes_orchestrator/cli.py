@@ -28,6 +28,7 @@ from hermes_orchestrator.cells import (
     HARNESS_LANE,
     ProfileCapacityEvidence,
     ProjectCellService,
+    bind_admitted_issue_worktree,
     ensure_harness_checkout,
 )
 from hermes_orchestrator.channel_hub import (
@@ -190,6 +191,19 @@ def _parser() -> argparse.ArgumentParser:
     observe.add_argument("--json", action="store_true")
 
     reconcile = commands.add_parser("reconcile", help="reconcile durable local state")
+    reconcile.add_argument(
+        "--bind-issue-lane",
+        default=None,
+        help=(
+            "<project>:<issue> — bind one already-active issue's "
+            "dedicated worktree lane"
+        ),
+    )
+    reconcile.add_argument(
+        "--bind-issue-branch",
+        default=None,
+        help="explicit validated branch for --bind-issue-lane",
+    )
     reconcile.add_argument("--json", action="store_true")
 
     daemon = commands.add_parser("daemon", help="run the local supervisor loop")
@@ -1327,9 +1341,25 @@ def _open_rotation_collaborators(
     # acceptance testing only and never selects or implements product
     # issues (see ``prompts/claude-harness.md``).
     prompt_name = "claude-harness.md" if lane_role == HARNESS_LANE else "claude-lead.md"
+    # INFRA-214 (observed live 2026-09-01): resolving this from
+    # ``settings.repo_root`` pointed at the stale primary checkout,
+    # which does not carry the merged ``claude-harness.md`` — Claude
+    # exited 1 on a prompt file that was not there. Assets resolve from
+    # the ACTIVATED runtime, version-matched to the running code, and a
+    # missing asset fails closed HERE, before any process is launched.
+    from hermes_orchestrator.runtime import resolve_prompt_file
+
+    prompt_file = resolve_prompt_file(
+        prompt_name, repo_root=settings.repo_root, state_dir=settings.state_dir
+    )
+    if not prompt_file.is_file():
+        raise FileNotFoundError(
+            f"the {lane_role} lead prompt is missing at {prompt_file}; "
+            "refusing to launch a lead with an unresolvable prompt asset"
+        )
     runner = ClaudeRunner(
         registry,
-        prompt_file=settings.repo_root / "prompts" / prompt_name,
+        prompt_file=prompt_file,
         base_env=environment,
         processes=runtime.processes,
         freeze_dir=settings.state_dir / "freezes",
@@ -1352,6 +1382,26 @@ def _open_rotation_collaborators(
         checkpoints=runtime.checkpoints,
         context=ContextMonitor(database, events, policy=settings.policy),
         surfaces=seater,
+        # INFRA-214 (observed live 2026-09-01): this one-shot composition
+        # omitted classic-seat mode, so ``_activate_seat`` passed
+        # ``classic_command=None`` -- Hermes created an EMPTY cmux
+        # workspace and separately launched a hidden ``claude -p``
+        # shadow process instead of the visible channel-enabled classic
+        # session. The daemon's own composition (runtime.py) has always
+        # set this; ``start-lane``/``rotate-lead`` must agree with it, so
+        # the same predicate is used here rather than a second rule.
+        classic_seats=(
+            settings.cmux is not None
+            and settings.cmux.classic_leads
+            and seater is not None
+        ),
+        # INFRA-214: with classic seats enabled,
+        # ``_activate_issue_transaction`` publishes the lead's durable
+        # assignment through ``self._assignments`` -- omitting it would
+        # let the visible harness seat launch correctly and then sit
+        # IDLE with no assignment or channel wake, which is the same
+        # silent-idle class of failure this issue exists to remove.
+        assignments=LeadAssignments(database, events=events),
     )
     return cells, seater
 
@@ -4890,6 +4940,63 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "findings": list(result.findings),
                 "admission_open": result.admission_open,
             }
+            # INFRA-214 migration path: issues admitted BEFORE the
+            # assignment-time binding existed are already
+            # in_development, so that hook will never run for them and
+            # their candidates stay unpublishable. This idempotent
+            # catch-up binds any occupying issue that still has no live
+            # lease, and is a no-op for those that do.
+            if args.bind_issue_lane:
+                # Targeted and observable: one exact issue, and a failure
+                # surfaces rather than being suppressed. A blanket sweep
+                # would try to bind legacy issues whose branches are
+                # checked out elsewhere and bury the real repair in noise.
+                #
+                # Bound to the lease store and git directly, NOT to
+                # runtime.cells: `reconcile` is a non-live runtime and
+                # builds no cell service, so gating on one made this
+                # silently do nothing and still exit zero.
+                project_key, _, issue_id = args.bind_issue_lane.partition(":")
+                project = settings.projects.get(project_key)
+                if not issue_id:
+                    _print(
+                        {"error": "expected --bind-issue-lane <project>:<issue>"},
+                        json_output=args.json,
+                        human="--bind-issue-lane takes <project>:<issue>.",
+                    )
+                    return 1
+                if (
+                    project is None
+                    or runtime.worktree_leases is None
+                    or runtime.worktree_git is None
+                ):
+                    _print(
+                        {"error": f"no registered project {project_key!r}"},
+                        json_output=args.json,
+                        human=f"Unknown project {project_key!r}.",
+                    )
+                    return 1
+                try:
+                    payload["bound_issue_lanes"] = list(
+                        bind_admitted_issue_worktree(
+                            database,
+                            runtime.worktree_leases,
+                            runtime.worktree_git,
+                            project_key=project_key,
+                            issue_id=issue_id,
+                            repo_path=project.repo_path,
+                            branch=args.bind_issue_branch,
+                            forbidden=(Path.cwd(),),
+                            integration_branch=project.integration_branch,
+                        )
+                    )
+                except Exception as error:
+                    _print(
+                        {"error": f"{type(error).__name__}: {error}"},
+                        json_output=args.json,
+                        human=f"issue-lane binding failed: {error}",
+                    )
+                    return 1
             _print(
                 payload,
                 json_output=args.json,

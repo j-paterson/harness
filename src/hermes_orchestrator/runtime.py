@@ -223,6 +223,11 @@ class Runtime:
     channel_hub: ChannelHub | None = None
     channel_capabilities: ChannelCapabilities | None = None
     control_operations: ControlOperations | None = None
+    # INFRA-214: built for EVERY runtime, live or not, so the
+    # issue-worktree catch-up can run from `reconcile` — which
+    # deliberately builds no cell service.
+    worktree_leases: WorktreeLeases | None = None
+    worktree_git: WorktreeGit | None = None
     dashboard_refresh: DashboardRefreshAction | None = None
     # Sol correction b4b545f3 (v5): production composition no longer
     # builds a fakechat wake plane, so this is always None from
@@ -263,6 +268,41 @@ def cmux_password_source(
         return cache[0]
 
     return read
+
+
+def resolve_prompt_file(
+    name: str, *, repo_root: Path, state_dir: Path
+) -> Path:
+    """Resolve a prompt asset from the ACTIVATED runtime, not a checkout.
+
+    INFRA-214 (observed live 2026-09-01): ``start-lane --lane harness``
+    launched Claude with ``--append-system-prompt-file <repo_root>/
+    prompts/claude-harness.md`` and the process exited 1, because
+    ``repo_root`` is the stable PRIMARY checkout, which carries only
+    the prompts that existed when it was last updated — the merged
+    ``claude-harness.md`` lives solely in the activated runtime
+    artifact. Prompt and config assets must therefore resolve the same
+    way :func:`resolve_sidecar_entry` already resolves the sidecar:
+    through the ``runtimes/ACTIVE`` pointer, so the asset is always
+    version-matched to the code being run. The ``repo_root`` fallback
+    exists only for the documented pre-activation state, when no ACTIVE
+    runtime is recorded; it is never an arbitrarily stale source
+    checkout standing in for an activated one.
+
+    Existence is deliberately NOT checked here — the caller fails
+    closed before launching any process, so a missing asset can never
+    reach Claude as a bad argument (the exact observed failure).
+    """
+
+    fallback = repo_root / "prompts" / name
+    pointer = state_dir / "runtimes" / "ACTIVE"
+    try:
+        recorded = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback
+    if not recorded:
+        return fallback
+    return Path(recorded) / "prompts" / name
 
 
 def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
@@ -857,6 +897,23 @@ def open_runtime(
                 # for a lane it actually finds a key for, so with no
                 # harness lane configured this composition is
                 # byte-identical to pre-R5b behavior.
+                worktree_leases=worktree_leases,
+                # INFRA-214: the worktree primitives live on WorktreeGit;
+                # GitVerifier has none of them.
+                issue_git=worktree_git,
+                # ``project_paths`` above is each project's lead_cwd, NOT
+                # its stable repository root, so deriving an issue's
+                # dedicated path from it would place the lane beside the
+                # lead worktree instead of the repo. The stable roots are
+                # passed separately for that derivation.
+                issue_repo_paths={
+                    alias: project.repo_path
+                    for alias, project in settings.projects.items()
+                },
+                issue_integration_branches={
+                    alias: project.integration_branch
+                    for alias, project in settings.projects.items()
+                },
                 lane_project_paths={
                     (alias, HARNESS_LANE): _harness_lead_cwd(project.lead_cwd)
                     for alias, project in settings.projects.items()
@@ -935,6 +992,8 @@ def open_runtime(
             channel_capabilities=channel_capabilities,
             control_operations=control_operations,
             dashboard_refresh=dashboard_refresh,
+            worktree_leases=worktree_leases,
+            worktree_git=worktree_git,
             fakechat_router=None,
             _daemon_lock=daemon_lock,
         )

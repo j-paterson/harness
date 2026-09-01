@@ -1347,3 +1347,161 @@ async def test_workspace_processes_refuses_unstructured_output() -> None:
 
     with pytest.raises(CmuxProtocolError, match="structured process"):
         await port.workspace_processes(WORKSPACE)
+
+
+def test_activation_intent_carries_the_seat_lane(
+    seater_bindings: CmuxSurfaceBindings, seater_database: Database
+) -> None:
+    """INFRA-214 (observed live 2026-09-01): the lane never reached the
+    activation intent, so BOTH failed harness seats persisted as
+    ``lane_role=development`` and their residue was indistinguishable
+    from the development lane's own binding. ``record_intent`` always
+    accepted the lane; the seat simply never passed it, so this pins
+    the durable row rather than the parameter default.
+    """
+
+    intent = seater_bindings.record_intent(
+        project_key="demo",
+        cell_id="cell-harness",
+        session_id="11111111-1111-4111-8111-111111111111",
+        profile_alias="max-b",
+        lane_role="harness",
+    )
+
+    stored = seater_database.execute(
+        "SELECT lane_role FROM cmux_activation_intents WHERE intent_id = ?",
+        (intent.intent_id,),
+    ).fetchone()
+    assert stored["lane_role"] == "harness"
+
+    # A development activation is unchanged and never mislabelled.
+    development = seater_bindings.record_intent(
+        project_key="demo",
+        cell_id="cell-dev",
+        session_id="22222222-2222-4222-8222-222222222222",
+        profile_alias="max-a",
+    )
+    stored_dev = seater_database.execute(
+        "SELECT lane_role FROM cmux_activation_intents WHERE intent_id = ?",
+        (development.intent_id,),
+    ).fetchone()
+    assert stored_dev["lane_role"] == "development"
+
+
+@pytest.mark.asyncio
+async def test_retire_failed_seat_closes_the_workspace_then_marks_closed(
+    seater_bindings: CmuxSurfaceBindings, seater_database: Database
+) -> None:
+    """INFRA-214 (observed live 2026-09-01): the two failed harness
+    starts left TWO dead visible cmux workspaces plus active binding
+    residue. Marking only the durable row closed would HIDE that
+    residue; the workspace must actually close first, and the session's
+    channel config must be cleaned once its surface is gone.
+    """
+
+    port = FakeSeaterPort()
+    channel = FakeChannelLaunch(config=Path("/tmp/x.mcp.json"))
+    seater = make_seater(seater_bindings, port, channel_launch=channel)
+    ref = CmuxSurfaceRef(workspace_uuid="ws-1", surface_uuid="sf-1")
+    binding = seater_bindings.bind_lead(
+        ref=ref,
+        project_key=LEAD_PROJECT,
+        cell_id="cell-harness",
+        session_id=LEAD_SESSION,
+        profile_alias=LEAD_PROFILE,
+    )
+
+    closed = await seater.retire_failed_seat(
+        cell_id="cell-harness",
+        session_id=LEAD_SESSION,
+        reason="lead_start_failed",
+    )
+
+    assert closed is True
+    # The real workspace was closed through the port, not just the row.
+    assert port.closed == ["ws-1"]
+    state = seater_database.execute(
+        "SELECT state FROM cmux_surface_bindings WHERE binding_id = ?",
+        (binding.binding_id,),
+    ).fetchone()
+    assert state["state"] == "closed"
+    # Channel configuration is cleaned once the surface is gone.
+    assert channel.cleaned == [LEAD_SESSION]
+    # An immediate retry finds no active binding residue.
+    assert seater_bindings.active_lead("cell-harness") is None
+
+
+@pytest.mark.asyncio
+async def test_retire_failed_seat_holds_residual_when_close_is_unconfirmed(
+    seater_bindings: CmuxSurfaceBindings, seater_database: Database
+) -> None:
+    """An unconfirmed close must NOT be recorded as closed: the binding
+    is held as residual ownership evidence so a later reconciliation
+    reclaims the exact surface instead of leaking it (INFRA-214, same
+    idiom as the channel-trust close path).
+
+    Sol correction d85c374d: the session's channel configuration must
+    ALSO survive. The workspace may still be alive, and stripping a live
+    surface of its configuration is worse than the residue -- it stays
+    on screen with no way to reach it, and the residual binding
+    reconciliation depends on can no longer be resolved. This assertion
+    was missing, which is exactly why the unsafe cleanup passed."""
+
+    class RefusingPort(FakeSeaterPort):
+        async def close_workspace(self, workspace_uuid: str) -> None:
+            from hermes_orchestrator.cmux import CmuxError as _CmuxError
+
+            raise _CmuxError("close could not be confirmed")
+
+    port = RefusingPort()
+    channel = FakeChannelLaunch(config=Path("/tmp/x.mcp.json"))
+    seater = make_seater(seater_bindings, port, channel_launch=channel)
+    ref = CmuxSurfaceRef(workspace_uuid="ws-2", surface_uuid="sf-2")
+    binding = seater_bindings.bind_lead(
+        ref=ref,
+        project_key=LEAD_PROJECT,
+        cell_id="cell-harness",
+        session_id=LEAD_SESSION,
+        profile_alias=LEAD_PROFILE,
+    )
+
+    closed = await seater.retire_failed_seat(
+        cell_id="cell-harness",
+        session_id=LEAD_SESSION,
+        reason="lead_start_failed",
+    )
+
+    assert closed is False
+    state = seater_database.execute(
+        "SELECT state FROM cmux_surface_bindings WHERE binding_id = ?",
+        (binding.binding_id,),
+    ).fetchone()
+    assert state["state"] == "residual"
+    # The surface may still be alive: its configuration and capability
+    # are PRESERVED so the residual binding stays reconcilable.
+    assert channel.cleaned == []
+    assert seater_bindings.active_lead("cell-harness") is None
+
+
+@pytest.mark.asyncio
+async def test_retire_failed_seat_cleans_channel_when_no_binding_exists(
+    seater_bindings: CmuxSurfaceBindings,
+) -> None:
+    """Sol correction d85c374d, the other half: with NO binding there is
+    no surface to retain, so the orphaned session configuration is safe
+    -- and correct -- to remove. Gating cleanup on a confirmed close
+    alone would strand it forever."""
+
+    port = FakeSeaterPort()
+    channel = FakeChannelLaunch(config=Path("/tmp/x.mcp.json"))
+    seater = make_seater(seater_bindings, port, channel_launch=channel)
+
+    closed = await seater.retire_failed_seat(
+        cell_id="cell-harness",
+        session_id=LEAD_SESSION,
+        reason="lead_start_failed",
+    )
+
+    assert closed is False
+    assert port.closed == []
+    assert channel.cleaned == [LEAD_SESSION]

@@ -3571,6 +3571,8 @@ async def test_confirmed_session_gets_exactly_one_lead_seat(
             "profile_alias": "max-a",
             "issue_id": "ENG-9",
             "classic_command": None,
+            # INFRA-214: the seat now carries its true lane.
+            "lane_role": "development",
         }
     ]
 
@@ -5560,3 +5562,334 @@ def test_ensure_harness_checkout_refuses_head_mismatch_after_provisioning(
 
     with pytest.raises(HarnessCheckoutRefused):
         ensure_harness_checkout(git, repo_path=repo_path, harness_path=harness_path)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_binds_distinct_issue_lanes_that_publication_resolves(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-214 / reopened INFRA-219: the live publication blocker.
+
+    ``candidate-ready`` was refused because ``resolve_lane`` needs an
+    issue-bound worktree lease and NOTHING in production created one --
+    ``worktree_leases`` was empty. This proves the production path now
+    does: dispatching two admitted issues binds two DISTINCT dedicated
+    lanes, and publication resolves one exact checkout while the other
+    stays independent.
+    """
+
+    from hermes_orchestrator.emission import resolve_lane
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    class _RecordingGit:
+        def __init__(self) -> None:
+            self.added: list[tuple[Path, Path, str]] = []
+            self.created: list[tuple[Path, str, str]] = []
+            self.fetched: list[tuple[str, str]] = []
+            self.existing_branches: set[str] = set()
+
+        def worktree_add_branch(
+            self, repo_path: Path, path: Path, branch: str
+        ) -> None:
+            self.added.append((repo_path, path, branch))
+
+        def local_branch_exists(self, repo_path: Path, branch: str) -> bool:
+            return branch in self.existing_branches
+
+        def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
+            self.fetched.append((remote, branch))
+
+        def worktree_add_new_branch(
+            self, repo_path: Path, path: Path, branch: str, start_point: str
+        ) -> None:
+            self.created.append((path, branch, start_point))
+
+        def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
+            return tuple(str(p) for _r, p, _b in self.added)
+
+        def branch(self, path: Path) -> str | None:
+            for _r, p, b in self.added:
+                if p == path:
+                    return b
+            return None
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    leases = WorktreeLeases(database, EventStore(database))
+    git = _RecordingGit()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        worktree_leases=leases,
+        issue_git=git,
+        issue_repo_paths={"demo": repo},
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+    admit(queue, "ENG-10")
+    await service.dispatch("ENG-10")
+
+    first = resolve_lane(leases, "demo", "ENG-9")
+    second = resolve_lane(leases, "demo", "ENG-10")
+
+    # Two admitted lanes, two distinct dedicated checkouts.
+    assert first.path != second.path
+    assert first.branch == "feature/eng-9"
+    assert second.branch == "feature/eng-10"
+    # Neither is the shared project checkout -- that is what made the
+    # earlier shared-lead_cwd design unusable.
+    assert first.path != repo and second.path != repo
+    assert len(git.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_issue_lane_binding_leaves_the_issue_queued(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-214: binding failure must FAIL CLOSED.
+
+    Swallowing it and activating anyway recreates the original defect --
+    an issue that looks assigned but can never publish, discovered only
+    when candidate-ready refuses. The issue stays durably queued.
+    """
+
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    class _RefusingGit:
+        def worktree_add_branch(self, repo_path, path, branch) -> None:
+            raise RuntimeError("git worktree add failed")
+
+        def local_branch_exists(self, repo_path, branch) -> bool:
+            return True
+
+        def fetch(self, repo_path, remote, branch) -> None:
+            return None
+
+        def worktree_add_new_branch(
+            self, repo_path, path, branch, start_point
+        ) -> None:
+            raise RuntimeError("git worktree add failed")
+
+        def worktree_list(self, repo_path):
+            return ()
+
+        def branch(self, path):
+            return None
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        worktree_leases=WorktreeLeases(database, EventStore(database)),
+        issue_git=_RefusingGit(),
+        issue_repo_paths={"demo": repo},
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+
+    # Durably queued, never silently "assigned but unpublishable".
+    assert queue.get("ENG-9").state is IssueState.QUEUED
+    assert int(
+        database.scalar("SELECT COUNT(*) FROM worktree_leases")
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_harness_dispatch_binds_no_issue_worktree_or_lease(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-214: the harness lane owns no product issue lane.
+
+    ``start-lane --lane harness`` runs on its own dedicated harness
+    checkout and never publishes product candidates, so it must neither
+    provision an issue worktree nor be blocked by one. Binding there
+    would make the harness launch depend on — and fail closed on — a
+    development artifact it will never use.
+    """
+
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    class _ExplodingGit:
+        def worktree_add_branch(self, repo_path, path, branch) -> None:
+            raise AssertionError("the harness lane must not provision one")
+
+        def local_branch_exists(self, repo_path, branch) -> bool:
+            raise AssertionError("the harness lane must not probe branches")
+
+        def fetch(self, repo_path, remote, branch) -> None:
+            raise AssertionError("the harness lane must not fetch")
+
+        def worktree_add_new_branch(
+            self, repo_path, path, branch, start_point
+        ) -> None:
+            raise AssertionError("the harness lane must not create one")
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter(
+        [
+            UUID("66666666-6666-4666-8666-666666666666"),
+            UUID("77777777-7777-4777-8777-777777777777"),
+        ]
+    )
+    cells = iter(["cell-harness", "cell-extra"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        worktree_leases=WorktreeLeases(database, EventStore(database)),
+        issue_git=_ExplodingGit(),
+        issue_repo_paths={"demo": repo},
+    )
+
+    admit(queue, "ENG-9")
+    result = await service.dispatch(
+        "ENG-9", lane_role="harness", harness_run="run-1"
+    )
+
+    # The launch proceeds; no issue worktree or lease is created.
+    assert result.status == "working"
+    assert int(database.scalar("SELECT COUNT(*) FROM worktree_leases")) == 0
+
+
+@pytest.mark.asyncio
+async def test_bind_missing_issue_lanes_catches_up_an_already_active_issue(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-214 migration path.
+
+    An issue admitted BEFORE assignment-time binding existed is already
+    in_development with an acknowledged assignment, so the dispatch hook
+    will never run for it and its candidate stays unpublishable despite
+    green tests. The supported catch-up binds it, and candidate
+    publication then resolves the resulting lease. Idempotent: a second
+    pass creates nothing further.
+    """
+
+    from hermes_orchestrator.emission import resolve_lane
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    class _RecordingGit:
+        def __init__(self) -> None:
+            self.created: list[tuple[Path, str, str]] = []
+            self.fetched: list[tuple[str, str]] = []
+
+        def local_branch_exists(self, repo_path, branch) -> bool:
+            return False
+
+        def fetch(self, repo_path, remote, branch) -> None:
+            self.fetched.append((remote, branch))
+
+        def worktree_add_new_branch(
+            self, repo_path, path, branch, start_point
+        ) -> None:
+            self.created.append((path, branch, start_point))
+
+        def worktree_add_branch(self, repo_path, path, branch) -> None:
+            raise AssertionError("no local branch exists yet")
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    leases = WorktreeLeases(database, EventStore(database))
+    git = _RecordingGit()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        worktree_leases=leases,
+        issue_git=git,
+        issue_repo_paths={"demo": repo},
+        issue_integration_branches={"demo": "main"},
+    )
+
+    # Dispatch WITHOUT the lease collaborators, mimicking an issue that
+    # was activated before assignment-time binding existed.
+    plain = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+    admit(queue, "ENG-9")
+    await plain.dispatch("ENG-9")
+    assert int(database.scalar("SELECT COUNT(*) FROM worktree_leases")) == 0
+
+    bound = service.bind_missing_issue_lanes("demo", issue_id="ENG-9")
+
+    assert bound == ("ENG-9",)
+    lane = resolve_lane(leases, "demo", "ENG-9")
+    assert lane.branch == "feature/eng-9"
+    assert lane.path.name == "project-issue-ENG-9"
+    assert git.fetched == [("origin", "main")]
+
+    # Idempotent: a second catch-up creates nothing further and the
+    # lease still resolves (two live rows would refuse just as hard).
+    service.bind_missing_issue_lanes("demo", issue_id="ENG-9")
+    assert len(git.created) == 1
+    assert resolve_lane(leases, "demo", "ENG-9").path == lane.path

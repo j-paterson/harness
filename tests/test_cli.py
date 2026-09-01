@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import subprocess
 import sys
 import types
 from contextlib import redirect_stderr, redirect_stdout
@@ -1665,6 +1667,10 @@ def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
     lead_worktree = tmp_path / "lead-worktree"
     lead_worktree.mkdir()
     (repo_root / "config").mkdir()
+    # INFRA-214: the launch path fails closed on a missing prompt.
+    (repo_root / "prompts").mkdir(exist_ok=True)
+    for _name in ("claude-lead.md", "claude-harness.md"):
+        (repo_root / "prompts" / _name).write_text("# prompt\n")
     (repo_root / "config/projects.yaml").write_text(
         "projects:\n"
         "  demo:\n"
@@ -2795,6 +2801,10 @@ def test_open_rotation_collaborators_agrees_bootstrap_and_seat_paths_on_lead_wor
     lead_worktree = tmp_path / "lead-worktree"
     lead_worktree.mkdir()
     (repo_root / "config").mkdir()
+    # INFRA-214: the launch path fails closed on a missing prompt.
+    (repo_root / "prompts").mkdir(exist_ok=True)
+    for _name in ("claude-lead.md", "claude-harness.md"):
+        (repo_root / "prompts" / _name).write_text("# prompt\n")
     (repo_root / "config/projects.yaml").write_text(
         "projects:\n"
         "  demo:\n"
@@ -5388,3 +5398,238 @@ def test_open_rotation_collaborators_selects_prompt_by_lane(
         "claude-harness.md",
     ]
     assert prompt_files[1].parent == prompt_files[0].parent
+
+
+def test_start_lane_composes_the_visible_classic_seat_not_a_hidden_runner(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-214 (observed live 2026-09-01): ``start-lane``'s one-shot
+    composition omitted classic-seat mode, so ``_activate_seat`` passed
+    ``classic_command=None`` -- Hermes created an EMPTY cmux workspace
+    and separately launched a hidden ``claude -p`` shadow process
+    instead of the visible channel-enabled classic session. The
+    composition must agree with the daemon's own predicate."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    settings = load_settings(repo_root, state_dir)
+
+    assert settings.cmux is not None
+    # The daemon's predicate (runtime.py) and this command's must agree:
+    # with cmux configured for classic leads, the seat is classic.
+    assert settings.cmux.classic_leads is True
+    source = inspect.getsource(cli_module._open_rotation_collaborators)
+    assert "classic_seats=" in source, (
+        "start-lane's composition must set classic_seats; omitting it is "
+        "what produced the empty workspace plus hidden claude -p shadow"
+    )
+    assert "settings.cmux.classic_leads" in source
+
+
+def test_start_lane_prompt_resolution_fails_closed_before_launch(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing prompt asset must be refused BEFORE any process is
+    launched -- the observed failure handed Claude a path that did not
+    exist and let it exit 1 (INFRA-214)."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    (repo_root / "prompts" / "claude-harness.md").unlink()
+
+    source = inspect.getsource(cli_module._open_rotation_collaborators)
+    assert "resolve_prompt_file" in source
+    assert "refusing to launch a lead with an unresolvable prompt asset" in source
+
+
+def test_start_lane_composition_wires_assignments_for_classic_seats(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-214: with ``classic_seats`` enabled,
+    ``_activate_issue_transaction`` publishes the lead's durable
+    assignment through ``self._assignments``. Omitting it would let the
+    visible harness seat launch correctly and then sit IDLE with no
+    assignment or channel wake -- the same silent-idle failure class
+    this issue exists to remove, and one that would only surface as a
+    lead that started and did nothing."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    source = inspect.getsource(cli_module._open_rotation_collaborators)
+    assert "classic_seats=" in source
+    assert "assignments=LeadAssignments(" in source, (
+        "classic seats publish the assignment through self._assignments; "
+        "the composition must supply it or the seat starts and sits idle"
+    )
+
+
+def _git(repository: Path, *arguments: str) -> None:
+    subprocess.run(
+        ("git", *arguments),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _configured_git_project(tmp_path: Path) -> tuple[Path, Path]:
+    """A registered project whose ``repo_path`` is a REAL checkout.
+
+    The issue-lane binding runs actual git, so proving it from the CLI
+    needs a real repository with a real ``origin`` carrying the
+    integration branch -- exactly the shape the first assignment of a
+    never-before-seen issue meets in production.
+    """
+
+    origin = tmp_path / "origin.git"
+    repository = tmp_path / "project"
+    repository.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", "-b", "main", str(origin)),
+        check=True,
+        capture_output=True,
+    )
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    (repository / "README.md").write_text("demo\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "initial")
+    _git(repository, "remote", "add", "origin", str(origin))
+    _git(repository, "push", "-u", "origin", "main")
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {repository}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (config / "policies.yaml").write_text(
+        "mode: observe\nmax_unresolved_ci_merges: 2\n",
+        encoding="utf-8",
+    )
+    return tmp_path, tmp_path / "state"
+
+
+def _admit_through_cli(configured: tuple[Path, Path], issue_id: str) -> None:
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.domain import IssueState
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.queue import AdmissionRequest, QueueService
+
+    _repo_root, state_dir = configured
+    database = Database.open(state_dir / "state.db")
+    try:
+        QueueService(database, EventStore(database), {"demo"}).admit(
+            AdmissionRequest(
+                issue_id=issue_id,
+                project_key="demo",
+                linear_priority=1,
+                admitted_by="operator",
+                instruction_id=f"chat-{issue_id}",
+            )
+        )
+        # The migration exists FOR issues already occupying a lane from
+        # before the assignment-time hook existed; that state is the
+        # fixture, not something this path is expected to produce.
+        database.execute(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            (IssueState.IN_DEVELOPMENT.value, issue_id),
+        )
+    finally:
+        database.close()
+
+
+def test_reconcile_binds_issue_lane_without_a_live_cell_service(
+    tmp_path: Path,
+) -> None:
+    """INFRA-214: the catch-up must BIND from ``reconcile``.
+
+    ``reconcile`` opens a NON-live runtime, which deliberately builds no
+    ``ProjectCellService`` (that needs the profile pool, runner and
+    Linear client -- none of which this binding touches). Gating the
+    catch-up on ``runtime.cells`` made it silently skip and still exit
+    zero: the operator saw a clean reconcile while the lease store
+    stayed empty and the candidate stayed unpublishable, which is the
+    very failure this path exists to remove.
+    """
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.emission import resolve_lane
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    configured = _configured_git_project(tmp_path)
+    assert invoke([*base_arguments(configured), "init", "--json"]).exit_code == 0
+    _admit_through_cli(configured, "ENG-9")
+
+    result = invoke(
+        [
+            *base_arguments(configured),
+            "reconcile",
+            "--bind-issue-lane",
+            "demo:ENG-9",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["bound_issue_lanes"] == ["ENG-9"]
+
+    _repo_root, state_dir = configured
+    database = Database.open(state_dir / "state.db")
+    try:
+        lane = resolve_lane(
+            WorktreeLeases(database, EventStore(database)), "demo", "ENG-9"
+        )
+    finally:
+        database.close()
+    # The dedicated per-issue checkout, on the derived lane branch --
+    # never the coordinator's own working copy.
+    assert lane.path == tmp_path / "project-issue-ENG-9"
+    assert lane.path.is_dir()
+    assert (
+        subprocess.run(
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"),
+            cwd=lane.path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "feature/eng-9"
+    )
+
+
+def test_reconcile_reports_an_unbindable_issue_lane_instead_of_exiting_clean(
+    tmp_path: Path,
+) -> None:
+    """A failed catch-up must be LOUD. Reporting success for an issue
+    that was never bound is what let the empty lease store survive
+    unnoticed until ``candidate-ready`` refused."""
+
+    configured = _configured_git_project(tmp_path)
+    assert invoke([*base_arguments(configured), "init", "--json"]).exit_code == 0
+
+    result = invoke(
+        [
+            *base_arguments(configured),
+            "reconcile",
+            "--bind-issue-lane",
+            "demo:ENG-404",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert "ENG-404" in json.loads(result.stdout)["error"]
+    assert not (tmp_path / "project-issue-ENG-404").exists()
