@@ -378,3 +378,122 @@ def test_a_tool_use_id_cannot_satisfy_the_lifecycle_identity(
     )
 
     assert database.scalar("SELECT COUNT(*) FROM lead_children") == 0
+
+
+CLEARED_SESSION = "7e6b4849-0000-4000-8000-000000000001"
+
+
+def seed_live_channel(
+    database: Database, cwd: str, *, sessions: tuple[str, ...] = (SESSION,)
+) -> None:
+    """The durable evidence a live ``/clear``-ed seat already leaves: a
+    cwd->project directory row and the connected sidecar registration.
+    The lead process lease is deliberately ``stopped`` -- a reboot
+    leaves no active lead lease, so it must never be the proof."""
+
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO process_leases("
+            "lease_id, worker_id, project_key, kind, pid, pgid, "
+            "executable, cwd, create_time, state, acquired_at, updated_at"
+            ") VALUES ('lease-1', ?, 'demo', 'claude_lead', 1053, 1053, "
+            "'claude', ?, 1.0, 'stopped', ?, ?)",
+            (SESSION, cwd, NOW.isoformat(), NOW.isoformat()),
+        )
+        for index, session in enumerate(sessions):
+            project = "demo" if session == SESSION else "rival"
+            cell = "cell-demo" if session == SESSION else "cell-rival"
+            if project == "rival":
+                connection.execute(
+                    "INSERT INTO process_leases("
+                    "lease_id, worker_id, project_key, kind, pid, pgid, "
+                    "executable, cwd, create_time, state, acquired_at, "
+                    "updated_at) VALUES ('lease-2', ?, 'rival', "
+                    "'claude_lead', 9, 9, 'claude', ?, 1.0, 'stopped', "
+                    "?, ?)",
+                    (session, cwd, NOW.isoformat(), NOW.isoformat()),
+                )
+                connection.execute(
+                    "INSERT INTO project_cells("
+                    "cell_id, project_key, state, profile_alias, "
+                    "session_id, created_at, updated_at) VALUES "
+                    "('cell-rival', 'rival', 'active', 'max-d', ?, ?, ?)",
+                    (session, NOW.isoformat(), NOW.isoformat()),
+                )
+            connection.execute(
+                "INSERT INTO channel_registrations("
+                "registration_id, project_key, cell_id, session_id, "
+                "profile_alias, generation, state, connected_at"
+                ") VALUES (?, ?, ?, ?, 'max-c', ?, 'active', ?)",
+                (
+                    f"reg-{index}",
+                    project,
+                    cell,
+                    session,
+                    index + 1,
+                    NOW.isoformat(),
+                ),
+            )
+
+
+def test_a_cleared_session_canonicalizes_to_the_bound_seat(
+    database: Database, tmp_path: Path
+) -> None:
+    """INFRA-198: ``/clear`` changes only the logical session id. The
+    payload session names no active cell, but the seat resolves through
+    cwd -> project -> active cell -> its one live registration, and the
+    stable id it yields is the one every hook path then uses."""
+
+    from hermes_orchestrator.lead_children import bound_session_at
+
+    seed_active_cell(database)
+    seed_live_channel(database, str(tmp_path))
+    with database.transaction() as connection:
+        assert bound_session_at(connection, str(tmp_path)) == SESSION
+
+
+@pytest.mark.parametrize(
+    "managed_cwd, sessions",
+    [
+        (False, (SESSION,)),
+        (True, ()),
+        (True, (SESSION, FOREIGN_SESSION)),
+    ],
+)
+def test_unproven_or_ambiguous_seats_stay_inert(
+    database: Database,
+    tmp_path: Path,
+    managed_cwd: bool,
+    sessions: tuple[str, ...],
+) -> None:
+    """An unmanaged cwd, no connected sidecar, and two live managed
+    seats sharing the cwd each resolve to nothing, leaving every hook
+    inert."""
+
+    from hermes_orchestrator.lead_children import bound_session_at
+
+    seed_active_cell(database)
+    seed_live_channel(database, str(tmp_path), sessions=sessions)
+    probe = str(tmp_path) if managed_cwd else str(tmp_path / "elsewhere")
+    with database.transaction() as connection:
+        assert bound_session_at(connection, probe) is None
+
+
+def test_the_hook_entry_canonicalizes_once_and_leaves_a_bound_id_alone(
+    database: Database, tmp_path: Path
+) -> None:
+    """The one seam every lead-hook entry uses: a cleared id becomes the
+    stable one, an already-bound id is returned untouched, and an
+    unresolvable id comes back unchanged so the hook stays inert."""
+
+    from hermes_orchestrator.cli import _canonical_session
+
+    seed_active_cell(database)
+    seed_live_channel(database, str(tmp_path))
+    cwd = str(tmp_path)
+    assert _canonical_session(database, CLEARED_SESSION, cwd) == SESSION
+    assert _canonical_session(database, SESSION, cwd) == SESSION
+    stray = str(tmp_path / "elsewhere")
+    assert _canonical_session(database, CLEARED_SESSION, stray) == (
+        CLEARED_SESSION
+    )
