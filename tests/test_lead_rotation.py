@@ -1155,9 +1155,11 @@ async def test_aged_claim_from_a_crashed_winner_still_rotates(
     runner: RecordingRunner,
 ) -> None:
     """Crash-resume survives the claim: the winner journaled its attempt
-    and died before the transfer committed. A retry past the claim-age
-    bound presumes the claimant dead, ADOPTS the open attempt (no second
-    append), and completes the rotation."""
+    and died before the transfer committed. A retry past the expiry
+    bound presumes the claimant dead and adopts ownership through the
+    atomic takeover CAS (Sol 04d013b0 finding 4) — exactly one takeover
+    event references the expired claim, never a second attempt — then
+    completes the rotation."""
 
     await start_cell(cells, queue)
     handoff_id = submit_handoff(handoffs)
@@ -1171,10 +1173,226 @@ async def test_aged_claim_from_a_crashed_winner_still_rotates(
     assert report.ok is True
     assert report.phase == "complete"
     assert report.replacement_session == str(REPLACEMENT_SESSION)
-    # Adoption, not duplication: still exactly one attempt, one close.
+    # Takeover, not duplication: one attempt, one takeover, one close.
     assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert rotation_event_count(database, "lead_rotation.takeover") == 1
     assert rotation_event_count(database, "lead_rotation.completed") == 1
     assert len(seater.calls) == 1
     assert database.scalar(
         "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
     ) == str(REPLACEMENT_SESSION)
+
+
+# -- durable exclusive ownership over the claim (Sol 04d013b0 f4/f5) ------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_over_one_expired_attempt_admits_one_adopter(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Sol 04d013b0 finding 4, required test 4 (first half): two
+    concurrent recovery callers over one EXPIRED attempt race the
+    takeover CAS — exactly one appends the takeover and crosses into
+    cells.rotate; the loser's serialized transaction observes the fresh
+    takeover it did not create and fails closed with zero side effects
+    (the old age-only heuristic let both pass, rotate_calls 1/1)."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    journal_rotation_attempt(database, handoff_id)
+    backdate_rotation_attempts(database, seconds=3600.0)
+    winner_cells = CountingCells(cells)
+    winner_cells.stall_next = True
+    winner = make_rotation(database, handoffs, winner_cells, bindings, seater)
+    loser_cells = CountingCells(cells)
+    loser_seater = RecordingSeater(bindings, database)
+    loser = make_rotation(database, handoffs, loser_cells, bindings, loser_seater)
+
+    task = asyncio.create_task(winner.rotate("cell-demo"))
+    while winner_cells.rotate_calls == 0:
+        await asyncio.sleep(0)
+    # The winner's takeover CAS committed ownership of the expired
+    # claim and it stalls BEFORE the transactional transfer — the exact
+    # window the age-only heuristic let a second adopter race through.
+    assert rotation_event_count(database, "lead_rotation.takeover") == 1
+
+    blocked = await loser.rotate("cell-demo")
+
+    assert blocked.ok is False
+    assert blocked.phase == "claim"
+    assert "rotation attempt already in progress" in (blocked.failure or "")
+    # The loser never crossed into cells.rotate and journaled nothing.
+    assert loser_cells.rotate_calls == 0
+    assert loser_seater.calls == []
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert rotation_event_count(database, "lead_rotation.takeover") == 1
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+    winner_cells.release.set()
+    report = await task
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert winner_cells.rotate_calls == 1
+    assert rotation_event_count(database, "lead_rotation.takeover") == 1
+    assert rotation_event_count(database, "lead_rotation.completed") == 1
+    assert database.scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'project_cell.rotated'"
+    ) == 1
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_a_live_slow_acknowledgement_stream_is_not_stolen_on_age(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Sol 04d013b0 finding 4, required test 4 (second half): a live
+    owner stalled inside the unbounded acknowledgement stream keeps its
+    claim through the in-transfer heartbeat renewals — expiry is
+    measured from the NEWEST renewal by the current owner, so wall-clock
+    age of the original claim alone can never justify a steal."""
+
+    await start_cell(cells, queue)
+    submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    owner_cells = CountingCells(cells)
+    owner_cells.stall_next = True
+    owner = LeadRotation(
+        database=database,
+        handoffs=handoffs,
+        cells=owner_cells,
+        bindings=bindings,
+        seater=seater,
+        worktree_state=lambda project_key: make_worktree_state(),
+        registration_wait_seconds=0,
+        renewal_interval_seconds=0.005,
+    )
+    thief_cells = CountingCells(cells)
+    thief_seater = RecordingSeater(bindings, database)
+    thief = make_rotation(database, handoffs, thief_cells, bindings, thief_seater)
+
+    task = asyncio.create_task(owner.rotate("cell-demo"))
+    while rotation_event_count(database, "lead_rotation.renewed") == 0:
+        await asyncio.sleep(0.005)
+    # Age the CLAIM far past the expiry bound while the owner is alive
+    # (stalled in the acknowledgement stream) and heartbeating.
+    backdate_rotation_attempts(database, seconds=3600.0)
+
+    blocked = await thief.rotate("cell-demo")
+
+    assert blocked.ok is False
+    assert blocked.phase == "claim"
+    assert "rotation attempt already in progress" in (blocked.failure or "")
+    assert thief_cells.rotate_calls == 0
+    assert thief_seater.calls == []
+    assert rotation_event_count(database, "lead_rotation.takeover") == 0
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+    owner_cells.release.set()
+    report = await task
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert rotation_event_count(database, "lead_rotation.completed") == 1
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_post_transfer_recovery_completes_exactly_once(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    runner: RecordingRunner,
+) -> None:
+    """Sol 04d013b0 finding 5, required test 5: two concurrent
+    post-transfer recovery calls converge on ONE ``lead_rotation.
+    completed`` event and ONE complete report — the atomic
+    check-and-complete admits exactly one closer — with no duplicate
+    seat, launch, or transfer side effects (the seat phase's durable
+    active-binding read keeps the second caller off the seater)."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    journal_rotation_attempt(database, handoff_id)
+    rotated = await cells.rotate("cell-demo", handoff_id)
+    assert rotated.session_id == REPLACEMENT_SESSION
+    start_count_after_transfer = runner.start_count
+
+    gate = asyncio.Event()
+    parked = {"count": 0}
+
+    async def parked_sleep(seconds: float) -> None:
+        parked["count"] += 1
+        await gate.wait()
+
+    def recovery(seat: RecordingSeater) -> LeadRotation:
+        return LeadRotation(
+            database=database,
+            handoffs=handoffs,
+            cells=cells,
+            bindings=bindings,
+            seater=seat,
+            worktree_state=lambda project_key: make_worktree_state(),
+            registration_wait_seconds=5,
+            sleep=parked_sleep,
+        )
+
+    seater_a = RecordingSeater(bindings, database, registers_channel=False)
+    seater_b = RecordingSeater(bindings, database, registers_channel=False)
+    task_a = asyncio.create_task(recovery(seater_a).rotate("cell-demo"))
+    while parked["count"] == 0:
+        await asyncio.sleep(0)
+    task_b = asyncio.create_task(recovery(seater_b).rotate("cell-demo"))
+    while parked["count"] < 2:
+        await asyncio.sleep(0)
+    # Both recovery calls observed the OPEN attempt and are parked in
+    # the registration wait; the registration lands and both race the
+    # atomic completion.
+    insert_active_registration(database, session_id=str(REPLACEMENT_SESSION))
+    gate.set()
+    report_a = await task_a
+    report_b = await task_b
+
+    complete = [r for r in (report_a, report_b) if r.ok]
+    assert len(complete) == 1
+    assert complete[0].phase == "complete"
+    assert complete[0].replacement_session == str(REPLACEMENT_SESSION)
+    [lost] = [r for r in (report_a, report_b) if not r.ok]
+    assert lost.phase == "completed_elsewhere"
+    assert "concurrent recovery call" in (lost.failure or "")
+    assert rotation_event_count(database, "lead_rotation.completed") == 1
+    # No duplicate side effects: one seat activation total, no new
+    # runner launches, one transactional transfer.
+    assert len(seater_a.calls) + len(seater_b.calls) == 1
+    assert runner.start_count == start_count_after_transfer
+    assert database.scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'project_cell.rotated'"
+    ) == 1
+    binding = bindings.active_lead("cell-demo")
+    assert binding is not None
+    assert binding.session_id == str(REPLACEMENT_SESSION)

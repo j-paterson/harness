@@ -3974,10 +3974,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
         if args.command == "merge-settle":
             flow = _open_merge_flow(settings, runtime)
+
+            async def _settle_single_review(review_id: str) -> Any:
+                # Sol 04d013b0 finding 3: the per-review maintenance
+                # entry must repair acceptance drift exactly like the
+                # project-wide resume (which composes the pass inside
+                # resume_settlements) — a satisfied gate stranded by a
+                # crash between satisfaction and completion converges to
+                # Done through EITHER supported merge-settle shape. The
+                # pass is scoped to this invocation's project and is
+                # idempotent, so a review with no gated issue repairs
+                # nothing.
+                outcome = await flow.reviews.merge_approved(review_id)
+                await flow.reviews.reconcile_acceptance(args.project)
+                return outcome
+
             try:
                 if args.review is not None:
                     outcomes = (
-                        asyncio.run(flow.reviews.merge_approved(args.review)),
+                        asyncio.run(_settle_single_review(args.review)),
                     )
                 else:
                     outcomes = asyncio.run(

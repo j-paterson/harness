@@ -517,6 +517,27 @@ class ReviewService:
           acceptance assignment once a live project cell exists (the
           same ``_dispatch_acceptance_assignment`` identity binding the
           settlement path uses, so replays are durable no-ops).
+        - Sol 04d013b0 finding 2 (option a — reconcile QA into the
+          hold): a PENDING gate on a proven merged review whose issue
+          was routed to ``qa`` BEFORE the gate existed (a late gate; a
+          gate pending at merge time always wins over QA routing in
+          ``_project_after_merge``) transitions into the same hold.
+          Option (a) is chosen over refusing late gate creation because
+          the ``("QA", "In Development")`` Linear pair is already
+          allowed (``linear._ALLOWED_STATUS_TRANSITIONS`` — the
+          ``qa_reject`` return path projects exactly it), a merged
+          QA-routed issue is a legitimate target for a late acceptance
+          requirement, and a creation-time refusal could not bind the
+          lifecycle anyway: the issue's state keeps moving after the
+          gate row persists, so drift must be repaired at this
+          reconciliation boundary regardless.
+        - Sol 04d013b0 finding 1: the reconciliation replay of the hold
+          is gate-scoped-deduplicated — an existing non-superseded
+          assignment for the issue and instruction (``published`` OR
+          ``acknowledged``) means the action is already dispatched, so
+          recovery never supersedes an acknowledged packet into a
+          duplicate. Only the genuine re-queue path (the merge-time
+          dispatch) keeps ``publish_in``'s consumed-epoch supersession.
         - A SATISFIED gate whose queue or Linear completion never landed
           (a crash after ``AcceptanceGates.satisfy`` persisted but
           before the queue transition / Linear projection) completes the
@@ -556,8 +577,9 @@ class ReviewService:
                 if gate.state == ACCEPTANCE_PENDING and issue_state in (
                     IssueState.DONE,
                     IssueState.POST_MERGE_ACCEPTANCE,
+                    IssueState.QA,
                 ):
-                    await self._hold_for_acceptance(record)
+                    await self._hold_for_acceptance(record, reconciling=True)
                     repairs.append(
                         AcceptanceRepair(gate.issue_id, gate.state, "held")
                     )
@@ -1237,7 +1259,9 @@ class ReviewService:
             effect_id=f"linear:{record.issue_id}:after-merge:{record.review_id}",
         )
 
-    async def _hold_for_acceptance(self, record: ReviewRecord) -> None:
+    async def _hold_for_acceptance(
+        self, record: ReviewRecord, *, reconciling: bool = False
+    ) -> None:
         """Hold a merged, acceptance-gated issue short of completion.
 
         INFRA-198 J1: the merge recorded implementation completion, not
@@ -1249,6 +1273,9 @@ class ReviewService:
         produces one queue transition, one durable assignment, and one
         Linear effect. Once the gate is satisfied (or absent), replays
         of this projection complete the issue exactly as before.
+        ``reconciling`` marks the recovery replay (Sol 04d013b0 finding
+        1): dispatch then dedups against any live assignment instead of
+        opening a fresh dispatch epoch over an acknowledged one.
         """
 
         assert self._acceptance is not None
@@ -1262,7 +1289,7 @@ class ReviewService:
             reason=f"merged {record.merge_sha}; acceptance pending",
         )
         self._dispatch_acceptance_assignment(
-            record, gate, prior_state=prior_state.value
+            record, gate, prior_state=prior_state.value, reconciling=reconciling
         )
         await self._linear.project(
             record.issue_id,
@@ -1278,6 +1305,7 @@ class ReviewService:
         gate: AcceptanceGate,
         *,
         prior_state: str,
+        reconciling: bool = False,
     ) -> None:
         """Publish the durable acceptance assignment packet, exactly once.
 
@@ -1290,12 +1318,31 @@ class ReviewService:
         the assignment is skipped — the issue still holds in
         ``post_merge_acceptance``, and the reconciliation repair (packet
         K) re-derives the missing dispatch from the durable gate.
+
+        Sol 04d013b0 finding 1: ``publish_in`` treats an acknowledged
+        row as a consumed dispatch epoch and supersedes it with a fresh
+        packet — right for a genuine re-queue, wrong for recovery, which
+        must repair a MISSING dispatch, never replace a delivered one.
+        On the RECONCILIATION path a gate-scoped durable dedup runs in
+        the same transaction first: any non-superseded assignment for
+        this issue and instruction (``published`` OR ``acknowledged``)
+        proves the action already dispatched, and the replay does
+        nothing. The merge-time dispatch keeps its epoch semantics.
         """
 
         if self._assignments is None:
             return
         assignment = None
         with self._database.transaction() as connection:
+            if reconciling:
+                dispatched = connection.execute(
+                    "SELECT 1 FROM lead_assignments WHERE issue_id = ? "
+                    "AND instruction_id = ? AND state != 'superseded' "
+                    "LIMIT 1",
+                    (record.issue_id, gate.instruction_id),
+                ).fetchone()
+                if dispatched is not None:
+                    return
             cell = connection.execute(
                 "SELECT cell_id, session_id, profile_alias FROM project_cells "
                 "WHERE project_key = ? AND state IN "

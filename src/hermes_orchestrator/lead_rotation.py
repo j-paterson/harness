@@ -26,7 +26,11 @@ lands completes idempotently.
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -48,13 +52,31 @@ _LIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 _RESUMABLE_HANDOFF_STATES = ("submitted", "acknowledged")
 
 # Margin added to ``registration_wait_seconds`` to form the rotation
-# claim-age bound (see ``LeadRotation._claim_attempt``). Between the
-# claim and the transactional transfer a live rotation runs at most the
-# replacement acknowledgement turn plus seat launch plus the bounded
-# registration wait; five minutes of slack over the registration wait
-# is conservative for all of that, so a younger open attempt is treated
-# as a LIVE claimant and a concurrent request fails closed.
+# claim-EXPIRY bound (see ``LeadRotation._claim_attempt``). Sol 04d013b0
+# finding 4: expiry is measured from the NEWEST renewal appended by the
+# claim's current owner (or from the ownership event itself while no
+# renewal exists), never from the original claim's wall-clock age alone
+# — a live owner heartbeats through every long-running stretch (the
+# in-transfer heartbeat task brackets the unbounded acknowledgement
+# runner stream at ``_RENEWAL_INTERVAL_SECONDS``), so the bound only
+# has to outlast one renewal gap plus scheduling slack, and five
+# minutes over the registration wait is conservative for that.
 _CLAIM_AGE_MARGIN_SECONDS = 300.0
+
+# How often the in-transfer heartbeat task renews the journaled claim
+# while ``cells.rotate`` runs. The replacement acknowledgement runner
+# stream inside ``cells.rotate`` has no upper bound and offers
+# LeadRotation no seam to renew from within a turn, so the heartbeat
+# runs CONCURRENTLY with the awaited transfer — appends only ever
+# interleave between transactions (every ``database.transaction()``
+# block is synchronous), and the cadence keeps a live slow owner's
+# newest renewal far inside the expiry bound.
+_RENEWAL_INTERVAL_SECONDS = 60.0
+
+# The events that carry ownership of one handoff's open rotation
+# attempt: the write-ahead claim itself and any takeover of an expired
+# claim. The NEWEST of these is the current owner.
+_OWNERSHIP_EVENT_TYPES = ("lead_rotation.attempt", "lead_rotation.takeover")
 
 
 def live_cell_project_key(database: Database, cell_id: str) -> str | None:
@@ -134,6 +156,7 @@ class LeadRotation:
         worktree_state: Callable[[str], WorktreeState],
         registration_wait_seconds: float = 60.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        renewal_interval_seconds: float = _RENEWAL_INTERVAL_SECONDS,
     ) -> None:
         self._database = database
         self._events = EventStore(database)
@@ -144,6 +167,7 @@ class LeadRotation:
         self._worktree_state = worktree_state
         self._registration_wait_seconds = registration_wait_seconds
         self._sleep = sleep
+        self._renewal_interval_seconds = renewal_interval_seconds
 
     async def rotate(self, cell_id: str) -> RotationReport:
         """Advance one cell's lead rotation exactly as far as durable
@@ -252,23 +276,44 @@ class LeadRotation:
                         "rotate-lead"
                     ),
                 )
+            # Post-transfer recovery holds no claim token: the claim
+            # guards only the pre-transfer window, every phase from here
+            # on is idempotent, and duplicate completion is excluded by
+            # the atomic ``_journal_completed`` CAS instead.
             replacement_session = incumbent_session
             profile_alias = incumbent_profile
+            claim_token: str | None = None
         else:
             # Sol 524a38ed finding 3: the claim is acquired atomically,
             # BEFORE cells.rotate or any runner/seat launch, so two
             # concurrent rotate-lead processes can never both transfer.
-            refusal = self._claim_attempt(cell_id, handoff_id)
+            refusal, claim_token = self._claim_attempt(cell_id, handoff_id)
             if refusal is not None:
                 return self._blocked(
                     cell_id, handoff_id, phase="claim", failure=refusal
                 )
+            assert claim_token is not None
+            # Sol 04d013b0 finding 4: the acknowledgement runner stream
+            # inside cells.rotate has no upper bound and no seam for
+            # LeadRotation to renew from within, so a concurrent
+            # heartbeat task brackets the whole awaited transfer —
+            # renewals interleave only between transactions, and a live
+            # slow owner is never mistaken for a dead one.
+            heartbeat = asyncio.ensure_future(
+                self._renew_periodically(cell_id, handoff_id, claim_token)
+            )
             try:
                 rotated = await self._cells.rotate(cell_id, handoff_id)
             except RotationBlocked as error:
                 return self._blocked(
                     cell_id, handoff_id, phase="transfer", failure=str(error)
                 )
+            finally:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+            # Renewal at the phase transition: the transfer committed.
+            self._renew(cell_id, handoff_id, claim_token, phase="transferred")
             replacement_session = str(rotated.session_id)
             profile_alias = rotated.profile_alias
 
@@ -278,6 +323,7 @@ class LeadRotation:
             project_key=project_key,
             replacement_session=replacement_session,
             profile_alias=profile_alias,
+            claim_token=claim_token,
         )
 
     async def _seat(
@@ -288,7 +334,11 @@ class LeadRotation:
         project_key: str,
         replacement_session: str,
         profile_alias: str | None,
+        claim_token: str | None = None,
     ) -> RotationReport:
+        if claim_token is not None:
+            # Renewal at the phase transition: entering the seat phase.
+            self._renew(cell_id, handoff_id, claim_token, phase="seat")
         # A durable read, not an in-memory flag: an active binding
         # already owned by the replacement session means a prior run (or
         # this one, replayed) already completed the seat phase, and no
@@ -304,6 +354,7 @@ class LeadRotation:
                 replacement_session=replacement_session,
                 profile_alias=profile_alias,
                 binding_id=existing_binding.binding_id,
+                claim_token=claim_token,
             )
         classic_command = classic_resume_command(replacement_session, resume=True)
         try:
@@ -340,6 +391,7 @@ class LeadRotation:
             replacement_session=replacement_session,
             profile_alias=profile_alias,
             binding_id=binding.binding_id,
+            claim_token=claim_token,
         )
 
     async def _completion_report(
@@ -350,16 +402,42 @@ class LeadRotation:
         replacement_session: str,
         profile_alias: str | None,
         binding_id: str,
+        claim_token: str | None = None,
     ) -> RotationReport:
         """Report ``complete`` only once the replacement session's active
         hermes-control registration is durably observed — a bound seat
         without its channel is reported blocked instead of a false
         success. The seat itself is never retired, closed, or otherwise
         modified here: a rerun re-enters the idempotent short-circuit
-        above and re-checks the registration."""
+        above and re-checks the registration. Exactly one caller ever
+        reports ``complete``: the atomic ``_journal_completed`` CAS
+        closes the attempt once, and a concurrent recovery call whose
+        completion lost that race reports the loss instead of a second
+        success (Sol 04d013b0 finding 5)."""
 
-        if await self._replacement_is_registered(replacement_session):
-            self._journal_completed(cell_id, handoff_id, replacement_session)
+        if await self._replacement_is_registered(
+            replacement_session,
+            cell_id=cell_id,
+            handoff_id=handoff_id,
+            claim_token=claim_token,
+        ):
+            if not self._journal_completed(
+                cell_id, handoff_id, replacement_session
+            ):
+                return RotationReport(
+                    ok=False,
+                    phase="completed_elsewhere",
+                    cell_id=cell_id,
+                    handoff_id=handoff_id,
+                    replacement_session=replacement_session,
+                    profile=profile_alias,
+                    binding_id=binding_id,
+                    failure=(
+                        "a concurrent recovery call already journaled this "
+                        "rotation's completion; the one complete report was "
+                        "issued there and nothing further remains to do"
+                    ),
+                )
             return RotationReport(
                 ok=True,
                 phase="complete",
@@ -386,10 +464,20 @@ class LeadRotation:
             ),
         )
 
-    async def _replacement_is_registered(self, session_id: str) -> bool:
+    async def _replacement_is_registered(
+        self,
+        session_id: str,
+        *,
+        cell_id: str | None = None,
+        handoff_id: str | None = None,
+        claim_token: str | None = None,
+    ) -> bool:
         """Poll immediately, then every 1.0s (via the injected sleep)
         until an active registration for ``session_id`` is observed or
-        ``registration_wait_seconds`` elapses (0 checks exactly once)."""
+        ``registration_wait_seconds`` elapses (0 checks exactly once).
+        A caller that still owns the journaled claim renews it on every
+        wait iteration, so this bounded stretch never ages the claim
+        toward a false expiry."""
 
         elapsed = 0.0
         while True:
@@ -403,6 +491,10 @@ class LeadRotation:
                 return False
             await self._sleep(1.0)
             elapsed += 1.0
+            if claim_token is not None and cell_id and handoff_id:
+                self._renew(
+                    cell_id, handoff_id, claim_token, phase="registration_wait"
+                )
 
     def _attempt_open(self, handoff_id: str) -> bool:
         """True while a journaled ``lead_rotation.attempt`` for
@@ -421,96 +513,212 @@ class LeadRotation:
             (handoff_id, handoff_id),
         ).fetchone() is not None
 
-    def _claim_attempt(self, cell_id: str, handoff_id: str) -> str | None:
-        """Atomically claim the exclusive rotation attempt for this handoff.
+    def _claim_attempt(
+        self, cell_id: str, handoff_id: str
+    ) -> tuple[str | None, str | None]:
+        """Atomically claim exclusive rotation ownership for this handoff.
 
-        Sol 524a38ed finding 3: the open-attempt check used to run
-        OUTSIDE the append transaction, so two concurrent rotate-lead
-        processes could both observe "no open attempt", both journal one,
-        and both enter ``cells.rotate`` — potentially launching two
-        replacements. Here the check AND the write-ahead
-        ``lead_rotation.attempt`` append run inside ONE
-        ``database.transaction()``: ``BEGIN IMMEDIATE`` serializes
-        writers, so exactly one caller finds no open attempt and appends
-        it (the winner); every concurrent caller's own atomic
-        check-then-append observes an open attempt it did not create.
-        The claim is acquired before ``cells.rotate`` or any runner/seat
-        launch, so the loser fails closed with zero side effects.
+        Sol 524a38ed finding 3 established the write-ahead claim; Sol
+        04d013b0 finding 4 makes it a durable exclusive OWNERSHIP
+        protocol over the events journal. Ownership events —
+        ``lead_rotation.attempt`` (the initial claim) and
+        ``lead_rotation.takeover`` (adoption of an expired claim) —
+        each carry a unique ``claim_token``; the NEWEST ownership event
+        for an open attempt names the current owner, and the owner
+        proves liveness by appending ``lead_rotation.renewed`` events
+        carrying its token at every phase transition (plus the
+        in-transfer heartbeat that brackets the unbounded
+        acknowledgement stream).
 
-        Claim-age rule: an open attempt does not by itself prove a LIVE
-        claimant — the winner may have crashed before closing it. The
-        attempt event's ``occurred_at`` is the discriminator, bounded by
-        ``registration_wait_seconds + 300s``: between claiming and the
-        transactional transfer (the only window this claim guards — a
-        committed transfer resumes through the ``transfer_already_
-        committed`` branch instead), a live rotation runs at most the
-        replacement acknowledgement turn, the seat launch, and the
-        bounded registration wait, so five minutes of margin over the
-        registration wait is conservative. An attempt YOUNGER than the
-        bound presumes a live claimant and this call fails closed
-        (returns the refusal reason); an OLDER one presumes the claimant
-        dead and the retry adopts the open attempt (no second append —
-        the journal keeps exactly one open attempt per handoff) and
-        resumes. Adoption is safe because nothing pre-transfer is
-        externally visible and every later phase derives from durable
-        rows. An unparsable timestamp fails closed. Returns ``None``
-        when the claim is acquired, fresh or adopted.
+        Everything here — the newest-ownership read, the expiry
+        decision, and the append — runs inside ONE
+        ``database.transaction()`` (``BEGIN IMMEDIATE`` takes the write
+        lock at BEGIN), so writers are fully serialized:
+
+        - No open attempt: append the claim; this caller owns it.
+        - Open attempt whose owner is LIVE (its newest renewal — or the
+          ownership event itself when none exists — is within
+          ``registration_wait_seconds + 300s``): fail closed. A slow
+          but renewing owner can therefore never be stolen on the
+          original claim's wall-clock age alone.
+        - Open attempt whose owner EXPIRED: an atomic takeover CAS. The
+          same transaction re-verifies the target is still the newest
+          ownership event AND that no takeover already references it
+          (the NOT-EXISTS guard) before appending the takeover — so of
+          any number of concurrent adopters exactly one appends, and
+          every loser's own serialized transaction then observes a
+          fresh takeover it did not create and fails closed.
+
+        The claim guards only the pre-transfer window (a committed
+        transfer resumes through the ``transfer_already_committed``
+        branch, whose phases are idempotent and whose completion is a
+        CAS). An unparsable timestamp fails closed. Returns
+        ``(refusal_reason, None)`` on refusal or ``(None, claim_token)``
+        when ownership is acquired, fresh or taken over.
         """
 
         now = datetime.now(UTC)
+        token = uuid.uuid4().hex
+        bound = self._registration_wait_seconds + _CLAIM_AGE_MARGIN_SECONDS
+        refusal = (
+            "rotation attempt already in progress for handoff "
+            f"{handoff_id!r}: another rotate-lead holds the journaled "
+            f"claim (renewed within the {bound:g}s liveness bound); "
+            "nothing was transferred or launched. Retry once it "
+            "completes or its claim expires without renewal"
+        )
+        placeholders = ",".join("?" for _ in _OWNERSHIP_EVENT_TYPES)
         with self._database.transaction() as connection:
-            row = connection.execute(
-                "SELECT occurred_at FROM events "
-                "WHERE event_type = 'lead_rotation.attempt' "
+            owner = connection.execute(
+                "SELECT sequence, occurred_at, payload_json FROM events "
+                f"WHERE event_type IN ({placeholders}) "
                 "AND aggregate_id = ? AND NOT EXISTS ("
                 "SELECT 1 FROM events AS closed "
                 "WHERE closed.event_type = 'lead_rotation.completed' "
                 "AND closed.aggregate_id = ?) "
                 "ORDER BY sequence DESC LIMIT 1",
-                (handoff_id, handoff_id),
+                (*_OWNERSHIP_EVENT_TYPES, handoff_id, handoff_id),
             ).fetchone()
-            if row is not None:
-                bound = (
-                    self._registration_wait_seconds + _CLAIM_AGE_MARGIN_SECONDS
+            if owner is None:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="lead_rotation.attempt",
+                        aggregate_type="handoff",
+                        aggregate_id=handoff_id,
+                        payload={"cell_id": cell_id, "claim_token": token},
+                    ),
                 )
-                try:
-                    occurred = datetime.fromisoformat(str(row["occurred_at"]))
-                    if occurred.tzinfo is None:
-                        occurred = occurred.replace(tzinfo=UTC)
-                    age = (now - occurred).total_seconds()
-                except ValueError:
-                    age = None
-                if age is None or age <= bound:
-                    return (
-                        "rotation attempt already in progress for handoff "
-                        f"{handoff_id!r}: another rotate-lead holds the "
-                        "journaled claim (within the "
-                        f"{bound:g}s liveness bound); nothing was "
-                        "transferred or launched. Retry once it completes "
-                        "or its claim ages out"
-                    )
-                # Aged claim: the claimant is presumed dead; adopt its
-                # open attempt and resume without a second append.
-                return None
+                return None, token
+            owner_sequence = int(owner["sequence"])
+            owner_token = _payload_token(owner["payload_json"])
+            liveness = self._newest_liveness_stamp(
+                connection,
+                handoff_id,
+                owner_sequence=owner_sequence,
+                owner_token=owner_token,
+                fallback=str(owner["occurred_at"]),
+            )
+            age = _seconds_since(liveness, now)
+            if age is None or age <= bound:
+                return refusal, None
+            # Expired owner: the takeover CAS. The NOT-EXISTS guard runs
+            # in this same serialized transaction, so exactly one
+            # concurrent adopter appends the takeover.
+            taken = connection.execute(
+                "SELECT 1 FROM events "
+                "WHERE event_type = 'lead_rotation.takeover' "
+                "AND aggregate_id = ? AND sequence > ? LIMIT 1",
+                (handoff_id, owner_sequence),
+            ).fetchone()
+            if taken is not None:
+                return refusal, None
             self._events.append(
                 connection,
                 EventInput(
-                    event_type="lead_rotation.attempt",
+                    event_type="lead_rotation.takeover",
                     aggregate_type="handoff",
                     aggregate_id=handoff_id,
-                    payload={"cell_id": cell_id},
+                    payload={
+                        "cell_id": cell_id,
+                        "claim_token": token,
+                        "supersedes_sequence": owner_sequence,
+                        "supersedes_token": owner_token,
+                    },
                 ),
             )
-        return None
+        return None, token
+
+    def _newest_liveness_stamp(
+        self,
+        connection: sqlite3.Connection,
+        handoff_id: str,
+        *,
+        owner_sequence: int,
+        owner_token: str | None,
+        fallback: str,
+    ) -> str:
+        """The current owner's newest renewal timestamp, else its claim's.
+
+        Only renewals appended AFTER the ownership event and carrying
+        the owner's exact ``claim_token`` count — a legacy ownership
+        event without a token (pre-protocol rows) can never be renewed
+        and expires from its own ``occurred_at``.
+        """
+
+        if owner_token is None:
+            return fallback
+        rows = connection.execute(
+            "SELECT occurred_at, payload_json FROM events "
+            "WHERE event_type = 'lead_rotation.renewed' "
+            "AND aggregate_id = ? AND sequence > ? "
+            "ORDER BY sequence DESC",
+            (handoff_id, owner_sequence),
+        ).fetchall()
+        for row in rows:
+            if _payload_token(row["payload_json"]) == owner_token:
+                return str(row["occurred_at"])
+        return fallback
+
+    def _renew(
+        self, cell_id: str, handoff_id: str, claim_token: str, *, phase: str
+    ) -> None:
+        """Append one durable claim renewal proving the owner is alive."""
+
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="lead_rotation.renewed",
+                    aggregate_type="handoff",
+                    aggregate_id=handoff_id,
+                    payload={
+                        "cell_id": cell_id,
+                        "claim_token": claim_token,
+                        "phase": phase,
+                    },
+                ),
+            )
+
+    async def _renew_periodically(
+        self, cell_id: str, handoff_id: str, claim_token: str
+    ) -> None:
+        """Heartbeat the claim while the transfer (and its unbounded
+        acknowledgement runner stream) runs; cancelled when it returns."""
+
+        while True:
+            await self._sleep(self._renewal_interval_seconds)
+            self._renew(
+                cell_id, handoff_id, claim_token, phase="acknowledgement_turn"
+            )
 
     def _journal_completed(
         self, cell_id: str, handoff_id: str, replacement_session: str
-    ) -> None:
-        """Close the attempt with the one ``complete`` report, once."""
+    ) -> bool:
+        """Atomically close the open attempt with its one completion.
 
-        if not self._attempt_open(handoff_id):
-            return
+        Sol 04d013b0 finding 5: the openness check used to run OUTSIDE
+        the append transaction, so concurrent post-transfer recovery
+        could journal duplicate completion events. Check and append now
+        run inside ONE ``BEGIN IMMEDIATE`` transaction — the same
+        serialized check-then-append pattern as the claim — so exactly
+        one caller appends ``lead_rotation.completed`` and returns True
+        (earning the one ``complete`` report); every other concurrent
+        caller observes the closed attempt and returns False.
+        """
+
         with self._database.transaction() as connection:
+            open_attempt = connection.execute(
+                "SELECT 1 FROM events "
+                "WHERE event_type = 'lead_rotation.attempt' "
+                "AND aggregate_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM events AS closed "
+                "WHERE closed.event_type = 'lead_rotation.completed' "
+                "AND closed.aggregate_id = ?) LIMIT 1",
+                (handoff_id, handoff_id),
+            ).fetchone()
+            if open_attempt is None:
+                return False
             self._events.append(
                 connection,
                 EventInput(
@@ -523,6 +731,7 @@ class LeadRotation:
                     },
                 ),
             )
+        return True
 
     def _cell_row(self, cell_id: str) -> object | None:
         return self._database.execute(
@@ -553,3 +762,27 @@ class LeadRotation:
             handoff_id=handoff_id,
             failure=failure,
         )
+
+
+def _payload_token(payload_json: object) -> str | None:
+    """The ``claim_token`` carried by one journaled event, if any."""
+
+    try:
+        payload = json.loads(str(payload_json))
+    except (TypeError, ValueError):
+        return None
+    token = payload.get("claim_token") if isinstance(payload, dict) else None
+    return None if token is None else str(token)
+
+
+def _seconds_since(stamp: str, now: datetime) -> float | None:
+    """Age of one ISO timestamp, or ``None`` when it cannot be parsed
+    (the caller fails closed on ``None``)."""
+
+    try:
+        occurred = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if occurred.tzinfo is None:
+        occurred = occurred.replace(tzinfo=UTC)
+    return (now - occurred).total_seconds()

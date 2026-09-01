@@ -3973,3 +3973,96 @@ def test_hermes_command_satisfy_acceptance_refuses_unmerged_lifecycles(
         )
     finally:
         database.close()
+
+
+def test_merge_settle_review_reconciles_a_stranded_satisfied_gate(
+    configured_repo: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sol 04d013b0 finding 3 (required test 3): the acceptance gate's
+    satisfaction persisted but the process crashed before the queue
+    transition and Linear completion. The per-review maintenance entry —
+    ``merge-settle --review`` — must run the acceptance reconciliation
+    exactly like the project-wide resume does, converging the issue to
+    Done exactly once, and a replay of the same command repeats
+    nothing."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.domain import IssueState
+    from tests.integration.test_codex_merge_acceptance import GOOD, Acceptance
+
+    harness_root = tmp_path / "acceptance-harness"
+    harness_root.mkdir()
+    harness = Acceptance(harness_root)
+    try:
+        harness.seat_cell()
+        harness.gates.require(
+            "ENG-9",
+            instruction_id="chat-accept-eng-9",
+            predicates=("live_smoke",),
+        )
+        outcome = asyncio.run(harness.submit("ENG-9", GOOD))
+        assert outcome.state == "merged"
+        assert (
+            harness.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+
+        harness.gates.satisfy("ENG-9", evidence={"live_smoke": "receipt-1"})
+        # The crash point: satisfaction is durable, completion never ran.
+        assert (
+            harness.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert not any(t[1] == "Done" for t in harness.linear.targets)
+
+        monkeypatch.setattr(
+            cli_module,
+            "_open_merge_flow",
+            lambda settings, runtime: types.SimpleNamespace(
+                reviews=harness.service
+            ),
+        )
+        settle = [
+            *base_arguments(configured_repo),
+            "merge-settle",
+            "--project",
+            "demo",
+            "--review",
+            outcome.review_id,
+            "--json",
+        ]
+
+        result = invoke(settle)
+
+        assert result.exit_code == 0
+        [payload] = json.loads(result.stdout)
+        assert payload["state"] == "merged"
+        assert payload["review_id"] == outcome.review_id
+        assert harness.queue.get("ENG-9").state is IssueState.DONE
+        assert [
+            t for t in harness.linear.targets if t[1] == "Done"
+        ] == [("ENG-9", "Done", "operator")]
+
+        def done_transitions() -> int:
+            return int(
+                harness.database.scalar(
+                    "SELECT COUNT(*) FROM events WHERE event_type = "
+                    "'issue.transitioned' AND aggregate_id = 'ENG-9' AND "
+                    "payload_json LIKE '%\"to\":\"done\"%'"
+                )
+            )
+
+        assert done_transitions() == 1
+
+        # Exactly once: replaying the same maintenance command changes
+        # nothing — no second transition, no second Linear projection.
+        replay = invoke(settle)
+        assert replay.exit_code == 0
+        assert done_transitions() == 1
+        assert [
+            t for t in harness.linear.targets if t[1] == "Done"
+        ] == [("ENG-9", "Done", "operator")]
+    finally:
+        harness.close()

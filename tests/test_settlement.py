@@ -1731,6 +1731,93 @@ class TestAcceptanceReconciliation:
             target for target in acceptance.linear.targets if target[1] == "Done"
         ] == [("ENG-9", "Done", "operator")]
 
+    async def test_reconciliation_never_replaces_an_acknowledged_assignment(
+        self, acceptance: Any
+    ) -> None:
+        # Sol 04d013b0 finding 1 (required test 1): the gated merge
+        # published the acceptance assignment and the lead ACKNOWLEDGED
+        # it. Recovery replays of the hold must treat that acknowledged
+        # row as already-dispatched — publish_in's consumed-epoch
+        # supersession is for genuine re-queues, not reconciliation —
+        # so repeated restart/maintenance passes leave exactly one
+        # assignment row and no replacement packet.
+        acceptance.seat_cell()
+        self._gate(acceptance)
+        outcome = await acceptance.submit("ENG-9", GOOD)
+        assert outcome.state == "merged"
+        [published] = self._assignments(acceptance)
+        assert published["state"] == "published"
+        assert acceptance.assignments.acknowledge(
+            str(published["assignment_id"]),
+            session_id="11111111-1111-4111-8111-111111111111",
+        )
+
+        for _ in range(3):
+            await acceptance.service.resume_settlements("demo")
+
+        rows = self._assignments(acceptance)
+        assert len(rows) == 1
+        assert rows[0]["assignment_id"] == published["assignment_id"]
+        assert rows[0]["state"] == "acknowledged"
+        assert int(
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM events "
+                "WHERE event_type = 'assignment.superseded'"
+            )
+        ) == 0
+        assert self._transition_count(acceptance, "post_merge_acceptance") == 1
+
+    async def test_a_late_gate_on_a_qa_routed_merge_reaches_the_hold(
+        self, acceptance: Any
+    ) -> None:
+        # Sol 04d013b0 finding 2, option (a) (required test 2): the
+        # merge routed to QA before any gate existed; the operator then
+        # requires acceptance. The next recovery boundary reconciles the
+        # QA-routed issue into the acceptance hold — the ("QA", "In
+        # Development") Linear pair is already allowed (the qa_reject
+        # path projects it) — and the gate is then satisfiable through
+        # the ordinary completion path.
+        acceptance.seat_cell()
+        outcome = await acceptance.submit(
+            "ENG-9", GOOD, qa_origin="ryan_assigned"
+        )
+        assert outcome.state == "merged"
+        assert acceptance.queue.get("ENG-9").state is IssueState.QA
+        assert acceptance.linear.targets[-1] == ("ENG-9", "QA", "ryan")
+        self._gate(acceptance)
+
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert acceptance.linear.targets[-1] == (
+            "ENG-9",
+            "In Development",
+            "operator",
+        )
+        rows = self._assignments(acceptance)
+        assert len(rows) == 1
+        assert rows[0]["state"] == "published"
+        assert rows[0]["queue_transition"] == "qa->post_merge_acceptance"
+        assert self._transition_count(acceptance, "post_merge_acceptance") == 1
+
+        # Deterministic and exactly-once: another pass repeats nothing.
+        await acceptance.service.resume_settlements("demo")
+        assert len(self._assignments(acceptance)) == 1
+        assert self._transition_count(acceptance, "post_merge_acceptance") == 1
+
+        # The held gate is satisfiable: satisfaction plus the next
+        # recovery boundary completes the issue exactly once.
+        acceptance.gates.satisfy("ENG-9", evidence={"live_smoke": "receipt-1"})
+        await acceptance.service.resume_settlements("demo")
+        assert acceptance.queue.get("ENG-9").state is IssueState.DONE
+        assert [
+            target for target in acceptance.linear.targets if target[1] == "Done"
+        ] == [("ENG-9", "Done", "operator")]
+        assert self._transition_count(acceptance, "done") == 1
+
     async def test_a_gate_on_unmerged_work_never_advances(
         self, acceptance: Any
     ) -> None:
