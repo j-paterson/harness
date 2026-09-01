@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from hermes_orchestrator.codex_merger import ReviewerChannel, WakeRegistration
+from hermes_orchestrator.codex_merger import (
+    QueueStartOutcome,
+    ReviewerChannel,
+    WakeRegistration,
+)
 from hermes_orchestrator.manifests import (
     WAKE_STATUSES as WAKE_STATUSES,
 )
@@ -68,16 +72,30 @@ class ChannelStore(Protocol):
         self, project_key: str, event_id: str, *, claim_token: str
     ) -> None: ...
 
+    async def drive_queue_head(
+        self, project_key: str, *, expect_event_id: str | None = None
+    ) -> QueueStartOutcome: ...
+
 
 @dataclass(frozen=True, slots=True)
 class QueueDeliveryResult:
-    """Bounded outcome of one wake delivery; never claims false success."""
+    """Bounded outcome of one wake delivery; never claims false success.
+
+    INFRA-223: ``delivered`` means the wake is durably QUEUED into the
+    exact thread queue -- which is all a ``codex queue`` exit 0 ever
+    proved. Whether the resident app-server actually STARTED the turn is
+    a separate, separately durable fact, reported here as ``started``
+    with the exact ``start_reason`` that decided it, and carried across
+    restarts by ``wake_deliveries.queue_state``.
+    """
 
     delivered: bool
     attempts: int
     thread_id: str | None
     generation: int | None
     reason: str
+    started: bool = False
+    start_reason: str = "not_attempted"
 
 
 class CodexQueueDelivery:
@@ -240,12 +258,22 @@ class CodexQueueDelivery:
                     candidate_sha=event.candidate_sha,
                 )
                 if recorded:
+                    # INFRA-223: the queue CLI exiting 0 put the wake in
+                    # the thread queue; it did not start the turn. Ask the
+                    # daemon-owned merger adapter to start the exact idle
+                    # head now, and report what actually happened -- never
+                    # a start we did not observe.
+                    start = await self._start_queue_head(
+                        project_key, event.event_id
+                    )
                     return QueueDeliveryResult(
                         delivered=True,
                         attempts=attempts,
                         thread_id=thread_id,
                         generation=generation,
                         reason="delivered",
+                        started=start.started,
+                        start_reason=start.kind,
                     )
                 reason = "redelivery_required"
             else:
@@ -270,6 +298,27 @@ class CodexQueueDelivery:
             generation=generation,
             reason=reason,
         )
+
+    async def _start_queue_head(
+        self, project_key: str, event_id: str
+    ) -> QueueStartOutcome:
+        """Start the exact head just queued, or fall back and say so.
+
+        Pinned to this exact event, so the drive can only ever start the
+        candidate this delivery queued -- never a later one waiting
+        behind the INFRA-221 gate. Every failure mode (a channel store
+        with no queue surface, an app-server that never advertised it, an
+        RPC error) falls back to today's behaviour rather than failing
+        the delivery: the wake stays durably queued-not-started and the
+        recovery boundary re-drives it.
+        """
+
+        try:
+            return await self._channels.drive_queue_head(
+                project_key, expect_event_id=event_id
+            )
+        except Exception:
+            return QueueStartOutcome(kind="start_unavailable", started=False)
 
     def _ready_channel(self, project_key: str) -> ReviewerChannel | None:
         channel = self._channels.read_channel(project_key)

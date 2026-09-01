@@ -816,6 +816,13 @@ class MergerTurnService:
         outcomes: list[TurnOutcome] = []
         for project_key in project_keys or tuple(self._projects):
             self.reconcile_orphaned_submissions(project_key)
+            # INFRA-223: recover the exact queue head BEFORE advancing.
+            # A `codex queue` exit 0 only queued the wake, and a
+            # connection that closed mid-turn leaves its head interrupted
+            # or never started at all -- both look identical to a
+            # crashed daemon and both must be re-driven as the SAME
+            # queue item, never skipped and never re-queued.
+            await self._drive_queue_head(project_key)
             if self.outstanding_wake(project_key) is None:
                 # INFRA-221: a restart between a settled verdict and the
                 # release of the candidate queued behind it leaves nothing
@@ -838,6 +845,23 @@ class MergerTurnService:
                     )
                 )
         return tuple(outcomes)
+
+    async def _drive_queue_head(self, project_key: str) -> object | None:
+        """Ask the merger adapter to start the exact idle queue head.
+
+        INFRA-223: the turn boundary's half of the exact-start rule. The
+        adapter itself decides everything that matters -- the capability
+        handshake, never interrupting an active turn, proving the head is
+        this candidate's, and the exactly-once durable transition -- so
+        this is deliberately a thin, fail-closed call: any failure starts
+        nothing, records nothing, and is simply re-driven at the next
+        boundary.
+        """
+
+        try:
+            return await self._merger.drive_queue_head(project_key)
+        except Exception:  # pragma: no cover - fail closed to fallback
+            return None
 
     async def release_next_candidate(self, project_key: str) -> object | None:
         """Wake the next queued candidate, but only once nothing is current.
@@ -899,6 +923,14 @@ class MergerTurnService:
         # verdict.
         submitted = self._pending_submission(project_key, event.event_id)
         if submitted is None:
+            # INFRA-223: a turn completed (or was interrupted) and the
+            # outstanding candidate still has no submitted verdict. If its
+            # own queue item is still sitting unstarted in the exact
+            # thread queue -- the observed defect -- start it here, at
+            # this same boundary. A head that the finished turn already
+            # consumed is gone from the queue and nothing is re-driven,
+            # so no candidate is ever executed twice.
+            await self._drive_queue_head(project_key)
             return TurnOutcome(
                 project_key, "awaiting_submission", event.event_id,
                 event.issue_id,

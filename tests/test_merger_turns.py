@@ -2359,3 +2359,116 @@ async def test_reconciliation_never_derives_a_verdict_from_transcript_text(
     # Not one thread read: the transcript is never a verdict source.
     assert flow.rpc.methods == before
     assert "thread/read" not in flow.rpc.methods
+
+
+# ---------------------------------------------------------------------------
+# INFRA-223 item 1: exact queue start and recovery at the turn boundary
+# ---------------------------------------------------------------------------
+
+
+def _wire_thread_queue(flow: ProductionShapedFlow, *, advertised: bool) -> None:
+    """Make the fake `codex queue` CLI land in the fake thread queue.
+
+    This is the exact seam the defect lives in: the CLI exits 0 and the
+    message sits in the resident app-server's thread queue, started by
+    nobody.
+    """
+
+    flow.rpc.thread_queue_advertised = advertised
+
+    def enqueue(thread_id: str) -> None:
+        flow.rpc.enqueue_item(
+            f"qi-{len(flow.rpc.queue_items) + 1}", flow.processes.messages()[-1]
+        )
+
+    flow.processes.on_call = enqueue
+
+
+def _queue_row(flow: ProductionShapedFlow, event_id: str) -> tuple[Any, ...]:
+    row = flow.database.execute(
+        "SELECT state, queue_state, queue_item_id FROM wake_deliveries "
+        "WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    return (row["state"], row["queue_state"], row["queue_item_id"])
+
+
+@pytest.mark.asyncio
+async def test_interrupted_queue_head_is_redriven_after_a_daemon_restart(
+    flow: ProductionShapedFlow,
+) -> None:
+    """Observed 2026-09-01: a turn was interrupted before review and the
+    candidate sat in the queue while the daemon-owned writer was idle. On
+    reconnect, recovery must re-drive that EXACT head before advancing —
+    never skip it, and never queue the candidate a second time."""
+
+    await flow.merger.ensure_thread("demo")
+    _wire_thread_queue(flow, advertised=True)
+    flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+
+    assert (emitted.delivery.delivered, emitted.delivery.started) == (True, True)
+    assert flow.rpc.started_items == ["qi-1"]
+    assert _queue_row(flow, emitted.event.event_id) == (
+        "delivered", "started", "qi-1",
+    )
+
+    # The turn is interrupted before review: Codex returns the exact item
+    # to the queue, unstarted, and the daemon restarts over the same
+    # durable state with a fresh connection.
+    flow.rpc.queue_items[0]["status"] = "queued"
+    merger = flow.new_merger(flow.rpc)
+    turns = flow.new_turns(merger, flow.rpc)
+
+    outcomes = await turns.recover_outstanding(("demo",))
+
+    assert [outcome.kind for outcome in outcomes] == ["awaiting_submission"]
+    # The SAME head, re-driven exactly once more — not a new queue item,
+    # and no second `codex queue` delivery.
+    assert flow.rpc.started_items == ["qi-1", "qi-1"]
+    assert flow.rpc.effective_starts == 2
+    assert len(flow.processes.calls) == 1
+    assert _queue_row(flow, emitted.event.event_id) == (
+        "delivered", "started", "qi-1",
+    )
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+
+@pytest.mark.asyncio
+async def test_a_completed_turn_starts_the_head_left_queued_but_unstarted(
+    flow: ProductionShapedFlow,
+) -> None:
+    """The reported shape: `codex queue` exited 0 while the connected
+    Codex advertised no queue surface, so the required submission turn
+    stayed queued and never started. The next turn boundary lists the
+    exact queue and starts the exact idle head."""
+
+    await flow.merger.ensure_thread("demo")
+    _wire_thread_queue(flow, advertised=False)
+    flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+
+    assert emitted.delivery.delivered is True
+    assert (emitted.delivery.started, emitted.delivery.start_reason) == (
+        False, "capability_absent",
+    )
+    assert _queue_row(flow, emitted.event.event_id) == (
+        "delivered", "queued", None,
+    )
+    channel = flow.merger.read_channel("demo")
+    assert channel is not None and channel.thread_queue_capability == "absent"
+
+    # A Codex that does advertise the surface connects, and a turn
+    # completes with no verdict submitted for the outstanding candidate.
+    flow.rpc.thread_queue_advertised = True
+    outcome = await flow.turns.handle_turn("demo")
+
+    assert outcome.kind == "awaiting_submission"
+    assert flow.rpc.started_items == ["qi-1"]
+    assert _queue_row(flow, emitted.event.event_id) == (
+        "delivered", "started", "qi-1",
+    )
+    assert len(flow.processes.calls) == 1
+    channel = flow.merger.read_channel("demo")
+    assert channel is not None
+    assert channel.thread_queue_capability == "advertised"

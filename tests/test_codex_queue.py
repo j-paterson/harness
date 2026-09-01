@@ -146,10 +146,11 @@ def make_merger(
     database: Database,
     lease_seconds: float = 300.0,
     now: Callable[[], datetime] | None = None,
+    rpc: Any = None,
 ) -> CodexMerger:
     prompt = Path(__file__).parent.parent / "prompts" / "codex-merger.md"
     return CodexMerger(
-        rpc=NullRpc(),
+        rpc=NullRpc() if rpc is None else rpc,
         database=database,
         projects={
             "demo": ProjectConfig(
@@ -1494,3 +1495,134 @@ async def test_a_lapsed_claim_alone_cannot_record_a_delivery_success(
     )
     assert (await delivery.deliver("demo", event)).delivered is True
     assert delivered_event_ids(database) == ["evt-1"]
+
+
+# ---------------------------------------------------------------------------
+# INFRA-223 item 1: a `codex queue` exit 0 is not a started turn
+# ---------------------------------------------------------------------------
+
+
+def queue_row(database: Database, event_id: str = "evt-1") -> tuple[Any, ...]:
+    row = database.execute(
+        "SELECT state, queue_state, queue_item_id FROM wake_deliveries "
+        "WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    return (row["state"], row["queue_state"], row["queue_item_id"])
+
+
+@pytest.mark.asyncio
+async def test_queue_success_without_a_start_stays_queued_until_recovery(
+    delivery: CodexQueueDelivery,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """The defect, and its repair, in one test: `codex queue` exiting 0
+    proves only that the wake reached the thread queue. Nothing may read
+    that as a started turn, and the recovery boundary starts the exact
+    idle head it left behind."""
+
+    from tests.test_codex_merger import FakeRpc
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+
+    result = await delivery.deliver("demo", event)
+
+    assert result.delivered is True
+    assert len(factory.calls) == 1
+    # Exit 0 bought a QUEUED wake and nothing more.
+    assert (result.started, result.start_reason) == (False, "capability_absent")
+    assert queue_row(database) == ("delivered", "queued", None)
+
+    # Recovery, over the very same durable row, against a Codex that does
+    # advertise the experimental queue surface: the exact idle head is
+    # listed and started, and only then is the wake durably started.
+    rpc = FakeRpc()
+    rpc.thread_queue_advertised = True
+    rpc.enqueue_item("qi-1", event.render(1))
+    recovered = make_merger(database, rpc=rpc)
+
+    outcome = await recovered.drive_queue_head("demo")
+
+    assert (outcome.kind, outcome.started) == ("started", True)
+    assert rpc.started_items == ["qi-1"]
+    assert queue_row(database) == ("delivered", "started", "qi-1")
+    # Recovery re-drove the SAME queued head; it never re-queued the wake.
+    assert len(factory.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_queue_delivery_is_deduplicated_by_durable_identity(
+    delivery: CodexQueueDelivery,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    from tests.test_codex_merger import FakeRpc
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    rpc = FakeRpc()
+    rpc.thread_queue_advertised = True
+    rpc.enqueue_item("qi-1", event.render(1))
+    merger = make_merger(database, rpc=rpc)
+    starting = CodexQueueDelivery(
+        channels=merger, manifest_root=manifest_root, process_factory=factory
+    )
+
+    first = await starting.deliver("demo", event)
+    assert (first.delivered, first.started) == (True, True)
+    assert queue_row(database) == ("delivered", "started", "qi-1")
+
+    # The same durable event id, delivered again: nothing is queued a
+    # second time and nothing is started a second time.
+    duplicate = await starting.deliver("demo", event)
+
+    assert duplicate.reason == "duplicate_delivered"
+    assert (duplicate.delivered, duplicate.started) == (True, False)
+    assert len(factory.calls) == 1
+    assert rpc.effective_starts == 1
+    assert rpc.started_items == ["qi-1"]
+    assert queue_row(database) == ("delivered", "started", "qi-1")
+
+
+@pytest.mark.asyncio
+async def test_a_later_candidate_never_interrupts_the_started_candidate(
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """INFRA-221's one-at-a-time invariant, still green with the exact
+    start: the second candidate is durably queued in wake_deliveries,
+    never rendered into the thread, and never started."""
+
+    from tests.test_codex_merger import FakeRpc
+
+    stored_channel(database)
+    first = wake_event(manifest_root)
+    second = wake_event(manifest_root, event_id="evt-2", candidate_sha="5" * 40)
+    rpc = FakeRpc()
+    rpc.thread_queue_advertised = True
+    rpc.enqueue_item("qi-1", first.render(1))
+    merger = make_merger(database, rpc=rpc)
+    delivery = CodexQueueDelivery(
+        channels=merger, manifest_root=manifest_root, process_factory=factory
+    )
+
+    assert (await delivery.deliver("demo", first)).started is True
+
+    held = await delivery.deliver("demo", second)
+
+    assert (held.delivered, held.reason) == (False, CANDIDATE_QUEUED)
+    assert factory.thread_targets() == ["thr_stored"]
+    assert rpc.effective_starts == 1
+    assert queue_row(database, "evt-2") == ("pending", None, None)
+    # The current candidate keeps the head; a later one can never take it.
+    candidate = merger.queued_candidate("demo")
+    assert candidate is not None and candidate.event_id == "evt-1"
+    assert (
+        await merger.drive_queue_head("demo", expect_event_id="evt-2")
+    ).kind == "no_queued_candidate"
+    assert rpc.effective_starts == 1

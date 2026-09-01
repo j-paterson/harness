@@ -50,6 +50,21 @@ _STABLE_METHODS = frozenset(
         "turn/start",
     }
 )
+
+# INFRA-223: Codex's EXPERIMENTAL thread-queue surface. These two are the
+# only methods that can list the exact thread queue and start the exact
+# idle head, which is what turns a queued message into a started turn.
+# They are deliberately kept out of ``_STABLE_METHODS``: an experimental
+# method may simply not exist on the connected app-server, so it is
+# usable only behind the explicit initialize-time capability handshake
+# (:meth:`CodexRpcClient.supports_thread_queue`). ``request`` refuses
+# them outright when the connected server did not advertise them, so a
+# Codex without the surface is never probed by accident -- the caller
+# sees the refusal and falls back to today's behaviour instead of failing
+# hard.
+THREAD_QUEUE_LIST = "thread/queue/list"
+THREAD_QUEUE_START = "thread/queue/start"
+_EXPERIMENTAL_METHODS = frozenset({THREAD_QUEUE_LIST, THREAD_QUEUE_START})
 _CLOSED = object()
 
 
@@ -188,6 +203,48 @@ class CodexRpcClient:
         self._processes = processes
         self._project_key = project_key
         self._lease_id: str | None = None
+        self._thread_queue_advertised = False
+
+    def supports_thread_queue(self) -> bool:
+        """Report the connected server's explicit thread-queue advertisement.
+
+        The handshake is explicit and per-connection: it is read from the
+        ``initialize`` result of the app-server this client is talking to
+        right now, and it is cleared the moment that connection ends. A
+        server that advertises nothing answers ``False``, which is what
+        makes the fallback (rather than a hard failure) possible.
+        """
+
+        return self._thread_queue_advertised
+
+    @staticmethod
+    def _reads_thread_queue(result: dict[str, Any]) -> bool:
+        """Parse an ``initialize`` result for an EXPLICIT queue advertisement.
+
+        Two shapes are honoured, and nothing else: an explicit
+        ``capabilities.experimental.threadQueue`` of exactly ``True``, or
+        a method list (``capabilities.methods`` or
+        ``capabilities.experimental.methods``) naming BOTH experimental
+        methods. Anything absent, false, partial, or unrecognised means
+        "not advertised" -- the handshake fails closed.
+        """
+
+        capabilities = result.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return False
+        experimental = capabilities.get("experimental")
+        if not isinstance(experimental, dict):
+            experimental = {}
+        if experimental.get("threadQueue") is True:
+            return True
+        for source in (capabilities, experimental):
+            methods = source.get("methods")
+            if not isinstance(methods, list):
+                continue
+            named = {name for name in methods if isinstance(name, str)}
+            if named >= _EXPERIMENTAL_METHODS:
+                return True
+        return False
 
     @property
     def dropped_notifications(self) -> int:
@@ -241,8 +298,9 @@ class CodexRpcClient:
         self._notifications = asyncio.Queue(maxsize=self._notification_limit)
         self._stderr_task = asyncio.create_task(self._drain(process.stderr))
         self._reader_task = asyncio.create_task(self._read_loop(process))
+        self._thread_queue_advertised = False
         try:
-            await self._roundtrip(
+            handshake = await self._roundtrip(
                 "initialize",
                 {"clientInfo": dict(_CLIENT_INFO)},
                 self._handshake_timeout,
@@ -250,15 +308,21 @@ class CodexRpcClient:
         except BaseException:
             await self.close()
             raise
+        self._thread_queue_advertised = self._reads_thread_queue(handshake)
         self._write({"method": "initialized", "params": {}})
 
     async def request(
         self, method: str, params: dict[str, Any] | None, timeout: float
     ) -> dict[str, Any]:
-        """Send one stable request and return its result object."""
+        """Send one allowed request and return its result object."""
 
-        if method not in _STABLE_METHODS:
+        if method not in _STABLE_METHODS and method not in _EXPERIMENTAL_METHODS:
             raise ValueError(f"{method} is not a stable Codex App Server method")
+        if method in _EXPERIMENTAL_METHODS and not self._thread_queue_advertised:
+            raise CodexUnavailable(
+                f"{method} is experimental and was not advertised by the "
+                "connected codex app-server"
+            )
         return await self._roundtrip(method, params, timeout)
 
     async def notifications(self) -> AsyncIterator[RpcNotification]:
@@ -466,6 +530,10 @@ class CodexRpcClient:
                     self._dropped += 1
 
     def _fail_connection(self, reason: str) -> None:
+        # The capability handshake is per-connection: once this connection
+        # is gone nothing is advertised any more, so a reconnect must
+        # handshake again before either experimental method is usable.
+        self._thread_queue_advertised = False
         if self._failure is None:
             self._failure = reason
             self._enqueue(_CLOSED)

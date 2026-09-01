@@ -12,6 +12,8 @@ from typing import Any, Protocol
 
 from hermes_orchestrator.codex_ponytail_guard import session_guard_config
 from hermes_orchestrator.codex_rpc import (
+    THREAD_QUEUE_LIST,
+    THREAD_QUEUE_START,
     CodexRateLimits,
     CodexRequestFailed,
     parse_rate_limits,
@@ -84,6 +86,188 @@ _SECTION_PAGE_LIMIT = 16
 # continuation until a validated explicit wake arrives.
 IDLE_GOAL_STATUS = "blocked"
 
+# INFRA-223: the durable queued/started truth carried by
+# ``wake_deliveries.queue_state`` (see migration 0057). A successful
+# ``codex queue`` exit buys QUEUE_QUEUED and nothing more; only an
+# OBSERVED start advances the row.
+QUEUE_QUEUED = "queued"
+QUEUE_STARTING = "starting"
+QUEUE_STARTED = "started"
+QUEUE_SETTLED = "settled"
+#: The queue states a candidate can still be driven from. ``started`` is
+#: included because a started head that is STILL in the queue was
+#: interrupted before it consumed its item, and recovery must re-drive
+#: that exact item rather than advance past it.
+_DRIVABLE_QUEUE_STATES = (QUEUE_QUEUED, QUEUE_STARTING, QUEUE_STARTED)
+
+# An item status reported by ``thread/queue/list`` that still means "sitting
+# in the queue, not running". A missing status is treated the same way: an
+# item listed in the queue is queued by definition. Anything else --
+# ``running``, ``inProgress``, ``started`` -- means Codex is already
+# executing it, and no second start is ever issued for it.
+_IDLE_ITEM_STATUSES = frozenset(
+    {"queued", "pending", "idle", "notStarted", "waiting"}
+)
+_ACTIVE_THREAD_STATUSES = frozenset(
+    {"running", "inProgress", "busy", "turnActive", "active", "streaming"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedCandidate:
+    """The single candidate currently occupying Codex's thread queue."""
+
+    event_id: str
+    queue_state: str
+    queue_item_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class QueueStartOutcome:
+    """Bounded, never-optimistic result of one exact queue-head drive."""
+
+    kind: str
+    started: bool
+    event_id: str | None = None
+    queue_item_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _QueueItem:
+    """One item of the exact thread queue, as listed by Codex."""
+
+    item_id: str
+    idle: bool
+    text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _QueueListing:
+    """One ``thread/queue/list`` reading of the exact thread queue."""
+
+    turn_active: bool
+    items: tuple[_QueueItem, ...]
+
+    @property
+    def head(self) -> _QueueItem | None:
+        """The exact queue head, or ``None`` for an empty queue."""
+
+        return self.items[0] if self.items else None
+
+    def find(self, item_id: str) -> _QueueItem | None:
+        """The listed item with this exact id, if it is still queued."""
+
+        return next(
+            (item for item in self.items if item.item_id == item_id), None
+        )
+
+
+def _status_type(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("type"), str):
+        return str(value["type"])
+    return None
+
+
+def _item_is_idle(entry: Mapping[str, Any]) -> bool:
+    status = _status_type(entry.get("status")) or _status_type(entry.get("state"))
+    if status is None:
+        return True
+    return status in _IDLE_ITEM_STATUSES
+
+
+def _item_text(entry: Mapping[str, Any]) -> str | None:
+    """The queued message text, if the listing exposes it in any known shape."""
+
+    for key in ("text", "message", "input", "prompt"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            return value
+    content = entry.get("content")
+    if isinstance(content, list):
+        parts = [
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def _turn_is_active(result: Mapping[str, Any]) -> bool:
+    """True when the listing shows Sol already running a turn.
+
+    A queued candidate must NEVER interrupt an active Sol turn, so every
+    ambiguous or unrecognised "there is a turn" signal counts as active
+    and nothing is started.
+    """
+
+    if isinstance(result.get("activeTurnId"), str) and result["activeTurnId"]:
+        return True
+    for key in ("activeTurn", "currentTurn", "turn"):
+        if isinstance(result.get(key), dict) and result[key]:
+            return True
+    if result.get("turnActive") is True or result.get("isRunning") is True:
+        return True
+    for key in ("status", "threadStatus"):
+        status = _status_type(result.get(key))
+        if status is not None and status in _ACTIVE_THREAD_STATUSES:
+            return True
+    return False
+
+
+def _parse_queue_listing(result: Mapping[str, Any]) -> _QueueListing:
+    raw = result.get("items")
+    if not isinstance(raw, list):
+        raw = result.get("data")
+    items: list[_QueueItem] = []
+    for entry in raw if isinstance(raw, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        identifier = next(
+            (
+                entry[key]
+                for key in ("id", "itemId", "queueItemId")
+                if isinstance(entry.get(key), str) and entry[key]
+            ),
+            None,
+        )
+        if identifier is None:
+            continue
+        items.append(
+            _QueueItem(
+                item_id=str(identifier),
+                idle=_item_is_idle(entry),
+                text=_item_text(entry),
+            )
+        )
+    return _QueueListing(
+        turn_active=_turn_is_active(result), items=tuple(items)
+    )
+
+
+def _head_is_candidate(head: _QueueItem, candidate: QueuedCandidate) -> bool:
+    """Prove the listed head IS this candidate's own queued wake.
+
+    Two proofs, and nothing weaker. The durable ``queue_item_id`` bound by
+    an earlier observation is exact, and is the identity a restart
+    re-drives the same head by. Otherwise the queued text must carry this
+    wake's own ``event=<event_id>`` envelope field (see
+    ``WakeEvent.render``), which is the durable event identity that made
+    it into Codex's queue in the first place. A head that proves neither
+    -- someone else's message, or a listing that exposes no text at all --
+    is never started and never recorded: the row stays queued and today's
+    behaviour stands.
+    """
+
+    if candidate.queue_item_id is not None:
+        return head.item_id == candidate.queue_item_id
+    if head.text is None:
+        return False
+    return f"event={candidate.event_id}" in head.text
+
 
 def _reviewer_is_held(
     connection: sqlite3.Connection,
@@ -144,7 +328,8 @@ def _requeue_expired_claims(
 
     connection.execute(
         "UPDATE wake_deliveries SET state = 'pending', claim_token = NULL, "
-        "claim_expires_at = NULL, updated_at = ? "
+        "claim_expires_at = NULL, queue_state = NULL, queue_item_id = NULL, "
+        "updated_at = ? "
         "WHERE project_key = ? AND state = 'claimed' "
         "AND (claim_expires_at IS NULL OR claim_expires_at <= ?)",
         (stamp, project_key, stamp),
@@ -203,6 +388,11 @@ class ReviewerChannel:
     last_delivered_candidate_sha: str | None
     last_delivery_failure_at: str | None
     heartbeat_enabled: bool
+    #: INFRA-223: the durable record of the explicit thread-queue
+    #: capability handshake against the app-server this channel was last
+    #: driven by -- ``'advertised'``, ``'absent'`` (fell back to today's
+    #: behaviour), or ``None`` when it has never been probed.
+    thread_queue_capability: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +482,8 @@ class CodexMerger:
                 "prior_thread_id, "
                 "replacement_reason, last_delivered_event_id, "
                 "last_delivered_candidate_sha, last_delivery_failure_at, "
-                "heartbeat_enabled FROM reviewer_channels "
+                "heartbeat_enabled, thread_queue_capability "
+                "FROM reviewer_channels "
                 "WHERE project_key = ?",
                 (project_key,),
             ).fetchone()
@@ -310,6 +501,7 @@ class CodexMerger:
             last_delivered_candidate_sha=row["last_delivered_candidate_sha"],
             last_delivery_failure_at=row["last_delivery_failure_at"],
             heartbeat_enabled=bool(row["heartbeat_enabled"]),
+            thread_queue_capability=row["thread_queue_capability"],
         )
 
     def read_status(self, project_key: str) -> MergerStatus:
@@ -617,6 +809,7 @@ class CodexMerger:
                     connection.execute(
                         "UPDATE wake_deliveries SET state = 'pending', "
                         "claim_token = NULL, claim_expires_at = NULL, "
+                        "queue_state = NULL, queue_item_id = NULL, "
                         "updated_at = ? WHERE project_key = ? "
                         "AND event_id = ? AND state = 'delivered'",
                         (stamp, project_key, event.event_id),
@@ -677,6 +870,7 @@ class CodexMerger:
                     connection.execute(
                         "UPDATE wake_deliveries SET state = 'pending', "
                         "claim_token = NULL, claim_expires_at = NULL, "
+                        "queue_state = NULL, queue_item_id = NULL, "
                         "updated_at = ? WHERE project_key = ? "
                         "AND event_id = ? AND state = 'delivered'",
                         (stamp, project_key, str(owner["event_id"])),
@@ -698,6 +892,7 @@ class CodexMerger:
                         "manifest_mode = ?, state = 'pending', "
                         "thread_id = NULL, generation = NULL, "
                         "claim_token = NULL, claim_expires_at = NULL, "
+                        "queue_state = NULL, queue_item_id = NULL, "
                         "updated_at = ? WHERE project_key = ? "
                         "AND event_id = ? AND state = 'deferred'",
                         (
@@ -789,10 +984,17 @@ class CodexMerger:
                 # instant; past it the lease has lapsed, and any release
                 # that observed the lapse already voided this token via
                 # _requeue_expired_claims, so the token test fails too.
+                # INFRA-223: `codex queue` exited 0, so this candidate is
+                # durably QUEUED into the exact thread queue -- and that
+                # is ALL it is. queue_state carries that truth
+                # separately from `state`, and only an observed start
+                # (record_queue_started) ever advances it, so no caller
+                # can read a bare exit 0 as a started turn again.
                 wake = connection.execute(
                     "UPDATE wake_deliveries SET state = 'delivered', "
                     "thread_id = ?, generation = ?, claim_token = NULL, "
-                    "claim_expires_at = NULL, "
+                    "claim_expires_at = NULL, queue_state = 'queued', "
+                    "queue_item_id = NULL, "
                     "attempts = attempts + 1, updated_at = ? "
                     "WHERE project_key = ? AND event_id = ? "
                     "AND state = 'claimed' AND claim_token = ? "
@@ -825,11 +1027,314 @@ class CodexMerger:
             connection.execute(
                 "UPDATE wake_deliveries SET state = 'pending', "
                 "claim_token = NULL, claim_expires_at = NULL, "
+                "queue_state = NULL, queue_item_id = NULL, "
                 "attempts = attempts + 1, updated_at = ? "
                 "WHERE project_key = ? AND event_id = ? "
                 "AND state = 'claimed' AND claim_token = ?",
                 (self._now().isoformat(), project_key, event_id, claim_token),
             )
+
+    # INFRA-223 -- exact queue start and recovery. A successful
+    # ``codex queue`` exit is not proof that the resident app-server
+    # STARTED the turn, so the daemon-owned adapter below lists the exact
+    # thread queue and starts the exact idle head itself, behind an
+    # explicit capability handshake, and re-drives an interrupted or
+    # unstarted head after a reconnect.
+
+    def thread_queue_capability(self, project_key: str) -> str:
+        """Probe and durably record the explicit thread-queue handshake.
+
+        ``'advertised'`` only when the CONNECTED app-server said so at
+        ``initialize``; every other case -- an older Codex, a fake or
+        legacy client with no handshake surface, a probe that raises --
+        answers ``'absent'``, which is the instruction to fall back to
+        today's behaviour rather than fail hard. The answer is written to
+        ``reviewer_channels.thread_queue_capability`` (only when it
+        changes), so a fallback is durably recorded and operator-visible
+        instead of silent.
+        """
+
+        probe = getattr(self._rpc, "supports_thread_queue", None)
+        advertised = False
+        if callable(probe):
+            try:
+                advertised = bool(probe())
+            except Exception:  # pragma: no cover - fail closed to fallback
+                advertised = False
+        capability = "advertised" if advertised else "absent"
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE reviewer_channels SET thread_queue_capability = ?, "
+                "updated_at = ? WHERE project_key = ? "
+                "AND (thread_queue_capability IS NULL "
+                "OR thread_queue_capability != ?)",
+                (capability, self._now().isoformat(), project_key, capability),
+            )
+        return capability
+
+    def queued_candidate(self, project_key: str) -> QueuedCandidate | None:
+        """The one candidate whose queue item may still need starting.
+
+        Scoped to the wake states that hold the primary Sol writer
+        (``delivered``/``admitted`` -- INFRA-221's one-at-a-time
+        invariant) and to the drivable queue states, so a settled wake,
+        an undelivered one, and a wake queued behind the gate are all
+        invisible here: only the current candidate's own head is ever
+        driven, and a later candidate can never jump it.
+        """
+
+        self._project(project_key)
+        placeholders = ",".join("?" for _ in _DRIVABLE_QUEUE_STATES)
+        row = self._database.execute(
+            "SELECT event_id, queue_state, queue_item_id FROM wake_deliveries "
+            "WHERE project_key = ? AND state IN ('delivered', 'admitted') "
+            f"AND queue_state IN ({placeholders}) "
+            "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            (project_key, *_DRIVABLE_QUEUE_STATES),
+        ).fetchone()
+        if row is None:
+            return None
+        return QueuedCandidate(
+            event_id=str(row["event_id"]),
+            queue_state=str(row["queue_state"]),
+            queue_item_id=(
+                None
+                if row["queue_item_id"] is None
+                else str(row["queue_item_id"])
+            ),
+        )
+
+    def _claim_queue_start(
+        self, project_key: str, event_id: str, *, queue_item_id: str
+    ) -> bool:
+        """Bind this exact queue item and claim the single start attempt.
+
+        The claim is what makes the start exactly-once in effect: only the
+        caller that wins this compare-and-swap issues
+        ``thread/queue/start``, and it issues it for the exact item id it
+        just bound durably. A row already bound to a DIFFERENT item is
+        refused outright -- a candidate is never started twice under two
+        identities.
+        """
+
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET queue_state = 'starting', "
+                "queue_item_id = ?, updated_at = ? "
+                "WHERE project_key = ? AND event_id = ? "
+                "AND state IN ('delivered', 'admitted') "
+                "AND queue_state IN ('queued', 'starting', 'started') "
+                "AND (queue_item_id IS NULL OR queue_item_id = ?)",
+                (
+                    queue_item_id,
+                    self._now().isoformat(),
+                    project_key,
+                    event_id,
+                    queue_item_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def record_queue_started(
+        self, project_key: str, event_id: str, *, queue_item_id: str
+    ) -> bool:
+        """Record the OBSERVED start of this exact queue item, once.
+
+        Returns ``True`` only for the call that actually transitioned the
+        row, so an auto-start observed in the listing and an explicit
+        ``thread/queue/start`` that raced it can never both count as a
+        start. A row already at ``started`` answers ``False`` and nothing
+        is written twice.
+        """
+
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET queue_state = 'started', "
+                "queue_item_id = ?, updated_at = ? "
+                "WHERE project_key = ? AND event_id = ? "
+                "AND state IN ('delivered', 'admitted') "
+                "AND queue_state IN ('queued', 'starting')",
+                (
+                    queue_item_id,
+                    self._now().isoformat(),
+                    project_key,
+                    event_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def _release_queue_start(self, project_key: str, event_id: str) -> None:
+        """Return an unstarted claim to ``queued`` after a refused start."""
+
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE wake_deliveries SET queue_state = 'queued', "
+                "updated_at = ? WHERE project_key = ? AND event_id = ? "
+                "AND queue_state = 'starting'",
+                (self._now().isoformat(), project_key, event_id),
+            )
+
+    async def drive_queue_head(
+        self, project_key: str, *, expect_event_id: str | None = None
+    ) -> QueueStartOutcome:
+        """List the exact thread queue and start the exact idle head.
+
+        The whole INFRA-223 start rule, in one fail-closed place:
+
+        * nothing at all happens unless the connected app-server
+          ADVERTISED the experimental queue surface -- otherwise the
+          fallback is recorded and today's behaviour stands;
+        * a queued candidate NEVER interrupts an active Sol turn: an
+          active turn in the listing starts nothing, and the only start
+          verb used is ``thread/queue/start`` on an already-queued item,
+          never ``turn/start``;
+        * the head must be PROVEN to be this candidate's -- by the queue
+          item id already bound to the durable row, or by the wake
+          envelope's own ``event=`` identity in the queued text --
+          otherwise nothing is started and nothing is recorded;
+        * a head Codex already auto-started is recorded as started
+          exactly once and is never started again;
+        * an ambiguous outcome leaves the row ``starting``, which
+          recovery re-drives as the same item rather than advancing.
+
+        ``expect_event_id`` pins the drive to one exact candidate (the
+        delivery path, which has just queued that event); recovery passes
+        nothing and drives whichever candidate durably holds the queue.
+        """
+
+        self._project(project_key)
+        if self.thread_queue_capability(project_key) != "advertised":
+            return QueueStartOutcome(kind="capability_absent", started=False)
+        channel = self.read_channel(project_key)
+        if channel is None or channel.state != "ready":
+            return QueueStartOutcome(kind="channel_unavailable", started=False)
+        candidate = self.queued_candidate(project_key)
+        if candidate is None or (
+            expect_event_id is not None
+            and candidate.event_id != expect_event_id
+        ):
+            return QueueStartOutcome(kind="no_queued_candidate", started=False)
+        listing = await self._read_thread_queue(channel.thread_id)
+        if listing.turn_active:
+            return QueueStartOutcome(
+                kind="turn_active", started=False, event_id=candidate.event_id
+            )
+        head = listing.head
+        if head is None:
+            # The queue is empty: an item that was started and consumed
+            # leaves nothing to re-drive, and re-queuing it here would be
+            # exactly the double execution this change exists to prevent.
+            return QueueStartOutcome(
+                kind="queue_empty", started=False, event_id=candidate.event_id
+            )
+        if not _head_is_candidate(head, candidate):
+            return QueueStartOutcome(
+                kind="head_unmatched",
+                started=False,
+                event_id=candidate.event_id,
+                queue_item_id=head.item_id,
+            )
+        if not head.idle:
+            # Codex auto-started this exact head (observed live after a
+            # recovery connection closed). It is already running, so no
+            # start is issued at all -- the observation alone advances the
+            # durable truth, exactly once.
+            self.record_queue_started(
+                project_key, candidate.event_id, queue_item_id=head.item_id
+            )
+            return QueueStartOutcome(
+                kind="already_started",
+                started=True,
+                event_id=candidate.event_id,
+                queue_item_id=head.item_id,
+            )
+        if not self._claim_queue_start(
+            project_key, candidate.event_id, queue_item_id=head.item_id
+        ):
+            return QueueStartOutcome(
+                kind="start_unclaimed",
+                started=False,
+                event_id=candidate.event_id,
+                queue_item_id=head.item_id,
+            )
+        try:
+            await self._rpc.request(
+                THREAD_QUEUE_START,
+                {"threadId": channel.thread_id, "queueItemId": head.item_id},
+                self._timeout,
+            )
+        except Exception:
+            return await self._reconcile_refused_start(
+                project_key,
+                channel.thread_id,
+                candidate.event_id,
+                head.item_id,
+            )
+        self.record_queue_started(
+            project_key, candidate.event_id, queue_item_id=head.item_id
+        )
+        return QueueStartOutcome(
+            kind="started",
+            started=True,
+            event_id=candidate.event_id,
+            queue_item_id=head.item_id,
+        )
+
+    async def _reconcile_refused_start(
+        self,
+        project_key: str,
+        thread_id: str,
+        event_id: str,
+        queue_item_id: str,
+    ) -> QueueStartOutcome:
+        """Decide what a refused or ambiguous start really did, fail closed.
+
+        A refusal is exactly what an auto-start race looks like from
+        here: Codex started the item itself, so our explicit start was
+        rejected. The queue is therefore re-read before anything is
+        concluded -- an item that is gone or already running WAS started
+        (recorded once, never started again), and only a head still
+        sitting idle proves the start did not happen and is returned to
+        ``queued`` for the next boundary. If the re-read itself fails the
+        row deliberately stays ``starting``: ambiguous, and re-driven by
+        recovery as the same item.
+        """
+
+        try:
+            listing = await self._read_thread_queue(thread_id)
+        except Exception:
+            return QueueStartOutcome(
+                kind="start_failed",
+                started=False,
+                event_id=event_id,
+                queue_item_id=queue_item_id,
+            )
+        item = listing.find(queue_item_id)
+        if item is None or not item.idle:
+            self.record_queue_started(
+                project_key, event_id, queue_item_id=queue_item_id
+            )
+            return QueueStartOutcome(
+                kind="already_started",
+                started=True,
+                event_id=event_id,
+                queue_item_id=queue_item_id,
+            )
+        self._release_queue_start(project_key, event_id)
+        return QueueStartOutcome(
+            kind="start_failed",
+            started=False,
+            event_id=event_id,
+            queue_item_id=queue_item_id,
+        )
+
+    async def _read_thread_queue(self, thread_id: str) -> _QueueListing:
+        """Read the exact thread queue of one exact thread."""
+
+        result = await self._rpc.request(
+            THREAD_QUEUE_LIST, {"threadId": thread_id}, self._timeout
+        )
+        return _parse_queue_listing(result)
 
     @staticmethod
     def _recompute_heartbeat(
@@ -930,7 +1435,8 @@ class CodexMerger:
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE wake_deliveries SET state = ?, claim_token = NULL, "
-                "claim_expires_at = NULL, updated_at = ? "
+                "claim_expires_at = NULL, queue_state = 'settled', "
+                "updated_at = ? "
                 "WHERE project_key = ? AND event_id = ? "
                 "AND state = 'delivered'",
                 (outcome, stamp, project_key, event_id),
@@ -944,6 +1450,7 @@ class CodexMerger:
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE wake_deliveries SET state = 'completed', "
+                "queue_state = 'settled', "
                 "updated_at = ? WHERE project_key = ? AND event_id = ? "
                 "AND state = 'admitted'",
                 (self._now().isoformat(), project_key, event_id),
