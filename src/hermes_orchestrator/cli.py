@@ -73,6 +73,7 @@ from hermes_orchestrator.handoffs import (
     derived_handoff_document,
 )
 from hermes_orchestrator.hermes_tools import HermesCommandService
+from hermes_orchestrator.issue_targeting import IssueTargetingRefused, target_issue
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
@@ -175,6 +176,17 @@ def _parser() -> argparse.ArgumentParser:
 
     queue_list = commands.add_parser("queue-list", help="list the private queue")
     queue_list.add_argument("--json", action="store_true")
+
+    target_issue_cmd = commands.add_parser(
+        "target-issue",
+        help="bind a named existing session to one admitted issue",
+    )
+    target_issue_cmd.add_argument("issue_id")
+    target_issue_cmd.add_argument("--project", required=True)
+    target_issue_cmd.add_argument("--cell", required=True)
+    target_issue_cmd.add_argument("--session", required=True)
+    target_issue_cmd.add_argument("--instruction", required=True)
+    target_issue_cmd.add_argument("--json", action="store_true")
 
     queue_complete = commands.add_parser(
         "queue-complete",
@@ -4931,6 +4943,34 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 payload,
                 json_output=args.json,
                 human=f"{len(payload)} explicitly admitted issue(s).",
+            )
+            return 0
+
+        if args.command == "target-issue":
+            events = EventStore(database)
+            assignments = LeadAssignments(database, events=events)
+            try:
+                result = target_issue(
+                    database,
+                    assignments=assignments,
+                    issue_id=args.issue_id,
+                    project_key=args.project,
+                    cell_id=args.cell,
+                    session_id=args.session,
+                    instruction=args.instruction,
+                    known_projects=settings.projects.keys(),
+                )
+            except IssueTargetingRefused as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print(
+                result.assignment.as_dict(),
+                json_output=args.json,
+                human=(
+                    f"Targeted {result.assignment.issue_id} to session "
+                    f"{result.assignment.session_id}"
+                    + (" (already pending)" if result.idempotent else ".")
+                ),
             )
             return 0
 

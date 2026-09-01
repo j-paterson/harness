@@ -6340,6 +6340,13 @@ def test_start_lane_harness_checkout_refusal_exits_nonzero(
 
     monkeypatch.setattr(cli_module, "ensure_harness_checkout", _refusing)
 
+def test_target_issue_refuses_an_unknown_issue_without_writes(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    # INFRA-220: the CLI surface reaches the strict transition and its
+    # fail-closed refusal exits non-zero without publishing anything.
+    invoke([*base_arguments(configured_repo), "init"])
+
     result = invoke(
         [
             *base_arguments(configured_repo),
@@ -6353,6 +6360,17 @@ def test_start_lane_harness_checkout_refusal_exits_nonzero(
             "--harness-run",
             "run-1",
             "--json",
+
+            "target-issue",
+            "ENG-404",
+            "--project",
+            "demo",
+            "--cell",
+            "cell-1",
+            "--session",
+            "session-1",
+            "--instruction",
+            "work this issue next",
         ]
     )
 
@@ -6695,3 +6713,16 @@ def test_reconcile_reports_an_unbindable_issue_lane_instead_of_exiting_clean(
     assert result.exit_code == 1
     assert "ENG-404" in json.loads(result.stdout)["error"]
     assert not (tmp_path / "project-issue-ENG-404").exists()
+
+    assert result.output.strip()
+
+
+def test_target_issue_requires_every_binding_flag(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    result = invoke(
+        [*base_arguments(configured_repo), "target-issue", "ENG-7", "--project", "demo"]
+    )
+
+    assert result.exit_code == 2
+    assert "--cell" in result.output
