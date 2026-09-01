@@ -7,7 +7,11 @@ whatever presentation hooks it already carries. Each required hook
 exists exactly once under its exact event *and matcher* — a Hermes
 command found under any other matcher is misplaced and is repaired
 into the one canonical binding, duplicates are collapsed, and foreign
-hooks are preserved. The settings file is replaced atomically: the
+hooks are preserved. INFRA-204 extends that same single sweep to
+retire superseded Hermes shims (``.hermes/intake-poll-hook.sh``): the
+one legacy hook object is removed wherever it sits, its siblings and
+every unrelated entry survive, and the canonical binding below still
+leaves exactly one hook per event. The settings file is replaced atomically: the
 merged document is validated, written to a temporary file in the same
 directory, fsynced, moved over settings.json with its permissions
 preserved, and the directory is fsynced — an interruption at any point
@@ -45,6 +49,17 @@ _HOOK_SPECS: tuple[tuple[str, str, str], ...] = (
     ("SubagentStart", "*", "child_start"),
 )
 
+# INFRA-204: superseded Hermes hook shells. A profile that still
+# references one of these is carrying a hook this installer replaced;
+# the entry is retired wherever it sits, under any event and any
+# matcher. Matching is by path fragment, not by exact command, because
+# the legacy entry was written with several different prefixes
+# (bare path, ``bash <path>``, ``$HOME``-expanded) — but it stays a
+# fragment of OUR retired shim's path, so a foreign hook can never
+# match it. Retirement removes the one hook object; every sibling hook
+# in the same entry and every unrelated entry survive untouched.
+LEGACY_HOOK_FRAGMENTS: tuple[str, ...] = (".hermes/intake-poll-hook.sh",)
+
 
 @dataclass(frozen=True, slots=True)
 class ProfileHookReport:
@@ -54,10 +69,11 @@ class ProfileHookReport:
     path: str
     installed: tuple[str, ...]
     repaired: tuple[str, ...]
+    retired: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
-        return bool(self.installed or self.repaired)
+        return bool(self.installed or self.repaired or self.retired)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -65,15 +81,33 @@ class ProfileHookReport:
             "path": self.path,
             "installed": list(self.installed),
             "repaired": list(self.repaired),
+            "retired": list(self.retired),
             "changed": self.changed,
         }
 
 
+def _command_of(hook: object) -> str | None:
+    """The command string of a ``{"type": "command"}`` hook, else None."""
+
+    if isinstance(hook, dict) and hook.get("type") == "command":
+        command = hook.get("command")
+        if isinstance(command, str):
+            return command
+    return None
+
+
 def _is_our_hook(hook: object, command: str) -> bool:
-    return (
-        isinstance(hook, dict)
-        and hook.get("type") == "command"
-        and hook.get("command") == command
+    return _command_of(hook) == command
+
+
+def _is_legacy_hook(hook: object) -> bool:
+    """A superseded Hermes shim this installer must retire."""
+
+    command = _command_of(hook)
+    if command is None:
+        return False
+    return any(
+        fragment in command for fragment in LEGACY_HOOK_FRAGMENTS
     )
 
 
@@ -111,12 +145,16 @@ class HookInstaller:
         # Cross-event sweep first: a Hermes command parked under any
         # event other than its home (e.g. a stale child-start left on
         # PreToolUse) is removed there and repaired into the canonical
-        # binding below.
+        # binding below. The same single pass retires superseded Hermes
+        # shims (INFRA-204) wherever they sit — one hook object at a
+        # time, so unrelated hooks sharing the entry, and unrelated
+        # entries under the same event, are never disturbed.
         home_events = {
             getattr(self._commands, attribute): event
             for event, _matcher, attribute in _HOOK_SPECS
         }
         crossed: set[str] = set()
+        retired: list[str] = []
         for event_name, entries in list(hooks.items()):
             if not isinstance(entries, list):
                 continue
@@ -128,12 +166,11 @@ class HookInstaller:
                     continue
                 kept = []
                 for hook in entry_hooks:
-                    command = (
-                        hook.get("command")
-                        if isinstance(hook, dict)
-                        and hook.get("type") == "command"
-                        else None
-                    )
+                    if _is_legacy_hook(hook):
+                        if event_name not in retired:
+                            retired.append(event_name)
+                        continue
+                    command = _command_of(hook)
                     home = home_events.get(command)
                     if home is not None and home != event_name:
                         crossed.add(home)
@@ -145,6 +182,16 @@ class HookInstaller:
                 for entry in entries
                 if not isinstance(entry, dict) or entry.get("hooks")
             ]
+        # An event section left empty purely because its only content
+        # was a retired shim is dropped, rather than published as a
+        # bare `"Notification": []`. Only sections we emptied are
+        # considered, and never one of our own home events.
+        home_names = {event for event, _matcher, _attr in _HOOK_SPECS}
+        for event_name in retired:
+            if event_name in home_names:
+                continue
+            if hooks.get(event_name) == []:
+                hooks.pop(event_name, None)
         for event, matcher, attribute in _HOOK_SPECS:
             command = getattr(self._commands, attribute)
             entries = hooks.setdefault(event, [])
@@ -196,6 +243,7 @@ class HookInstaller:
             path=str(path),
             installed=tuple(installed),
             repaired=tuple(repaired),
+            retired=tuple(retired),
         )
         if report.changed:
             config_dir.mkdir(parents=True, exist_ok=True)

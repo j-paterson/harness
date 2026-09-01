@@ -17,6 +17,7 @@ the exact lead through the dedicated channel.
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,6 +42,25 @@ class LeadContinuation:
     state: str
 
 
+def _bound_cell(
+    connection: sqlite3.Connection, session_id: str
+) -> sqlite3.Row | None:
+    """The active managed cell this Claude session is bound to, if any.
+
+    The ONE binding predicate every lead-hook path shares (it mirrors
+    ``LeadIntakePoll.next_offer`` and the idle dispatch exactly): a
+    session with no active ``project_cells`` row is not a managed lead,
+    and every hook must be inert for it.
+    """
+
+    return connection.execute(
+        "SELECT cell_id, project_key FROM project_cells "
+        "WHERE session_id = ? AND state = 'active' "
+        "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+
+
 class LeadChildTracker:
     """Track child identities; reactivate a waiting lead exactly once."""
 
@@ -62,12 +82,26 @@ class LeadChildTracker:
 
         An identity-less start fails closed: nothing is recorded, so it
         can never create outstanding work no completion could settle.
+
+        INFRA-204: so does a start from a session bound to NO active
+        managed cell. The SubagentStart hook is installed profile-wide,
+        so it fires for every Claude session using that profile,
+        including ordinary human sessions the orchestrator does not
+        manage. Those must leave nothing behind — an unbound session's
+        row would be outstanding work no continuation could ever settle
+        and no lead could ever be woken for. The binding predicate is
+        the same active-cell lookup :meth:`record_turn_stop`,
+        ``LeadIntakePoll.next_offer`` and the idle dispatch already
+        use, and it is read inside the insert's own transaction, so a
+        cell that deactivates concurrently cannot admit a row.
         """
 
         if not child_id.strip():
             return False
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            if _bound_cell(connection, session_id) is None:
+                return False
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO lead_children("
                 "session_id, child_id, state, started_at, completed_at) "
@@ -90,6 +124,20 @@ class LeadChildTracker:
         continuation's compare-and-swap commit in one transaction, so a
         crash can never separate them, and the continuation-id dedup
         key makes any retry a durable no-op.
+
+        INFRA-204 (Sol correction 7a810aad): so does a completion from
+        a session bound to NO active managed cell. The compare-and-swap
+        alone only covers a session that was NEVER bound (no child row
+        matches it); a child row created *while* the session was bound
+        outlives the binding, so a later profile-wide SubagentStop
+        would still match it, settle the continuation and enqueue
+        ``children.completed`` for a lead nothing manages any more. The
+        binding is therefore re-read first, inside this same
+        transaction, using the one predicate :meth:`child_started`,
+        :meth:`record_turn_stop`, ``LeadIntakePoll.next_offer`` and the
+        idle dispatch already share; an unbound session changes no
+        child row, no continuation row and no control operation, and
+        returns the same "no effect" ``None`` the CAS-miss path does.
         """
 
         if not child_id.strip():
@@ -97,6 +145,8 @@ class LeadChildTracker:
         stamp = self._now().isoformat()
         operation: ControlOperation | None = None
         with self._database.transaction() as connection:
+            if _bound_cell(connection, session_id) is None:
+                return None
             settled = connection.execute(
                 "UPDATE lead_children SET state = 'completed', "
                 "completed_at = ? "
@@ -181,12 +231,7 @@ class LeadChildTracker:
                     (stamp, session_id),
                 )
                 return None
-            cell = connection.execute(
-                "SELECT cell_id, project_key FROM project_cells "
-                "WHERE session_id = ? AND state = 'active' "
-                "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
+            cell = _bound_cell(connection, session_id)
             if cell is None:
                 return None
             existing = connection.execute(
