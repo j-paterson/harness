@@ -442,6 +442,13 @@ async def test_defect_returns_packet_via_outbox_then_correction_routes_to_ryan(
     assert pending[0].reviewed_sha == SHA_A
     assert pending[0].source == "codex_review"
     assert flow.github.merge_calls == []
+    # INFRA-212: the return to the lead is durable the moment the
+    # submission settles, and needs no credential to be. Its Linear
+    # status move is journaled as a pending effect and applied at the
+    # next recovery boundary, so a submission from Sol's own workspace
+    # can never be blocked by an unreachable Linear.
+    assert flow.linear.targets == []
+    await flow.reviews.resume_settlements("demo")
     assert flow.linear.targets[-1] == ("ENG-10", "In Development", "operator")
 
     flow.outbox.acknowledge(pending[0].correction_id)

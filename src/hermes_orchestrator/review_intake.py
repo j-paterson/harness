@@ -155,6 +155,7 @@ class CandidateAdmission:
         event: WakeEvent,
         *,
         received_generation: int,
+        external_gates: bool = True,
     ) -> AdmittedCandidate:
         """Run every read-only admission check with zero durable writes.
 
@@ -174,10 +175,15 @@ class CandidateAdmission:
         below still re-runs the same checks and performs the actual
         (idempotent) admission, which is retained to catch races between
         prevalidation and settlement.
+
+        ``external_gates`` is documented on :meth:`_run_checks`.
         """
 
         _snapshot, manifest, channel = self._run_checks(
-            project_key, event, received_generation=received_generation
+            project_key,
+            event,
+            received_generation=received_generation,
+            external_gates=external_gates,
         )
         return AdmittedCandidate(
             project_key=project_key,
@@ -192,11 +198,20 @@ class CandidateAdmission:
         event: WakeEvent,
         *,
         received_generation: int,
+        external_gates: bool = True,
     ) -> AdmittedCandidate:
-        """Admit the wake's candidate or fail closed with a bounded reason."""
+        """Admit the wake's candidate or fail closed with a bounded reason.
+
+        ``external_gates`` is documented on :meth:`_run_checks`; the
+        durable ``admit_wake`` compare-and-swap below is unconditional
+        and identical either way.
+        """
 
         snapshot, manifest, channel = self._run_checks(
-            project_key, event, received_generation=received_generation
+            project_key,
+            event,
+            received_generation=received_generation,
+            external_gates=external_gates,
         )
         if not self._channels.admit_wake(
             project_key,
@@ -222,9 +237,41 @@ class CandidateAdmission:
         event: WakeEvent,
         *,
         received_generation: int,
+        external_gates: bool = True,
     ) -> tuple[ManifestSnapshot, CandidateManifest, ReviewerChannel]:
         """The complete read-only admission checks, shared by both entry
         points above; never performs a durable write.
+
+        INFRA-212: the checks split cleanly in two, and ``external_gates``
+        selects between them.
+
+        The LOCAL half -- the immutable manifest, the wake envelope's
+        exact match against it, and the ready reviewer channel at the
+        exact received generation -- is always run. It is the identity of
+        the candidate under review and is proven entirely from durable
+        local state.
+
+        The EXTERNAL half -- the remote branch head (with its
+        merged-pull-request excuse), the base policy's fetch, and the
+        intake gate's CircleCI reconciliation and one-open-pull-request
+        rule -- exists to authorize CROSSING an external boundary: it
+        decides whether this candidate may be merged. Those checks
+        require GitHub, CircleCI, git remote access and therefore
+        credentials, and they run whenever ``external_gates`` is true,
+        which is the default and remains the case for every settlement
+        that can merge.
+
+        A ``corrections_required`` verdict crosses no external boundary:
+        it opens no pull request, merges nothing, and its only durable
+        effects are the review row and the correction packets routed to
+        the lead. ``merger_turns`` therefore passes
+        ``external_gates=False`` for exactly that case, so a correction
+        can be validated, persisted and settled from Sol's own workspace
+        with no credential at all. Nothing is weakened for the merging
+        path: the one-open-pull-request rule and the CI window still gate
+        every approval, and the durable one-writer compare-and-swap in
+        :meth:`admit` (exactly one review per delivered candidate, one
+        admitted candidate per project) is unconditional either way.
         """
 
         try:
@@ -255,6 +302,8 @@ class CandidateAdmission:
             raise CandidateRejected(
                 "wake generation is stale for the current reviewer channel"
             )
+        if not external_gates:
+            return snapshot, manifest, channel
         try:
             head = self._branch_head(project_key, manifest.branch)
         except BranchHeadUnknown as error:

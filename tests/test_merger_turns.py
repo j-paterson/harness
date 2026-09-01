@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,11 @@ import pytest
 
 from hermes_orchestrator.circleci import CiCheck
 from hermes_orchestrator.codex_rpc import RpcNotification
+from hermes_orchestrator.merge_flow import (
+    CIRCLECI_KEYCHAIN_SERVICE,
+    GITHUB_KEYCHAIN_SERVICE,
+    DeferredCollaborator,
+)
 from hermes_orchestrator.merger_turns import (
     CodexThreadReports,
     SubmissionRejected,
@@ -1353,6 +1360,246 @@ async def test_corrections_required_still_settles_with_no_pull_request(
     assert len(pending) == 1
     assert pending[0].pr_number == 0
     assert flow.github.merge_calls == []
+
+
+# INFRA-212: a corrections_required submission must validate, persist and
+# settle from Sol's own Codex workspace, where no credential is readable
+# at all. The live defect was a Keychain read (`security` exited 44)
+# during composition; these tests hold the whole submission path to the
+# stronger rule -- not one credential read anywhere.
+
+LINEAR_KEYCHAIN_SERVICE = "hermes-orchestrator-linear"
+
+
+class _CredentialUnavailable(RuntimeError):
+    """The live sandbox failure: ``security`` exits 44 on every read."""
+
+
+@dataclass
+class _RefusingKeychain:
+    """A credential reader that RECORDS then REFUSES every read.
+
+    Any read at all is therefore visible to the assertions below, and
+    any code that depends on one fails loudly instead of degrading.
+    """
+
+    reads: list[tuple[str, str]] = field(default_factory=list)
+
+    def read(self, service: str, account: str) -> str:
+        self.reads.append((service, account))
+        raise _CredentialUnavailable(f"security exited 44 reading {service}")
+
+
+def _forward(proxy: Any, name: str) -> Callable[..., Any]:
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return getattr(proxy, name)(*args, **kwargs)
+
+    return call
+
+
+def _refuse_credentials(flow: ProductionShapedFlow) -> _RefusingKeychain:
+    """Put every credentialed entry point behind the PRODUCTION proxy.
+
+    Each of GitHub, CircleCI and Linear is replaced by the real
+    :class:`DeferredCollaborator` over a keychain that refuses, which is
+    exactly the shape ``build_merge_flow`` / ``cli._open_merge_flow``
+    compose in the Codex workspace: nothing is read while the graph is
+    built, and the first genuine USE of a collaborator reads the
+    credential and fails closed. The harness's fakes keep their plain
+    data attributes (the branch-head probe reads ``open_pulls``), so only
+    the credentialed calls are affected.
+    """
+
+    keychain = _RefusingKeychain()
+    github = DeferredCollaborator(
+        lambda: keychain.read(GITHUB_KEYCHAIN_SERVICE, "default")
+    )
+    circleci = DeferredCollaborator(
+        lambda: keychain.read(CIRCLECI_KEYCHAIN_SERVICE, "default")
+    )
+    linear = DeferredCollaborator(
+        lambda: keychain.read(LINEAR_KEYCHAIN_SERVICE, "default")
+    )
+    for name in (
+        "merge",
+        "list_open_pulls",
+        "get_pull_request",
+        "discover_pull_request",
+    ):
+        setattr(flow.github, name, _forward(github, name))
+    flow.ci.check = _forward(circleci, "check")
+    flow.linear.project = _forward(linear, "project")
+    return keychain
+
+
+def _pending_linear_effects(flow: ProductionShapedFlow) -> list[str]:
+    return [
+        str(row["effect_id"])
+        for row in flow.database.execute(
+            "SELECT effect_id FROM external_effects "
+            "WHERE adapter = 'linear' AND state = 'pending' "
+            "ORDER BY effect_id"
+        ).fetchall()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_corrections_submission_settles_without_any_credential_read(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-212 required test 1: the exact live case. Sol submits a
+    # corrections_required verdict from a workspace where GitHub,
+    # CircleCI and Linear are all unreadable; the submission must still
+    # validate the exact event, issue, candidate SHA, thread, generation,
+    # manifest and verdict, persist once, settle, and deliver the
+    # correction durably -- without one credential read.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-10", SHA_A, pr_number=15)
+    emitted = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 15, defect=True)
+    keychain = _refuse_credentials(flow)
+
+    outcome = await flow.turns.submit_review(
+        "demo", **_submission(emitted.event.event_id, "ENG-10", SHA_A, document)
+    )
+
+    assert keychain.reads == []
+    assert outcome.kind == "corrections_required", outcome
+    assert outcome.event_id == emitted.event.event_id
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "settled", document)
+    ]
+    # Durable correction delivery is unchanged and is what actually
+    # returns the work to the lead.
+    pending = flow.outbox.pending("demo")
+    assert len(pending) == 1
+    assert pending[0].issue_id == "ENG-10"
+    assert pending[0].reviewed_sha == SHA_A
+    assert pending[0].source == "codex_review"
+    row = flow.database.execute("SELECT state FROM wake_deliveries").fetchone()
+    assert row["state"] == "completed"
+    # The Linear status move is never silently skipped: it is journaled
+    # as a durable pending effect for the next recovery boundary.
+    review_id = f"review:demo:{emitted.event.event_id}"
+    assert _pending_linear_effects(flow) == [
+        f"linear:ENG-10:corrections:{review_id}"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_credential_free_corrections_preserve_every_refusal(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-212 required test 2: the preserved behaviours still hold on
+    # the credential-free path -- stale generation refused, conflicting
+    # submission refused, exact duplicate idempotent, and the durable
+    # correction delivered exactly once.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-10", SHA_A, pr_number=15)
+    emitted = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 15, defect=True)
+    submission = _submission(emitted.event.event_id, "ENG-10", SHA_A, document)
+    keychain = _refuse_credentials(flow)
+
+    # Stale generation (and a stale thread) refuse before any write.
+    for stale in (
+        {**submission, "reviewed_generation": 2},
+        {**submission, "reviewed_thread_id": "thr_other"},
+    ):
+        with pytest.raises(SubmissionRejected):
+            await flow.turns.submit_review("demo", **stale)
+    assert _submitted_rows(flow) == []
+
+    first = await flow.turns.submit_review("demo", **submission)
+    assert first.kind == "corrections_required"
+
+    # Exact duplicate is idempotent: same result, no second review,
+    # correction, or projection.
+    reviews = _review_count(flow)
+    corrections = len(flow.outbox.pending("demo"))
+    effects = _pending_linear_effects(flow)
+    second = await flow.turns.submit_review("demo", **submission)
+    assert second == first
+    assert _review_count(flow) == reviews
+    assert len(flow.outbox.pending("demo")) == corrections
+    assert _pending_linear_effects(flow) == effects
+
+    # A conflicting verdict for the same wake event fails closed.
+    conflicting = {
+        **submission, "verdict_json": flow.verdict(SHA_A, branch, 15)
+    }
+    with pytest.raises(
+        SubmissionRejected, match="conflicting verdict submission"
+    ):
+        await flow.turns.submit_review("demo", **conflicting)
+
+    assert keychain.reads == []
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "settled", document)
+    ]
+    assert flow.github.merge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approved_submission_still_refuses_without_credentials(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-212 required test 3: an approval genuinely needs GitHub, so
+    # it must still fail closed -- loudly, at the point of use, with zero
+    # durable writes -- rather than settle while skipping the external
+    # effect.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-10", SHA_A, pr_number=15)
+    emitted = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
+    keychain = _refuse_credentials(flow)
+
+    with pytest.raises(_CredentialUnavailable):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                emitted.event.event_id, "ENG-10", SHA_A,
+                flow.verdict(SHA_A, branch, 15),
+            ),
+        )
+
+    assert keychain.reads == [(GITHUB_KEYCHAIN_SERVICE, "default")]
+    assert _submitted_rows(flow) == []
+    assert _review_count(flow) == 0
+    assert flow.outbox.pending("demo") == ()
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+
+@pytest.mark.asyncio
+async def test_pending_return_projection_replays_at_the_next_boundary(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-212: the deferred Linear projection is not lost. Once a
+    # credentialed boundary is reachable again, the same idempotent
+    # projection is replayed from the durable pending row that the
+    # credential-free settlement left behind.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-10", SHA_A, pr_number=15)
+    emitted = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
+    keychain = _refuse_credentials(flow)
+    await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-10", SHA_A,
+            flow.verdict(SHA_A, branch, 15, defect=True),
+        ),
+    )
+    review_id = f"review:demo:{emitted.event.event_id}"
+    effect_id = f"linear:ENG-10:corrections:{review_id}"
+    assert _pending_linear_effects(flow) == [effect_id]
+    assert keychain.reads == []
+
+    # A live projector is available again at the next recovery boundary.
+    del flow.linear.project
+    replayed = await flow.reviews.reconcile_returned_projections("demo")
+
+    assert replayed == (effect_id,)
+    assert flow.linear.targets == [("ENG-10", "In Development", "operator")]
+    assert _pending_linear_effects(flow) == []
 
 
 @pytest.mark.asyncio

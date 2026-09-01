@@ -1,10 +1,11 @@
 """Compose the live Codex merge flow from real adapters (INFRA-166).
 
-Credentials are read from the profile-isolated macOS Keychain only when the
-flow is built; nothing here starts a process or performs a network call.
-The Codex App Server client is returned unstarted so the caller controls
-its lifecycle. CircleCI is consulted only inside ``CiWindow`` at intake
-boundaries; there is no polling loop anywhere in this graph.
+Credentials are read from the profile-isolated macOS Keychain at the first
+POINT OF USE of the collaborator that needs them (INFRA-212), never while
+the flow is built; nothing here starts a process or performs a network
+call. The Codex App Server client is returned unstarted so the caller
+controls its lifecycle. CircleCI is consulted only inside ``CiWindow`` at
+intake boundaries; there is no polling loop anywhere in this graph.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from hermes_orchestrator.acceptance import AcceptanceGates
 from hermes_orchestrator.ci_window import CircleCiIntakeGate, CiStatusPort, CiWindow
@@ -98,6 +99,72 @@ class KeychainReader(Protocol):
     def read(self, service: str, account: str) -> str: ...
 
 
+class DeferredCollaborator:
+    """One credentialed collaborator, composed at its first point of use.
+
+    INFRA-212: ``build_merge_flow`` used to read every Keychain
+    credential it might need while it composed the graph, so a strictly
+    local command that touches none of them still failed closed on a
+    Keychain read -- the observed ``submit-review`` failure inside the
+    Codex workspace, where ``security`` exited 44 before the submission
+    could be validated at all.
+
+    This is a transparent forwarding proxy, NOT an alternative
+    implementation: it holds the exact factory that builds the exact
+    production collaborator and runs it once, on the first attribute
+    access, then delegates every attribute to that one instance
+    thereafter. There is no second code path to drift from the
+    credentialed one -- a caller that touches the collaborator composes
+    and uses the real client, and a caller that never touches it never
+    reads a credential. A composition failure (an unreadable Keychain
+    item, missing routing config) is raised at the point of use, so a
+    path that genuinely needs the credential still fails closed with the
+    same exception it always raised, merely later.
+
+    ``__getattr__`` forwarding is deliberate: it can never fall behind
+    the wrapped client's surface the way a hand-written stub with an
+    enumerated method list would.
+
+    ``surface`` names the methods a consumer may PROBE (``hasattr``)
+    while wiring the graph -- ``CiWindow`` checks ``hasattr(status,
+    "check")`` in its constructor, and a bare forwarding proxy would
+    compose the client just to answer that. Those names are answered
+    with a forwarding callable that composes on CALL instead. It is an
+    optimisation only: a name outside ``surface`` still resolves
+    correctly, merely by composing sooner, so the list can never make
+    the proxy behave differently from the client it wraps.
+    """
+
+    __slots__ = ("_factory", "_instance", "_surface")
+
+    def __init__(
+        self, factory: Callable[[], Any], *, surface: tuple[str, ...] = ()
+    ) -> None:
+        self._factory = factory
+        self._instance: Any | None = None
+        self._surface = frozenset(surface)
+
+    def _resolve(self) -> Any:
+        instance = self._instance
+        if instance is None:
+            instance = self._factory()
+            self._instance = instance
+        return instance
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__") or name in ("_factory", "_instance", "_surface"):
+            # Never forward this proxy's own slots: an unset slot would
+            # otherwise re-enter here and recurse.
+            raise AttributeError(name)
+        if name in self._surface and self._instance is None:
+
+            def call(*args: Any, **kwargs: Any) -> Any:
+                return getattr(self._resolve(), name)(*args, **kwargs)
+
+            return call
+        return getattr(self._resolve(), name)
+
+
 class DatabaseDurableWakeReader:
     """Read-only ``wake_deliveries`` lookup satisfying ``DurableWakePort``.
 
@@ -179,17 +246,46 @@ def build_merge_flow(
     manifest_root.mkdir(parents=True, exist_ok=True)
     runner = git_runner if git_runner is not None else SubprocessGitRunner()
 
-    github_token = keychain.read(GITHUB_KEYCHAIN_SERVICE, "default")
     merge_journal = MergeEffectJournal(database)
-    github = GitHubClient(
-        transport=HttpxGitHubTransport(github_token),
-        journal=merge_journal,
+    # INFRA-212: the GitHub and CircleCI clients are the graph's only
+    # credentialed collaborators, and both are now composed at their
+    # first point of use rather than here. The durable, local half of
+    # the flow (manifests, wake/submission identity, correction
+    # delivery) is therefore fully usable with no Keychain read at all,
+    # while every caller that does cross an external boundary gets the
+    # identical client -- and the identical fail-closed error when the
+    # credential cannot be read.
+    github = cast(
+        GitHubClient,
+        DeferredCollaborator(
+            lambda: GitHubClient(
+                transport=HttpxGitHubTransport(
+                    keychain.read(GITHUB_KEYCHAIN_SERVICE, "default")
+                ),
+                journal=merge_journal,
+            ),
+            surface=(
+                "merge",
+                "list_open_pulls",
+                "get_pull_request",
+                "discover_pull_request",
+            ),
+        ),
     )
     circleci: CiStatusPort
     if any(project.ci == "circleci" for project in settings.projects.values()):
-        circleci_token = keychain.read(CIRCLECI_KEYCHAIN_SERVICE, "default")
-        circleci = CircleCiStatusAdapter(
-            CircleCiClient(transport=HttpxCircleCiTransport(circleci_token))
+        circleci = cast(
+            CiStatusPort,
+            DeferredCollaborator(
+                lambda: CircleCiStatusAdapter(
+                    CircleCiClient(
+                        transport=HttpxCircleCiTransport(
+                            keychain.read(CIRCLECI_KEYCHAIN_SERVICE, "default")
+                        )
+                    )
+                ),
+                surface=("check",),
+            ),
         )
     else:
         circleci = NoCiStatusPort()

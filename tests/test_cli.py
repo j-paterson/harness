@@ -4441,6 +4441,81 @@ def test_submit_review_rejection_fails_closed_from_stdin(
     assert turns.calls[0][1]["verdict_json"] == '{"pr_number": 7}'
 
 
+class _RefusingKeychain:
+    """A credential reader that RECORDS then REFUSES every read.
+
+    INFRA-212: the live failure was ``security`` exiting 44 for the very
+    first read this command's composition performed.
+    """
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.reads: list[tuple[str, str]] = []
+
+    def read(self, service: str, account: str) -> str:
+        self.reads.append((service, account))
+        raise RuntimeError(f"security exited 44 reading {service}")
+
+
+def test_submit_review_opens_the_real_flow_without_reading_a_credential(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # INFRA-212: the observed live defect, end to end through the real
+    # ``_open_merge_flow`` (NOT the stub the tests above install).
+    # ``submit-review`` composed the full Linear + GitHub + CircleCI +
+    # App Server graph eagerly, that composition read the macOS
+    # Keychain, and a valid structured verdict could not be submitted
+    # from Sol's own workspace at all. The command must now reach the
+    # submission itself -- refusing it on its own durable terms -- with
+    # no credential read whatsoever.
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root, _state_dir = configured_repo
+    (repo_root / "config" / "linear.yaml").write_text(
+        "assignee_ids: {operator: user-operator, ryan: user-ryan}\n"
+        "teams:\n"
+        "  ENG:\n"
+        "    team_id: team-eng\n"
+        "    status_ids:\n"
+        "      Todo: state-todo\n"
+        "      In Development: state-development\n"
+        "      Review: state-review\n"
+        "      QA: state-qa\n"
+        "      Done: state-done\n",
+        encoding="utf-8",
+    )
+    keychains: list[_RefusingKeychain] = []
+
+    def _record(*args: object, **kwargs: object) -> _RefusingKeychain:
+        keychain = _RefusingKeychain(*args, **kwargs)
+        keychains.append(keychain)
+        return keychain
+
+    monkeypatch.setattr(cli_module, "Keychain", _record)
+    verdict_path = repo_root / "verdict.json"
+    verdict_path.write_text(
+        json.dumps(
+            {
+                "verdict": "corrections_required",
+                "repository": "owner/demo",
+                "branch": "feature/eng-9",
+                "reviewed_sha": "a" * 40,
+                "packets": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = invoke(_submit_arguments(configured_repo, str(verdict_path)))
+
+    # The submission was actually attempted and refused on its own
+    # durable terms — no reviewer channel exists in this fresh state —
+    # rather than the command dying while composing collaborators it
+    # never needed.
+    assert result.exit_code == 1
+    assert "reviewer channel is not ready" in result.stderr
+    assert [read for keychain in keychains for read in keychain.reads] == []
+
+
 def test_submit_review_refuses_invalid_input_before_opening_the_flow(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

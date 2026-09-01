@@ -157,6 +157,96 @@ def test_build_merge_flow_wires_no_admission_enforcement_seams(
         assert not hasattr(flow.emitter, seam)
 
 
+class _RefusingKeychain:
+    """A credential reader that RECORDS then REFUSES every read."""
+
+    def __init__(self) -> None:
+        self.reads: list[tuple[str, str]] = []
+
+    def read(self, service: str, account: str) -> str:
+        self.reads.append((service, account))
+        raise RuntimeError(f"security exited 44 reading {service}")
+
+
+def _circleci_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """The same tree as ``_minimal_repo`` but with a CircleCI project."""
+
+    repo_root, state_dir = _minimal_repo(tmp_path)
+    projects = repo_root / "config" / "projects.yaml"
+    projects.write_text(
+        projects.read_text(encoding="utf-8").replace("ci: none", "ci: circleci"),
+        encoding="utf-8",
+    )
+    return repo_root, state_dir
+
+
+def _flow_over(
+    tmp_path: Path, keychain: object, *, circleci: bool = False
+) -> object:
+    repo_root, state_dir = (
+        _circleci_repo(tmp_path) if circleci else _minimal_repo(tmp_path)
+    )
+    settings = load_settings(repo_root, state_dir)
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    database = Database.open(settings.state_dir / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, settings.projects)
+    return build_merge_flow(
+        settings,
+        database=database,
+        events=events,
+        queue=queue,
+        linear=_NullLinear(),
+        keychain=keychain,
+        base_env={},
+    )
+
+
+@pytest.mark.parametrize("circleci", [False, True])
+def test_build_merge_flow_reads_no_credential(
+    tmp_path: Path, circleci: bool
+) -> None:
+    """INFRA-212: composing the graph must read nothing.
+
+    The observed live failure was exactly this: ``submit-review`` inside
+    the Codex workspace composed the full merge graph, that composition
+    read the macOS Keychain, ``security`` exited 44, and a valid verdict
+    could not be submitted at all. Building the flow over a keychain
+    that refuses every read must now succeed, with zero reads --
+    including for a deployment that DOES use CircleCI, whose token was
+    the second eager read.
+    """
+
+    keychain = _RefusingKeychain()
+
+    flow = _flow_over(tmp_path, keychain, circleci=circleci)
+
+    assert flow is not None
+    assert keychain.reads == []
+
+
+def test_a_credentialed_call_still_fails_closed_at_its_point_of_use(
+    tmp_path: Path,
+) -> None:
+    """INFRA-212: deferring is not skipping.
+
+    A path that genuinely needs GitHub still reads the credential and
+    still fails closed with the same error -- merely at the point of use
+    instead of at composition. Nothing silently proceeds without the
+    external effect.
+    """
+
+    keychain = _RefusingKeychain()
+    flow = _flow_over(tmp_path, keychain)
+
+    with pytest.raises(RuntimeError, match="security exited 44"):
+        flow.turns._github.discover_pull_request(
+            "owner/demo", branch="feature/x", head_sha="a" * 40
+        )
+
+    assert keychain.reads == [("hermes-orchestrator-github", "default")]
+
+
 def test_build_merge_flow_wires_a_durable_wake_reader_into_the_emitter(
     tmp_path: Path,
 ) -> None:

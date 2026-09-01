@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from hermes_orchestrator import migration_env as migration_env_module
 from hermes_orchestrator.acceptance import AcceptanceGates
@@ -83,7 +83,11 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
 )
 from hermes_orchestrator.linear import LinearProjection, ProjectLinearRouter
-from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
+from hermes_orchestrator.merge_flow import (
+    DeferredCollaborator,
+    MergeFlow,
+    build_merge_flow,
+)
 from hermes_orchestrator.merger_session import MergerSession
 from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
 from hermes_orchestrator.migration_gate import (
@@ -1061,8 +1065,25 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
     if runtime.merge_flow is not None:
         return runtime.merge_flow
     keychain = Keychain()
-    linear = build_linear_router(
-        settings, database=runtime.database, queue=runtime.queue, keychain=keychain
+    # INFRA-212: the Linear router validates ``config/linear.yaml`` and
+    # reads its Keychain token; both are deferred to the first
+    # projection through the same transparent proxy ``build_merge_flow``
+    # uses for GitHub and CircleCI, so a strictly local command (a
+    # ``corrections_required`` submit-review from Sol's own workspace)
+    # composes this graph without touching a credential at all. The
+    # router built on first use is byte-for-byte the one this call
+    # always built, and any composition failure still raises there.
+    linear = cast(
+        ProjectLinearRouter,
+        DeferredCollaborator(
+            lambda: build_linear_router(
+                settings,
+                database=runtime.database,
+                queue=runtime.queue,
+                keychain=keychain,
+            ),
+            surface=("project", "validate"),
+        ),
     )
     events = EventStore(runtime.database)
     return build_merge_flow(
