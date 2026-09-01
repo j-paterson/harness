@@ -586,6 +586,64 @@ def _durable_counts(flow: ProductionShapedFlow) -> dict[str, int]:
 
 
 @pytest.mark.asyncio
+async def test_settlement_admission_race_keeps_same_wake_retryable(
+    tmp_path: Path,
+) -> None:
+    """A head change after prevalidation cannot terminally poison retry."""
+
+    flow = ProductionShapedFlow(tmp_path)
+    try:
+        await flow.merger.ensure_thread("demo")
+        branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+        emitted = await flow.emitter.emit(
+            "demo", "ENG-9", verification=(("t", "ok"),)
+        )
+        document = flow.verdict(SHA_A, branch, 14)
+        heads = iter((SHA_A, SHA_B))
+        flow.admission._branch_head = lambda project_key, candidate_branch: next(
+            heads
+        )
+
+        raced = await flow.submit(
+            "ENG-9", emitted.event.event_id, SHA_A, document
+        )
+
+        assert raced.kind == "admission_race"
+        assert flow.turns.outstanding_wake("demo") == (
+            emitted.event,
+            "delivered",
+        )
+        submitted = flow.database.execute(
+            "SELECT state, result_json FROM submitted_verdicts WHERE event_id = ?",
+            (emitted.event.event_id,),
+        ).fetchone()
+        assert submitted is not None
+        assert (submitted["state"], submitted["result_json"]) == (
+            "submitted",
+            None,
+        )
+        assert flow.database.scalar("SELECT count(*) FROM reviews") == 0
+        assert flow.database.scalar("SELECT count(*) FROM merge_settlements") == 0
+        assert flow.database.scalar("SELECT count(*) FROM lead_corrections") == 0
+
+        flow.admission._branch_head = (
+            lambda project_key, candidate_branch: SHA_A
+        )
+        settled = await flow.submit(
+            "ENG-9", emitted.event.event_id, SHA_A, document
+        )
+
+        assert settled.kind == "merged"
+        assert flow.turns.outstanding_wake("demo") is None
+        assert flow.database.scalar(
+            "SELECT state FROM submitted_verdicts WHERE event_id = ?",
+            (emitted.event.event_id,),
+        ) == "settled"
+    finally:
+        flow.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_rework_rejected_at_intake_leaves_the_ledger_failed(
     tmp_path: Path,
 ) -> None:
