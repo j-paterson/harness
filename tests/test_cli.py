@@ -3267,6 +3267,44 @@ def test_intake_poll_idle_dispatch_survives_a_linear_composition_failure(
     ]
 
 
+def test_idle_dispatch_rechecks_reprioritization_in_transaction(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The idle transaction must see a post-selection priority change."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir, pressure="yellow", issue_priority=1)
+    linear = _IdleLinear()
+    _patch_idle_linear(monkeypatch, linear)
+    import hermes_orchestrator.cells as cells_module
+
+    real_activate = cells_module.activate_admitted_issue
+
+    async def reprioritize_then_activate(**kwargs: object) -> object:
+        from hermes_orchestrator.db import Database
+        from hermes_orchestrator.events import EventStore
+        from hermes_orchestrator.queue import QueueService
+
+        database = Database.open(state_dir / "state.db")
+        try:
+            QueueService(
+                database, EventStore(database), registered_projects=("demo",)
+            ).reprioritize("INFRA-9", 2)
+        finally:
+            database.close()
+        return await real_activate(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        cells_module, "activate_admitted_issue", reprioritize_then_activate
+    )
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    assert _idle_dispatch_counts(state_dir) == (0, 0, "queued")
+    assert linear.targets == []
+
+
 @pytest.mark.parametrize(
     "occupying_state", ["in_development", "review"], ids=["in_development", "review"]
 )

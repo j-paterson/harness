@@ -1719,7 +1719,6 @@ class ProjectCellService:
         if self._dispatch_freshness_minutes is None:
             return None
         freshness_minutes = self._dispatch_freshness_minutes
-        priority = self._queue.get(issue_id).linear_priority
 
         def guard(connection: sqlite3.Connection) -> bool:
             ceiling = admission_priority_ceiling(
@@ -1727,7 +1726,15 @@ class ProjectCellService:
                 now=self._aware_now(),
                 freshness_minutes=freshness_minutes,
             )
-            return ceiling is not None and priority <= ceiling
+            row = connection.execute(
+                "SELECT priority FROM admitted_issues WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+            return (
+                row is not None
+                and ceiling is not None
+                and int(row["priority"]) <= ceiling
+            )
 
         return guard
 

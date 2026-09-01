@@ -2519,7 +2519,15 @@ def _dispatch_idle_lead(
         current_max = _idle_admission_priority(
             connection, now=datetime.now(UTC), freshness_minutes=freshness_minutes
         )
-        return current_max is not None and candidate.linear_priority <= current_max
+        row = connection.execute(
+            "SELECT priority FROM admitted_issues WHERE issue_id = ?",
+            (candidate.issue_id,),
+        ).fetchone()
+        return (
+            row is not None
+            and current_max is not None
+            and int(row["priority"]) <= current_max
+        )
 
     activated, assignment = asyncio.run(
         activate_admitted_issue(

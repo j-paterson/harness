@@ -234,6 +234,13 @@ async def test_replay_adopts_the_pending_row_and_completes_it_exactly_once(
         status="In Development",
         assignee_alias="operator",
     )
+    with database.transaction() as connection:
+        ExternalEffectStore.begin_in(
+            connection,
+            "effect-race",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
 
     # The mutation applied on Linear's side but the response was lost:
     # exactly one pending row survives the crash boundary.
@@ -267,6 +274,62 @@ async def test_replay_adopts_the_pending_row_and_completes_it_exactly_once(
     replayed = await client.project("ENG-9", target, effect_id="effect-race")
     assert replayed == result
     assert transport.operations == []
+
+
+@pytest.mark.asyncio
+async def test_non_prejournaled_projection_preserves_revision_conflict_guard(
+    database: Database,
+) -> None:
+    """A lost response must not let a retry overwrite a newer Linear edit."""
+
+    class LostResponseTransport(RecordingLinearTransport):
+        fail_after_update = True
+
+        async def execute(
+            self,
+            operation: str,
+            query: str,
+            variables: dict[str, Any],
+        ) -> dict[str, Any]:
+            result = await super().execute(operation, query, variables)
+            if operation == "IssueUpdate" and self.fail_after_update:
+                self.fail_after_update = False
+                raise TimeoutError("Linear response was lost")
+            return result
+
+    transport = LostResponseTransport()
+    client = LinearClient(
+        transport=transport,
+        effects=ExternalEffectStore(database),
+        status_ids={
+            "Todo": "state-todo",
+            "In Development": "state-development",
+            "Review": "state-review",
+            "QA": "state-qa",
+            "Done": "state-done",
+        },
+        assignee_ids={"operator": "user-operator", "ryan": "user-ryan"},
+        expected_team_id="team-engineering",
+    )
+    target = LinearProjection(
+        status="In Development",
+        assignee_alias="operator",
+    )
+
+    with pytest.raises(TimeoutError, match="response was lost"):
+        await client.project("ENG-9", target, effect_id="effect-review-flow")
+    transport.issue(
+        status="Review",
+        state_id="state-review",
+        assignee_id="user-operator",
+        revision="human-r3",
+    )
+
+    with pytest.raises(RuntimeError, match="changed after projection began"):
+        await client.project("ENG-9", target, effect_id="effect-review-flow")
+
+    assert transport.state_id == "state-review"
+    assert transport.operations.count("IssueUpdate") == 1
 
 
 @pytest.mark.asyncio
@@ -316,10 +379,7 @@ def test_allowed_projection_has_no_comment_or_label_fields() -> None:
 async def test_initial_read_failure_still_leaves_the_pending_row(
     database: Database,
 ) -> None:
-    """Sol ec0ed7fe gap 2: the pending journal row is durable BEFORE
-    the first network read, so an outage on the very first ``Issue``
-    query — previously invisible: no row at all — leaves exactly the
-    stable target-only record reconciliation reads."""
+    """The activation journal survives an outage on the first read."""
 
     class UnreachableTransport:
         async def execute(
@@ -336,6 +396,13 @@ async def test_initial_read_failure_still_leaves_the_pending_row(
         expected_team_id="team-engineering",
     )
     target = LinearProjection(status="In Development", assignee_alias="operator")
+    with database.transaction() as connection:
+        ExternalEffectStore.begin_in(
+            connection,
+            "effect-read-outage",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
 
     with pytest.raises(TimeoutError, match="unreachable"):
         await client.project("ENG-9", target, effect_id="effect-read-outage")
@@ -397,11 +464,7 @@ async def test_validation_failures_preserve_one_pending_row(
     issue_overrides: dict[str, Any],
     match: str,
 ) -> None:
-    """Sol ec0ed7fe gap 2: every validation failure class — team
-    mismatch, missing status/assignee mapping, disallowed transition —
-    happens strictly after the pending row is durable, so each leaves
-    exactly ONE pending record, never rolls it back, and a retry never
-    duplicates it."""
+    """Validation failures preserve the activation's pending row."""
 
     if issue_overrides:
         transport.issue(**issue_overrides)
@@ -421,6 +484,13 @@ async def test_validation_failures_preserve_one_pending_row(
     arguments.update(client_overrides)
     client = LinearClient(**arguments)
     target = LinearProjection(status="In Development", assignee_alias="operator")
+    with database.transaction() as connection:
+        ExternalEffectStore.begin_in(
+            connection,
+            "effect-validation",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
 
     with pytest.raises(ValueError, match=match):
         await client.project("ENG-9", target, effect_id="effect-validation")

@@ -4094,6 +4094,69 @@ async def test_activation_commit_journals_the_stable_pending_projection_row(
     ]
 
 
+@pytest.mark.parametrize("effect_state", ["pending", "completed"])
+@pytest.mark.asyncio
+async def test_activation_adopts_legacy_revision_bearing_projection_row(
+    database: Database,
+    queue: QueueService,
+    effect_state: str,
+) -> None:
+    """An upgrade preserves a matching row written by current main."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    legacy_request = {
+        **_IN_DEV_REQUEST,
+        "source_revision": "legacy-r1",
+        "changed_fields": ["status"],
+    }
+    response = (
+        {
+            "issue_id": "ENG-9",
+            "changed_fields": ["status"],
+            "source_revision": "legacy-r1",
+            "response_revision": "legacy-r2",
+        }
+        if effect_state == "completed"
+        else None
+    )
+    now = datetime.now(UTC).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO external_effects("
+            "effect_id, adapter, operation, target, state, request_json, "
+            "response_json, created_at, updated_at"
+            ") VALUES (?, 'linear', 'project', 'ENG-9', ?, ?, ?, ?, ?)",
+            (
+                "linear:ENG-9:in-development:v2",
+                effect_state,
+                json.dumps(legacy_request, sort_keys=True, separators=(",", ":")),
+                (
+                    json.dumps(response, sort_keys=True, separators=(",", ":"))
+                    if response is not None
+                    else None
+                ),
+                now,
+                now,
+            ),
+        )
+
+    activated, assignment = await _activate(database, RecordingLinear())
+
+    assert activated is True
+    assert assignment is not None
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+    row = database.execute(
+        "SELECT state, request_json FROM external_effects WHERE effect_id = ?",
+        ("linear:ENG-9:in-development:v2",),
+    ).fetchone()
+    assert row is not None
+    assert str(row["state"]) == effect_state
+    assert json.loads(row["request_json"]) == legacy_request
+
+
 class _ReadOutageTransport:
     """A fake ``LinearTransport`` whose ``Issue`` read fails while
     ``fail_reads`` is True — the early-failure class that used to leave
@@ -4341,6 +4404,36 @@ async def test_armed_daemon_dispatch_fails_closed_on_a_superseding_red_sample(
     assert queue.get("ENG-9").state == IssueState.QUEUED
     assert _issue_started_count(database) == 0
     assert linear.targets == []
+
+
+@pytest.mark.asyncio
+async def test_armed_daemon_dispatch_rechecks_reprioritization_in_transaction(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transaction-local guard must see a post-selection priority change."""
+
+    cell_service.require_dispatch_capacity_guard(5)
+    admit(queue, "ENG-9")
+    _insert_resource_sample(database, pressure="yellow", sampled_at=_GUARD_NOW)
+    original_guard = cell_service._capacity_guard
+
+    def reprioritize_after_guard_snapshot(issue_id: str) -> object:
+        guard = original_guard(issue_id)
+        queue.reprioritize(issue_id, 2)
+        return guard
+
+    monkeypatch.setattr(
+        cell_service, "_capacity_guard", reprioritize_after_guard_snapshot
+    )
+
+    result = await cell_service.dispatch("ENG-9")
+
+    assert result.status == "start_unconfirmed"
+    assert queue.get("ENG-9").state == IssueState.QUEUED
+    assert _issue_started_count(database) == 0
 
 
 @pytest.mark.asyncio

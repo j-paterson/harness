@@ -271,6 +271,23 @@ def _effect_from_row(row: Any) -> ExternalEffect:
     )
 
 
+def _same_projection_request(
+    existing: dict[str, Any], requested: dict[str, Any]
+) -> bool:
+    """Match target-only and legacy envelopes for the same projection."""
+
+    if existing == requested:
+        return True
+    target_keys = {"issue_id", "target"}
+    legacy_keys = target_keys | {"source_revision", "changed_fields"}
+    if (set(existing), set(requested)) not in (
+        (legacy_keys, target_keys),
+        (target_keys, legacy_keys),
+    ):
+        return False
+    return all(existing.get(key) == requested.get(key) for key in target_keys)
+
+
 class ExternalEffectStore:
     """Durably suppress duplicate Linear effects across retries and restarts."""
 
@@ -304,7 +321,7 @@ class ExternalEffectStore:
         ).fetchone()
         if row is not None:
             existing = _effect_from_row(row)
-            if existing.request != request:
+            if not _same_projection_request(existing.request, request):
                 raise ValueError("effect_id was already used for another request")
             return existing
 
@@ -330,7 +347,7 @@ class ExternalEffectStore:
 
         existing = self.get(effect_id)
         if existing is not None:
-            if existing.request != request:
+            if not _same_projection_request(existing.request, request):
                 raise ValueError("effect_id was already used for another request")
             return existing
 
@@ -415,26 +432,18 @@ class LinearClient:
     ) -> ProjectionResult:
         """Apply only differing state or assignee values exactly once.
 
-        The durable pending journal row is the FIRST thing this method
-        guarantees: ``begin`` ADOPTS an already-begun row for the same
-        effect id with the byte-identical target-only request (the
-        local activation transaction journals one at commit time — see
-        ``cells._activate_issue_transaction``) or writes it now, BEFORE
-        any network read or validation runs. Every failure class from
-        here on — the initial issue read, a team mismatch, a missing
-        status/assignee mapping, a disallowed transition, the update or
-        its verification — therefore leaves exactly that one ``pending``
-        row behind for reconciliation
-        (``reconcile._project_pending_linear_effect``), never nothing
-        and never a duplicate. The request is a pure function of the
-        requested target, so any replay adopts the same row and the
-        completed response makes every later retry a network no-op.
+        Activation supplies a target-only row before this call. Other flows
+        retain the revision-bearing journal that protects newer Linear edits.
         """
 
-        request = projection_request(issue_id, target)
-        effect = self._effects.begin(effect_id, target=issue_id, request=request)
-        if effect.state == "completed" and effect.response is not None:
-            return ProjectionResult.from_record(effect.response)
+        requested_target = projection_request(issue_id, target)
+        effect = self._effects.get(effect_id)
+        if effect is not None:
+            if not _same_projection_request(effect.request, requested_target):
+                raise ValueError("effect_id was already used for another request")
+            if effect.state == "completed" and effect.response is not None:
+                return ProjectionResult.from_record(effect.response)
+        target_only = effect is not None and "source_revision" not in effect.request
 
         issue = await self.validate_issue(issue_id)
         update: dict[str, str] = {}
@@ -454,6 +463,27 @@ class LinearClient:
                 f"Linear assignee {target.assignee_alias} is not configured"
             ) from error
 
+        target_matches = (
+            target_state_id is None or issue.state_id == target_state_id
+        ) and issue.assignee_id == target_assignee_id
+        if effect is not None and target_matches:
+            result = ProjectionResult(
+                issue_id=issue_id,
+                changed_fields=tuple(effect.request.get("changed_fields", ())),
+                source_revision=str(
+                    effect.request.get("source_revision", issue.revision)
+                ),
+                response_revision=issue.revision,
+            )
+            self._effects.complete(effect_id, result.as_record())
+            return result
+        if (
+            effect is not None
+            and not target_only
+            and effect.request.get("source_revision") != issue.revision
+        ):
+            raise RuntimeError("Linear issue changed after projection began")
+
         if target_state_id is not None and issue.state_id != target_state_id:
             current_status = self._logical_status(issue.state_id)
             if (current_status, target.status) not in _ALLOWED_STATUS_TRANSITIONS:
@@ -466,6 +496,17 @@ class LinearClient:
         if issue.assignee_id != target_assignee_id:
             update["assigneeId"] = target_assignee_id
             changed_fields.append("assignee")
+
+        if effect is None:
+            effect = self._effects.begin(
+                effect_id,
+                target=issue_id,
+                request={
+                    **requested_target,
+                    "source_revision": issue.revision,
+                    "changed_fields": changed_fields,
+                },
+            )
 
         response_revision = issue.revision
         if update:
