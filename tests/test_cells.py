@@ -11,11 +11,13 @@ import pytest
 
 from hermes_orchestrator.cells import (
     MAX_DEVELOPMENT_ISSUE_LANES,
+    HarnessCheckoutRefused,
     ProfileCapacityEvidence,
     ProjectCell,
     ProjectCellService,
     RotationBlocked,
     activate_admitted_issue,
+    ensure_harness_checkout,
 )
 from hermes_orchestrator.claude import (
     ClaudeEvent,
@@ -5423,3 +5425,138 @@ async def test_second_harness_dispatch_resumes_rather_than_duplicating(
         "SELECT cell_id FROM project_cells WHERE lane_role = 'harness'"
     ).fetchall()
     assert [str(row["cell_id"]) for row in rows] == ["cell-harness"]
+
+
+class FakeHarnessGit:
+    """Fake ``HarnessCheckoutPort`` for :func:`ensure_harness_checkout`.
+
+    INFRA-219 R7 / Sol correction 110ed759: mirrors exactly the surface
+    ``hermes_orchestrator.git.WorktreeGit`` exposes for worktree
+    evidence/provisioning, so these regressions prove the VALIDATE-then
+    -provision strategy without ever spawning real git.
+    """
+
+    def __init__(
+        self,
+        *,
+        worktrees: set[Path] = frozenset(),
+        heads: dict[Path, str] | None = None,
+        branches: dict[Path, str | None] | None = None,
+        mismatch_provisioned_head: bool = False,
+    ) -> None:
+        self._worktrees: set[Path] = set(worktrees)
+        self._heads: dict[Path, str] = dict(heads or {})
+        self._branches: dict[Path, str | None] = dict(branches or {})
+        self._mismatch_provisioned_head = mismatch_provisioned_head
+        self.add_calls: list[tuple[Path, Path, str]] = []
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
+        return tuple(str(path) for path in self._worktrees)
+
+    def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None:
+        self.add_calls.append((repo_path, path, sha))
+        self._worktrees.add(path)
+        self._heads[path] = (
+            "f" * 40 if self._mismatch_provisioned_head else sha
+        )
+
+    def head_sha(self, path: Path) -> str:
+        return self._heads.get(path, "a" * 40)
+
+    def branch(self, path: Path) -> str | None:
+        return self._branches.get(path)
+
+
+def test_ensure_harness_checkout_validates_existing_worktree(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: a harness checkout already registered as a git
+    worktree of the project repository is VALIDATED and proceeds --
+    never re-created."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    git = FakeHarnessGit(worktrees={harness_path}, heads={harness_path: "a" * 40})
+
+    status = ensure_harness_checkout(
+        git, repo_path=repo_path, harness_path=harness_path
+    )
+
+    assert status.provisioned is False
+    assert status.path == harness_path
+    assert git.add_calls == []
+
+
+def test_ensure_harness_checkout_provisions_when_absent(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: an absent harness checkout is PROVISIONED
+    through the existing worktree-materialization primitive
+    (``worktree_add_detached``), pinned to the repository's current
+    HEAD as the stable operational-only harness head -- never a bespoke
+    subprocess call."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    repo_head = "b" * 40
+    git = FakeHarnessGit(worktrees=set(), heads={repo_path: repo_head})
+
+    status = ensure_harness_checkout(
+        git, repo_path=repo_path, harness_path=harness_path
+    )
+
+    assert status.provisioned is True
+    assert status.head_sha == repo_head
+    assert git.add_calls == [(repo_path, harness_path, repo_head)]
+
+
+def test_ensure_harness_checkout_refuses_foreign_directory(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: a path that exists but is NOT registered as a
+    worktree of this repository is a foreign directory -- refused
+    fail-closed, never silently adopted."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    harness_path.mkdir()
+    git = FakeHarnessGit(worktrees=set())
+
+    with pytest.raises(HarnessCheckoutRefused):
+        ensure_harness_checkout(git, repo_path=repo_path, harness_path=harness_path)
+
+
+def test_ensure_harness_checkout_refuses_branch_mismatch(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: an already-registered checkout whose branch
+    disagrees with what Hermes expects refuses fail-closed rather than
+    launching a harness lead into the wrong identity."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    git = FakeHarnessGit(
+        worktrees={harness_path},
+        heads={harness_path: "a" * 40},
+        branches={harness_path: "some-other-branch"},
+    )
+
+    with pytest.raises(HarnessCheckoutRefused):
+        ensure_harness_checkout(
+            git,
+            repo_path=repo_path,
+            harness_path=harness_path,
+            expected_branch="demo-harness-head",
+        )
+
+
+def test_ensure_harness_checkout_refuses_head_mismatch_after_provisioning(
+    tmp_path: Path,
+) -> None:
+    """R7 / Sol 110ed759: even immediately after provisioning, the
+    checkout's actual HEAD is re-proven against the repository HEAD it
+    was provisioned from -- a disagreement refuses fail-closed instead
+    of launching a harness lead onto an unexpected commit."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    git = FakeHarnessGit(
+        worktrees=set(),
+        heads={repo_path: "c" * 40},
+        mismatch_provisioned_head=True,
+    )
+
+    with pytest.raises(HarnessCheckoutRefused):
+        ensure_harness_checkout(git, repo_path=repo_path, harness_path=harness_path)

@@ -990,6 +990,31 @@ class CmuxReconciliationReport:
     intents_ambiguous: tuple[str, ...] = ()
 
 
+
+def _lane_cwd(
+    project_paths: Mapping[str, Path],
+    lane_project_paths: Mapping[tuple[str, str], Path],
+    project_key: str,
+    lane_role: str,
+) -> Path | None:
+    """Resolve one lane's checkout, falling back to the project's own.
+
+    INFRA-219 R5b (Sol correction 110ed759): the seater and the
+    reconciler resolved a seat's cwd by project alone, so a HARNESS
+    binding was restored into the DEVELOPMENT lead's worktree — the
+    exact defect Sol reported, and the reason lane identity on
+    ``CmuxBinding`` alone was not enough. A lane-keyed override wins
+    when present; every lane without one falls back to the historical
+    project mapping, so development behavior is byte-compatible with
+    today whenever no harness lane is configured.
+    """
+
+    override = lane_project_paths.get((project_key, lane_role))
+    if override is not None:
+        return override
+    return project_paths.get(project_key)
+
+
 class CmuxSurfaceReconciler:
     """Restore visible seats from durable identity before accepting work.
 
@@ -1047,6 +1072,7 @@ class CmuxSurfaceReconciler:
         bindings: CmuxSurfaceBindings,
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
+        lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
         profile_dirs: ProfileDirectory,
         environ: Mapping[str, str],
         channel_launch: ChannelLaunchSource | None = None,
@@ -1056,6 +1082,9 @@ class CmuxSurfaceReconciler:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
+        # INFRA-219 R5b: lane-keyed checkout overrides, so a harness
+        # seat/binding never resolves into the development worktree.
+        self._lane_project_paths = dict(lane_project_paths or {})
         self._profile_dirs = profile_dirs
         self._environ = dict(environ)
         self._channel_launch = channel_launch
@@ -1174,7 +1203,12 @@ class CmuxSurfaceReconciler:
     ) -> None:
         assert binding.project_key is not None
         assert binding.profile_alias is not None
-        cwd = self._project_paths.get(binding.project_key)
+        cwd = _lane_cwd(
+            self._project_paths,
+            self._lane_project_paths,
+            binding.project_key,
+            getattr(binding, "lane_role", "development"),
+        )
         try:
             config_dir = self._profile_dirs.config_dir(binding.profile_alias)
         except (KeyError, ValueError):
@@ -1793,6 +1827,7 @@ class CmuxLeadSeater:
         bindings: CmuxSurfaceBindings,
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
+        lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
         profile_dirs: ProfileDirectory,
         auth_probe: Callable[[str], bool] | None = None,
         channel_launch: ChannelLaunchSource | None = None,
@@ -1802,6 +1837,9 @@ class CmuxLeadSeater:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
+        # INFRA-219 R5b: lane-keyed checkout overrides, so a harness
+        # seat/binding never resolves into the development worktree.
+        self._lane_project_paths = dict(lane_project_paths or {})
         self._profile_dirs = profile_dirs
         self._auth_probe = auth_probe
         self._channel_launch = channel_launch

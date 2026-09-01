@@ -28,6 +28,7 @@ from hermes_orchestrator.cells import (
     HARNESS_LANE,
     ProfileCapacityEvidence,
     ProjectCellService,
+    ensure_harness_checkout,
 )
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
@@ -61,6 +62,7 @@ from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.emission import EmissionBlocked, ResolvedLane, resolve_lane
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
+from hermes_orchestrator.git import GitError, WorktreeGit
 from hermes_orchestrator.handoffs import (
     HandoffRecord,
     HandoffRejected,
@@ -1166,9 +1168,14 @@ def _harness_lead_cwd(lead_cwd: Path) -> Path:
     directory -- ``start-lane --lane harness`` never launches or
     resumes a lead in the same worktree a development lead uses, so
     the two lanes' sessions can never collide on working-tree state.
-    The path is a deterministic convention (no new config surface);
-    provisioning the actual worktree there is out of this packet's
-    scope -- see the L2 report.
+    The path is a deterministic convention (no new config surface).
+
+    INFRA-219 R7 / Sol correction 110ed759: L2 left provisioning the
+    actual worktree here out of scope -- this naming convention alone
+    never created or validated the checkout. ``_open_rotation_collaborators``
+    now runs :func:`hermes_orchestrator.cells.ensure_harness_checkout`
+    against exactly this path before a harness lane ever launches into
+    it.
     """
 
     return lead_cwd.parent / f"{lead_cwd.name}-harness"
@@ -1179,6 +1186,7 @@ def _open_rotation_collaborators(
     runtime: Runtime,
     *,
     lane_role: str = DEVELOPMENT_LANE,
+    harness_project_key: str | None = None,
 ) -> tuple[ProjectCellService, CmuxLeadSeater]:
     """Compose the project cell service and classic seater rotation needs.
 
@@ -1194,6 +1202,22 @@ def _open_rotation_collaborators(
     ``ValueError`` with an actionable message when a required local file
     (``config/profiles.yaml``) is missing; the caller turns that into a
     clean refusal rather than a traceback.
+
+    INFRA-219 R7 / Sol correction 110ed759: when ``lane_role`` is
+    ``HARNESS_LANE`` and ``harness_project_key`` names the project being
+    started, the dedicated harness checkout
+    (:func:`_harness_lead_cwd`) is VALIDATED (or PROVISIONED, if absent)
+    against the project's real repository through
+    :func:`ensure_harness_checkout` -- the worktree machinery
+    ``WorktreeGit`` already provides, never a bespoke subprocess call --
+    before the seater/cell service are ever composed to launch into it.
+    :class:`hermes_orchestrator.cells.HarnessCheckoutRefused` is a
+    ``ValueError`` subclass, so a mismatched or foreign checkout flows
+    through this function's existing ``ValueError`` refusal path with no
+    new exception handling here. ``harness_project_key`` is ``None`` for
+    every pre-R7 caller (development rotation, and the direct unit tests
+    that call this function without a project) so this check runs only
+    when a caller opts a specific project into it.
     """
 
     assert settings.cmux is not None
@@ -1262,6 +1286,13 @@ def _open_rotation_collaborators(
         )
         for alias, project in settings.projects.items()
     }
+    if lane_role == HARNESS_LANE and harness_project_key is not None:
+        harness_project = settings.projects[harness_project_key]
+        ensure_harness_checkout(
+            WorktreeGit(),
+            repo_path=harness_project.repo_path,
+            harness_path=_harness_lead_cwd(harness_project.lead_cwd),
+        )
     cmux_port = CmuxCliAdapter(
         settings.cmux.cli,
         base_env=environment,
@@ -1290,9 +1321,15 @@ def _open_rotation_collaborators(
     )
     if runtime.cells is not None:
         return runtime.cells, seater
+    # INFRA-219 R7 / Sol correction 110ed759: an operational-only prompt,
+    # distinct from the development lead's ``claude-lead.md`` -- the
+    # harness lane owns restart/rotation/wake-confirm/recovery/dedup/
+    # acceptance testing only and never selects or implements product
+    # issues (see ``prompts/claude-harness.md``).
+    prompt_name = "claude-harness.md" if lane_role == HARNESS_LANE else "claude-lead.md"
     runner = ClaudeRunner(
         registry,
-        prompt_file=settings.repo_root / "prompts" / "claude-lead.md",
+        prompt_file=settings.repo_root / "prompts" / prompt_name,
         base_env=environment,
         processes=runtime.processes,
         freeze_dir=settings.state_dir / "freezes",
@@ -1389,9 +1426,16 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
     lane_role = HARNESS_LANE if args.lane == "harness" else DEVELOPMENT_LANE
     try:
         cells, _seater = _open_rotation_collaborators(
-            settings, runtime, lane_role=lane_role
+            settings,
+            runtime,
+            lane_role=lane_role,
+            # INFRA-219 R7 / Sol correction 110ed759: only a harness
+            # start ever needs its dedicated checkout validated or
+            # provisioned; a development start passes no project here
+            # and ``_open_rotation_collaborators`` skips the check.
+            harness_project_key=args.project if lane_role == HARNESS_LANE else None,
         )
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, GitError) as error:
         _print({"error": str(error)}, json_output=args.json, human=f"{error}.")
         return 1
 

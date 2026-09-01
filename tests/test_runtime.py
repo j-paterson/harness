@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import hermes_orchestrator.runtime as runtime_module
+from hermes_orchestrator.cells import DEVELOPMENT_LANE, HARNESS_LANE
 from hermes_orchestrator.channel_hub import ChannelLauncher
 from hermes_orchestrator.cmux_surfaces import (
     CHANNEL_ENTRY,
@@ -23,6 +24,7 @@ from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.profiles import JsonCommand
 from hermes_orchestrator.runtime import (
     DaemonAlreadyRunning,
+    _harness_lead_cwd,
     open_runtime,
     resolve_sidecar_entry,
 )
@@ -688,6 +690,58 @@ def test_live_runtime_composes_every_lead_cwd_from_the_dedicated_worktree(
         trusted = document["projects"][str(lead_worktree)]
         assert trusted["hasTrustDialogAccepted"] is True
         assert str(tmp_path) not in document["projects"]
+    finally:
+        runtime.close()
+
+
+def test_harness_lead_cwd_derives_the_sibling_worktree_convention() -> None:
+    """INFRA-219 R5b: the pure helper runtime.py duplicates from
+    ``cli.py``'s ``_harness_lead_cwd`` (Sol correction 110ed759) --
+    the harness lane's dedicated checkout is always a sibling of the
+    development lead's own directory, never that directory itself."""
+
+    lead_cwd = Path("/repos/demo-lead")
+    harness_cwd = _harness_lead_cwd(lead_cwd)
+    assert harness_cwd == Path("/repos/demo-lead-harness")
+    assert harness_cwd != lead_cwd
+
+
+def test_live_runtime_composes_a_distinct_harness_lane_project_path(
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 R5b (Sol correction 110ed759): the composed
+    ``ProjectCellService`` must resolve the HARNESS lane to its own
+    dedicated checkout, not the development ``lead_cwd`` runtime.py's
+    plain ``project_paths`` map still carries -- otherwise a restored
+    harness cell would launch/resume into the development lead's own
+    worktree."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    lead_cwd = settings.projects["demo"].lead_cwd
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        assert runtime.cells is not None
+        harness_cwd = runtime.cells._lane_project_paths[("demo", HARNESS_LANE)]
+        assert harness_cwd == _harness_lead_cwd(lead_cwd)
+        assert harness_cwd != lead_cwd
+        # Lane-aware resolution: the harness lane's private ``_cell_cwd``
+        # seam picks up the dedicated checkout...
+        assert runtime.cells._cell_cwd("demo", HARNESS_LANE) == harness_cwd
+        # ...while development-lane resolution is untouched -- no
+        # development entry was ever added to ``_lane_project_paths``,
+        # so it still falls back to the historical ``project_paths``
+        # map, byte-compatible with pre-R5b composition.
+        assert ("demo", DEVELOPMENT_LANE) not in runtime.cells._lane_project_paths
+        assert runtime.cells._cell_cwd("demo", DEVELOPMENT_LANE) == lead_cwd
+        assert runtime.cells._project_paths == {"demo": lead_cwd}
     finally:
         runtime.close()
 

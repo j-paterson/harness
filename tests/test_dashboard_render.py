@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from datetime import UTC, datetime
 
@@ -17,6 +18,7 @@ from hermes_orchestrator.dashboard_sources import (
     ControlAttentionFact,
     DashboardSnapshot,
     IdleFact,
+    LaneCellFact,
     ProfileLeaseFact,
     ProfileUsage,
     ResourceFact,
@@ -247,6 +249,7 @@ def _frame_snapshot(
     attention_control: ControlAttentionFact | None = None,
     tasks_observed_at: str | None = "2026-08-31T11:55:00+00:00",
     idle: tuple[IdleFact, ...] = (),
+    lanes: tuple[LaneCellFact, ...] = (),
 ) -> DashboardSnapshot:
     if capacity is None:
         capacity = tuple(_capacity_fact(alias) for alias in _ALIASES)
@@ -271,6 +274,7 @@ def _frame_snapshot(
         transitions=transitions,
         attention_control=attention_control,
         idle=idle,
+        lanes=lanes,
     )
 
 
@@ -726,3 +730,115 @@ def test_positive_pr_numbers_still_render_as_pr_n_in_work_and_attention() -> Non
         line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
     )
     assert attention_line.strip() == "corrections requested on PR#35 (INFRA-208)"
+
+
+# ---------------------------------------------------------------------------
+# INFRA-219 R4 (Sol correction 110ed759): render_frame's Lanes section --
+# the actual pane dashboard_refresh.py draws every tick was silently
+# ignoring snapshot.lanes entirely. These tests exercise render_frame
+# directly (not render_dashboard), which is the substitution the defect
+# was about.
+# ---------------------------------------------------------------------------
+
+
+def _lane(
+    *,
+    project_key: str = "proj",
+    lane_role: str = "development",
+    cell_id: str = "cell-dev",
+    session_id: str = "sess-dev",
+    state: str = "active",
+    issue_ids: tuple[str, ...] = (),
+    blocked_issue_ids: tuple[str, ...] = (),
+    subagents_total: int = 0,
+    subagents_completed: int = 0,
+) -> LaneCellFact:
+    return LaneCellFact(
+        project_key=project_key,
+        lane_role=lane_role,
+        cell_id=cell_id,
+        session_id=session_id,
+        state=state,
+        issue_ids=issue_ids,
+        blocked_issue_ids=blocked_issue_ids,
+        subagents_total=subagents_total,
+        subagents_completed=subagents_completed,
+    )
+
+
+def test_frame_shows_both_leads_lane_specific_issues_without_cross_attribution() -> (
+    None
+):
+    dev = _lane(
+        lane_role="development",
+        cell_id="cell-dev",
+        session_id="sess-dev",
+        issue_ids=("INFRA-1", "INFRA-2"),
+    )
+    harness = _lane(
+        lane_role="harness",
+        cell_id="cell-harness",
+        session_id="sess-harness",
+        issue_ids=(),
+    )
+    snapshot = _frame_snapshot(lanes=(dev, harness))
+    lines = render_frame(snapshot, width=100, height=30, now=_NOW)
+    joined = "\n".join(lines)
+    assert "Lanes" in joined
+
+    dev_row = next(line for line in lines if "proj/development" in line)
+    harness_row = next(line for line in lines if "proj/harness" in line)
+    assert "INFRA-1" in dev_row and "INFRA-2" in dev_row
+    # The harness row must never carry the development lane's issues --
+    # this is exactly the cross-lane attribution Sol's correction bars.
+    assert "INFRA-1" not in harness_row and "INFRA-2" not in harness_row
+    assert "no product issue" in harness_row
+
+
+def test_frame_lane_row_shows_subagents_head_event_pressure_and_blockers() -> None:
+    dev = _lane(
+        issue_ids=("INFRA-5",),
+        blocked_issue_ids=("INFRA-5",),
+        subagents_total=3,
+        subagents_completed=1,
+    )
+    transitions = (
+        TransitionFact(
+            project_key="proj",
+            occurred_at="2026-08-31T11:58:00+00:00",
+            phrase="issue INFRA-5 → blocked",
+        ),
+    )
+    resource = _resource_fact(pressure="yellow")
+    snapshot = _frame_snapshot(lanes=(dev,), transitions=transitions, resource=resource)
+    lines = render_frame(snapshot, width=200, height=30, now=_NOW)
+    dev_row = next(line for line in lines if "proj/development" in line)
+    assert "kids 1/3" in dev_row
+    assert "issue INFRA-5" in dev_row  # head/event phrase
+    assert "pressure yellow" in dev_row
+    assert "blockers INFRA-5" in dev_row
+
+
+def test_frame_lane_row_placeholders_when_event_or_resource_are_unknown() -> None:
+    dev = _lane()
+    # ``_frame_snapshot`` substitutes a default resource fact when given
+    # None, so absence is expressed on the built snapshot itself.
+    snapshot = dataclasses.replace(
+        _frame_snapshot(lanes=(dev,), transitions=()), resource=None
+    )
+    lines = render_frame(snapshot, width=200, height=30, now=_NOW)
+    dev_row = next(line for line in lines if "proj/development" in line)
+    assert "no recorded event" in dev_row
+    assert "no resource sample" in dev_row
+    assert "no active issue" in dev_row
+    assert "blockers none" in dev_row
+
+
+def test_frame_with_lanes_still_honors_exact_height_and_width_contract() -> None:
+    dev = _lane(issue_ids=("INFRA-1",))
+    harness = _lane(lane_role="harness", cell_id="cell-h", session_id="sess-h")
+    snapshot = _frame_snapshot(tasks=(_task(),), lanes=(dev, harness))
+    for width, height in ((40, 12), (60, 20), (24, 6), (100, 30)):
+        lines = render_frame(snapshot, width=width, height=height, now=_NOW)
+        assert len(lines) == height
+        assert all(visible_length(line) == width for line in lines)

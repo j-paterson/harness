@@ -12,6 +12,7 @@ from typing import Any, Protocol, TextIO
 
 from hermes_orchestrator.admission import AdmissionController, PressureClassifier
 from hermes_orchestrator.cells import (
+    HARNESS_LANE,
     DispatchResult,
     ProfileCapacityEvidence,
     ProjectCellService,
@@ -411,6 +412,28 @@ def build_linear_router(
     )
 
 
+def _harness_lead_cwd(lead_cwd: Path) -> Path:
+    """The harness lane's dedicated worktree for a project's ``lead_cwd``.
+
+    INFRA-219 R5b (Sol correction 110ed759): the durable half (packet
+    R5) gave ``cmux_surface_bindings`` and ``cmux_activation_intents``
+    a ``lane_role`` column, but the runtime composition that reads
+    those bindings still built its project path maps from
+    ``project.lead_cwd`` alone -- a restored HARNESS binding had
+    nowhere but the development lead's own worktree to resolve to.
+    This mirrors ``cli.py``'s ``_harness_lead_cwd`` -- the same
+    deterministic sibling-checkout convention (``start-lane --lane
+    harness`` never launches into the development lead's directory) --
+    duplicated here rather than imported so ``runtime.py`` does not
+    depend on ``cli.py`` (the wrong dependency direction: ``cli.py``
+    already depends on ``runtime.py``). The coordinator should decide
+    whether to hoist this convention to a shared module once both
+    packets land.
+    """
+
+    return lead_cwd.parent / f"{lead_cwd.name}-harness"
+
+
 def open_runtime(
     settings: Settings,
     *,
@@ -668,6 +691,34 @@ def open_runtime(
                     alias: project.lead_cwd
                     for alias, project in settings.projects.items()
                 }
+                # INFRA-219 R5b (Sol correction 110ed759): unlike
+                # ``lane_project_paths`` below, this mapping cannot yet
+                # be made lane-aware from here. ``CmuxLeadSeater.ensure``
+                # and ``CmuxSurfaceReconciler._reconcile_lead``
+                # (cmux_surfaces.py) both resolve a seat's cwd through
+                # ``self._project_paths.get(project_key)`` alone --
+                # keyed by project only, with no lane parameter and no
+                # read of the ``lane_role`` R5 already put on
+                # ``CmuxBinding`` -- so a restored HARNESS binding still
+                # resolves to this same development ``lead_cwd`` map.
+                # Fixing this requires widening both constructors'
+                # ``project_paths: Mapping[str, Path]`` to a
+                # lane-scoped mapping (mirroring
+                # ``ProjectCellService.lane_project_paths``) and
+                # threading ``lane_role``/``binding.lane_role`` through
+                # ``ensure`` and ``_reconcile_lead`` -- out of this
+                # packet's reach (cmux_surfaces.py is not in R5b's
+                # boundary); flagged for the coordinator to wire.
+                # INFRA-219 R5b (lead completion): the lane-keyed
+                # overrides the seater and reconciler consult so a
+                # HARNESS binding is restored into its own checkout
+                # rather than the development lead's worktree.
+                cmux_lane_project_paths = {
+                    (alias, HARNESS_LANE): _harness_lead_cwd(
+                        project.lead_cwd
+                    )
+                    for alias, project in settings.projects.items()
+                }
                 cmux_profile_dirs = RegistryProfileDirectory(registry)
                 # The dedicated channel is an accelerator over the
                 # same durable packets: freshly committed wakes and
@@ -702,6 +753,7 @@ def open_runtime(
                     bindings=cmux_bindings,
                     port=cmux_port,
                     project_paths=cmux_project_paths,
+                    lane_project_paths=cmux_lane_project_paths,
                     profile_dirs=cmux_profile_dirs,
                     # The read-only auth-status probe under the leased
                     # profile's exact CLAUDE_CONFIG_DIR: a seat is
@@ -716,6 +768,7 @@ def open_runtime(
                     bindings=cmux_bindings,
                     port=cmux_port,
                     project_paths=cmux_project_paths,
+                    lane_project_paths=cmux_lane_project_paths,
                     profile_dirs=cmux_profile_dirs,
                     environ=environment,
                     # Sol correction a06cbce0: restart recovery reseats a
@@ -794,6 +847,18 @@ def open_runtime(
                 # launches into.
                 project_paths={
                     alias: project.lead_cwd
+                    for alias, project in settings.projects.items()
+                },
+                # INFRA-219 R5b (Sol correction 110ed759): the harness
+                # lane's dedicated checkout, keyed by (project_key,
+                # 'harness') per ``ProjectCellService``'s ``lane_project_paths``
+                # override (packet L2). Development-lane resolution is
+                # untouched -- ``_cell_cwd`` only consults this mapping
+                # for a lane it actually finds a key for, so with no
+                # harness lane configured this composition is
+                # byte-identical to pre-R5b behavior.
+                lane_project_paths={
+                    (alias, HARNESS_LANE): _harness_lead_cwd(project.lead_cwd)
                     for alias, project in settings.projects.items()
                 },
                 handoffs=HandoffService(database),

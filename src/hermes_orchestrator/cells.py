@@ -43,6 +43,128 @@ _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 DEVELOPMENT_LANE = "development"
 HARNESS_LANE = "harness"
 
+
+class HarnessCheckoutPort(Protocol):
+    """The exact worktree-git surface the harness checkout needs.
+
+    INFRA-219 R7 / Sol correction 110ed759: a structural subset of
+    ``hermes_orchestrator.git.WorktreeGit`` (already used for
+    checkpointed worktree reclamation) so :func:`ensure_harness_checkout`
+    reuses the existing worktree machinery -- never a bespoke
+    ``subprocess`` call -- and so tests exercise it with a fake port
+    instead of spawning real git.
+    """
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]: ...
+
+    def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None: ...
+
+    def head_sha(self, path: Path) -> str: ...
+
+    def branch(self, path: Path) -> str | None: ...
+
+
+class HarnessCheckoutRefused(ValueError):
+    """A harness checkout's identity disagrees with what Hermes expects.
+
+    A ``ValueError`` subclass on purpose: ``cli.py``'s
+    ``_open_rotation_collaborators`` caller already turns a ``ValueError``
+    into a clean, nonzero CLI refusal (see its docstring), so this needs
+    no new exception handling at the call site to fail closed.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessCheckoutStatus:
+    """The resolved, verified state of one project's harness checkout."""
+
+    path: Path
+    provisioned: bool
+    head_sha: str
+    branch: str | None
+
+
+def ensure_harness_checkout(
+    git: HarnessCheckoutPort,
+    *,
+    repo_path: Path,
+    harness_path: Path,
+    expected_branch: str | None = None,
+) -> HarnessCheckoutStatus:
+    """VALIDATE-then-provision the harness lane's dedicated checkout.
+
+    INFRA-219 R7 / Sol correction 110ed759 (verbatim): ``cli.py``'s
+    ``_harness_lead_cwd`` "derives a sibling path but explicitly leaves
+    worktree provisioning out of scope" -- nothing ever created or
+    validated that checkout, so a harness lane start silently launched
+    (or resumed) into a directory that might not exist, or might exist
+    as something other than a worktree of THIS repository.
+
+    Strategy, in order:
+
+    1. If ``harness_path`` is already registered in ``git worktree
+       list`` for ``repo_path`` (the same idiom ``worktrees.py`` uses at
+       its own reconciliation/removal checkpoints -- membership in the
+       repo's own worktree list, not a bespoke path comparison) it is a
+       genuine worktree of this repository; validated, never re-created.
+    2. Otherwise, if nothing exists at ``harness_path`` yet, it is
+       PROVISIONED via ``git.worktree_add_detached`` -- the existing
+       worktree-materialization primitive INFRA-198 P2 already uses for
+       exactly this "bounded, detached worktree at an exact commit"
+       shape -- pinned to ``repo_path``'s current HEAD as the stable,
+       operational-only harness head.
+    3. If ``harness_path`` exists but is NOT registered as a worktree of
+       ``repo_path``, this refuses fail-closed with
+       :class:`HarnessCheckoutRefused` -- a foreign directory (a stray
+       clone, an unrelated project, a leftover from another repo) is
+       never silently adopted.
+
+    After validating or provisioning, the resolved checkout's branch
+    (when ``expected_branch`` is supplied) and HEAD (always, against the
+    commit it was provisioned from) are re-proven to agree with what
+    Hermes expects; any disagreement refuses fail-closed rather than
+    launching a harness lead into an unexpected identity.
+    """
+
+    registered = harness_path in {Path(entry) for entry in git.worktree_list(repo_path)}
+    provisioned = False
+    if not registered:
+        if harness_path.exists():
+            raise HarnessCheckoutRefused(
+                f"harness checkout {harness_path} exists but is not a git "
+                f"worktree of {repo_path} -- refusing to adopt a foreign "
+                "directory (INFRA-219 R7 / Sol correction 110ed759)"
+            )
+        expected_head = git.head_sha(repo_path)
+        git.worktree_add_detached(repo_path, harness_path, expected_head)
+        provisioned = True
+        post = {Path(entry) for entry in git.worktree_list(repo_path)}
+        if harness_path not in post:
+            raise HarnessCheckoutRefused(
+                f"provisioning {harness_path} did not register it as a "
+                f"worktree of {repo_path}"
+            )
+        actual_head = git.head_sha(harness_path)
+        if actual_head != expected_head:
+            raise HarnessCheckoutRefused(
+                f"provisioned harness checkout {harness_path} HEAD "
+                f"{actual_head!r} disagrees with the repository HEAD "
+                f"{expected_head!r} it was provisioned from"
+            )
+
+    actual_branch = git.branch(harness_path)
+    if expected_branch is not None and actual_branch != expected_branch:
+        raise HarnessCheckoutRefused(
+            f"harness checkout {harness_path} is on branch "
+            f"{actual_branch!r}, expected {expected_branch!r}"
+        )
+    return HarnessCheckoutStatus(
+        path=harness_path,
+        provisioned=provisioned,
+        head_sha=git.head_sha(harness_path),
+        branch=actual_branch,
+    )
+
 # A fable cap is a weekly-budget exhaustion, but the sanitized Claude
 # stream exposes no reset horizon. The conservative fallback is one full
 # weekly cycle — the documented worst case — never the flat hour that

@@ -2475,12 +2475,17 @@ def _install_fake_lane_dispatch(
             *,
             lane_role: str,
             harness_run: str | None = None,
+            **extra: object,
         ) -> object:
+            # ``**extra`` absorbs lane arguments later packets add (R7's
+            # harness_project_key), so this CLI-boundary fake never has
+            # to track ProjectCellService.dispatch's full signature.
             calls.append(
                 {
                     "issue_id": issue_id,
                     "lane_role": lane_role,
                     "harness_run": harness_run,
+                    **extra,
                 }
             )
             if not dispatch_should_be_called:
@@ -2494,7 +2499,7 @@ def _install_fake_lane_dispatch(
     monkeypatch.setattr(
         cli_module,
         "_open_rotation_collaborators",
-        lambda settings, runtime, *, lane_role="development": (
+        lambda settings, runtime, *, lane_role="development", **extra: (
             _FakeCells(),
             None,
         ),
@@ -5185,3 +5190,201 @@ def test_submit_handoff_without_an_awaiting_rotation_just_submits(
         ) == "active"
     finally:
         database.close()
+
+
+def test_open_rotation_collaborators_validates_or_provisions_harness_checkout(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-219 R7 / Sol correction 110ed759: cli.py:1152-1161 derived a
+    sibling harness path but left worktree provisioning out of scope --
+    nothing ever created or validated that checkout. A harness-lane call
+    to ``_open_rotation_collaborators`` now runs
+    ``ensure_harness_checkout`` against exactly the project's real
+    repository path and its ``_harness_lead_cwd`` sibling before
+    composing the seater/cell service; a development-lane call, and a
+    harness-lane call with no ``harness_project_key``, never touch it."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
+    from hermes_orchestrator.runtime import open_runtime
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_ensure_harness_checkout(
+        git: object,
+        *,
+        repo_path: object,
+        harness_path: object,
+        expected_branch: object = None,
+    ) -> object:
+        calls.append({"repo_path": repo_path, "harness_path": harness_path})
+        return object()
+
+    monkeypatch.setattr(
+        cli_module, "ensure_harness_checkout", _fake_ensure_harness_checkout
+    )
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        cli_module._open_rotation_collaborators(
+            settings, runtime, lane_role=cli_module.DEVELOPMENT_LANE
+        )
+        assert calls == []
+
+        cli_module._open_rotation_collaborators(
+            settings, runtime, lane_role=cli_module.HARNESS_LANE
+        )
+        assert calls == []
+
+        cli_module._open_rotation_collaborators(
+            settings,
+            runtime,
+            lane_role=cli_module.HARNESS_LANE,
+            harness_project_key="demo",
+        )
+    finally:
+        runtime.close()
+
+    project = settings.projects["demo"]
+    assert calls == [
+        {
+            "repo_path": project.repo_path,
+            "harness_path": cli_module._harness_lead_cwd(project.lead_cwd),
+        }
+    ]
+
+
+def test_open_rotation_collaborators_propagates_harness_checkout_refusal(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mismatched or foreign harness checkout must refuse fail-closed
+    all the way out of ``_open_rotation_collaborators`` as the same
+    ``ValueError`` its docstring already promises callers turn into a
+    clean, nonzero CLI refusal -- never a traceback, never a silent
+    launch."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.cells import HarnessCheckoutRefused
+    from hermes_orchestrator.config import load_settings
+    from hermes_orchestrator.runtime import open_runtime
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    def _refusing(*args: object, **kwargs: object) -> object:
+        raise HarnessCheckoutRefused("foreign harness checkout")
+
+    monkeypatch.setattr(cli_module, "ensure_harness_checkout", _refusing)
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        with pytest.raises(ValueError, match="foreign harness checkout"):
+            cli_module._open_rotation_collaborators(
+                settings,
+                runtime,
+                lane_role=cli_module.HARNESS_LANE,
+                harness_project_key="demo",
+            )
+    finally:
+        runtime.close()
+
+
+def test_start_lane_harness_checkout_refusal_exits_nonzero(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through ``start-lane``: a refused harness checkout
+    (mismatched or foreign) never reaches ``dispatch`` and exits
+    nonzero with a clear message, exactly like the existing
+    ``harness_run_required`` CLI-boundary refusal."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.cells import HarnessCheckoutRefused
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    def _refusing(*args: object, **kwargs: object) -> object:
+        raise HarnessCheckoutRefused(
+            "harness checkout is not a worktree of this repository"
+        )
+
+    monkeypatch.setattr(cli_module, "ensure_harness_checkout", _refusing)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "harness",
+            "--issue",
+            "ENG-1",
+            "--harness-run",
+            "run-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert "not a worktree" in json.loads(result.stdout)["error"]
+
+
+def test_open_rotation_collaborators_selects_prompt_by_lane(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-219 R7 / Sol correction 110ed759: the harness lane must
+    launch with an operational-only prompt distinct from the
+    development lead's ``prompts/claude-lead.md`` -- selected by
+    ``lane_role``, not shared."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
+    from hermes_orchestrator.runtime import open_runtime
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+
+    monkeypatch.setattr(
+        cli_module,
+        "ensure_harness_checkout",
+        lambda *args, **kwargs: object(),
+    )
+
+    prompt_files: list[Path] = []
+
+    class _RecordingRunner:
+        def __init__(self, *args: object, prompt_file: Path, **kwargs: object) -> None:
+            prompt_files.append(prompt_file)
+
+    monkeypatch.setattr(cli_module, "ClaudeRunner", _RecordingRunner)
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        cli_module._open_rotation_collaborators(
+            settings, runtime, lane_role=cli_module.DEVELOPMENT_LANE
+        )
+        cli_module._open_rotation_collaborators(
+            settings,
+            runtime,
+            lane_role=cli_module.HARNESS_LANE,
+            harness_project_key="demo",
+        )
+    finally:
+        runtime.close()
+
+    assert [path.name for path in prompt_files] == [
+        "claude-lead.md",
+        "claude-harness.md",
+    ]
+    assert prompt_files[1].parent == prompt_files[0].parent

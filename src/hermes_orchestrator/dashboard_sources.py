@@ -244,12 +244,38 @@ class ControlAttentionFact:
 
 @dataclass(frozen=True, slots=True)
 class LaneCellFact:
-    """One lead cell's lane row (INFRA-219 L2).
+    """One lead cell's lane row (INFRA-219 L2, corrected under R4).
 
-    Minimal by design: lane role, durable identity, state, and a
-    best-effort current issue. Per-lead subagents, head/event, resource
-    pressure, and blockers are the fuller contract display and are
-    explicitly deferred past this packet.
+    Sol correction 110ed759: the prior shape resolved a single
+    "current issue" per PROJECT (``admitted_issues`` carries no lane
+    dimension) and reported it on every lane row for that project --
+    the harness lane claimed a product issue it never held, and a
+    development lane running MULTIPLE concurrent issues (bounded by
+    ``cells.MAX_DEVELOPMENT_ISSUE_LANES``) only ever showed one.
+
+    ``issue_ids``/``blocked_issue_ids`` are instead resolved through
+    ``lead_assignments``, which IS durably lane-scoped: dispatch
+    (``cells._dispatch_locked``) only ever publishes an assignment
+    packet for a non-harness dispatch, bound to the exact ``cell_id``
+    of the lane doing the work. Joining ``admitted_issues`` to the
+    live (non-superseded) assignment for THIS cell_id therefore
+    attributes every issue to the one lane that actually holds it: a
+    harness row's cell_id never has a live assignment, so it resolves
+    to no issues at all -- never the project's development issue(s).
+
+    ``subagents_total``/``subagents_completed`` come from
+    ``lead_children`` keyed by this lane's own ``session_id`` -- each
+    lane has its own session, so this is naturally lane-scoped with no
+    cross-lane risk.
+
+    Head/event and resource pressure are deliberately NOT carried
+    here: their durable sources (``TransitionProvider``,
+    ``ResourceProvider``) are project-wide and host-wide respectively
+    -- neither has a lane dimension to resolve, so
+    ``dashboard_render`` reads them straight off the snapshot
+    (matched by ``project_key``, or global) rather than inventing a
+    lane-exclusive fact that the durable state does not actually
+    contain.
     """
 
     project_key: str
@@ -257,7 +283,10 @@ class LaneCellFact:
     cell_id: str
     session_id: str
     state: str
-    issue_id: str | None
+    issue_ids: tuple[str, ...]
+    blocked_issue_ids: tuple[str, ...]
+    subagents_total: int
+    subagents_completed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,14 +529,19 @@ class TaskProvider:
 
     def lane_cells(self) -> tuple[LaneCellFact, ...]:
         """One row per live lead cell, development and harness alike
-        (INFRA-219 L2).
+        (INFRA-219 L2; issue attribution corrected under R4, Sol
+        correction 110ed759 -- see ``LaneCellFact``).
 
-        ``issue_id`` is a best-effort read of the project's currently
-        occupying issue (``admitted_issues`` in ``in_development`` or
-        ``review``) -- occupancy is tracked per project today, not per
-        lane, so a project running both lanes reports the same current
-        issue on both rows until the occupancy model itself grows a
-        lane dimension (left for a later packet).
+        ``issue_ids`` is every currently in-flight or blocked
+        admitted issue whose live (non-superseded) ``lead_assignments``
+        row is bound to THIS cell's ``cell_id`` -- never a
+        project-wide guess. Harness cells never publish an assignment
+        (``cells._dispatch_locked`` skips it whenever the dispatch is
+        a harness one), so a harness row's ``issue_ids`` is always
+        empty by construction, not by a name/state filter that could
+        rot out of sync. ``blocked_issue_ids`` is the subset of those
+        issues sitting in a blocked/failed/stalled state -- this
+        lane's own blockers, never another lane's.
         """
 
         rows = self._database.execute(
@@ -517,15 +551,25 @@ class TaskProvider:
             _ACTIVE_CELL_STATES,
         ).fetchall()
         issue_rows = self._database.execute(
-            "SELECT project_key, issue_id FROM admitted_issues "
-            "WHERE state IN ('in_development', 'review') "
-            "ORDER BY project_key, updated_at DESC",
+            "SELECT ai.issue_id AS issue_id, ai.state AS issue_state, "
+            "la.cell_id AS cell_id "
+            "FROM admitted_issues ai "
+            "JOIN lead_assignments la ON la.issue_id = ai.issue_id "
+            "WHERE la.state != 'superseded' AND ai.state IN "
+            "('in_development', 'review', 'blocked', 'failed', 'stalled') "
+            "ORDER BY ai.issue_id",
         ).fetchall()
-        current_issue: dict[str, str] = {}
+        issues_by_cell: dict[str, list[str]] = {}
+        blocked_by_cell: dict[str, list[str]] = {}
         for issue_row in issue_rows:
-            current_issue.setdefault(
-                str(issue_row["project_key"]), str(issue_row["issue_id"])
-            )
+            cell_id = str(issue_row["cell_id"])
+            issue_id = str(issue_row["issue_id"])
+            issues_by_cell.setdefault(cell_id, []).append(issue_id)
+            if str(issue_row["issue_state"]) in _BLOCKED_STATES:
+                blocked_by_cell.setdefault(cell_id, []).append(issue_id)
+
+        subagents_by_session = self._children_by_session()
+
         return tuple(
             LaneCellFact(
                 project_key=str(row["project_key"]),
@@ -533,7 +577,16 @@ class TaskProvider:
                 cell_id=str(row["cell_id"]),
                 session_id=str(row["session_id"]),
                 state=str(row["state"]),
-                issue_id=current_issue.get(str(row["project_key"])),
+                issue_ids=tuple(issues_by_cell.get(str(row["cell_id"]), ())),
+                blocked_issue_ids=tuple(
+                    blocked_by_cell.get(str(row["cell_id"]), ())
+                ),
+                subagents_total=subagents_by_session.get(
+                    str(row["session_id"]), (0, 0)
+                )[0],
+                subagents_completed=subagents_by_session.get(
+                    str(row["session_id"]), (0, 0)
+                )[1],
             )
             for row in rows
         )

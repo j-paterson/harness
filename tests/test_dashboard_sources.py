@@ -272,18 +272,51 @@ def _insert_cell(
     state: str,
     profile_alias: str | None,
     session_id: str | None,
+    lane_role: str = "development",
 ) -> None:
     connection.execute(
         "INSERT INTO project_cells("
         "cell_id, project_key, state, profile_alias, session_id, "
-        "created_at, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "lane_role, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             cell_id,
             project_key,
             state,
             profile_alias,
             session_id,
+            lane_role,
+            "2026-08-30T00:00:00+00:00",
+            "2026-08-30T00:00:00+00:00",
+        ),
+    )
+
+
+def _insert_assignment(
+    connection,
+    *,
+    assignment_id: str,
+    project_key: str,
+    issue_id: str,
+    cell_id: str,
+    session_id: str,
+    state: str = "published",
+) -> None:
+    connection.execute(
+        "INSERT INTO lead_assignments("
+        "assignment_id, schema_version, project_key, issue_id, cell_id, "
+        "session_id, profile_alias, instruction_id, queue_transition, "
+        "state, created_at, updated_at"
+        ") VALUES (?, 1, ?, ?, ?, ?, 'max-a', ?, 'queued->in_development', "
+        "?, ?, ?)",
+        (
+            assignment_id,
+            project_key,
+            issue_id,
+            cell_id,
+            session_id,
+            f"instr-{assignment_id}",
+            state,
             "2026-08-30T00:00:00+00:00",
             "2026-08-30T00:00:00+00:00",
         ),
@@ -660,6 +693,181 @@ def test_idle_notes_reports_the_top_lanes_concrete_hold(
     [note] = TaskProvider(database).idle_notes(resource)
 
     assert note == IdleFact(project_key="proj-a", hold=expected_hold)
+    database.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-219 R4 (Sol correction 110ed759): TaskProvider.lane_cells attribution.
+#
+# The prior implementation resolved one "current issue" per PROJECT and
+# copied it onto every lane row -- these tests pin the corrected,
+# cell-scoped (via lead_assignments) behavior: a harness row never
+# inherits a development issue, and a development row can carry more
+# than one concurrently assigned issue.
+# ---------------------------------------------------------------------------
+
+
+def _lane_setup(connection) -> None:
+    _insert_cell(
+        connection,
+        cell_id="cell-dev",
+        project_key="proj",
+        state="active",
+        profile_alias="max-a",
+        session_id="sess-dev",
+        lane_role="development",
+    )
+    _insert_cell(
+        connection,
+        cell_id="cell-harness",
+        project_key="proj",
+        state="active",
+        profile_alias="max-b",
+        session_id="sess-harness",
+        lane_role="harness",
+    )
+
+
+def test_lane_cells_never_attributes_a_development_issue_to_the_harness_row(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-1",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-1",
+            project_key="proj",
+            issue_id="INFRA-1",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    assert lanes["development"].issue_ids == ("INFRA-1",)
+    assert lanes["harness"].issue_ids == ()
+    database.close()
+
+
+def test_lane_cells_reports_multiple_concurrent_development_issues(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        for issue_id in ("INFRA-1", "INFRA-2", "INFRA-3"):
+            _insert_issue(
+                connection,
+                issue_id=issue_id,
+                project_key="proj",
+                priority=1,
+                state="in_development",
+                updated_at="2026-08-30T10:00:00+00:00",
+            )
+            _insert_assignment(
+                connection,
+                assignment_id=f"a-{issue_id}",
+                project_key="proj",
+                issue_id=issue_id,
+                cell_id="cell-dev",
+                session_id="sess-dev",
+            )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    assert set(lanes["development"].issue_ids) == {"INFRA-1", "INFRA-2", "INFRA-3"}
+    assert lanes["harness"].issue_ids == ()
+    database.close()
+
+
+def test_lane_cells_reports_this_lanes_own_blockers_only(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-4",
+            project_key="proj",
+            priority=1,
+            state="blocked",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-4",
+            project_key="proj",
+            issue_id="INFRA-4",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    assert lanes["development"].blocked_issue_ids == ("INFRA-4",)
+    assert lanes["harness"].blocked_issue_ids == ()
+
+
+def test_lane_cells_ignores_superseded_assignments(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-5",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-5",
+            project_key="proj",
+            issue_id="INFRA-5",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+            state="superseded",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    assert lanes["development"].issue_ids == ()
+    database.close()
+
+
+def test_lane_cells_reports_subagents_from_its_own_session_only(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_child(
+            connection, session_id="sess-dev", child_id="c-1",
+            state="completed",
+        )
+        _insert_child(
+            connection, session_id="sess-dev", child_id="c-2",
+            state="started",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    development = lanes["development"]
+    assert (development.subagents_completed, development.subagents_total) == (
+        1,
+        2,
+    )
+    harness = lanes["harness"]
+    assert (harness.subagents_completed, harness.subagents_total) == (0, 0)
     database.close()
 
 
