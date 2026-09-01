@@ -1681,6 +1681,217 @@ async def test_smoke_records_surface_scoped_pid_and_argv_lineage(
 
 
 # ---------------------------------------------------------------------------
+# INFRA-216 W1: active-runtime dashboard launch, healthy lower-pane
+# preservation (do not respawn/rebuild a live chat over its own tool
+# children).
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_pane_command_uses_the_active_runtime_launcher_when_installed(
+    tmp_path: Path,
+) -> None:
+    # The deployment renders an active-runtime launcher at
+    # <state_dir>/bin/hermes-orchestrator (a /bin/sh shim that execs
+    # `uv run --project $ACTIVE hermes-orchestrator "$@"` from the
+    # live runtime, never the mutable config checkout the plain `uv
+    # run` composition reads from). When it is installed, the upper
+    # pane launches through it.
+    state_dir = tmp_path / "state"
+    bin_dir = state_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    launcher = bin_dir / "hermes-orchestrator"
+    launcher.write_text(
+        '#!/bin/sh\nexec uv run --project "$ACTIVE" '
+        'hermes-orchestrator "$@"\n'
+    )
+
+    command = dashboard_pane_command(
+        repo_root=REPO_ROOT, state_dir=state_dir, interval=10
+    )
+
+    assert command == (
+        f"{launcher} --repo-root {REPO_ROOT} "
+        f"--state-dir {state_dir} dashboard --interval 10"
+    )
+
+
+def test_dashboard_pane_command_falls_back_without_an_installed_launcher(
+    tmp_path: Path,
+) -> None:
+    # Isolated/dev state dirs and temp-state smokes carry no rendered
+    # launcher: the plain `uv run` composition (against the mutable
+    # config checkout) is unchanged.
+    state_dir = tmp_path / "state"
+
+    command = dashboard_pane_command(
+        repo_root=REPO_ROOT, state_dir=state_dir, interval=10
+    )
+
+    assert command == (
+        f"uv run hermes-orchestrator --repo-root {REPO_ROOT} "
+        f"--state-dir {state_dir} dashboard --interval 10"
+    )
+    # And a state dir whose bin/ exists but holds no launcher file
+    # falls back identically — only the exact file's presence matters.
+    (state_dir / "bin").mkdir(parents=True)
+    assert (
+        dashboard_pane_command(
+            repo_root=REPO_ROOT, state_dir=state_dir, interval=10
+        )
+        == command
+    )
+
+
+def test_upper_role_proof_passes_for_the_launcher_composed_command(
+    tmp_path: Path, bindings: CmuxSurfaceBindings
+) -> None:
+    # Once the launcher is installed, the observed upper-pane tree is
+    # sh (stripped wrapper) -> uv -> python (the hermes-orchestrator
+    # console script), not the bare `uv run hermes-orchestrator …`
+    # line the plain composition produces. Shape and lineage must
+    # still prove the role against this shape.
+    state_dir = tmp_path / "state"
+    (state_dir / "bin").mkdir(parents=True)
+    launcher = state_dir / "bin" / "hermes-orchestrator"
+    launcher.write_text("#!/bin/sh\n")
+    port = FakeWorkspacePort()
+    owner = OrchestratorWorkspaceLifecycle(
+        port=port,
+        bindings=bindings,
+        repo_root=REPO_ROOT,
+        state_dir=state_dir,
+        name="orch",
+        title="Orchestrator",
+        lineage=port,
+    )
+    assert owner.dashboard_command == (
+        f"{launcher} --repo-root {REPO_ROOT} "
+        f"--state-dir {state_dir} dashboard --interval 10"
+    )
+    assert owner.upper_expectation == RoleExpectation(
+        executable="hermes-orchestrator",
+        arguments=(
+            "--repo-root",
+            str(REPO_ROOT),
+            "--state-dir",
+            str(state_dir),
+            "dashboard",
+            "--interval",
+            "10",
+        ),
+    )
+
+    trailing = " ".join(owner.dashboard_command.split(" ")[1:])
+    python_child = (
+        "/runtimes/5e7d148/.venv/bin/python3.13 "
+        f"/runtimes/5e7d148/.venv/bin/hermes-orchestrator {trailing}"
+    )
+    surface = CmuxSurfaceProcesses(
+        pane_uuid="pane-u",
+        surface_uuid="surf-u",
+        process_names=("zsh", "sh", "uv", "python3.13"),
+        process_ids=(200, 201, 202, 203),
+    )
+    table = (
+        ProcessRecord(pid=200, ppid=1, command="-zsh"),
+        ProcessRecord(pid=201, ppid=200, command="-sh"),
+        ProcessRecord(
+            pid=202,
+            ppid=201,
+            command=(
+                'uv run --project "/runtimes/5e7d148" '
+                f"hermes-orchestrator {trailing}"
+            ),
+        ),
+        ProcessRecord(pid=203, ppid=202, command=python_child),
+    )
+
+    proof = owner.role_proof(UPPER_ROLE, surface, table)
+
+    assert proof["shape_ok"] is True
+    assert proof["correlation"] == "ok"
+    # role_proof truncates each matched line to 200 chars; tmp_path
+    # can make the full python_child line longer than that.
+    assert proof["lineage_matches"] == [python_child[:200]]
+    assert proof["role_proven"] is True
+
+
+@pytest.mark.asyncio
+async def test_lower_pane_with_extra_tool_children_is_adopted_without_respawn(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    # The reproduced defect: a chat-launched `uv run
+    # hermes-orchestrator dashboard` (here modeled with uv,
+    # hermes-orchestrator, and git tool children) used to fail
+    # hermes_process_shape and cause _adopt to respawn the lower pane
+    # — closing a healthy chat mid-turn is one ensure() away from
+    # there. The exact live `hermes chat --continue orch
+    # --create-if-missing` lineage is still observed on this surface's
+    # own correlated tree, so the pane is now adopted unchanged: no
+    # respawn, no close, no rebuild.
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    port.set_processes(
+        first.lower.surface_uuid,
+        ["zsh", "hermes", "uv", "hermes-orchestrator", "git"],
+        command=HERMES_COMMAND,
+    )
+
+    adopted = await owner.ensure()
+
+    assert adopted.outcome == "adopted"
+    assert adopted.respawned == ()
+    assert adopted.workspace_uuid == first.workspace_uuid
+    assert adopted.lower == first.lower
+    assert port.respawns == []
+    assert port.closed == []
+    inspection = await inspect_workspace(owner, adopted)
+    lower = next(
+        row for row in inspection["surfaces"] if row["role"] == LOWER_ROLE
+    )
+    # The shape check fails (uv/hermes-orchestrator/git are not
+    # accepted lower-role names) but no longer vetoes a proven lineage.
+    assert lower["shape_ok"] is False
+    assert lower["lineage_matches"] == [HERMES_COMMAND]
+    assert lower["role_proven"] is True
+
+    # A second ensure stays a pure adoption: proof, not luck.
+    settled = await owner.ensure()
+    assert settled.outcome == "adopted"
+    assert settled.respawned == ()
+    assert port.respawns == []
+    assert port.closed == []
+
+
+@pytest.mark.asyncio
+async def test_lower_pane_without_expected_lineage_still_respawns(
+    bindings: CmuxSurfaceBindings,
+) -> None:
+    # The flip side of the previous test, spelled out explicitly: the
+    # SAME extra tool children, but the launcher-index process no
+    # longer carries the expected session argv (dead/unrelated), so
+    # nothing on this surface proves the role and the pane is
+    # respawned exactly as before INFRA-216 W1.
+    port = FakeWorkspacePort()
+    owner = lifecycle(port, bindings)
+    first = await owner.ensure()
+    port.set_processes(
+        first.lower.surface_uuid,
+        ["zsh", "hermes", "uv", "hermes-orchestrator", "git"],
+        command=None,
+    )
+
+    recovered = await owner.ensure()
+
+    assert recovered.outcome == "recovered"
+    assert recovered.respawned == (LOWER_ROLE,)
+    assert port.respawns[-1] == (first.lower, HERMES_COMMAND)
+    assert len(port.created) == 1
+    assert len(port.workspaces[first.workspace_uuid].panes) == 2
+
+
+# ---------------------------------------------------------------------------
 # Sol L2 (9cbe7613): one exclusive ownership fence for every mutator.
 # ---------------------------------------------------------------------------
 

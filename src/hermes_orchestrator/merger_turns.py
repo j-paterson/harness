@@ -32,6 +32,7 @@ from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
 from hermes_orchestrator.codex_rpc import RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.manifests import (
     CandidateManifest,
     ManifestError,
@@ -210,21 +211,107 @@ class MergerTurnService:
         self._lead = lead
         self._manifest_root = manifest_root
         self._now = now or (lambda: datetime.now(UTC))
+        self._events = EventStore(self._database)
 
     def outstanding_wake(self, project_key: str) -> tuple[WakeEvent, str] | None:
-        """The project's admitted wake, else its oldest delivered wake."""
+        """The project's admitted wake, else its oldest delivered wake.
+
+        INFRA-216 rework R2: before a candidate row is returned, any
+        admitted or delivered wake whose review is durably proven merged
+        AND whose merge settlement is durably settled is first reconciled
+        to ``'completed'`` -- exactly the terminal vocabulary
+        ``complete_admitted_wake`` writes for a cleanly settled wake (see
+        ``_settle_wake``/``_record_settled``). Without this, a wake whose
+        review was driven to completion but never transitioned (crash
+        after settlement, an externally reconciled merge, or a settlement
+        resumed by ``resume_settlements`` without its wake row catching
+        up) would permanently mask the genuinely outstanding wake behind
+        it: ``handle_turn`` would keep selecting the dead row and report
+        ``awaiting_submission`` forever. The predicate is exact and
+        fail-closed, joined on the wake's own identity -- ``project_key``,
+        ``event_id``, and ``candidate_sha`` -- against the ``reviews`` row
+        for that event (``state = 'merged'``) and the ``merge_settlements``
+        row for that event (``state = 'settled'``); anything ambiguous or
+        missing leaves the row untouched and selection is unchanged.
+        Reconciled rows are skipped in the same pass, so the next
+        genuinely outstanding wake surfaces without a second call.
+        """
 
         for state in ("admitted", "delivered"):
-            row = self._database.execute(
+            rows = self._database.execute(
                 "SELECT status, issue_id, candidate_sha, base_sha, "
                 "manifest_path, event_id, manifest_digest FROM wake_deliveries "
                 "WHERE project_key = ? AND state = ? "
-                "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                "ORDER BY created_at ASC, rowid ASC",
                 (project_key, state),
-            ).fetchone()
-            if row is not None:
+            ).fetchall()
+            for row in rows:
+                if self._reconcile_settled_wake(project_key, state, row):
+                    continue
                 return _row_to_event(row), state
         return None
+
+    def _reconcile_settled_wake(
+        self, project_key: str, state: str, row: sqlite3.Row
+    ) -> bool:
+        """Reconcile one stale admitted/delivered row to 'completed'.
+
+        Returns ``True`` iff the row was reconciled (so the caller should
+        keep scanning past it for the genuinely outstanding wake); ``False``
+        leaves the row exactly as it was, meaning it is still outstanding.
+        Both durable facts -- a proven-merged review and a settled
+        settlement -- must exist for this exact wake identity or nothing
+        is written.
+        """
+
+        event_id = str(row["event_id"])
+        candidate_sha = str(row["candidate_sha"])
+        merged_review = self._database.execute(
+            "SELECT 1 FROM reviews WHERE project_key = ? AND event_id = ? "
+            "AND reviewed_sha = ? AND state = 'merged' LIMIT 1",
+            (project_key, event_id, candidate_sha),
+        ).fetchone()
+        if merged_review is None:
+            return False
+        settled_settlement = self._database.execute(
+            "SELECT 1 FROM merge_settlements WHERE project_key = ? "
+            "AND event_id = ? AND candidate_sha = ? AND state = 'settled' "
+            "LIMIT 1",
+            (project_key, event_id, candidate_sha),
+        ).fetchone()
+        if settled_settlement is None:
+            return False
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET state = 'completed', "
+                "updated_at = ? WHERE project_key = ? AND event_id = ? "
+                "AND state = ?",
+                (stamp, project_key, event_id, state),
+            )
+            if cursor.rowcount == 1:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="wake_delivery.reconciled_complete",
+                        aggregate_type="wake_delivery",
+                        aggregate_id=f"wake:{project_key}:{event_id}",
+                        correlation_id=event_id,
+                        actor="merger_turns",
+                        payload={
+                            "project_key": project_key,
+                            "issue_id": str(row["issue_id"]),
+                            "candidate_sha": candidate_sha,
+                            "prior_state": state,
+                            "reason": (
+                                "review already merged and merge settlement "
+                                "already settled; reconciled before "
+                                "outstanding-wake selection (INFRA-216 R2)"
+                            ),
+                        },
+                    ),
+                )
+        return cursor.rowcount == 1
 
     def has_pending_submission(self, project_key: str) -> bool:
         """True iff a ``submitted_verdicts`` row for the project is 'submitted'.

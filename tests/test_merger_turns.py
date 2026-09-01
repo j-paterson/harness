@@ -1057,3 +1057,127 @@ async def test_has_pending_submission_true_only_while_a_submitted_row_exists(
     )
 
     assert flow.turns.has_pending_submission("demo") is False
+
+
+@pytest.mark.asyncio
+async def test_stale_settled_wake_is_reconciled_before_selection(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-216 rework R2: an admitted/delivered wake whose review is
+    # already 'merged' and whose merge settlement is already 'settled'
+    # (the wake row missed its terminal transition — crash after
+    # settlement, or an externally reconciled merge) must be reconciled
+    # to the normal 'completed' vocabulary during intake selection, so
+    # it can never mask the genuinely outstanding wake behind it.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    settled = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A,
+            flow.verdict(SHA_A, branch, 14),
+        ),
+    )
+    assert settled.kind == "merged"
+    # Preconditions for the reconciliation predicate, both durable.
+    assert flow.database.execute(
+        "SELECT state FROM reviews WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()["state"] == "merged"
+    assert flow.database.execute(
+        "SELECT state FROM merge_settlements WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()["state"] == "settled"
+    completed = flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()["state"]
+
+    for stale_state in ("delivered", "admitted"):
+        # Simulate the missed terminal transition.
+        flow.database.execute(
+            "UPDATE wake_deliveries SET state = ? WHERE event_id = ?",
+            (stale_state, emitted.event.event_id),
+        )
+        outstanding = flow.turns.outstanding_wake("demo")
+        assert outstanding is None  # nothing else pending: stale row consumed
+        row = flow.database.execute(
+            "SELECT state FROM wake_deliveries WHERE event_id = ?",
+            (emitted.event.event_id,),
+        ).fetchone()
+        # Byte-identical vocabulary to a cleanly settled wake's terminal state.
+        assert row["state"] == completed == "completed"
+
+    # The genuinely outstanding wake behind the stale row surfaces in
+    # the SAME pass.
+    flow.database.execute(
+        "UPDATE wake_deliveries SET state = 'delivered' WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    flow.stage("ENG-11", SHA_B, pr_number=16)
+    fresh = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+    outstanding = flow.turns.outstanding_wake("demo")
+    assert outstanding is not None
+    event, state = outstanding
+    assert (event.event_id, state) == (fresh.event.event_id, "delivered")
+    # Idempotent: a second pass neither rewrites nor re-journals.
+    events_after_first = flow.database.execute(
+        "SELECT COUNT(*) AS n FROM events "
+        "WHERE event_type = 'wake_delivery.reconciled_complete'",
+    ).fetchone()["n"]
+    again = flow.turns.outstanding_wake("demo")
+    assert again is not None and again[0].event_id == fresh.event.event_id
+    assert flow.database.execute(
+        "SELECT COUNT(*) AS n FROM events "
+        "WHERE event_type = 'wake_delivery.reconciled_complete'",
+    ).fetchone()["n"] == events_after_first
+    assert events_after_first >= 1
+
+
+@pytest.mark.asyncio
+async def test_partially_settled_wake_is_never_reconciled(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Fail-closed: merged review WITHOUT a settled settlement (and the
+    # missing-rows case) leaves the stale row untouched and selected,
+    # exactly as before INFRA-216 R2.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    settled = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A,
+            flow.verdict(SHA_A, branch, 14),
+        ),
+    )
+    assert settled.kind == "merged"
+    flow.database.execute(
+        "UPDATE wake_deliveries SET state = 'delivered' WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    flow.database.execute(
+        "UPDATE merge_settlements SET state = 'merging' WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    outstanding = flow.turns.outstanding_wake("demo")
+    assert outstanding is not None
+    assert outstanding[0].event_id == emitted.event.event_id
+    assert flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()["state"] == "delivered"
+
+    # Missing both rows entirely: a plain freshly delivered wake is
+    # selected untouched.
+    flow.database.execute(
+        "DELETE FROM merge_settlements WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    flow.database.execute(
+        "DELETE FROM reviews WHERE event_id = ?", (emitted.event.event_id,)
+    )
+    outstanding = flow.turns.outstanding_wake("demo")
+    assert outstanding is not None
+    assert outstanding[0].event_id == emitted.event.event_id
