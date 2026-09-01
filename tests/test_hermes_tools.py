@@ -149,10 +149,87 @@ def test_new_review_intents_route_to_handlers(database: Database) -> None:
     )
     assert rejected.code == "rejected"
     assert "no merged review" in str(rejected.state["reason"])
-    missing = service.execute({"intent": "ack_correction", "correction_id": "c"})
+    missing = service.execute(
+        {
+            "intent": "ack_correction",
+            "correction_id": "c",
+            "observed_count": 4,
+            "payload_sha256": "0" * 64,
+        }
+    )
     assert missing.code == "intent_unavailable"
     invalid = service.execute({"intent": "qa_reject", "issue_id": "ENG-9"})
     assert invalid.code == "invalid_command"
+
+
+def test_correction_intake_intents_are_strict(database: Database) -> None:
+    """INFRA-193: confirmation must carry proof of a complete read.
+
+    ``fetch_correction`` is a routed intent, and ``ack_correction``
+    cannot even parse without both ``observed_count`` and a nonblank
+    ``payload_sha256`` — a truncated glance has no shape that validates.
+    """
+
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def fetch(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"declared_count": 4, "payload_sha256": "a" * 64}
+
+    def ack(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"state": "acknowledged"}
+
+    service = HermesCommandService(
+        queue, handlers={"fetch_correction": fetch, "ack_correction": ack}
+    )
+    assert service.supports("fetch_correction")
+
+    fetched = service.execute(
+        {"intent": "fetch_correction", "correction_id": "corr-1"}
+    )
+    assert fetched.code == "accepted"
+    assert fetched.state["declared_count"] == 4
+    assert seen[0].correction_id == "corr-1"
+
+    # The old id-alone confirmation no longer validates at all.
+    assert (
+        service.execute(
+            {"intent": "ack_correction", "correction_id": "corr-1"}
+        ).code
+        == "invalid_command"
+    )
+    for omitted in ("observed_count", "payload_sha256"):
+        raw = {
+            "intent": "ack_correction",
+            "correction_id": "corr-1",
+            "observed_count": 4,
+            "payload_sha256": "a" * 64,
+        }
+        del raw[omitted]
+        assert service.execute(raw).code == "invalid_command"
+    blank = service.execute(
+        {
+            "intent": "ack_correction",
+            "correction_id": "corr-1",
+            "observed_count": 4,
+            "payload_sha256": "   ",
+        }
+    )
+    assert blank.code == "invalid_command"
+
+    accepted = service.execute(
+        {
+            "intent": "ack_correction",
+            "correction_id": "corr-1",
+            "observed_count": 4,
+            "payload_sha256": "a" * 64,
+        }
+    )
+    assert accepted.code == "accepted"
+    assert seen[-1].observed_count == 4
+    assert seen[-1].payload_sha256 == "a" * 64
 
 
 def test_stall_intents_are_strict_and_routed(database: Database) -> None:

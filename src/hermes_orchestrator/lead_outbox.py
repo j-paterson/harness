@@ -5,13 +5,21 @@ Every Critical or Important packet — from a Codex verdict, a CircleCI
 failure at an intake boundary, or a QA rejection — is journaled here, and
 Hermes reads pending packets to resume the exact lead with the exact
 reviewed SHA and branch. Acknowledgement is explicit and idempotent.
+
+INFRA-193: a correction is only confirmable on proof of a complete read.
+``fetch`` is the one supported intake — the whole durable record plus its
+``declared_count`` and ``payload_sha256`` — and ``acknowledge`` refuses
+unless the confirming caller reproduces both exactly. A lead who read
+three of four findings cannot produce the right count, and one who read a
+truncated or altered payload cannot produce the right digest.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -20,6 +28,14 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.manifests import CandidateManifest
 from hermes_orchestrator.verdicts import CorrectionPacket
+
+
+class CorrectionPayloadError(ValueError):
+    """The stored packets column is not a complete, parseable record."""
+
+
+class CorrectionConfirmationRefused(ValueError):
+    """A confirmation did not prove a complete read of the record."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +68,26 @@ class LeadCorrection:
             "state": self.state,
             "created_at": self.created_at,
         }
+
+    @property
+    def declared_count(self) -> int:
+        """How many packets are durably stored under this correction."""
+
+        return len(self.packets)
+
+    @property
+    def payload_sha256(self) -> str:
+        """The digest of the canonically serialized stored packets."""
+
+        return payload_digest(self.packets)
+
+    def as_fetch_document(self) -> dict[str, Any]:
+        """The complete record, untruncated, with its integrity metadata."""
+
+        document = self.as_dict()
+        document["declared_count"] = self.declared_count
+        document["payload_sha256"] = self.payload_sha256
+        return document
 
 
 class LeadCorrectionOutbox:
@@ -123,11 +159,7 @@ class LeadCorrectionOutbox:
                     first.branch,
                     first.pr_number,
                     first.reviewed_sha,
-                    json.dumps(
-                        [packet_to_dict(packet) for packet in packets],
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
+                    canonical_packets_json(packets),
                     stamp,
                 ),
             )
@@ -171,7 +203,49 @@ class LeadCorrectionOutbox:
             ).fetchall()
         return tuple(_row_to_correction(row) for row in rows)
 
-    def acknowledge(self, correction_id: str) -> LeadCorrection:
+    def fetch(self, correction_id: str) -> dict[str, Any]:
+        """Return the COMPLETE durable record and its integrity metadata.
+
+        This is the supported intake. Display may shorten what it shows,
+        but confirmation and delegation must rest on this document: it
+        carries every packet with every field, plus the
+        ``declared_count`` and ``payload_sha256`` a confirmation has to
+        reproduce. A malformed stored payload fails closed here rather
+        than returning a partial document.
+        """
+
+        return self.get(correction_id).as_fetch_document()
+
+    def acknowledge(
+        self,
+        correction_id: str,
+        *,
+        observed_count: int,
+        payload_sha256: str,
+    ) -> LeadCorrection:
+        """Confirm a correction on proof that the whole record was read.
+
+        Both the observed packet count and the payload digest must match
+        the durable record exactly. A mismatch refuses fail-closed with
+        zero durable writes: the correction stays ``pending`` and
+        retryable after a complete ``fetch``.
+        """
+
+        correction = self.get(correction_id)
+        declared = correction.declared_count
+        if observed_count != declared:
+            raise CorrectionConfirmationRefused(
+                f"correction {correction_id} declares {declared} packets but the "
+                f"confirmation observed {observed_count}; fetch the complete "
+                "record with fetch_correction before confirming"
+            )
+        expected = correction.payload_sha256
+        if payload_sha256 != expected:
+            raise CorrectionConfirmationRefused(
+                f"correction {correction_id} payload_sha256 mismatch: durable "
+                f"{expected}, confirmed {payload_sha256}; fetch the complete "
+                "record with fetch_correction before confirming"
+            )
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             cursor = connection.execute(
@@ -232,6 +306,27 @@ class LeadCorrectionOutbox:
         return _row_to_correction(row)
 
 
+def canonical_packets_json(packets: Sequence[CorrectionPacket]) -> str:
+    """The ONE canonical serialization of a correction's packets.
+
+    Durable storage, the fetched ``payload_sha256``, and the digest
+    checked at confirmation all go through this function, so a fetch and
+    a verification can never disagree about what the payload is.
+    """
+
+    return json.dumps(
+        [packet_to_dict(packet) for packet in packets],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def payload_digest(packets: Sequence[CorrectionPacket]) -> str:
+    """SHA-256 over the canonical serialization of ``packets``."""
+
+    return hashlib.sha256(canonical_packets_json(packets).encode("utf-8")).hexdigest()
+
+
 def packet_to_dict(packet: CorrectionPacket) -> dict[str, Any]:
     return {
         "severity": packet.severity,
@@ -260,6 +355,35 @@ def packet_from_dict(value: dict[str, Any]) -> CorrectionPacket:
     )
 
 
+def _parse_packets(correction_id: str, raw: Any) -> tuple[CorrectionPacket, ...]:
+    """Parse the stored packets or fail closed — never a partial record."""
+
+    def refuse(detail: str, error: Exception | None = None) -> CorrectionPayloadError:
+        refusal = CorrectionPayloadError(
+            f"correction {correction_id} has a malformed stored payload "
+            f"({detail}); no partial record is returned"
+        )
+        if error is not None:
+            refusal.__cause__ = error
+        return refusal
+
+    try:
+        decoded = json.loads(str(raw))
+    except ValueError as error:
+        raise refuse("unparseable JSON", error) from error
+    if not isinstance(decoded, list) or not decoded:
+        raise refuse("the packets column is not a non-empty list")
+    packets: list[CorrectionPacket] = []
+    for index, item in enumerate(decoded):
+        if not isinstance(item, dict):
+            raise refuse(f"packet {index} is not an object")
+        try:
+            packets.append(packet_from_dict(item))
+        except (KeyError, TypeError, ValueError) as error:
+            raise refuse(f"packet {index} is incomplete", error) from error
+    return tuple(packets)
+
+
 def _row_to_correction(row: Any) -> LeadCorrection:
     return LeadCorrection(
         correction_id=str(row["correction_id"]),
@@ -270,9 +394,7 @@ def _row_to_correction(row: Any) -> LeadCorrection:
         branch=str(row["branch"]),
         pr_number=int(row["pr_number"]),
         reviewed_sha=str(row["reviewed_sha"]),
-        packets=tuple(
-            packet_from_dict(item) for item in json.loads(str(row["packets_json"]))
-        ),
+        packets=_parse_packets(str(row["correction_id"]), row["packets_json"]),
         state=str(row["state"]),
         created_at=str(row["created_at"]),
     )
