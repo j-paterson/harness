@@ -779,6 +779,227 @@ class ChannelTrustAnchors:
             )
         return self.get(anchor_id)
 
+    def adopt(
+        self,
+        *,
+        source_cell_id: str,
+        cell_id: str,
+        profile_alias: str,
+        entry_path: Path,
+        package_root: Path,
+        channel_entry: str,
+        launch_argv_template: Sequence[str],
+        workspace_uuid: str,
+        surface_uuid: str,
+        session_id: str,
+    ) -> ChannelTrustAnchor:
+        """Carry an already-proven anchor onto a SECOND cell that has no
+        anchor of its own (INFRA-198 blocker 1).
+
+        What the operator's one manual trust event proved is a PROGRAM
+        identity — canonical entry path, entry owner uid, entry sha256,
+        dist-tree sha256, manifest name/version, the fixed channel
+        entry, and the launch argv template. None of those are
+        properties of a cell, so a second visible lane may run under the
+        same proof. The cell is Hermes's own lane bookkeeping, and
+        binding trust to it is what otherwise leaves every new cell
+        permanently untrusted with no path to acquire an anchor —
+        :meth:`capture` records a MANUAL trust event, and auto-capturing
+        one would forge an operator decision that never happened.
+
+        The safety argument is :meth:`rebind`'s, verbatim: the
+        predecessor must be ``active`` AND carry bound prompt evidence
+        (``prompt_pattern is None`` refuses — there is nothing fully
+        proven to carry); every CONTENT fact is re-measured from disk
+        here (symlink guard, owner uid, entry sha256, dist-tree sha256,
+        manifest name/version, ``channel_entry``) and must equal the
+        predecessor's exactly; the new seat's ``launch_argv_template``
+        must match the predecessor's trusted template token for token
+        except at the two bounded substitutions the gate itself permits
+        (the session-UUID slot and the session-scoped MCP config-path
+        slot); and ``profile_alias`` must equal the predecessor's or be
+        provably Hermes's own durable selection for this exact seat via
+        :meth:`_selected_replacement`. Any difference is a genuinely new
+        trust decision, refused with zero database mutation so the
+        caller's manual-dialog fallback is the only path forward. The
+        successor persists the PREDECESSOR's argv template verbatim, so
+        the trusted launch baseline never drifts.
+
+        The ONE deliberate difference from :meth:`rebind`: the
+        predecessor is NOT retired. Adoption COPIES proven material to a
+        second cell rather than rotating a single seat, so the source
+        cell keeps its trust. The target cell must therefore have no
+        active anchor of its own — an existing one is a different trust
+        decision and refuses, exactly as :meth:`capture`'s at-most-one-
+        active-per-cell rule requires.
+        """
+
+        if channel_entry != CHANNEL_ENTRY:
+            raise TrustRefused(
+                f"channel_entry must be exactly {CHANNEL_ENTRY!r}"
+            )
+        canonical_session = str(uuid.UUID(str(session_id)))
+        entry_path = Path(entry_path)
+        package_root = Path(package_root)
+        if not entry_path.is_absolute():
+            raise TrustRefused("entry_path must be absolute")
+        _require_no_symlinks(entry_path, package_root)
+
+        if self.active_for_cell(cell_id) is not None:
+            raise TrustRefused(
+                f"cell {cell_id!r} already has an active channel trust "
+                "anchor; retire it first"
+            )
+        predecessor = self.active_for_cell(source_cell_id)
+        if predecessor is None:
+            raise TrustRefused(
+                f"cell {source_cell_id!r} has no active channel trust anchor "
+                "to adopt"
+            )
+        if predecessor.prompt_pattern is None:
+            raise TrustRefused(
+                f"anchor {predecessor.anchor_id!r} has no bound "
+                "prompt_pattern; trust is not yet fully proven and cannot "
+                "be carried forward"
+            )
+
+        # Identical to rebind: profile and launch composition are never
+        # adopted from caller input. The adopting seat's argv must equal
+        # the trusted template token for token except at the existing
+        # bounded session-UUID and session-scoped MCP config-path slots
+        # — otherwise drift would become the trusted baseline the gate
+        # compares against. A different profile is honored only as
+        # Hermes's own durable selection for this exact seat.
+        selected_binding_id: str | None = None
+        selected_intent_id: str | None = None
+        if profile_alias != predecessor.profile_alias:
+            selected_binding_id, selected_intent_id = self._selected_replacement(
+                cell_id,
+                session_id=canonical_session,
+                profile_alias=profile_alias,
+                workspace_uuid=workspace_uuid,
+                surface_uuid=surface_uuid,
+            )
+        adopting_argv = tuple(str(token) for token in launch_argv_template)
+        if not _argv_matches_template(
+            adopting_argv,
+            predecessor.launch_argv_template,
+            session_id=canonical_session,
+        ):
+            raise TrustRefused(
+                "the adopting launch argv does not match the proven "
+                f"anchor {predecessor.anchor_id!r}'s trusted launch "
+                "template (only the session UUID and the session-scoped "
+                "MCP config path may differ); this is a new trust "
+                "decision, not an adoption of proven trust"
+            )
+
+        stat = entry_path.stat()
+        entry_owner_uid = int(stat.st_uid)
+        entry_sha256 = hashlib.sha256(entry_path.read_bytes()).hexdigest()
+        dist_tree_sha256 = _dist_tree_sha256(package_root)
+        manifest_name, manifest_version = _read_manifest(package_root)
+        build_mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
+
+        if (
+            entry_sha256 != predecessor.entry_sha256
+            or dist_tree_sha256 != predecessor.dist_tree_sha256
+            or manifest_name != predecessor.manifest_name
+            or manifest_version != predecessor.manifest_version
+            or entry_owner_uid != predecessor.entry_owner_uid
+            or channel_entry != predecessor.channel_entry
+        ):
+            raise TrustRefused(
+                "the content re-measured at the adopting entry path does "
+                f"not match the proven anchor {predecessor.anchor_id!r}; "
+                "this is a new trust decision, not an adoption of proven "
+                "trust"
+            )
+
+        anchor_id = self._ids()
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            # The same live double-check pattern capture() and rebind()
+            # use: a concurrent retire or rebind of this exact
+            # predecessor, or a concurrent capture/adopt for the target
+            # cell, between the reads above and this transaction fails
+            # closed rather than copying trust that just moved.
+            live_source = connection.execute(
+                "SELECT anchor_id FROM channel_trust_anchors "
+                "WHERE cell_id = ? AND state = 'active'",
+                (source_cell_id,),
+            ).fetchone()
+            if (
+                live_source is None
+                or str(live_source["anchor_id"]) != predecessor.anchor_id
+            ):
+                raise TrustRefused(
+                    f"cell {source_cell_id!r}'s active anchor changed "
+                    "concurrently; refusing to adopt"
+                )
+            live_target = connection.execute(
+                "SELECT anchor_id FROM channel_trust_anchors "
+                "WHERE cell_id = ? AND state = 'active'",
+                (cell_id,),
+            ).fetchone()
+            if live_target is not None:
+                raise TrustRefused(
+                    f"cell {cell_id!r} already has an active channel trust "
+                    "anchor; retire it first"
+                )
+            connection.execute(
+                "INSERT INTO channel_trust_anchors("
+                "anchor_id, cell_id, profile_alias, canonical_entry_path, "
+                "entry_owner_uid, entry_sha256, dist_tree_sha256, "
+                "manifest_name, manifest_version, channel_entry, "
+                "build_mtime, launch_argv_template_json, workspace_uuid, "
+                "surface_uuid, session_id, prompt_pattern, state, "
+                "created_at, retired_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'active', ?, NULL)",
+                (
+                    anchor_id,
+                    cell_id,
+                    profile_alias,
+                    str(entry_path),
+                    entry_owner_uid,
+                    entry_sha256,
+                    dist_tree_sha256,
+                    manifest_name,
+                    manifest_version,
+                    channel_entry,
+                    build_mtime,
+                    json.dumps(
+                        list(predecessor.launch_argv_template), sort_keys=True
+                    ),
+                    workspace_uuid,
+                    surface_uuid,
+                    canonical_session,
+                    predecessor.prompt_pattern,
+                    stamp,
+                ),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="channel_trust_anchor.adopted",
+                    aggregate_type="channel_trust_anchor",
+                    aggregate_id=anchor_id,
+                    payload={
+                        "cell_id": cell_id,
+                        "source_cell_id": source_cell_id,
+                        "profile_alias": profile_alias,
+                        "canonical_entry_path": str(entry_path),
+                        "session_id": canonical_session,
+                        "predecessor_anchor_id": predecessor.anchor_id,
+                        "predecessor_profile_alias": predecessor.profile_alias,
+                        "selected_binding_id": selected_binding_id,
+                        "selected_intent_id": selected_intent_id,
+                    },
+                ),
+            )
+        return self.get(anchor_id)
+
     def _selected_replacement(
         self,
         cell_id: str,
@@ -917,6 +1138,38 @@ class ChannelTrustAnchors:
             (cell_id,),
         ).fetchone()
         return None if row is None else _row_to_anchor(row)
+
+    def proven_source_cell(
+        self, project_key: str, *, exclude_cell_id: str
+    ) -> str | None:
+        """A sibling cell whose anchor is fully proven, or ``None``.
+
+        The source for :meth:`adopt` (INFRA-198 blocker 1). Anchors
+        carry no project of their own, so the project comes from the
+        cell that holds them. Only a fully proven anchor qualifies —
+        ``active`` with bound prompt evidence — which is the same bar
+        :meth:`adopt` re-checks; selecting a candidate here decides
+        nothing on its own, since every content fact is re-measured and
+        re-compared there before anything is written.
+
+        The newest qualifying anchor wins, deterministically. Several
+        proven anchors in one project are equally valid proofs of the
+        same program identity, and any that no longer matches the live
+        entry is refused by the re-measurement rather than trusted.
+        """
+
+        row = self._database.execute(
+            "SELECT anchors.cell_id AS cell_id FROM channel_trust_anchors "
+            "AS anchors JOIN project_cells AS cells "
+            "ON cells.cell_id = anchors.cell_id "
+            "WHERE cells.project_key = ? AND anchors.cell_id != ? "
+            "AND anchors.state = 'active' "
+            "AND anchors.prompt_pattern IS NOT NULL "
+            "ORDER BY anchors.created_at DESC, anchors.rowid DESC "
+            "LIMIT 1",
+            (project_key, exclude_cell_id),
+        ).fetchone()
+        return None if row is None else str(row["cell_id"])
 
     def get(self, anchor_id: str) -> ChannelTrustAnchor:
         row = self._database.execute(

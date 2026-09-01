@@ -42,6 +42,10 @@ CONTROL_KINDS = frozenset(
         "channel.confirm_ambiguous",
         "lead.launch_failed",
         "channel.rebind_refused",
+        # INFRA-198: the adoption sibling of rebind_refused -- this cell
+        # has no anchor and the project's proven one could not be
+        # carried onto it, so the operator must confirm manually.
+        "channel.adopt_refused",
     }
 )
 

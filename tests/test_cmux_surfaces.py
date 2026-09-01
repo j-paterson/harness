@@ -55,9 +55,18 @@ THIRD = CmuxSurfaceRef(
     surface_uuid="77777777-7777-4777-8777-888888888888",
 )
 
+#: The second visible cell of the same project -- the harness lane's
+#: seat, which start-lane creates with no trust anchor of its own.
+HARNESS = CmuxSurfaceRef(
+    workspace_uuid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    surface_uuid="aaaaaaaa-aaaa-4aaa-8aaa-bbbbbbbbbbbb",
+)
+
 SESSION = "99999999-9999-4999-8999-999999999999"
 # The replacement session a managed rotation seats.
 SESSION_2 = "88888888-8888-4888-8888-888888888888"
+# The harness lane's own session.
+HARNESS_SESSION = "77777777-7777-4777-8777-999999999999"
 
 
 @pytest.fixture
@@ -87,6 +96,16 @@ def bind_demo_lead(bindings: CmuxSurfaceBindings, ref: CmuxSurfaceRef = LEAD) ->
         session_id=SESSION,
         profile_alias="max-a",
         ref=ref,
+    )
+
+
+def bind_harness_lead(bindings: CmuxSurfaceBindings) -> object:
+    return bindings.bind_lead(
+        project_key="demo",
+        cell_id="cell-harness",
+        session_id=HARNESS_SESSION,
+        profile_alias="max-a",
+        ref=HARNESS,
     )
 
 
@@ -597,6 +616,19 @@ def seed_cell(database: Database, state: str = "active") -> None:
         "created_at, updated_at) VALUES "
         "('cell-demo', 'demo', ?, 'max-a', ?, ?, ?)",
         (state, SESSION, NOW.isoformat(), NOW.isoformat()),
+    )
+
+
+def seed_harness_cell(database: Database, state: str = "active") -> None:
+    """A second cell of the SAME project -- the shape start-lane creates
+    for the harness lane, which has no trust anchor of its own."""
+
+    database.execute(
+        "INSERT INTO project_cells("
+        "cell_id, project_key, lane_role, state, profile_alias, "
+        "session_id, created_at, updated_at) VALUES "
+        "('cell-harness', 'demo', 'harness', ?, 'max-a', ?, ?, ?)",
+        (state, HARNESS_SESSION, NOW.isoformat(), NOW.isoformat()),
     )
 
 
@@ -2213,6 +2245,101 @@ class TestChannelTrustLifecycle:
         anchor = anchors.active_for_cell("cell-demo")
         assert anchor is not None
         assert anchor.surface_uuid == THIRD.surface_uuid
+
+    @pytest.mark.asyncio
+    async def test_an_anchorless_cell_adopts_the_projects_proven_anchor(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """INFRA-198 blocker 1 (observed live 2026-09-01): ``start-lane``
+        created visible harness cell 8369559d with NO anchor of its own,
+        while every existing anchor belonged to the development cell of
+        the same project. Trust was cell-scoped, so ``anchor_present``
+        refused on every attempt and no retry could ever succeed --
+        ``capture`` records a MANUAL trust event, so the new cell had no
+        path to acquire one.
+
+        The operator's proof is a PROGRAM identity, not a property of a
+        cell, so the sibling's proven anchor is carried onto this cell
+        before the gate runs and the seat auto-confirms with zero manual
+        dialog clicks. This drives the real ``confirm_seat`` path: it is
+        the assertion that the production caller exists at all."""
+
+        seed_cell(database)
+        seed_harness_cell(database)
+        entry = trust_package(tmp_path)
+        # The one proven anchor belongs to the DEVELOPMENT cell.
+        source = capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_harness_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert port.confirmed == [HARNESS]
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        adopted = anchors.active_for_cell("cell-harness")
+        assert adopted is not None
+        assert adopted.anchor_id != source.anchor_id
+        assert adopted.prompt_pattern == source.prompt_pattern
+        # Adoption COPIES: the development cell keeps its own trust.
+        kept = anchors.active_for_cell("cell-demo")
+        assert kept is not None
+        assert kept.anchor_id == source.anchor_id
+
+    @pytest.mark.asyncio
+    async def test_an_adopt_refusal_records_a_receipt_and_still_reaches_approval(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """An adoption can itself refuse -- here the build at the live
+        entry path changed after the sibling's anchor was trusted, so
+        the content re-measured no longer matches: a genuinely new trust
+        decision. It is recorded as ``channel.adopt_refused`` and the
+        seat still falls through to the gate's existing
+        approval-required path, leaving the manual dialog and its
+        receipts exactly as they were."""
+
+        seed_cell(database)
+        seed_harness_cell(database)
+        entry = trust_package(tmp_path)
+        source = capture_trust_anchor(database, entry)
+        entry.write_text("console.log('a different build');\n", encoding="utf-8")
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_harness_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert control_operation_kinds(database) == [
+            "channel.adopt_refused",
+            "channel.approval_required",
+        ]
+        row = database.execute(
+            "SELECT reason, result_json FROM control_operations "
+            "WHERE kind = 'channel.adopt_refused'"
+        ).fetchone()
+        assert row is not None
+        assert "ADOPT REFUSED" in str(row["reason"])
+        # Nothing was minted for the anchorless cell.
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        assert anchors.active_for_cell("cell-harness") is None
+        assert anchors.active_for_cell("cell-demo").anchor_id == source.anchor_id
 
     @pytest.mark.asyncio
     async def test_a_same_session_and_surface_re_ensure_never_rebinds(

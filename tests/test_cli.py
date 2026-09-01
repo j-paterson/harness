@@ -2678,6 +2678,120 @@ def test_start_lane_working_status_exits_zero(
     ]
 
 
+def test_start_lane_json_emits_session_id_as_string(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-198 blocker 2 (observed live 2026-09-01): ``start-lane``
+    built its ``--json`` payload with ``dataclasses.asdict(result)``,
+    which preserves ``DispatchResult.session_id``'s ``UUID`` object, so
+    ``_print``'s ``json.dumps`` raised ``TypeError: Object of type UUID
+    is not JSON serializable``. ``cells.dispatch`` had already run --
+    the cell was created and the seat launched -- so a succeeded
+    command reported as a traceback with a nonzero exit, and the
+    obvious operator retry risked a duplicate lane. The real CLI path
+    must now emit a parseable object whose ``session_id`` is the
+    identifier's string form, under the same key."""
+
+    import uuid
+
+    from hermes_orchestrator.cells import DispatchResult
+
+    session_id = uuid.UUID("9b539c86-c52f-43b2-b077-57491066ebcf")
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _install_fake_lane_dispatch(
+        monkeypatch,
+        dispatch_result=DispatchResult(
+            status="working",
+            issue_id="ENG-1",
+            cell_id="8369559d-f4cd-45ca-aa43-aae412853f16",
+            session_id=session_id,
+        ),
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "harness",
+            "--issue",
+            "ENG-1",
+            "--harness-run",
+            "run-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["session_id"] == str(session_id)
+    assert isinstance(payload["session_id"], str)
+
+
+def test_start_lane_json_keeps_absent_session_id_null(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coercion must not stringify absence: a refusal carries no
+    session, and ``session_id`` has to stay JSON ``null`` rather than
+    becoming the string ``"None"`` -- a consumer testing the field for
+    presence would read that as a real identifier."""
+
+    from hermes_orchestrator.cells import DispatchResult
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _install_fake_lane_dispatch(
+        monkeypatch,
+        dispatch_result=DispatchResult(status="project_busy", issue_id="ENG-1"),
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "development",
+            "--issue",
+            "ENG-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["session_id"] is None
+
+
+def test_print_json_falls_back_to_str_for_unencodable_values() -> None:
+    """INFRA-198 blocker 2, second half: ``_print`` is the last step of
+    commands whose effects have already committed, so it must never be
+    the thing that raises. A payload carrying a value ``json.dumps``
+    cannot natively encode -- a ``UUID`` is the one observed live --
+    has to render as its string form instead of aborting the
+    command."""
+
+    import uuid
+
+    from hermes_orchestrator.cli import _print
+
+    session_id = uuid.UUID("9b539c86-c52f-43b2-b077-57491066ebcf")
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        _print(
+            {"session_id": session_id, "status": "working"},
+            json_output=True,
+            human="unused",
+        )
+
+    payload = json.loads(stdout.getvalue())
+    assert payload == {"session_id": str(session_id), "status": "working"}
+
+
 def test_start_lane_parses_its_existing_flags(
     configured_repo: tuple[Path, Path],
 ) -> None:
@@ -5608,6 +5722,56 @@ def test_reconcile_binds_issue_lane_without_a_live_cell_service(
         ).stdout.strip()
         == "feature/eng-9"
     )
+
+
+def test_reconcile_binds_a_post_merge_acceptance_issue_lane(
+    tmp_path: Path,
+) -> None:
+    """INFRA-198: an acceptance-gated issue is held in
+    ``post_merge_acceptance`` while its lead keeps working it and keeps
+    publishing candidates. Excluding that state made ``candidate-ready``
+    refuse for an issue actively under assignment with no supported way
+    to bind its lane -- a live publication dead end."""
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.domain import IssueState
+    from hermes_orchestrator.emission import resolve_lane
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    configured = _configured_git_project(tmp_path)
+    assert invoke([*base_arguments(configured), "init", "--json"]).exit_code == 0
+    _admit_through_cli(configured, "ENG-9")
+    _repo_root, state_dir = configured
+    database = Database.open(state_dir / "state.db")
+    try:
+        database.execute(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            (IssueState.POST_MERGE_ACCEPTANCE.value, "ENG-9"),
+        )
+    finally:
+        database.close()
+
+    result = invoke(
+        [
+            *base_arguments(configured),
+            "reconcile",
+            "--bind-issue-lane",
+            "demo:ENG-9",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["bound_issue_lanes"] == ["ENG-9"]
+    database = Database.open(state_dir / "state.db")
+    try:
+        lane = resolve_lane(
+            WorktreeLeases(database, EventStore(database)), "demo", "ENG-9"
+        )
+    finally:
+        database.close()
+    assert lane.path == tmp_path / "project-issue-ENG-9"
 
 
 def test_reconcile_reports_an_unbindable_issue_lane_instead_of_exiting_clean(

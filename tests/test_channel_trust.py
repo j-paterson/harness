@@ -1152,6 +1152,274 @@ def test_rebind_succeeds_only_under_the_bounded_session_substitutions(
     assert anchors.active_for_cell(CELL) == third
 
 
+# --------------------------------------------------------------------
+# ChannelTrustAnchors.adopt (INFRA-198 blocker 1)
+# --------------------------------------------------------------------
+
+# The second visible lane: a NEW cell with no anchor of its own and no
+# manual trust event to give it one — the live harness cell.
+HARNESS_CELL = "cell-trust-harness"
+
+
+@pytest.fixture
+def seeded_harness_cell(database: Database) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "lane_role, created_at, updated_at) "
+            "VALUES (?, 'demo', 'active', ?, ?, 'harness', ?, ?)",
+            (HARNESS_CELL, PROFILE, SESSION_2, NOW.isoformat(), NOW.isoformat()),
+        )
+
+
+def _adopt(
+    anchors: ChannelTrustAnchors,
+    *,
+    package_root: Path,
+    entry_path: Path,
+    source_cell_id: str = CELL,
+    cell_id: str = HARNESS_CELL,
+    profile_alias: str = PROFILE,
+    launch_argv_template: list[str] | None = None,
+    session_id: str = SESSION_2,
+):
+    return anchors.adopt(
+        source_cell_id=source_cell_id,
+        cell_id=cell_id,
+        profile_alias=profile_alias,
+        entry_path=entry_path,
+        package_root=package_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=(
+            _argv(SESSION_2, CONFIG_PATH_2)
+            if launch_argv_template is None
+            else launch_argv_template
+        ),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        session_id=session_id,
+    )
+
+
+def test_adopt_captures_the_new_cell_and_leaves_the_source_active(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """The one deliberate difference from rebind: adoption COPIES the
+    proven material onto a second cell. The source cell — the one the
+    operator's manual trust event actually named — keeps its anchor
+    active, and the new cell gets a fully proven one of its own."""
+
+    package_root, entry_path = package
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+
+    adopted = _adopt(anchors, package_root=package_root, entry_path=entry_path)
+
+    assert adopted.anchor_id != proven.anchor_id
+    assert adopted.cell_id == HARNESS_CELL
+    assert adopted.state == "active"
+    assert anchors.active_for_cell(HARNESS_CELL) == adopted
+    # The source cell is NOT retired — adoption copies, never rotates.
+    assert anchors.get(proven.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == proven
+
+    # The proven prompt evidence and trusted launch baseline are carried
+    # forward verbatim; only the seat identity is the new lane's.
+    assert adopted.prompt_pattern == proven.prompt_pattern
+    assert adopted.launch_argv_template == proven.launch_argv_template
+    assert adopted.launch_argv_template == tuple(_argv())
+    assert adopted.profile_alias == proven.profile_alias
+    assert adopted.session_id == SESSION_2
+    assert adopted.workspace_uuid == WORKSPACE_2
+    assert adopted.surface_uuid == SURFACE_2
+    # Content facts are the re-measured ones, equal to the proven anchor's.
+    assert adopted.canonical_entry_path == str(entry_path)
+    assert adopted.entry_sha256 == proven.entry_sha256
+    assert adopted.dist_tree_sha256 == proven.dist_tree_sha256
+    assert adopted.manifest_name == proven.manifest_name
+    assert adopted.manifest_version == proven.manifest_version
+    assert adopted.entry_owner_uid == proven.entry_owner_uid
+
+    # No retirement event: exactly one capture and one adoption.
+    assert _anchor_event_types(database) == [
+        "channel_trust_anchor.captured",
+        "channel_trust_anchor.adopted",
+    ]
+    payload = json.loads(
+        str(
+            database.execute(
+                "SELECT payload_json FROM events "
+                "WHERE aggregate_type = 'channel_trust_anchor' "
+                "AND aggregate_id = ?",
+                (adopted.anchor_id,),
+            ).fetchone()["payload_json"]
+        )
+    )
+    assert payload["cell_id"] == HARNESS_CELL
+    assert payload["source_cell_id"] == CELL
+    assert payload["predecessor_anchor_id"] == proven.anchor_id
+
+
+def test_adopt_refuses_a_predecessor_with_prompt_evidence_pending(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """An anchor whose trust is not fully proven is never carried onto a
+    second cell — exactly rebind's rule."""
+
+    package_root, entry_path = package
+    _capture(
+        anchors, package_root=package_root, entry_path=entry_path, prompt_pattern=None
+    )
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="not yet fully proven"):
+        _adopt(anchors, package_root=package_root, entry_path=entry_path)
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(HARNESS_CELL) is None
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+def test_adopt_refuses_a_re_measured_content_drift_with_zero_mutation(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """Every fact is re-measured from disk at adoption time. A build
+    rewritten under the trusted path is a new trust decision, not
+    something the operator's one manual event proved."""
+
+    package_root, entry_path = package
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    entry_path.write_text("console.log('different!');\n", encoding="utf-8")
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="new trust decision"):
+        _adopt(anchors, package_root=package_root, entry_path=entry_path)
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(HARNESS_CELL) is None
+    assert anchors.get(proven.anchor_id).state == "active"
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+@pytest.mark.parametrize(
+    "drifted_argv",
+    [
+        pytest.param(
+            _drift_argv(lambda a: [*a, "--verbose"]), id="extra-flag-appended"
+        ),
+        pytest.param(
+            _drift_argv(
+                lambda a: [t for t in a if t != "--dangerously-skip-permissions"]
+            ),
+            id="fixed-flag-dropped",
+        ),
+        pytest.param(
+            _argv(SESSION_3, CONFIG_PATH_2), id="session-uuid-slot-is-another-session"
+        ),
+        pytest.param(
+            _argv(SESSION_2, CONFIG_PATH_3), id="config-path-is-another-sessions"
+        ),
+        pytest.param([], id="empty-argv"),
+    ],
+)
+def test_adopt_refuses_launch_argument_drift_with_zero_mutation(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    drifted_argv: list[str],
+) -> None:
+    """The adopting lane's argv may differ from the trusted template
+    only at the two bounded session slots; anything else would make
+    drift the new trusted baseline."""
+
+    package_root, entry_path = package
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="trusted launch template"):
+        _adopt(
+            anchors,
+            package_root=package_root,
+            entry_path=entry_path,
+            launch_argv_template=drifted_argv,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(HARNESS_CELL) is None
+    assert anchors.active_for_cell(CELL) == proven
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+def test_adopt_refuses_when_the_target_cell_already_has_an_active_anchor(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """At most one active anchor per cell still holds: adoption only
+    ever fills a cell that has none, never silently replaces a trust
+    decision the target cell already carries."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    existing = _capture(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        cell_id=HARNESS_CELL,
+    )
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="already has an active channel trust"):
+        _adopt(anchors, package_root=package_root, entry_path=entry_path)
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(HARNESS_CELL) == existing
+    assert _anchor_event_types(database) == [
+        "channel_trust_anchor.captured",
+        "channel_trust_anchor.captured",
+    ]
+
+
+def test_gate_still_refuses_anchor_present_for_a_cell_with_no_anchor(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+    seeded_harness_cell: None,
+) -> None:
+    """No implicit project-wide fallback was introduced: a fully proven
+    active anchor on a SIBLING cell of the same project does not make
+    the anchorless cell pass. Adoption is an explicit step; a read path
+    never mints trust as a side effect."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    gate, confirm, read_screen = _make_gate(database, events, anchors, control)
+
+    result = _evaluate(
+        gate,
+        entry_path=entry_path,
+        package_root=package_root,
+        cell_id=HARNESS_CELL,
+        session_id=SESSION_2,
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        argv=_argv(SESSION_2, CONFIG_PATH_2),
+    )
+
+    assert result.anchor_id is None
+    _assert_refused(result, control, confirm, first_failure="anchor_present")
+    assert read_screen.calls == 0
+
+
 def test_gate_auto_confirms_a_rebound_anchor_for_the_new_identity(
     database: Database,
     events: EventStore,

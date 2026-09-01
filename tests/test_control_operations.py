@@ -322,6 +322,10 @@ def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
         "channel.confirm_ambiguous",
         "lead.launch_failed",
         "channel.rebind_refused",
+        # INFRA-198: adoption's refusal is lead-actionable for the same
+        # reason rebind's is -- the seat could not auto-confirm and an
+        # operator must clear the dialog manually.
+        "channel.adopt_refused",
         "daemon.restarted",
         "channel.reregistered",
         "channel.replayed",

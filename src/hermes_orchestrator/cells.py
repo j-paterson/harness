@@ -365,6 +365,23 @@ _OCCUPYING_ISSUE_STATES = (
     IssueState.REVIEW.value,
 )
 
+#: The states in which an issue may hold a bound issue worktree lease.
+#: DELIBERATELY wider than ``_OCCUPYING_ISSUE_STATES`` and used only by
+#: :func:`bind_admitted_issue_worktree` -- never by the lane-occupancy
+#: accounting, which must keep counting exactly what it counted before.
+#:
+#: INFRA-198: a merged, acceptance-gated issue is held in
+#: ``post_merge_acceptance`` while its lead keeps working it and keeps
+#: publishing candidates -- the observed harness-blocker assignment is
+#: exactly that shape. Excluding it made ``candidate-ready`` refuse for
+#: an issue actively under assignment, with no supported way to bind.
+#: Admitting it here does NOT make the issue dispatchable: it stays
+#: outside every dispatch filter, as its own state contract requires.
+_LANE_BINDABLE_ISSUE_STATES = (
+    *_OCCUPYING_ISSUE_STATES,
+    IssueState.POST_MERGE_ACCEPTANCE.value,
+)
+
 # INFRA-219 R6 (Sol correction 110ed759): the operator ruling behind
 # INFRA-219 is that "one Fable project lead owns a single project ...
 # and continuously coordinates up to six explicitly admitted Linear
@@ -424,16 +441,16 @@ def bind_admitted_issue_worktree(
     completed, unknown, or unadmitted issue.
     """
 
-    placeholders = ",".join("?" for _ in _OCCUPYING_ISSUE_STATES)
+    placeholders = ",".join("?" for _ in _LANE_BINDABLE_ISSUE_STATES)
     row = database.execute(
         "SELECT issue_id FROM admitted_issues "
         f"WHERE project_key = ? AND issue_id = ? AND state IN ({placeholders})",
-        (project_key, issue_id, *_OCCUPYING_ISSUE_STATES),
+        (project_key, issue_id, *_LANE_BINDABLE_ISSUE_STATES),
     ).fetchone()
     if row is None:
         raise ValueError(
-            f"{issue_id!r} is not an occupying admitted issue of "
-            f"{project_key!r}; the catch-up targets one exact issue"
+            f"{issue_id!r} is not an admitted issue of {project_key!r} in a "
+            "lane-bindable state; the catch-up targets one exact issue"
         )
     bind_issue_worktree(
         leases,

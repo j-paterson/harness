@@ -72,6 +72,7 @@ _CONTROL_OPERATION_ATTENTION_KINDS = frozenset(
     {
         "channel.approval_required",
         "channel.rebind_refused",
+        "channel.adopt_refused",
         "lead.launch_failed",
         "signal.failed",
         "channel.blocked",

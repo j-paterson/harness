@@ -1751,6 +1751,60 @@ class ChannelTrustConfirmer:
                             "seat"
                         ),
                     )
+        elif active_anchor is None:
+            # INFRA-198 blocker 1 (observed live 2026-09-01):
+            # ``start-lane`` created visible harness cell 8369559d with
+            # no anchor of its own, and every existing anchor belonged
+            # to the development cell — so ``anchor_present`` refused on
+            # every attempt with no path to ever succeed. ``capture``
+            # records a MANUAL trust event, so nothing here may mint one.
+            #
+            # What the operator proved is a PROGRAM identity, not a
+            # property of a cell, so a sibling cell's already-proven
+            # anchor is carried onto this one BEFORE the gate runs.
+            # ``adopt`` re-measures every content fact and re-checks the
+            # argv against the trusted template, so a drifted or
+            # unproven candidate is refused rather than trusted. Exactly
+            # as with the rotation carry-forward above, a refusal is a
+            # genuinely new trust decision: it is recorded and this call
+            # falls through to evaluate() unchanged, leaving the manual-
+            # dialog fallback and its receipts as they are.
+            source_cell_id = anchors.proven_source_cell(
+                binding.project_key or "", exclude_cell_id=str(binding.cell_id)
+            )
+            if source_cell_id is not None:
+                try:
+                    anchors.adopt(
+                        source_cell_id=source_cell_id,
+                        cell_id=str(binding.cell_id),
+                        profile_alias=str(binding.profile_alias),
+                        entry_path=entry_path,
+                        package_root=entry_path.parents[2],
+                        channel_entry=CHANNEL_ENTRY,
+                        launch_argv_template=launch_argv,
+                        workspace_uuid=binding.workspace_uuid,
+                        surface_uuid=binding.surface_uuid,
+                        session_id=session_id,
+                    )
+                except Exception as error:
+                    with suppress(Exception):
+                        self._control.record(
+                            kind="channel.adopt_refused",
+                            project_key=binding.project_key or "",
+                            cell_id=str(binding.cell_id),
+                            session_id=session_id,
+                            result={
+                                "error": str(error)[:200],
+                                "source_cell_id": source_cell_id,
+                            },
+                            reason=(
+                                "CHANNEL ADOPT REFUSED: this cell has no "
+                                "trust anchor and the project's proven "
+                                "anchor could not be carried onto it; the "
+                                "operator must confirm the development-"
+                                "channel dialog manually for this seat"
+                            ),
+                        )
 
         def _run_bounded(operation: Callable[[], Awaitable[Any]]) -> Any:
             # The gate calls its collaborators synchronously between

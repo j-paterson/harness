@@ -1553,6 +1553,19 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
         cells.dispatch(args.issue, lane_role=lane_role, harness_run=args.harness_run)
     )
     payload = dataclasses.asdict(result)
+    # INFRA-198 blocker 2: ``DispatchResult.session_id`` is a ``UUID |
+    # None`` and ``dataclasses.asdict`` preserves the ``UUID`` object,
+    # which ``json.dumps`` cannot encode. Every effect of ``dispatch``
+    # has ALREADY landed by the time we get here -- the cell exists and
+    # the seat is launched -- so a reporting-side ``TypeError`` turns a
+    # succeeded command into a traceback and a nonzero exit, and the
+    # natural operator response (run it again) risks a duplicate lane.
+    # Coerce at the payload boundary so the documented contract (a JSON
+    # object carrying ``session_id``) actually holds; ``None`` stays
+    # null rather than becoming the string "None".
+    payload["session_id"] = (
+        None if result.session_id is None else str(result.session_id)
+    )
     _print(
         payload,
         json_output=args.json,
@@ -2191,7 +2204,16 @@ def _git_head_sha(repo_root: Path) -> str:
 
 def _print(payload: Any, *, json_output: bool, human: str) -> None:
     if json_output:
-        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        # INFRA-198 blocker 2: ``default=str`` is the backstop for the
+        # failure MODE the blocker named -- a value ``json.dumps``
+        # cannot natively encode (a ``UUID``, a ``datetime``, a
+        # ``Path``) reaching this reporting call AFTER an effectful
+        # command has already committed its effects. Rendering it as
+        # its string form keeps the command's exit code honest instead
+        # of converting a completed operation into a crash. Callers
+        # still coerce known identifiers at their own payload boundary
+        # so the emitted shape is deliberate, not incidental.
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
     else:
         print(human)
 
