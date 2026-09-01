@@ -107,3 +107,49 @@ A regression proving TWO admitted issues resolve DISTINCT bound paths
 through `resolve_lane`, and that `candidate-ready` can resolve the
 exact INFRA-214 checkout while the other admitted lanes remain
 independent.
+
+## Safety correction — adopt-first is UNSAFE; dedicated issue worktrees only
+
+The adopt-then-provision shape in the amendment above is withdrawn
+before implementation. Adopting "whatever worktree already has this
+issue's branch checked out" would have bound INFRA-214's lease to
+`/Users/josystem/hermes-orchestrator-live` — the COORDINATOR's own
+working directory, the checkout this lead is actively editing,
+committing, and switching branches in.
+
+**The coordinator CWD and the harness lead CWD are never leaseable.**
+A lease is a promise that a checkout's branch and HEAD are stable
+enough to freeze a candidate from. Neither of those directories can
+make that promise:
+
+- the coordinator's checkout changes branch and HEAD constantly as the
+  lead moves between lanes, so a candidate frozen from it could capture
+  an unrelated issue's head — the exact wrong-head hazard L5 exists to
+  prevent, reintroduced through the guard rather than around it;
+- the harness lead's checkout is owned by the harness lane and must
+  never be consumed by development work (INFRA-219's contract:
+  "Harness experiments never interrupt, rotate, mutate, or reuse the
+  development lead worktree/session", and the converse holds).
+
+Both were live here: the coordinator sits on `feature/infra-214`, and
+the harness checkout is at a detached HEAD with no branch at all —
+which `WorktreeLeaseInput` would have rejected for an empty branch
+even if it were otherwise permissible.
+
+### Corrected shape: dedicated issue worktrees only
+
+1. Hermes CREATES a dedicated worktree per admitted issue. There is no
+   adoption path. A checkout that already exists for that branch is not
+   evidence of a leaseable lane.
+2. The coordinator CWD, the harness lane CWD, and the project's stable
+   primary checkout are explicitly REFUSED as lease paths, fail-closed,
+   with a clear reason — never silently skipped.
+3. Registration stays idempotent (`resolve_lane` refuses zero and
+   refuses more than one) and paths stay distinct per issue, enforced
+   durably by `worktree_leases_live_path_idx`.
+4. The legacy INFRA-214 candidate is MATERIALIZED into its own
+   dedicated issue worktree and published from there, rather than
+   published from the coordinator's checkout.
+
+Publication guard in `emission.py` remains untouched. No new protocol,
+no schema change.
