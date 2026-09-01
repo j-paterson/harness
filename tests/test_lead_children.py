@@ -436,6 +436,30 @@ def seed_live_channel(
             )
 
 
+def seed_live_anchor(database: Database, tmp_path: Path) -> object:
+    from hermes_orchestrator.channel_trust import ChannelTrustAnchors
+    from tests.test_cmux_surfaces import (
+        APPROVED_PROMPT_PATTERN,
+        CHANNEL_ARGV,
+        LEAD,
+        trust_package,
+    )
+
+    entry = trust_package(tmp_path)
+    return ChannelTrustAnchors(database, events=EventStore(database)).capture(
+        cell_id="cell-demo",
+        profile_alias="max-c",
+        entry_path=entry,
+        package_root=entry.parents[2],
+        channel_entry="server:hermes-control",
+        launch_argv_template=CHANNEL_ARGV,
+        workspace_uuid=LEAD.workspace_uuid,
+        surface_uuid=LEAD.surface_uuid,
+        session_id=SESSION,
+        prompt_pattern=APPROVED_PROMPT_PATTERN,
+    )
+
+
 def test_a_cleared_session_canonicalizes_to_the_bound_seat(
     database: Database, tmp_path: Path
 ) -> None:
@@ -445,11 +469,21 @@ def test_a_cleared_session_canonicalizes_to_the_bound_seat(
     stable id it yields is the one every hook path then uses."""
 
     from hermes_orchestrator.lead_children import bound_session_at
+    from tests.test_cmux_surfaces import LEAD
 
     seed_active_cell(database)
     seed_live_channel(database, str(tmp_path))
+    seed_live_anchor(database, tmp_path)
     with database.transaction() as connection:
-        assert bound_session_at(connection, str(tmp_path)) == SESSION
+        assert (
+            bound_session_at(
+                connection,
+                str(tmp_path),
+                LEAD.workspace_uuid,
+                LEAD.surface_uuid,
+            )
+            == SESSION
+        )
 
 
 @pytest.mark.parametrize(
@@ -476,24 +510,50 @@ def test_unproven_or_ambiguous_seats_stay_inert(
     seed_live_channel(database, str(tmp_path), sessions=sessions)
     probe = str(tmp_path) if managed_cwd else str(tmp_path / "elsewhere")
     with database.transaction() as connection:
-        assert bound_session_at(connection, probe) is None
+        assert bound_session_at(connection, probe, "workspace", "surface") is None
 
 
 def test_the_hook_entry_canonicalizes_once_and_leaves_a_bound_id_alone(
-    database: Database, tmp_path: Path
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The one seam every lead-hook entry uses: a cleared id becomes the
     stable one, an already-bound id is returned untouched, and an
     unresolvable id comes back unchanged so the hook stays inert."""
 
     from hermes_orchestrator.cli import _canonical_session
+    from tests.test_cmux_surfaces import LEAD
 
     seed_active_cell(database)
     seed_live_channel(database, str(tmp_path))
+    seed_live_anchor(database, tmp_path)
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", LEAD.workspace_uuid)
+    monkeypatch.setenv("CMUX_SURFACE_ID", LEAD.surface_uuid)
     cwd = str(tmp_path)
     assert _canonical_session(database, CLEARED_SESSION, cwd) == SESSION
     assert _canonical_session(database, SESSION, cwd) == SESSION
     stray = str(tmp_path / "elsewhere")
     assert _canonical_session(database, CLEARED_SESSION, stray) == (
+        CLEARED_SESSION
+    )
+
+
+def test_same_cwd_with_the_wrong_cmux_surface_stays_foreign(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile-wide hook in the managed cwd is not the managed seat."""
+
+    from hermes_orchestrator.cli import _canonical_session
+    from tests.test_cmux_surfaces import (
+        FRESH,
+        LEAD,
+    )
+
+    seed_active_cell(database)
+    seed_live_channel(database, str(tmp_path))
+    seed_live_anchor(database, tmp_path)
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", LEAD.workspace_uuid)
+    monkeypatch.setenv("CMUX_SURFACE_ID", FRESH.surface_uuid)
+
+    assert _canonical_session(database, CLEARED_SESSION, str(tmp_path)) == (
         CLEARED_SESSION
     )

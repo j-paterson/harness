@@ -63,7 +63,10 @@ def _bound_cell(
 
 
 def bound_session_at(
-    connection: sqlite3.Connection, cwd: str | None
+    connection: sqlite3.Connection,
+    cwd: str | None,
+    workspace_uuid: str | None,
+    surface_uuid: str | None,
 ) -> str | None:
     """The stable session id of the managed seat running in ``cwd``.
 
@@ -96,7 +99,15 @@ def bound_session_at(
         "SELECT project_key FROM process_leases WHERE cwd = ?)",
         (str(cwd or os.getcwd()),),
     ).fetchall()
-    return str(rows[0]["session_id"]) if len(rows) == 1 else None
+    if len(rows) != 1 or not workspace_uuid or not surface_uuid:
+        return None
+    session_id = str(rows[0]["session_id"])
+    anchor = connection.execute(
+        "SELECT 1 FROM channel_trust_anchors WHERE state = 'active' "
+        "AND session_id = ? AND workspace_uuid = ? AND surface_uuid = ?",
+        (session_id, workspace_uuid, surface_uuid),
+    ).fetchone()
+    return session_id if anchor is not None else None
 
 
 class LeadChildTracker:

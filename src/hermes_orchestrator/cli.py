@@ -3168,7 +3168,15 @@ def _canonical_session(
 
         with database.transaction() as connection:
             if _bound_cell(connection, session) is None:
-                return bound_session_at(connection, cwd) or session
+                return (
+                    bound_session_at(
+                        connection,
+                        cwd,
+                        os.environ.get("CMUX_WORKSPACE_ID"),
+                        os.environ.get("CMUX_SURFACE_ID"),
+                    )
+                    or session
+                )
     return session
 
 
