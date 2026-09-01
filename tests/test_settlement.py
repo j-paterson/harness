@@ -1044,6 +1044,50 @@ class TestExternalReconciliation:
         )
         assert acceptance.database.scalar("SELECT COUNT(*) FROM ci_merge_ledger") == 1
 
+    async def test_a_fresh_merge_settles_despite_a_projection_failure(
+        self, acceptance: Any
+    ) -> None:
+        # INFRA-218 (S3): closes the same class of stall one step
+        # earlier than the S1(a) regression above. ``_settle_proven``
+        # is the ONE fresh caller of ``_project_after_merge`` — the
+        # docstring on that method names it exactly — reached right
+        # after the review row is durably transitioned to ``merged``
+        # with its real ``merge_sha``. Before this packet, that call
+        # was unguarded, so a downstream projection failure on the
+        # very FIRST pass (never mind a replay) propagated out of
+        # ``_drive_merge`` before ``merge_approved`` ever reached its
+        # ``mark_merged``/``mark_settled`` tail, leaving the
+        # just-claimed settlement stuck ``merging`` under its lease.
+        event, branch, number = acceptance.prepare("ENG-9", GOOD)
+        admitted = acceptance.admission.admit("demo", event, received_generation=1)
+        record = await acceptance.service.record_verdict(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+
+        real_project = acceptance.linear.project
+
+        async def flaky_project(issue_id: str, target: Any, effect_id: str) -> Any:
+            if "after-merge" in effect_id:
+                raise RuntimeError("linear outage")
+            return await real_project(issue_id, target, effect_id)
+
+        acceptance.linear.project = flaky_project
+
+        outcome = await acceptance.service.merge_approved(record.review_id)
+
+        assert outcome.state == "merged"
+        assert outcome.merge_sha == merge_sha_for(GOOD)
+        assert len(acceptance.github.merge_calls) == 1
+        settled = acceptance.settlements.get(record.review_id)
+        assert settled.state == "settled"
+        assert settled.merge_sha == merge_sha_for(GOOD)
+
+        # A second resume is a stable no-op: nothing left resumable
+        # (the settlement already reached its terminal durable state),
+        # zero additional merge calls.
+        assert await acceptance.service.resume_settlements("demo") == ()
+        assert len(acceptance.github.merge_calls) == 1
+
     async def test_reviewer_fix_chain_preserves_submitted_and_final_identities(
         self, acceptance: Any
     ) -> None:
@@ -1950,13 +1994,20 @@ class TestAcceptanceGatedSettlement:
         ]
         assert self._hold_transitions(acceptance) == 1
 
-    async def test_a_crash_inside_the_hold_projection_replays_exactly_once(
+    async def test_a_crash_inside_the_hold_projection_repairs_without_stranding(
         self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Crash between the queue hold + assignment and the Linear
-        # effect: the settlement stays 'merging' under its lease, and the
-        # resumed drive replays the hold without a second transition or
-        # assignment.
+        # INFRA-218 (S3): before this packet, ``_settle_proven``'s call
+        # into ``_project_after_merge`` (here, ``_hold_for_acceptance``'s
+        # Linear effect) was unguarded on the FRESH merge path, so this
+        # exact failure propagated out of ``submit`` and left the
+        # settlement stuck 'merging' until a resumed drive replayed the
+        # hold. Now the durable queue hold + assignment (both already
+        # written before the Linear call) and the settlement's own
+        # 'settled' convergence never depend on that projection: the
+        # pass still settles, and the missed 'acceptance-hold' effect is
+        # repaired by ``reconcile_acceptance`` at the very next resume
+        # boundary — dedup-aware, so it lands exactly once, not twice.
         self._gate(acceptance)
         original = acceptance.linear.project
         calls = {"count": 0}
@@ -1969,19 +2020,22 @@ class TestAcceptanceGatedSettlement:
             return await original(issue_id, target, effect_id)
 
         monkeypatch.setattr(acceptance.linear, "project", crash_once)
-        with pytest.raises(RuntimeError, match="simulated crash"):
-            await acceptance.submit("ENG-9", GOOD)
-        assert acceptance.settlements.get("review:demo:evt-1").state == "merging"
+
+        outcome = await acceptance.submit("ENG-9", GOOD)
+
+        assert outcome.state == "merged"
+        assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
         assert (
             acceptance.queue.get("ENG-9").state
             is IssueState.POST_MERGE_ACCEPTANCE
         )
         assert len(self._assignments(acceptance)) == 1
-        expire_settlement_lease(acceptance)
+        # The failed effect never landed on this pass.
+        assert ("ENG-9", "In Development", "operator") not in acceptance.linear.targets
 
-        [outcome] = await acceptance.service.resume_settlements("demo")
+        resumed = await acceptance.service.resume_settlements("demo")
 
-        assert outcome.state == "merged"
+        assert resumed == ()
         assert len(acceptance.github.merge_calls) == 1
         self._assert_held_exactly_once(acceptance)
 

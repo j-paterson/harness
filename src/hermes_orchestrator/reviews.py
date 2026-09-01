@@ -663,16 +663,7 @@ class ReviewService:
             # converges the settlement to ``settled`` under the real,
             # already-proven ``merge_sha`` — no new merge is ever
             # performed on this path.
-            try:
-                await self._project_after_merge(record, reconciling=True)
-            except Exception as error:
-                print(
-                    "post-merge projection replay for "
-                    f"{record.review_id!r} failed and will retry at the "
-                    f"next recovery boundary: {type(error).__name__}: "
-                    f"{error}",
-                    file=sys.stderr,
-                )
+            await self._project_fail_soft(record, reconciling=True)
             return _outcome(record, reason=record.reason or "merged")
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
@@ -846,7 +837,22 @@ class ReviewService:
                     file=sys.stderr,
                 )
         self._record_merge_proven(record, proven, reason=reason)
-        await self._project_after_merge(record)
+        # INFRA-218 (S3): this is the ONE fresh caller of
+        # ``_project_after_merge`` (the docstring on that method names
+        # it exactly) — everything durable is already proven and
+        # written above (the review row transitioned to ``merged``
+        # with its real ``merge_sha``, and the ``merge.proven`` event
+        # appended) before this projection ever runs. Both callers of
+        # ``_settle_proven`` (``_drive_merge``'s fresh-merge branch and
+        # ``reconcile_external_merge``'s) still owe their settlement
+        # row its ``mark_merged``/``mark_settled`` tail after this
+        # returns; an unguarded raise here would propagate out of
+        # BOTH before that tail runs, leaving a just-claimed settlement
+        # stuck ``merging`` under its lease for a projection failure —
+        # the identical class of stall S1(a) closed for the REPLAY
+        # branches, just one step earlier, on the very first pass. Fail
+        # soft the same way, so the settlement tail always completes.
+        await self._project_fail_soft(record, reconciling=False)
         return _outcome(record, reason=record.reason or "merged")
 
     def _record_merge_proven(
@@ -1158,16 +1164,7 @@ class ReviewService:
             # — a downstream projection failure must never block the
             # settlement tail below from converging this already-proven
             # merge to ``settled``.
-            try:
-                await self._project_after_merge(record, reconciling=True)
-            except Exception as error:
-                print(
-                    "post-merge projection replay for "
-                    f"{record.review_id!r} failed and will retry at the "
-                    f"next recovery boundary: {type(error).__name__}: "
-                    f"{error}",
-                    file=sys.stderr,
-                )
+            await self._project_fail_soft(record, reconciling=True)
             outcome = _outcome(record, reason=record.reason or "merged")
         else:
             outcome = await self._settle_proven(
@@ -1380,6 +1377,38 @@ class ReviewService:
             self._qa.after_rejection(record.issue_id),
             effect_id=effect_id,
         )
+
+    async def _project_fail_soft(
+        self, record: ReviewRecord, *, reconciling: bool
+    ) -> None:
+        """Run :meth:`_project_after_merge`, but never let it block settlement.
+
+        INFRA-218 (S3), generalizing S1(a): a durably-proven merge or
+        settlement must reach its terminal durable state regardless of
+        any downstream Linear/queue/assignment projection failure — a
+        missing stored projection, a Linear API error, an
+        acceptance-dispatch failure. Every caller of
+        ``_project_after_merge`` reaches it only after its own durable
+        write has already committed (the review row's ``merged``
+        transition and ``merge.proven`` event for the fresh caller in
+        ``_settle_proven``; nothing new at all for the replay callers
+        in ``_drive_merge`` and ``reconcile_external_merge``, which
+        perform no mutation), so a projection failure here is reported
+        and left for the next recovery boundary — ``reconcile_acceptance``,
+        riding the same ``resume_settlements`` pass — to repair,
+        exactly as that pass already fails soft per gate.
+        """
+
+        try:
+            await self._project_after_merge(record, reconciling=reconciling)
+        except Exception as error:
+            print(
+                "post-merge projection for "
+                f"{record.review_id!r} failed and will retry at the "
+                f"next recovery boundary: {type(error).__name__}: "
+                f"{error}",
+                file=sys.stderr,
+            )
 
     async def _project_after_merge(
         self, record: ReviewRecord, *, reconciling: bool = False
