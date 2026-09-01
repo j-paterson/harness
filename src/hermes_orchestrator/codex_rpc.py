@@ -42,6 +42,8 @@ _STABLE_METHODS = frozenset(
         "thread/name/set",
         "thread/section/move",
         "threadSection/list",
+        "thread/queue/list",
+        "thread/queue/start",
         "thread/read",
         "thread/resume",
         "thread/start",

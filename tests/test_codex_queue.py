@@ -1494,3 +1494,182 @@ async def test_a_lapsed_claim_alone_cannot_record_a_delivery_success(
     )
     assert (await delivery.deliver("demo", event)).delivered is True
     assert delivered_event_ids(database) == ["evt-1"]
+
+
+# ---------------------------------------------------------------------------
+# INFRA-223: the queued turn on the idle pinned thread must actually start
+# ---------------------------------------------------------------------------
+
+
+class FakeQueueRpc:
+    """One short-lived App Server connection, recorded end to end."""
+
+    def __init__(
+        self,
+        listing: dict[str, Any] | None = None,
+        *,
+        fail_on: str | None = None,
+    ) -> None:
+        self.listing = listing if listing is not None else {"items": []}
+        self.fail_on = fail_on
+        self.started = False
+        self.closed = 0
+        self.requests: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def start(self) -> None:
+        if self.fail_on == "start":
+            raise RuntimeError("codex app-server unavailable")
+        self.started = True
+
+    async def request(
+        self, method: str, params: dict[str, Any] | None, timeout: float
+    ) -> dict[str, Any]:
+        self.requests.append((method, params))
+        if self.fail_on == method:
+            raise RuntimeError(f"{method} is not supported")
+        if method == "thread/queue/list":
+            return self.listing
+        return {}
+
+    async def close(self) -> None:
+        self.closed += 1
+
+    def methods(self) -> list[str]:
+        return [method for method, _ in self.requests]
+
+
+def starting_delivery(
+    merger: CodexMerger, manifest_root: Path, factory: Any, rpc: FakeQueueRpc
+) -> CodexQueueDelivery:
+    return CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+        rpc_factory=lambda: rpc,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_queued_head_carrying_this_event_is_started_then_released(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """The observed blocker, closed: `codex queue` persisted the envelope
+    for the idle pinned thread but never started the turn. After a
+    successful delivery the exact queued head is listed, started, and the
+    connection is dropped immediately."""
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    rpc = FakeQueueRpc(
+        {"items": [{"id": "qi-1", "text": event.render(1)}]}
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, rpc)
+
+    result = await delivery.deliver("demo", event)
+
+    assert result.delivered is True
+    assert rpc.methods() == ["thread/queue/list", "thread/queue/start"]
+    assert rpc.requests[0][1] == {"threadId": "thr_stored"}
+    assert rpc.requests[1][1] == {
+        "threadId": "thr_stored",
+        "queueItemId": "qi-1",
+    }
+    # Never left attached to an idle Sol.
+    assert rpc.closed == 1
+    assert delivered_event_ids(database) == ["evt-1"]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_delivered_wake_retries_only_the_bounded_start(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+    )
+    assert (await delivery.deliver("demo", event)).delivered
+
+    rpc = FakeQueueRpc(
+        {"items": [{"id": "qi-1", "text": event.render(1)}]}
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, rpc)
+    await delivery.deliver("demo", event)
+    assert len(factory.calls) == 1
+    assert rpc.methods() == ["thread/queue/list", "thread/queue/start"]
+
+
+@pytest.mark.asyncio
+async def test_a_head_that_is_not_this_candidates_is_never_started(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """Identity comes only from what is already durable: the wake's own
+    event id inside the rendered envelope. A head that does not carry it
+    is someone else's turn and is left exactly where it is."""
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    other = wake_event(manifest_root, event_id="evt-9", candidate_sha="5" * 40)
+    rpc = FakeQueueRpc(
+        {"items": [{"id": "qi-other", "text": other.render(1)}]}
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, rpc)
+
+    result = await delivery.deliver("demo", event)
+
+    assert result.delivered is True
+    assert rpc.methods() == ["thread/queue/list"]
+    assert rpc.closed == 1
+    assert delivered_event_ids(database) == ["evt-1"]
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_queue_surface_changes_nothing_and_raises_nothing(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """A Codex without the two methods, and a connection that will not
+    open at all, are the same thing: do nothing, silently."""
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    refusing = FakeQueueRpc(
+        {"items": [{"id": "qi-1", "text": event.render(1)}]},
+        fail_on="thread/queue/list",
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, refusing)
+
+    result = await delivery.deliver("demo", event)
+
+    assert result.delivered is True
+    assert result.reason == "delivered"
+    assert refusing.methods() == ["thread/queue/list"]
+    assert refusing.closed == 1
+    assert delivered_event_ids(database) == ["evt-1"]
+
+    unreachable = FakeQueueRpc(fail_on="start")
+    second = wake_event(manifest_root, event_id="evt-2", candidate_sha="7" * 40)
+    assert merger.release_delivered_wake(
+        "demo", "evt-1", outcome="rejected"
+    ) is True
+    retry = starting_delivery(merger, manifest_root, factory, unreachable)
+
+    again = await retry.deliver("demo", second)
+
+    assert again.delivered is True
+    assert unreachable.requests == []
+    assert unreachable.closed == 1
+    assert delivered_event_ids(database) == ["evt-2"]

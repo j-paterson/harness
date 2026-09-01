@@ -2110,3 +2110,252 @@ async def test_restart_reopens_the_same_candidate_and_never_skips_it(
     assert settled.kind == "merged"
     assert _wake_states(flow)[second.event.event_id] == "delivered"
     assert restarted.outstanding_wake("demo") == (second.event, "delivered")
+
+
+# -- INFRA-223: orphaned submissions never hold the Sol thread ------------
+
+
+async def _orphaned_merged_submission(flow: ProductionShapedFlow) -> str:
+    """The observed shape: wake 'completed', review 'merged', row 'submitted'.
+
+    Drives the REAL approval end to end, so the wake and the review reach
+    their genuine terminal durable states, then re-opens only the
+    submission's own row — exactly the state a crash (or a lost signal)
+    between the settlement's durable writes and ``_record_settled``
+    leaves behind, and the state observed live for INFRA-212/INFRA-220.
+    """
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    settled = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+    assert settled.kind == "merged"
+    event_id = emitted.event.event_id
+    flow.database.execute(
+        "UPDATE submitted_verdicts SET state = 'submitted', result_json = NULL "
+        "WHERE event_id = ?",
+        (event_id,),
+    )
+    assert _wake_states(flow)[event_id] == "completed"
+    assert _review_state(flow, event_id) == "merged"
+    assert _submitted_rows(flow) == [
+        (event_id, "submitted", flow.verdict(SHA_A, branch, 14))
+    ]
+    return event_id
+
+
+def _review_state(flow: ProductionShapedFlow, event_id: str) -> str:
+    row = flow.database.execute(
+        "SELECT state FROM reviews WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    return str(row["state"])
+
+
+def _insert_review(
+    flow: ProductionShapedFlow,
+    *,
+    event_id: str,
+    issue_id: str,
+    sha: str,
+    state: str,
+) -> None:
+    """Insert one raw ``reviews`` row in an explicit state."""
+
+    stamp = flow.clock.isoformat()
+    flow.database.execute(
+        "INSERT INTO reviews(review_id, project_key, issue_id, event_id, "
+        "repository, branch, pr_number, reviewed_sha, state, merge_sha, "
+        "reason, projection_json, created_at, updated_at) "
+        "VALUES (?, 'demo', ?, ?, 'j-paterson/demo', ?, 14, ?, ?, NULL, "
+        "'fixture', NULL, ?, ?)",
+        (
+            f"review:demo:{event_id}",
+            issue_id,
+            event_id,
+            f"feature/{issue_id.lower()}",
+            sha,
+            state,
+            stamp,
+            stamp,
+        ),
+    )
+
+
+def _settled_result(flow: ProductionShapedFlow, event_id: str) -> dict[str, Any]:
+    row = flow.database.execute(
+        "SELECT state, result_json FROM submitted_verdicts WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert str(row["state"]) == "settled"
+    return json.loads(str(row["result_json"]))
+
+
+def _reconciled_submissions(flow: ProductionShapedFlow) -> list[dict[str, Any]]:
+    rows = flow.database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'submitted_verdict.reconciled_settled' "
+        "ORDER BY sequence ASC"
+    ).fetchall()
+    return [json.loads(r["payload_json"]) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_orphaned_submission_is_reconciled_at_the_recovery_boundary(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 required test 1, observed shape: a 'submitted' row whose
+    # own wake is 'completed' and whose own review is 'merged' is settled
+    # durably at the startup/recovery boundary — with no review re-run,
+    # no merge re-run, and no pull request touched.
+    event_id = await _orphaned_merged_submission(flow)
+    reviews_before = _review_count(flow)
+    merge_calls = list(flow.github.merge_calls)
+    discover_calls = list(flow.github.discover_calls)
+    list_calls = list(flow.github.list_calls)
+    rendered = flow.processes.messages()
+
+    outcomes = await flow.turns.recover_outstanding(("demo",))
+
+    assert outcomes == ()
+    result = _settled_result(flow, event_id)
+    # The derived terminal result is the review row's own terminal state,
+    # review id and proven merge SHA — nothing else.
+    assert result["kind"] == "merged"
+    assert result["event_id"] == event_id
+    assert result["review_id"] == f"review:demo:{event_id}"
+    assert result["merge_sha"] == merge_sha_for(SHA_A)
+    assert "INFRA-223" in result["reason"]
+    # Nothing was re-run: no new review, no merge, no PR discovery or
+    # listing, and no candidate re-rendered into the thread.
+    assert _review_count(flow) == reviews_before
+    assert flow.github.merge_calls == merge_calls
+    assert flow.github.discover_calls == discover_calls
+    assert flow.github.list_calls == list_calls
+    assert flow.processes.messages() == rendered
+    assert _wake_states(flow)[event_id] == "completed"
+    assert _review_state(flow, event_id) == "merged"
+    assert [event["reason"] for event in _reconciled_submissions(flow)] == [
+        result["reason"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconciled_submission_no_longer_reports_review_active(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 required test 2: has_pending_submission repairs the row
+    # first and then answers from the repaired state — False, with
+    # nothing outstanding, so MergerSession.review_active sees no work.
+    event_id = await _orphaned_merged_submission(flow)
+
+    assert flow.turns.has_pending_submission("demo") is False
+
+    assert _settled_result(flow, event_id)["kind"] == "merged"
+    assert flow.turns.outstanding_wake("demo") is None
+
+
+@pytest.mark.asyncio
+async def test_live_submission_is_preserved_and_still_holds_review_active(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 required test 3: a genuinely live submission is left
+    # exactly as it is and still reports active — in both shapes, a wake
+    # that still holds the reviewer, and a review that is not terminal.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 14)
+    _persist_submitted_row(flow, emitted.event.event_id, "ENG-9", SHA_A, document)
+    # Shape A: the wake is still 'delivered' (it holds the reviewer),
+    # even with a terminal review row for the same event.
+    _insert_review(
+        flow, event_id=emitted.event.event_id, issue_id="ENG-9", sha=SHA_A,
+        state="merged",
+    )
+
+    assert flow.turns.reconcile_orphaned_submissions("demo") == ()
+    assert flow.turns.has_pending_submission("demo") is True
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "submitted", document)
+    ]
+
+    # Shape B: the wake is terminal but the review is still in flight.
+    flow.database.execute(
+        "UPDATE wake_deliveries SET state = 'completed' WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    for live_state in ("recorded", "merging", "approved", "blocked"):
+        flow.database.execute(
+            "UPDATE reviews SET state = ? WHERE event_id = ?",
+            (live_state, emitted.event.event_id),
+        )
+        assert flow.turns.reconcile_orphaned_submissions("demo") == ()
+        assert flow.turns.has_pending_submission("demo") is True
+        assert _submitted_rows(flow) == [
+            (emitted.event.event_id, "submitted", document)
+        ]
+    assert _reconciled_submissions(flow) == []
+
+
+@pytest.mark.asyncio
+async def test_orphan_reconciliation_is_idempotent_across_a_restart(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 required test 4: running the boundary twice (the second
+    # from a freshly constructed service, as a restart would) settles the
+    # row once, journals exactly one event, and never rewrites it.
+    event_id = await _orphaned_merged_submission(flow)
+
+    assert await flow.turns.recover_outstanding(("demo",)) == ()
+    first = _settled_result(flow, event_id)
+    rows = _submitted_rows(flow)
+
+    restarted = flow.new_turns(flow.merger, flow.rpc)
+    assert restarted.reconcile_orphaned_submissions("demo") == ()
+    assert await restarted.recover_outstanding(("demo",)) == ()
+
+    assert _settled_result(flow, event_id) == first
+    assert _submitted_rows(flow) == rows
+    assert len(_reconciled_submissions(flow)) == 1
+    assert restarted.has_pending_submission("demo") is False
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_never_derives_a_verdict_from_transcript_text(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 required test 5: the terminal result comes only from the
+    # durable wake and review rows. An approval-shaped transcript neither
+    # settles a live submission nor is ever read.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 14)
+    _persist_submitted_row(flow, emitted.event.event_id, "ENG-9", SHA_A, document)
+    flow.database.execute(
+        "UPDATE wake_deliveries SET state = 'completed' WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    # The thread claims an approval; the durable review is not terminal.
+    _insert_review(
+        flow, event_id=emitted.event.event_id, issue_id="ENG-9", sha=SHA_A,
+        state="recorded",
+    )
+    flow.report(json.dumps(json.loads(document)))
+    before = list(flow.rpc.methods)
+
+    assert flow.turns.reconcile_orphaned_submissions("demo") == ()
+
+    assert flow.turns.has_pending_submission("demo") is True
+    assert _submitted_rows(flow) == [
+        (emitted.event.event_id, "submitted", document)
+    ]
+    assert flow.github.merge_calls == []
+    # Not one thread read: the transcript is never a verdict source.
+    assert flow.rpc.methods == before
+    assert "thread/read" not in flow.rpc.methods

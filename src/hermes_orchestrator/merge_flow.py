@@ -302,6 +302,12 @@ def build_merge_flow(
     delivery_kwargs: dict[str, Any] = {"processes": processes}
     if queue_process_factory is not None:
         delivery_kwargs["process_factory"] = queue_process_factory
+    # INFRA-223: a short-lived App Server connection, built fresh per
+    # bounded start and closed immediately, so the queued turn on the idle
+    # pinned thread is actually started without ever holding the thread.
+    delivery_kwargs["rpc_factory"] = lambda: CodexRpcClient(
+        app_server_command(), base_env=base_env, processes=processes
+    )
     delivery = CodexQueueDelivery(
         channels=merger, manifest_root=manifest_root, **delivery_kwargs
     )

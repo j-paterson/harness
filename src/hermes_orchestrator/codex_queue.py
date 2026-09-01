@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from hermes_orchestrator.codex_merger import ReviewerChannel, WakeRegistration
 from hermes_orchestrator.manifests import (
@@ -33,7 +33,59 @@ CODEX_QUEUE_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
 #: once the current candidate's verdict settles.
 CANDIDATE_QUEUED = "candidate_queued"
 
+#: INFRA-223: the observed blocker was exactly this -- ``codex queue
+#: --thread`` persisted the envelope for the idle pinned Sol thread, but
+#: the queued turn never started. These are the two App Server methods the
+#: bounded start below uses, and the only ones it is allowed to use.
+THREAD_QUEUE_LIST = "thread/queue/list"
+THREAD_QUEUE_START = "thread/queue/start"
+
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
+
+
+class QueueRpc(Protocol):
+    """The short-lived App Server connection the bounded start needs."""
+
+    async def start(self) -> None: ...
+
+    async def request(
+        self, method: str, params: dict[str, Any] | None, timeout: float
+    ) -> dict[str, Any]: ...
+
+    async def close(self) -> None: ...
+
+
+#: Builds one short-lived App Server connection. ``None`` means the caller
+#: wired no connection, and the bounded start is simply not attempted.
+RpcFactory = Callable[[], QueueRpc]
+
+
+def _own_queue_head(result: object, event_id: str) -> str | None:
+    """Return the head item id when the head is provably this wake's.
+
+    The only identity used is one that is ALREADY durable: the wake's own
+    event id, which :meth:`WakeEvent.render` writes into the queued
+    envelope text as ``event=<event_id> generation=<n>``. Nothing weaker
+    counts -- an empty queue, a head with no id, a head whose text is not
+    exposed, or a head carrying someone else's event id all return
+    ``None`` and nothing is started.
+    """
+
+    if not isinstance(result, dict):
+        return None
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+    head = items[0]
+    if not isinstance(head, dict):
+        return None
+    item_id = head.get("id")
+    text = head.get("text")
+    if not isinstance(item_id, str) or not item_id:
+        return None
+    if not isinstance(text, str) or f" event={event_id} " not in text:
+        return None
+    return item_id
 
 
 class ChannelStore(Protocol):
@@ -98,6 +150,7 @@ class CodexQueueDelivery:
         timeout: float = 10.0,
         termination_timeout: float = 5.0,
         processes: ProcessRegistry | None = None,
+        rpc_factory: RpcFactory | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("delivery timeout must be positive")
@@ -110,6 +163,7 @@ class CodexQueueDelivery:
         self._process_factory = process_factory
         self._timeout = timeout
         self._termination_timeout = termination_timeout
+        self._rpc_factory = rpc_factory
 
     async def deliver(
         self, project_key: str, event: WakeEvent
@@ -162,6 +216,11 @@ class CodexQueueDelivery:
                 generation=None,
                 reason="event_conflict",
             )
+        if (
+            registration.state in ("delivered", "admitted")
+            and registration.thread_id is not None
+        ):
+            await self._start_queued_head(registration.thread_id, event.event_id)
         if registration.state in ("delivered", "admitted", "completed"):
             return QueueDeliveryResult(
                 delivered=True,
@@ -240,6 +299,10 @@ class CodexQueueDelivery:
                     candidate_sha=event.candidate_sha,
                 )
                 if recorded:
+                    # INFRA-223: `codex queue` exiting 0 only persisted the
+                    # envelope onto the idle pinned thread. Start that exact
+                    # queued head now, then let go of the thread again.
+                    await self._start_queued_head(thread_id, event.event_id)
                     return QueueDeliveryResult(
                         delivered=True,
                         attempts=attempts,
@@ -270,6 +333,48 @@ class CodexQueueDelivery:
             generation=generation,
             reason=reason,
         )
+
+    async def _start_queued_head(self, thread_id: str, event_id: str) -> None:
+        """Start the exact head just queued, then disconnect immediately.
+
+        One bounded action, no state of its own: connect, list the thread
+        queue, start the head that provably carries this wake's event id,
+        disconnect. The connection is released in ``finally`` on every
+        path, so it can never stay attached to an idle Sol.
+
+        Everything else fails closed and silent -- no connection wired, a
+        connection that will not start, an empty queue, a head that is not
+        this candidate's, an App Server that does not implement the two
+        methods (a refused call is signal enough), or any RPC error. In
+        each case nothing is started, nothing is written, and the caller
+        sees exactly today's behaviour.
+        """
+
+        factory = self._rpc_factory
+        if factory is None:
+            return
+        try:
+            client = factory()
+        except Exception:
+            return
+        try:
+            await client.start()
+            listing = await client.request(
+                THREAD_QUEUE_LIST, {"threadId": thread_id}, self._timeout
+            )
+            item_id = _own_queue_head(listing, event_id)
+            if item_id is None:
+                return
+            await client.request(
+                THREAD_QUEUE_START,
+                {"threadId": thread_id, "queueItemId": item_id},
+                self._timeout,
+            )
+        except Exception:
+            return
+        finally:
+            with suppress(Exception):
+                await client.close()
 
     def _ready_channel(self, project_key: str) -> ReviewerChannel | None:
         channel = self._channels.read_channel(project_key)

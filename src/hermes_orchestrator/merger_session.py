@@ -79,6 +79,13 @@ class MergerSession:
         wake (``MergerTurnService.outstanding_wake``) or a durable
         ``submitted_verdicts`` row still in state ``'submitted'``
         (``MergerTurnService.has_pending_submission``).
+
+        INFRA-223: both helpers repair their own durable state before
+        answering -- ``outstanding_wake`` retires a settled or superseded
+        wake, and ``has_pending_submission`` settles a submission whose
+        own wake and own review are already terminal -- so a purely
+        historical row can no longer report live review work and hold
+        the pinned Sol transcript open behind an App Server.
         """
 
         if self._is_review_active is not None:
