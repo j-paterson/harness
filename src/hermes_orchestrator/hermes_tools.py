@@ -141,9 +141,26 @@ class PendingCorrectionsCommand(_Command):
     project_key: NonEmptyText | None = None
 
 
+class FetchCorrectionCommand(_Command):
+    """The one supported intake of a correction's complete record."""
+
+    intent: Literal["fetch_correction"]
+    correction_id: NonEmptyText
+
+
 class AckCorrectionCommand(_Command):
+    """Confirmation as an assertion of what was actually read.
+
+    ``observed_count`` and ``payload_sha256`` are required and strict: a
+    missing or blank field cannot parse into this command, so a
+    confirmation informed by a truncated glance at the payload never
+    reaches the outbox at all.
+    """
+
     intent: Literal["ack_correction"]
     correction_id: NonEmptyText
+    observed_count: int = Field(ge=0)
+    payload_sha256: NonEmptyText
 
 
 class PendingWakesCommand(_Command):
@@ -232,6 +249,7 @@ HermesCommand = Annotated[
     | RequestCleanupCommand
     | QaRejectCommand
     | PendingCorrectionsCommand
+    | FetchCorrectionCommand
     | AckCorrectionCommand
     | ReportStallCommand
     | ApprovePlaybookCommand
@@ -266,6 +284,7 @@ _ALLOWED_INTENTS = frozenset(
         "request_cleanup",
         "qa_reject",
         "pending_corrections",
+        "fetch_correction",
         "ack_correction",
         "report_stall",
         "approve_playbook",

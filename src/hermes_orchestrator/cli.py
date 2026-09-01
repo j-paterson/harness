@@ -2094,8 +2094,15 @@ def _hermes_handlers(
         items = outbox.pending(command.project_key)
         return {"corrections": [item.as_dict() for item in items]}
 
+    def fetch_correction(command: Any) -> dict[str, Any]:
+        return outbox.fetch(command.correction_id)
+
     def ack_correction(command: Any) -> dict[str, Any]:
-        return outbox.acknowledge(command.correction_id).as_dict()
+        return outbox.acknowledge(
+            command.correction_id,
+            observed_count=command.observed_count,
+            payload_sha256=command.payload_sha256,
+        ).as_dict()
 
     def pending_wakes(command: Any) -> dict[str, Any]:
         if runtime.lead_wakes is None:
@@ -2368,6 +2375,7 @@ def _hermes_handlers(
     return {
         "retry": _retry_handler(runtime.queue),
         "pending_corrections": pending_corrections,
+        "fetch_correction": fetch_correction,
         "ack_correction": ack_correction,
         "pending_wakes": pending_wakes,
         "ack_wake": ack_wake,

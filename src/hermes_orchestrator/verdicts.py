@@ -35,8 +35,11 @@ _ENVELOPE_KEYS = frozenset(
         "packets",
     }
 )
-_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-_PACKET_KEYS = frozenset(
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+#: The exact reviewer-supplied key set of one correction packet. Public
+#: because the durable outbox derives its own stored-packet key set from
+#: this one (plus the stamped ``pr_number``), so the two cannot drift.
+PACKET_KEYS = frozenset(
     {
         "severity",
         "repository",
@@ -47,6 +50,14 @@ _PACKET_KEYS = frozenset(
         "required_correction",
         "required_tests",
     }
+)
+#: The packet fields that must each be a non-empty string.
+_PACKET_TEXT_KEYS = (
+    "repository",
+    "branch",
+    "evidence",
+    "acceptance_criterion",
+    "required_correction",
 )
 
 
@@ -203,7 +214,7 @@ def _parse_binding(value: dict[str, Any]) -> VerdictBinding:
     reviewed_sha = value["reviewed_sha"]
     if (
         not isinstance(reviewed_sha, str)
-        or _SHA_PATTERN.match(reviewed_sha) is None
+        or SHA_PATTERN.match(reviewed_sha) is None
     ):
         raise VerdictError("verdict reviewed_sha is invalid")
     return VerdictBinding(
@@ -213,48 +224,73 @@ def _parse_binding(value: dict[str, Any]) -> VerdictBinding:
     )
 
 
-def _parse_packet(entry: Any) -> CorrectionPacket:
-    if not isinstance(entry, dict):
-        raise VerdictError("correction packet must be an object")
-    if set(entry) != _PACKET_KEYS:
-        unexpected = sorted(set(entry) ^ _PACKET_KEYS)[0]
-        raise VerdictError(
-            f"correction packet field {unexpected} is invalid"
-        )
-    if entry["severity"] not in SEVERITIES:
-        raise VerdictError(
-            f"unknown correction severity {entry['severity']!r}"
-        )
-    for field in (
-        "repository",
-        "branch",
-        "evidence",
-        "acceptance_criterion",
-        "required_correction",
-    ):
-        if not isinstance(entry[field], str) or not entry[field]:
-            raise VerdictError(f"correction packet {field} is invalid")
-    reviewed_sha = entry["reviewed_sha"]
+def packet_value_violation(entry: Any) -> str | None:
+    """Describe how ``entry``'s VALUES violate the packet schema.
+
+    This is the ONE authoritative statement of the ``CorrectionPacket``
+    value constraints — the severity vocabulary, the non-empty required
+    text, the 40-hex reviewed SHA, and the non-empty list of non-empty
+    required tests. :func:`_parse_packet` enforces it on a reviewer's
+    document and ``lead_outbox.packet_schema_violation`` enforces the
+    same function on a stored durable packet, so no rule can hold in one
+    place and not the other.
+
+    Keys are deliberately NOT checked here: each caller owns its own key
+    set (a stored packet additionally carries the stamped ``pr_number``)
+    and both derive it from :data:`PACKET_KEYS`. ``None`` means every
+    value is admissible.
+    """
+
+    severity = entry.get("severity")
+    if severity not in SEVERITIES:
+        return f"has an unknown severity {severity!r}"
+    for field in _PACKET_TEXT_KEYS:
+        value = entry.get(field)
+        if not isinstance(value, str) or not value:
+            return f"has an invalid {field} (a non-empty string is required)"
+    reviewed_sha = entry.get("reviewed_sha")
     if (
         not isinstance(reviewed_sha, str)
-        or _SHA_PATTERN.match(reviewed_sha) is None
+        or SHA_PATTERN.match(reviewed_sha) is None
     ):
-        raise VerdictError("correction packet reviewed_sha is invalid")
-    tests = entry["required_tests"]
+        return (
+            "has an invalid reviewed_sha (40 lowercase hex characters are "
+            "required)"
+        )
+    # JSON decoding only ever yields a list here; a tuple is admitted so
+    # in-process callers holding the stored form need no conversion.
+    tests = entry.get("required_tests")
     if (
-        not isinstance(tests, list)
+        not isinstance(tests, list | tuple)
         or not tests
         or not all(isinstance(item, str) and item for item in tests)
     ):
-        raise VerdictError("correction packet required_tests is invalid")
+        return (
+            "has an invalid required_tests (a non-empty list of non-empty "
+            "strings is required)"
+        )
+    return None
+
+
+def _parse_packet(entry: Any) -> CorrectionPacket:
+    if not isinstance(entry, dict):
+        raise VerdictError("correction packet must be an object")
+    if set(entry) != PACKET_KEYS:
+        unexpected = sorted(set(entry) ^ PACKET_KEYS)[0]
+        raise VerdictError(
+            f"correction packet field {unexpected} is invalid"
+        )
+    violation = packet_value_violation(entry)
+    if violation is not None:
+        raise VerdictError(f"correction packet {violation}")
     return CorrectionPacket(
         severity=entry["severity"],
         repository=entry["repository"],
         branch=entry["branch"],
         pr_number=0,
-        reviewed_sha=reviewed_sha,
+        reviewed_sha=entry["reviewed_sha"],
         evidence=entry["evidence"],
         acceptance_criterion=entry["acceptance_criterion"],
         required_correction=entry["required_correction"],
-        required_tests=tuple(tests),
+        required_tests=tuple(entry["required_tests"]),
     )

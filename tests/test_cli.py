@@ -1161,6 +1161,101 @@ def test_record_direct_exception_measures_the_live_diff_via_the_run_seam(
     }
 
 
+def test_correction_intake_is_fetched_whole_and_confirmed_on_proof(
+    tmp_path: Path,
+) -> None:
+    """INFRA-193: the ``hermes-command`` surface routes a complete fetch,
+    and only a confirmation carrying that fetch's exact ``declared_count``
+    and ``payload_sha256`` reaches the durable outbox. A confirmation
+    short by one finding — the recurrence — is rejected end to end with
+    the correction left pending."""
+
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.hermes_tools import HermesCommandService
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+    from hermes_orchestrator.verdicts import CorrectionPacket
+
+    runtime = _runtime_like(tmp_path)
+    events = EventStore(runtime.database)
+    outbox = LeadCorrectionOutbox(
+        database=runtime.database,
+        events=events,
+        project_for_issue=lambda issue_id: "demo",
+        ids=lambda: "corr-1",
+    )
+    handlers = _hermes_handlers(
+        SimpleNamespace(repo_root=tmp_path),
+        runtime,
+        outbox,
+        SubagentPackets(runtime.database, events=events),
+    )
+    service = HermesCommandService(runtime.queue, handlers=handlers)
+
+    sha = "a" * 40
+    findings = ("F1-retry", "F2-index", "F3-except", "F4-stale-cache-read")
+    outbox.deliver(
+        "ENG-9",
+        tuple(
+            CorrectionPacket(
+                severity="Critical" if marker.startswith("F1") else "Important",
+                repository="j-paterson/demo",
+                branch="feature/eng-9",
+                pr_number=14,
+                reviewed_sha=sha,
+                evidence=f"{marker}: " + f"evidence for {marker}. " * 40,
+                acceptance_criterion=f"{marker} regression test",
+                required_correction=f"correct {marker}",
+                required_tests=(f"test_{marker}",),
+            )
+            for marker in findings
+        ),
+    )
+
+    fetched = service.execute(
+        {"intent": "fetch_correction", "correction_id": "corr-1"}
+    )
+    assert fetched.code == "accepted"
+    assert fetched.state["declared_count"] == 4
+    rendered = json.dumps(fetched.state, sort_keys=True)
+    assert len(rendered) > 2400
+    for marker in findings:
+        assert marker in rendered
+
+    short = service.execute(
+        {
+            "intent": "ack_correction",
+            "correction_id": "corr-1",
+            "observed_count": 3,
+            "payload_sha256": fetched.state["payload_sha256"],
+        }
+    )
+    assert short.code == "rejected"
+    assert "declares 4 packets" in str(short.state["reason"])
+    assert outbox.get("corr-1").state == "pending"
+    assert (
+        runtime.database.scalar(
+            "SELECT count(*) FROM events "
+            "WHERE event_type = 'lead_correction.acknowledged'"
+        )
+        == 0
+    )
+
+    confirmed = service.execute(
+        {
+            "intent": "ack_correction",
+            "correction_id": "corr-1",
+            "observed_count": 4,
+            "payload_sha256": fetched.state["payload_sha256"],
+        }
+    )
+    assert confirmed.code == "accepted"
+    assert confirmed.state["state"] == "acknowledged"
+
+
 def test_record_direct_exception_refuses_before_any_packet_when_unmeasurable(
     tmp_path: Path,
 ) -> None:

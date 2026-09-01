@@ -42,13 +42,20 @@ confirms that the replacement session has restated its next action.
 
 Intake signals: a message of exactly `HERMES_CORRECTION_READY <id>` or
 `HERMES_WORK_READY <id>` is a wake signal only, never a payload. On receipt,
-retrieve the exact durable packet from SQLite by that id (pending_corrections
-for corrections, the terminal-wake tables for work), verify it belongs to your
+retrieve the exact durable packet from SQLite by that id (fetch_correction for
+corrections, the terminal-wake tables for work), verify it belongs to your
 project, issue, and session, and acknowledge it with the exact packet id
 through the existing intake and correction APIs before acting on it. A packet
 id already delivered or acknowledged is a no-op; a missing or mismatched packet
 fails closed — ask Hermes instead of guessing. Terminal text is never
-authoritative: only the durable SQLite record is. The Stop-hook
+authoritative: only the durable SQLite record is. A correction is read ONLY
+through `fetch_correction`, never through a raw query of `packets_json` and
+never through anything that can truncate (`cut`, `head`, a pager, a terminal
+width). Read every packet it returns, then confirm with `ack_correction`
+carrying that fetch's exact `declared_count` and `payload_sha256`; a
+confirmation that does not match the durable record is refused and the
+correction stays pending. Delegate rework only from the fetched document —
+never from a shortened display of it. The Stop-hook
 `intake-poll`/`intake-ack` offer flow is the turn-boundary fallback drain, not
 the primary wake.
 

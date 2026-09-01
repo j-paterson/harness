@@ -455,7 +455,14 @@ async def test_defect_returns_packet_via_outbox_then_correction_routes_to_ryan(
     await flow.reviews.resume_settlements("demo")
     assert flow.linear.targets[-1] == ("ENG-10", "In Development", "operator")
 
-    flow.outbox.acknowledge(pending[0].correction_id)
+    # INFRA-193: confirmation is only reachable through the complete
+    # fetch — the count and digest it returns are what acknowledge checks.
+    fetched = flow.outbox.fetch(pending[0].correction_id)
+    flow.outbox.acknowledge(
+        pending[0].correction_id,
+        observed_count=fetched["declared_count"],
+        payload_sha256=fetched["payload_sha256"],
+    )
     flow.stage("ENG-10", SHA_B, pr_number=15)
     corrected = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
     assert corrected.delivery.delivered
