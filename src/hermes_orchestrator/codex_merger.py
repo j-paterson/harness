@@ -104,8 +104,12 @@ def _reviewer_is_held(
     ``rejected`` written when a verdict settles -- leaves the reviewer
     free. An EXPIRED claim is an abandoned delivery, not a held reviewer,
     so a crashed deliverer can never wedge the queue past its bounded
-    lease. The row for ``except_event_id`` is never counted: a wake never
-    blocks itself (its own reopen and re-claim must still work).
+    lease -- but every caller must first run
+    :func:`_requeue_expired_claims` in the same transaction, so that an
+    abandoned claim is INVALIDATED rather than merely ignored before any
+    other candidate is allowed out. The row for ``except_event_id`` is
+    never counted: a wake never blocks itself (its own reopen and
+    re-claim must still work).
     """
 
     row = connection.execute(
@@ -117,6 +121,34 @@ def _reviewer_is_held(
     ).fetchone()
     return row is not None
 
+
+def _requeue_expired_claims(
+    connection: sqlite3.Connection, project_key: str, *, stamp: str
+) -> None:
+    """Invalidate every lapsed delivery claim, returning it to the queue.
+
+    Sol correction 370eb20c: honouring expiry when deciding whether the
+    reviewer is held is what stops a crashed deliverer from wedging the
+    queue, but ignoring an expired claim while leaving its token usable
+    opened a window in which a LATE success from that abandoned claimant
+    could deliver a second candidate. So expiry is applied as a durable
+    write, never as a read-time exemption: the lapsed row goes back to
+    ``pending`` and its ``claim_token`` is dropped, which both keeps the
+    candidate queued (never skipped) and makes the abandoned token
+    permanently unusable at :meth:`CodexMerger.record_wake_delivery_success`.
+
+    Callers run this inside the SAME ``BEGIN IMMEDIATE`` transaction as
+    the :func:`_reviewer_is_held` check and the release it guards, so no
+    late success can slip between the reap and the release.
+    """
+
+    connection.execute(
+        "UPDATE wake_deliveries SET state = 'pending', claim_token = NULL, "
+        "claim_expires_at = NULL, updated_at = ? "
+        "WHERE project_key = ? AND state = 'claimed' "
+        "AND (claim_expires_at IS NULL OR claim_expires_at <= ?)",
+        (stamp, project_key, stamp),
+    )
 
 
 class RpcRequester(Protocol):
@@ -436,8 +468,10 @@ class CodexMerger:
         heartbeat fallback before any external call. When the channel is
         ready, exactly one caller acquires the exclusive delivery claim and
         receives its token; an unexpired claim held elsewhere returns
-        ``in_flight`` without any invoke, and an expired claim is re-issued
-        so a crashed deliverer recovers after the bounded lease. A wake (or
+        ``in_flight`` without any invoke, and an expired claim is durably
+        invalidated and requeued before anything is released, so a crashed
+        deliverer recovers after the bounded lease while its abandoned
+        token can never complete afterwards. A wake (or
         the canonical owning event of the same candidate identity) that was
         delivered to a stale thread or generation is atomically reopened. A
         payload, digest, or durable file-identity divergence is a conflict
@@ -466,6 +500,11 @@ class CodexMerger:
         ).isoformat()
         identity = manifest.identity
         with self._database.transaction() as connection:
+            # Sol correction 370eb20c: invalidate abandoned claims FIRST,
+            # in this same transaction, so that any claim this
+            # registration is about to treat as expired has already lost
+            # its token before another candidate can be released.
+            _requeue_expired_claims(connection, project_key, stamp=stamp)
             channel_row = connection.execute(
                 "SELECT thread_id, generation, state FROM reviewer_channels "
                 "WHERE project_key = ?",
@@ -565,8 +604,8 @@ class CodexMerger:
                 "SELECT status, issue_id, candidate_sha, base_sha, branch, "
                 "manifest_path, manifest_digest, manifest_device, "
                 "manifest_inode, manifest_size, manifest_mtime_ns, "
-                "manifest_mode, state, thread_id, generation, claim_token, "
-                "claim_expires_at FROM wake_deliveries "
+                "manifest_mode, state, thread_id, generation "
+                "FROM wake_deliveries "
                 "WHERE project_key = ? AND event_id = ?",
                 (project_key, event.event_id),
             ).fetchone()
@@ -585,18 +624,11 @@ class CodexMerger:
                     arm_heartbeat()
                     return release_or_queue(event.event_id)
                 if state == "claimed":
+                    # Only an UNEXPIRED claim can still be read here: the
+                    # reap above already returned any lapsed claim to
+                    # 'pending' and voided its token.
                     arm_heartbeat()
-                    expires = row["claim_expires_at"]
-                    if expires is not None and str(expires) > stamp:
-                        return outcome("in_flight")
-                    connection.execute(
-                        "UPDATE wake_deliveries SET state = 'pending', "
-                        "claim_token = NULL, claim_expires_at = NULL, "
-                        "updated_at = ? WHERE project_key = ? "
-                        "AND event_id = ? AND state = 'claimed'",
-                        (stamp, project_key, event.event_id),
-                    )
-                    return release_or_queue(event.event_id)
+                    return outcome("in_flight")
                 if state == "pending":
                     arm_heartbeat()
                     return release_or_queue(event.event_id)
@@ -709,12 +741,31 @@ class CodexMerger:
         one transaction: a stale token cannot complete, a crash leaves the
         pre-armed fallback intact, and heartbeat is disabled only when no
         pending or claimed wake remains for the project.
+
+        Sol correction 370eb20c: this transition also FAILS CLOSED for a
+        LATE success arriving from a claim that has since lapsed or been
+        invalidated. State and token alone were not enough — an expired
+        claimant kept a usable token, so once another candidate had been
+        released its late success could still mark a second row
+        ``delivered``. The transition now additionally requires that the
+        row's claim has not lapsed as of this instant, and that no OTHER
+        candidate holds the reviewer. Both are read inside the same
+        ``BEGIN IMMEDIATE`` transaction as the write, so a late success
+        cannot slip between the read and the write of a concurrent
+        release, and the single-delivered-candidate invariant holds.
         """
 
         self._project(project_key)
         stamp = self._now().isoformat()
         try:
             with self._database.transaction() as connection:
+                if _reviewer_is_held(
+                    connection,
+                    project_key,
+                    except_event_id=event_id,
+                    stamp=stamp,
+                ):
+                    raise _WakeCasMiss
                 channel = connection.execute(
                     "UPDATE reviewer_channels SET "
                     "last_delivered_event_id = ?, "
@@ -734,13 +785,19 @@ class CodexMerger:
                 )
                 if channel.rowcount != 1:
                     raise _WakeCasMiss
+                # A claim is usable only up to and including its deadline
+                # instant; past it the lease has lapsed, and any release
+                # that observed the lapse already voided this token via
+                # _requeue_expired_claims, so the token test fails too.
                 wake = connection.execute(
                     "UPDATE wake_deliveries SET state = 'delivered', "
                     "thread_id = ?, generation = ?, claim_token = NULL, "
                     "claim_expires_at = NULL, "
                     "attempts = attempts + 1, updated_at = ? "
                     "WHERE project_key = ? AND event_id = ? "
-                    "AND state = 'claimed' AND claim_token = ?",
+                    "AND state = 'claimed' AND claim_token = ? "
+                    "AND claim_expires_at IS NOT NULL "
+                    "AND claim_expires_at >= ?",
                     (
                         thread_id,
                         generation,
@@ -748,6 +805,7 @@ class CodexMerger:
                         project_key,
                         event_id,
                         claim_token,
+                        stamp,
                     ),
                 )
                 if wake.rowcount != 1:
@@ -909,6 +967,13 @@ class CodexMerger:
         self._project(project_key)
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            # Sol correction 370eb20c: an abandoned claim is invalidated
+            # and requeued here, in the same transaction that decides
+            # whether the reviewer is free, so its token is already dead
+            # before this release can hand the reviewer to anyone else.
+            # The requeued candidate rejoins the queue in its original
+            # order, so an expired claim still never wedges the queue.
+            _requeue_expired_claims(connection, project_key, stamp=stamp)
             if _reviewer_is_held(
                 connection, project_key, except_event_id="", stamp=stamp
             ):
@@ -958,7 +1023,11 @@ class CodexMerger:
             # INFRA-221: the fallback is a delivery path too, so it obeys
             # the same one-candidate-at-a-time gate -- while a candidate
             # holds the reviewer with an unsettled verdict, the queued
-            # wakes behind it are not eligible to be woken.
+            # wakes behind it are not eligible to be woken. Sol correction
+            # 370eb20c: it is a release path too, so it invalidates lapsed
+            # claims first -- which is also how an abandoned delivery
+            # becomes eligible for the fallback at all.
+            _requeue_expired_claims(connection, project_key, stamp=stamp)
             if _reviewer_is_held(
                 connection, project_key, except_event_id="", stamp=stamp
             ):
@@ -968,10 +1037,9 @@ class CodexMerger:
                 "manifest_path, manifest_digest, manifest_device, "
                 "manifest_inode, manifest_size, manifest_mtime_ns, "
                 "manifest_mode, event_id FROM wake_deliveries "
-                "WHERE project_key = ? AND (state = 'pending' OR "
-                "(state = 'claimed' AND claim_expires_at <= ?)) "
+                "WHERE project_key = ? AND state = 'pending' "
                 "ORDER BY created_at",
-                (project_key, stamp),
+                (project_key,),
             ).fetchall()
         wakes: list[WakeEvent] = []
         for row in rows:
