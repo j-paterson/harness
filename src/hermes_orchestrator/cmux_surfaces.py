@@ -755,6 +755,60 @@ class CmuxSurfaceBindings:
         ).fetchone()
         return None if row is None else _row_to_binding(row)
 
+    def restorable_relaunched_leads(self) -> tuple[CmuxBinding, ...]:
+        """Stale lead bindings with no active sibling whose fully-proven
+        active anchor still names exactly their session and surface: the
+        reboot-relaunched seat a failed recovery retired (INFRA-198)."""
+
+        rows = self._database.execute(
+            "SELECT b.* FROM cmux_surface_bindings b "
+            "JOIN channel_trust_anchors a ON a.cell_id = b.cell_id "
+            "AND a.state = 'active' AND a.prompt_pattern IS NOT NULL "
+            "AND a.session_id = b.session_id "
+            "AND a.surface_uuid = b.surface_uuid "
+            "WHERE b.role = 'lead' AND b.state = 'stale' "
+            "AND NOT EXISTS (SELECT 1 FROM cmux_surface_bindings "
+            "WHERE role = 'lead' AND state = 'active' "
+            "AND cell_id = b.cell_id)"
+        ).fetchall()
+        return tuple(_row_to_binding(row) for row in rows)
+
+    def restore_lead(
+        self, binding_id: str, *, ref: CmuxSurfaceRef, reason: str
+    ) -> CmuxBinding:
+        """Flip one stale lead binding back to active at ``ref`` while
+        its cell has no active lead; the caller proved the seat alive.
+        A reboot re-mints only the WORKSPACE uuid around the surviving
+        surface, so workspace drift is absorbed and the same generation
+        keeps the running sidecar's capability valid; surface drift
+        refuses."""
+
+        current = self.get(binding_id)
+        if current.role != "lead" or current.state != "stale":
+            raise CmuxBindingConflict(
+                f"a {current.state} binding cannot be restored"
+            )
+        if current.cell_id is None or self.active_lead(str(current.cell_id)):
+            raise CmuxBindingConflict("an active binding already owns this cell")
+        if ref.surface_uuid != current.surface_uuid:
+            raise CmuxBindingConflict("a restored seat must keep its surface")
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE cmux_surface_bindings SET workspace_uuid = ? "
+                "WHERE binding_id = ?",
+                (ref.workspace_uuid, binding_id),
+            )
+            self._write_transition(
+                connection,
+                current,
+                "active",
+                event="bound",
+                reason=reason,
+                stamp=stamp,
+            )
+        return self.get(binding_id)
+
     def active_lead_for_project(
         self, project_key: str, lane_role: str = "development"
     ) -> CmuxBinding | None:
@@ -1079,7 +1133,13 @@ class CmuxSurfaceReconciler:
         channel_launch: ChannelLaunchSource | None = None,
         control: ControlOperations | None = None,
         channel_trust: ChannelTrustTrigger | None = None,
+        worker_alive: Callable[[str], bool | None] | None = None,
     ) -> None:
+        # Seam only: the default IS the real measurement, so no
+        # composition site needs wiring and tests need no live ``ps``.
+        self._worker_alive = (
+            worker_alive if worker_alive is not None else managed_claude_worker_alive
+        )
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
@@ -1141,6 +1201,7 @@ class CmuxSurfaceReconciler:
             seat = self.own_seat()
             if seat is not None and self._bindings.active_orchestrator() is None:
                 self._bindings.bind_orchestrator(seat)
+            await self._restore_relaunched_trusted_leads(replaced)
         except CmuxError:
             # cmux failed mid-pass. Visibility is optional: every
             # unfinished binding keeps its recoverable durable state, no
@@ -1195,6 +1256,48 @@ class CmuxSurfaceReconciler:
                 binding.binding_id, reason="orchestrator_surface_missing"
             )
             lost.append(binding.binding_id)
+
+    async def _restore_relaunched_trusted_leads(self, replaced: list[str]) -> None:
+        """Restore a reboot-relaunched, still-trusted seat that a failed
+        recovery attempt left behind (INFRA-198, observed 2026-09-01):
+        the relaunched pane, its managed process, its capability config,
+        and its stale binding all still exist — only the successor
+        attempt's early trust measurement raced and failed — so when the
+        exact seat the proven anchor names is demonstrably alive, its
+        own binding flips back to active and the already-running sidecar
+        registers with the generation it already carries. No relaunch,
+        no new capability, no keypress; a seat not provably alive stays
+        exactly as it is."""
+
+        for binding in self._bindings.restorable_relaunched_leads():
+            if binding.session_id is None:
+                continue
+            try:
+                alive = self._worker_alive(str(binding.session_id))
+            except Exception:
+                alive = None
+            if alive is not True:
+                continue
+            # The surviving surface is located in whatever live
+            # workspace holds it today — port reads only, never a create.
+            ref = None
+            for workspace_uuid in sorted(await self._port.live_workspace_uuids()):
+                candidate = CmuxSurfaceRef(
+                    workspace_uuid=workspace_uuid,
+                    surface_uuid=binding.ref.surface_uuid,
+                )
+                if await self._port.surface_alive(candidate):
+                    ref = candidate
+                    break
+            if ref is None:
+                continue
+            try:
+                restored = self._bindings.restore_lead(
+                    binding.binding_id, ref=ref, reason="relaunched_seat_restored"
+                )
+            except CmuxBindingConflict:
+                continue
+            replaced.append(restored.binding_id)
 
     async def _reconcile_lead(
         self,

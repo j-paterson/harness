@@ -3431,3 +3431,128 @@ async def test_dead_lead_sweep_stops_on_a_mid_pass_cmux_failure(
     assert live is not None
     assert live.binding_id == binding.binding_id
     assert _cell_state(database, "cell-demo") == "active"
+
+
+# -- relaunched trusted seat restoration (INFRA-198) ---------------------
+
+
+def restoring_reconciler(
+    bindings: CmuxSurfaceBindings,
+    port: FakePort,
+    *,
+    worker_alive: Callable[[str], bool | None],
+) -> CmuxSurfaceReconciler:
+    return CmuxSurfaceReconciler(
+        bindings=bindings,
+        port=port,
+        project_paths={"demo": Path("/repos/demo")},
+        profile_dirs=FakeProfileDirs({"max-a": Path("/profiles/max-a")}),
+        environ={},
+        worker_alive=worker_alive,
+    )
+
+
+def relaunched_seat_shape(bindings: CmuxSurfaceBindings) -> tuple[str, str]:
+    """The observed post-reboot shape (2026-09-01): the relaunched
+    seat's own binding is stale, the recovery attempt's successor is
+    lost as channel_trust_unconfirmed, and no active lead remains."""
+
+    original = bind_demo_lead(bindings)
+    successor = bindings.replace(
+        original.binding_id, FRESH, reason="surface_missing"
+    )
+    bindings.mark_lost(
+        successor.binding_id, reason="channel_trust_unconfirmed"
+    )
+    return str(original.binding_id), str(successor.binding_id)
+
+
+#: The reboot re-mints only the workspace uuid around the surviving
+#: surface (observed live 2026-09-01: workspace 29DBF6DA... became
+#: A6011199... while surface A9289997... survived).
+REBOOTED_WORKSPACE = CmuxSurfaceRef(
+    workspace_uuid="bbbbbbbb-cccc-4ccc-8ccc-cccccccccccc",
+    surface_uuid=LEAD.surface_uuid,
+)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_restores_relaunched_trusted_seat(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """A reboot-relaunched seat whose pane, process, and proven anchor
+    all still hold is restored to active without any relaunch, new
+    workspace, or capability regeneration — even though the reboot
+    re-minted the workspace uuid around the surviving surface — so its
+    existing sidecar registers with the generation it already carries."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, lost_id = relaunched_seat_shape(bindings)
+    port = FakePort(live={REBOOTED_WORKSPACE})
+    report = await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+    active = bindings.active_lead("cell-demo")
+    assert active is not None
+    assert active.binding_id == original_id
+    assert active.generation == 1
+    assert active.ref == REBOOTED_WORKSPACE
+    assert original_id in report.replaced
+    assert bindings.get(lost_id).state == "lost"
+    assert port.created == []
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_without_live_worker(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(bindings)
+    port = FakePort(live={LEAD})
+    for verdict in (False, None):
+        await restoring_reconciler(
+            bindings, port, worker_alive=lambda _session, v=verdict: v
+        ).reconcile()
+        assert bindings.active_lead("cell-demo") is None
+    def raising(_session: str) -> bool:
+        raise RuntimeError("ps unavailable")
+    await restoring_reconciler(
+        bindings, port, worker_alive=raising
+    ).reconcile()
+    assert bindings.active_lead("cell-demo") is None
+    assert bindings.get(original_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_without_matching_proven_anchor(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """An anchor bound to a DIFFERENT surface (or a dead pane) is not
+    this seat's proof: nothing is restored."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry, surface_uuid=FRESH.surface_uuid)
+    original_id, _lost_id = relaunched_seat_shape(bindings)
+    port = FakePort(live={LEAD})
+    await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+    assert bindings.active_lead("cell-demo") is None
+    assert bindings.get(original_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_when_its_pane_is_gone(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(bindings)
+    port = FakePort(live=set())
+    await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+    assert bindings.active_lead("cell-demo") is None
+    assert bindings.get(original_id).state == "stale"
