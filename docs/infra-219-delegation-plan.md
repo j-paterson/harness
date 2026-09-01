@@ -161,3 +161,49 @@ they flip to failures the moment L4 makes them pass. L4's boundary:
 reservation/restore call sites, and a migration keying
 `profile_leases` by (project_key, lane_role). Shared capacity and
 one-heavy-test limits stay global.
+
+## L5: targeted issue-lane candidate publication (authoritative, re-read 2026-09-01)
+
+INFRA-219's Linear text gained a **Candidate publication** section
+after L4 was delegated. It is authoritative scope for THIS issue — no
+new issue is created for it:
+
+- Publication is explicitly targeted to ONE admitted issue lane and
+  derives branch, HEAD, changed files, and verification from that
+  lane's BOUND WORKTREE — not from whichever worktree the
+  coordinating lead currently occupies.
+- Hermes REJECTS publication before creating a manifest or wake when
+  the requested issue, branch, bound worktree, or HEAD disagree.
+- A stale manifest file is never eligible without a matching durable
+  wake.
+- Concurrent lanes may prepare candidates independently; Sol still
+  reviews and merges one PR to main at a time.
+
+### Observed defect this closes (lead-reproduced, 2026-09-01)
+
+Live, while coordinating four lanes: `candidate-ready INFRA-218`
+emitted a manifest bound to `6e733cb` — the head of
+`feature/infra-217`, a different issue's branch containing NONE of
+INFRA-218's commits — because `CandidateEmitter.emit` freezes
+whatever checkout the lead occupies (`project.repo_path`, or a
+`lead_checkout` validated only to belong to the same repository, never
+to the requested ISSUE). Sol would have reviewed the wrong tree. The
+lead recovered manually by moving the lead worktree onto the right
+branch and re-emitting at `7e0ab1a`; the stale manifest for the wrong
+SHA still exists on disk, which is exactly the "stale manifest without
+a matching durable wake" hazard the new clause names.
+
+### Anchor: the binding already exists
+
+`worktree_leases` (migration 0018) already binds
+(`project_key`, `issue_id`, `repo_path`, `path`, `branch`) per live
+lease, with a unique live-path index. L5 needs NO new table: it reads
+the requested issue's live lease row and treats that as the one
+publishable lane.
+
+| Packet | Boundary | Files | Tier | Wave |
+|---|---|---|---|---|
+| L5 | Targeted publication: `candidate-ready` resolves the requested issue's LIVE worktree lease and freezes THAT path; the emitter refuses before any manifest write or wake when the resolved lane's branch/HEAD/worktree disagree with the request (or when no live lease binds the issue); manifest eligibility requires a matching durable wake so a stale file can never be adopted; concurrent lanes may prepare independently | `src/hermes_orchestrator/emission.py`, `src/hermes_orchestrator/cli.py`, `tests/test_emission.py`, `tests/test_cli.py` | Sonnet | 5 |
+
+Sequenced AFTER L4 so the two packets never share files. L5 lands
+before INFRA-219's final gate and candidate.

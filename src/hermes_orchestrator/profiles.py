@@ -338,13 +338,22 @@ class ClaudeProfileProbe:
         )
 
 
+_DEVELOPMENT_LANE = "development"
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileLease:
-    """One project-to-profile affinity lease."""
+    """One (project, lane)-to-profile affinity lease.
+
+    INFRA-219 L4: ``lane_role`` defaults to ``"development"`` so every
+    call site that predates the dual-lane model keeps constructing (and
+    reading) exactly the lease it always did.
+    """
 
     project_key: str
     profile_alias: str
     acquired_at: datetime
+    lane_role: str = _DEVELOPMENT_LANE
 
 
 # Fable budgets cycle weekly. A non-capped attestation older than one
@@ -391,7 +400,22 @@ class _PoolState:
 
 
 class ProfilePool:
-    """Lease healthy profile slots while preserving project affinity."""
+    """Lease healthy profile slots while preserving (project, lane) affinity.
+
+    INFRA-219 L4: leases were keyed by ``project_key`` alone, so a
+    harness cell dispatched alongside an active development cell for
+    the same project could never hold its own lease -- ``acquire``
+    returned the development lane's existing affinity verbatim, and the
+    harness cell's durable insert then collided with it on
+    ``profile_alias``. Every lease operation below is now keyed by
+    ``(project_key, lane_role)``, with ``lane_role`` defaulting to
+    ``"development"`` so every zero-argument call site that predates the
+    dual-lane model keeps today's exact behavior. The profile-slot
+    states (``_states``, keyed by alias) stay untouched: they are the
+    shared, global resource limit -- one profile serves one lease at a
+    time, across every project and lane -- while only the lease KEY
+    gained a lane dimension.
+    """
 
     def __init__(
         self,
@@ -407,8 +431,8 @@ class ProfilePool:
         # the INFRA-197-C2 wiring keep working unchanged.
         self._capacity_evidence = capacity_evidence
         self._states = {profile.alias: _PoolState() for profile in registry.profiles}
-        self._leases: dict[str, ProfileLease] = {}
-        self._replacement_reservations: dict[str, ProfileLease] = {}
+        self._leases: dict[tuple[str, str], ProfileLease] = {}
+        self._replacement_reservations: dict[tuple[str, str], ProfileLease] = {}
         self._last_refusal: str | None = None
 
     @property
