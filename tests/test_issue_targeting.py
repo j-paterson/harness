@@ -483,6 +483,93 @@ async def test_duplicate_confirmation_after_success_has_no_second_effect(
     ) == after_success
 
 
+@pytest.mark.asyncio
+async def test_exact_confirmation_activates_once(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 4: the happy path itself. One exact, session-bound
+    confirmation advances the issue and journals its projection exactly
+    once -- the positive control the failure-mode tests are measured
+    against."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    linear = _RecordingLinear()
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is True
+    assert _admitted_snapshot(database)[0][1] == "in_development"
+    assert _event_count(database, "issue.started", "INFRA-9") == 1
+    assert linear.projected == ["INFRA-9"]
+    assert _assignment_row(database, assignment_id)[0] == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_wrong_confirmation_changes_nothing(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 4: a confirmation that is not the exact bound one leaves
+    the world byte-identical -- no activation, no projection, no
+    consumed packet -- so the real confirmation stays retryable."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    linear = _RecordingLinear()
+    before = (
+        _admitted_snapshot(database),
+        _cell_touch(database),
+        _assignment_row(database, assignment_id),
+    )
+
+    wrong_session = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=OTHER_SESSION_ID,
+    )
+    unknown_packet = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id="assignment-that-does-not-exist",
+        session_id=SESSION_ID,
+    )
+
+    assert wrong_session.activated is False
+    assert unknown_packet.activated is False
+    assert linear.projected == []
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    assert (
+        _admitted_snapshot(database),
+        _cell_touch(database),
+        _assignment_row(database, assignment_id),
+    ) == before
+
+    # The exact confirmation still works afterwards: nothing was consumed.
+    recovered = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+    assert recovered.activated is True
+
+
 # ---------------------------------------------------------------------------
 # Sol correction 9944530c packet 2 -- the canonical development-lane bound.
 # ---------------------------------------------------------------------------
