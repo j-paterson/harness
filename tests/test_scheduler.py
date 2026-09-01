@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.domain import AdmissionRequest
+from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.scheduler import Scheduler
@@ -110,6 +110,65 @@ def test_scheduler_uses_timezone_aware_ranking_time(
     )
 
     assert scheduler.plan(FakeSnapshot("green", True))[0].issue_id == "ENG-7"
+
+
+def test_active_project_still_plans_next_ready_issue_with_other_lanes_occupying(
+    queue_service: QueueService,
+) -> None:
+    """INFRA-219 R6 (Sol correction 110ed759): the scheduler's per-project
+    dedup within one ``plan()`` cycle (``plan_key`` in :meth:`Scheduler.plan`)
+    is a one-action-per-cycle throttle on the SAME lead cell's next turn, not
+    a "no more than one issue may ever occupy this project" rule -- that
+    occupancy bound now lives, bounded to
+    ``hermes_orchestrator.cells.MAX_DEVELOPMENT_ISSUE_LANES``, in
+    ``cells.py``'s dispatch/activation path. ``list_ranked`` (``queue.py``)
+    already only ever returns QUEUED/BLOCKED issues, so an issue this test
+    moves to ``IN_DEVELOPMENT`` -- simulating one of several concurrently
+    occupying development-lane issues for project "demo" -- is invisible to
+    ranking, and the scheduler must still surface the next ready issue for
+    that same active project to resume/dispatch, exactly as it would with
+    only one lane in flight.
+    """
+
+    admit(queue_service, "ENG-7", "demo", 1)
+    queue_service.transition(
+        "ENG-7",
+        IssueState.IN_DEVELOPMENT,
+        actor="operator",
+        reason="already occupying one development lane",
+    )
+    admit(queue_service, "ENG-8", "demo", 2)
+    scheduler = Scheduler(queue_service, mode="active", active_projects={"demo"})
+
+    actions = scheduler.plan(FakeSnapshot(pressure="green", can_admit=True))
+
+    assert [(action.kind, action.issue_id, action.execute) for action in actions] == [
+        ("resume_project_cell", "ENG-8", True)
+    ]
+
+
+def test_multiple_ready_issues_for_active_project_plan_exactly_one_per_cycle(
+    queue_service: QueueService,
+) -> None:
+    """INFRA-219 R6: cell topology is unchanged by this packet -- one
+    development lead cell per project still exists (item 6 of the packet),
+    coordinating however many issue lanes are occupying underneath it. A
+    single ``plan()`` cycle therefore still proposes exactly one next turn
+    per project (the highest-ranked ready issue), never one action per
+    queued issue -- planning multiple concurrent lanes happens over
+    successive dispatches/cycles, not by fanning out cells per issue.
+    """
+
+    admit(queue_service, "ENG-7", "demo", 1)
+    admit(queue_service, "ENG-8", "demo", 2)
+    admit(queue_service, "ENG-9", "demo", 3)
+    scheduler = Scheduler(queue_service, mode="active", active_projects={"demo"})
+
+    actions = scheduler.plan(FakeSnapshot(pressure="green", can_admit=True))
+
+    starts = [action for action in actions if action.kind == "resume_project_cell"]
+    assert len(starts) == 1
+    assert starts[0].issue_id == "ENG-7"
 
 
 def test_yellow_pressure_admits_only_priority_one_work(

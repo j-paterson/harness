@@ -188,6 +188,12 @@ class CmuxActivationIntent:
     cell_id: str
     session_id: str
     profile_alias: str
+    # INFRA-219 R5 (Sol correction 110ed759): the lane this activation
+    # belongs to ('development' or 'harness'), carried from the intent
+    # through to the residual/active binding it produces so restart
+    # recovery can resolve the harness lane's OWN dedicated worktree
+    # instead of the development lead_cwd.
+    lane_role: str
     state: str
     binding_id: str | None
     created_at: str
@@ -208,6 +214,13 @@ class CmuxBinding:
     cell_id: str | None
     session_id: str | None
     profile_alias: str | None
+    # INFRA-219 R5 (Sol correction 110ed759): which lane this seat
+    # belongs to ('development' or 'harness'), defaulting to
+    # 'development' at the schema level (migration 0056) so every
+    # binding predating this packet is unambiguously the development
+    # lane. An 'orchestrator' binding carries the schema default too —
+    # it has no lane of its own.
+    lane_role: str
     workspace_uuid: str
     surface_uuid: str
     generation: int
@@ -285,6 +298,7 @@ class CmuxSurfaceBindings:
             profile_alias=None,
             ref=ref,
             generation=self._next_generation(role="orchestrator"),
+            lane_role="development",
         )
 
     def bind_lead(
@@ -295,8 +309,16 @@ class CmuxSurfaceBindings:
         session_id: str,
         profile_alias: str,
         ref: CmuxSurfaceRef,
+        lane_role: str = "development",
     ) -> CmuxBinding:
-        """Bind one lead cell's seat; duplicate activation reuses the row."""
+        """Bind one lead cell's seat; duplicate activation reuses the row.
+
+        INFRA-219 R5 (Sol correction 110ed759): ``lane_role`` defaults
+        to ``'development'`` so every existing call site (development
+        is the only lane a cell_id has ever carried) behaves exactly as
+        before; a harness cell's dedicated ``cell_id`` binds its own
+        row carrying ``lane_role='harness'``.
+        """
 
         existing = self.active_lead(cell_id)
         if existing is not None:
@@ -313,6 +335,7 @@ class CmuxSurfaceBindings:
             profile_alias=profile_alias,
             ref=ref,
             generation=self._next_generation(cell_id=cell_id),
+            lane_role=lane_role,
         )
 
     def replace(
@@ -353,6 +376,7 @@ class CmuxSurfaceBindings:
                 event="bound",
                 reason=None,
                 stamp=stamp,
+                lane_role=current.lane_role,
             )
         return self.get(successor_id)
 
@@ -435,6 +459,7 @@ class CmuxSurfaceBindings:
         profile_alias: str,
         ref: CmuxSurfaceRef,
         reason: str,
+        lane_role: str = "development",
     ) -> CmuxBinding:
         """Persist ownership of a created workspace that never activated.
 
@@ -454,6 +479,7 @@ class CmuxSurfaceBindings:
             state="residual",
             event="residual",
             reason=reason,
+            lane_role=lane_role,
         )
 
     def record_intent(
@@ -463,9 +489,17 @@ class CmuxSurfaceBindings:
         cell_id: str,
         session_id: str,
         profile_alias: str,
+        lane_role: str = "development",
     ) -> CmuxActivationIntent:
         """Commit the activation's durable identity before any external
-        create, so no later interruption can orphan the workspace."""
+        create, so no later interruption can orphan the workspace.
+
+        INFRA-219 R5 (Sol correction 110ed759): ``lane_role`` travels
+        with the intent so the residual/active binding it eventually
+        produces (:meth:`bind_intent`) carries the SAME lane identity —
+        never silently defaulting a harness activation's successor
+        binding back to development.
+        """
 
         intent_id = self._ids()
         stamp = self._now().isoformat()
@@ -473,14 +507,16 @@ class CmuxSurfaceBindings:
             connection.execute(
                 "INSERT INTO cmux_activation_intents("
                 "intent_id, project_key, cell_id, session_id, "
-                "profile_alias, state, binding_id, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, ?)",
+                "profile_alias, lane_role, state, binding_id, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)",
                 (
                     intent_id,
                     project_key,
                     cell_id,
                     session_id,
                     profile_alias,
+                    lane_role,
                     stamp,
                     stamp,
                 ),
@@ -496,6 +532,7 @@ class CmuxSurfaceBindings:
                         "cell_id": cell_id,
                         "session_id": session_id,
                         "profile_alias": profile_alias,
+                        "lane_role": lane_role,
                     },
                 ),
             )
@@ -529,6 +566,7 @@ class CmuxSurfaceBindings:
                 event="residual",
                 reason="activation_pending",
                 stamp=stamp,
+                lane_role=intent.lane_role,
             )
             self._write_intent_transition(
                 connection,
@@ -716,12 +754,26 @@ class CmuxSurfaceBindings:
         ).fetchone()
         return None if row is None else _row_to_binding(row)
 
-    def active_lead_for_project(self, project_key: str) -> CmuxBinding | None:
+    def active_lead_for_project(
+        self, project_key: str, lane_role: str = "development"
+    ) -> CmuxBinding | None:
+        """The project's active lead binding within one lane.
+
+        INFRA-219 R5 (Sol correction 110ed759): with a harness binding
+        now able to coexist with the development one for the SAME
+        project, a project-only lookup would be ambiguous — the
+        ``ORDER BY created_at DESC LIMIT 1`` used to silently prefer
+        whichever bound most recently. ``lane_role`` defaults to
+        ``'development'`` so every existing zero-argument caller keeps
+        exactly today's single-lane answer.
+        """
+
         row = self._database.execute(
             "SELECT * FROM cmux_surface_bindings "
-            "WHERE role = 'lead' AND project_key = ? AND state = 'active' "
+            "WHERE role = 'lead' AND project_key = ? AND lane_role = ? "
+            "AND state = 'active' "
             "ORDER BY created_at DESC LIMIT 1",
-            (project_key,),
+            (project_key, lane_role),
         ).fetchone()
         return None if row is None else _row_to_binding(row)
 
@@ -767,6 +819,7 @@ class CmuxSurfaceBindings:
         state: str = "active",
         event: str = "bound",
         reason: str | None = None,
+        lane_role: str = "development",
     ) -> CmuxBinding:
         binding_id = self._ids()
         stamp = self._now().isoformat()
@@ -785,6 +838,7 @@ class CmuxSurfaceBindings:
                 event=event,
                 reason=reason,
                 stamp=stamp,
+                lane_role=lane_role,
             )
         return self.get(binding_id)
 
@@ -804,13 +858,14 @@ class CmuxSurfaceBindings:
         event: str,
         reason: str | None,
         stamp: str,
+        lane_role: str = "development",
     ) -> None:
         connection.execute(
             "INSERT INTO cmux_surface_bindings("
             "binding_id, role, project_key, cell_id, session_id, "
             "profile_alias, workspace_uuid, surface_uuid, generation, "
-            "state, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "state, lane_role, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 binding_id,
                 role,
@@ -822,6 +877,7 @@ class CmuxSurfaceBindings:
                 ref.surface_uuid,
                 generation,
                 state,
+                lane_role,
                 stamp,
                 stamp,
             ),
@@ -834,6 +890,7 @@ class CmuxSurfaceBindings:
             profile_alias=profile_alias,
             ref=ref,
             generation=generation,
+            lane_role=lane_role,
         )
         if reason is not None:
             payload["reason"] = reason
@@ -896,6 +953,7 @@ class CmuxSurfaceBindings:
             profile_alias=binding.profile_alias,
             ref=binding.ref,
             generation=binding.generation,
+            lane_role=binding.lane_role,
         )
         if reason is not None:
             payload["reason"] = reason
@@ -930,6 +988,31 @@ class CmuxReconciliationReport:
     intents_reclaimed: tuple[str, ...] = ()
     intents_aborted: tuple[str, ...] = ()
     intents_ambiguous: tuple[str, ...] = ()
+
+
+
+def _lane_cwd(
+    project_paths: Mapping[str, Path],
+    lane_project_paths: Mapping[tuple[str, str], Path],
+    project_key: str,
+    lane_role: str,
+) -> Path | None:
+    """Resolve one lane's checkout, falling back to the project's own.
+
+    INFRA-219 R5b (Sol correction 110ed759): the seater and the
+    reconciler resolved a seat's cwd by project alone, so a HARNESS
+    binding was restored into the DEVELOPMENT lead's worktree — the
+    exact defect Sol reported, and the reason lane identity on
+    ``CmuxBinding`` alone was not enough. A lane-keyed override wins
+    when present; every lane without one falls back to the historical
+    project mapping, so development behavior is byte-compatible with
+    today whenever no harness lane is configured.
+    """
+
+    override = lane_project_paths.get((project_key, lane_role))
+    if override is not None:
+        return override
+    return project_paths.get(project_key)
 
 
 class CmuxSurfaceReconciler:
@@ -989,6 +1072,7 @@ class CmuxSurfaceReconciler:
         bindings: CmuxSurfaceBindings,
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
+        lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
         profile_dirs: ProfileDirectory,
         environ: Mapping[str, str],
         channel_launch: ChannelLaunchSource | None = None,
@@ -998,6 +1082,9 @@ class CmuxSurfaceReconciler:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
+        # INFRA-219 R5b: lane-keyed checkout overrides, so a harness
+        # seat/binding never resolves into the development worktree.
+        self._lane_project_paths = dict(lane_project_paths or {})
         self._profile_dirs = profile_dirs
         self._environ = dict(environ)
         self._channel_launch = channel_launch
@@ -1116,7 +1203,12 @@ class CmuxSurfaceReconciler:
     ) -> None:
         assert binding.project_key is not None
         assert binding.profile_alias is not None
-        cwd = self._project_paths.get(binding.project_key)
+        cwd = _lane_cwd(
+            self._project_paths,
+            self._lane_project_paths,
+            binding.project_key,
+            getattr(binding, "lane_role", "development"),
+        )
         try:
             config_dir = self._profile_dirs.config_dir(binding.profile_alias)
         except (KeyError, ValueError):
@@ -1735,6 +1827,7 @@ class CmuxLeadSeater:
         bindings: CmuxSurfaceBindings,
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
+        lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
         profile_dirs: ProfileDirectory,
         auth_probe: Callable[[str], bool] | None = None,
         channel_launch: ChannelLaunchSource | None = None,
@@ -1744,6 +1837,9 @@ class CmuxLeadSeater:
         self._bindings = bindings
         self._port = port
         self._project_paths = dict(project_paths)
+        # INFRA-219 R5b: lane-keyed checkout overrides, so a harness
+        # seat/binding never resolves into the development worktree.
+        self._lane_project_paths = dict(lane_project_paths or {})
         self._profile_dirs = profile_dirs
         self._auth_probe = auth_probe
         self._channel_launch = channel_launch
@@ -2103,6 +2199,7 @@ def _identity_payload(
     profile_alias: str | None,
     ref: CmuxSurfaceRef,
     generation: int,
+    lane_role: str = "development",
 ) -> dict[str, Any]:
     return {
         "role": role,
@@ -2113,6 +2210,7 @@ def _identity_payload(
         "workspace_uuid": ref.workspace_uuid,
         "surface_uuid": ref.surface_uuid,
         "generation": generation,
+        "lane_role": lane_role,
     }
 
 
@@ -2123,6 +2221,7 @@ def _row_to_intent(row: Any) -> CmuxActivationIntent:
         cell_id=str(row["cell_id"]),
         session_id=str(row["session_id"]),
         profile_alias=str(row["profile_alias"]),
+        lane_role=str(row["lane_role"]),
         state=str(row["state"]),
         binding_id=(None if row["binding_id"] is None else str(row["binding_id"])),
         created_at=str(row["created_at"]),
@@ -2140,6 +2239,7 @@ def _row_to_binding(row: Any) -> CmuxBinding:
         profile_alias=(
             None if row["profile_alias"] is None else str(row["profile_alias"])
         ),
+        lane_role=str(row["lane_role"]),
         workspace_uuid=str(row["workspace_uuid"]),
         surface_uuid=str(row["surface_uuid"]),
         generation=int(row["generation"]),

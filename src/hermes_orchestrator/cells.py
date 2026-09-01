@@ -34,6 +34,137 @@ from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
+# INFRA-219 L1: the durable lane-role model. A project cell now belongs to
+# exactly one lane; ``DEVELOPMENT_LANE`` is the historical, sole lane every
+# existing row and caller defaults to, so a project with no harness cell is
+# byte-compatible with pre-INFRA-219 behavior. The harness lane's launch/
+# rotate/recover surface is wave 2 (INFRA-219 L2) -- this packet only makes
+# the durable identity lane-aware.
+DEVELOPMENT_LANE = "development"
+HARNESS_LANE = "harness"
+
+
+class HarnessCheckoutPort(Protocol):
+    """The exact worktree-git surface the harness checkout needs.
+
+    INFRA-219 R7 / Sol correction 110ed759: a structural subset of
+    ``hermes_orchestrator.git.WorktreeGit`` (already used for
+    checkpointed worktree reclamation) so :func:`ensure_harness_checkout`
+    reuses the existing worktree machinery -- never a bespoke
+    ``subprocess`` call -- and so tests exercise it with a fake port
+    instead of spawning real git.
+    """
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]: ...
+
+    def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None: ...
+
+    def head_sha(self, path: Path) -> str: ...
+
+    def branch(self, path: Path) -> str | None: ...
+
+
+class HarnessCheckoutRefused(ValueError):
+    """A harness checkout's identity disagrees with what Hermes expects.
+
+    A ``ValueError`` subclass on purpose: ``cli.py``'s
+    ``_open_rotation_collaborators`` caller already turns a ``ValueError``
+    into a clean, nonzero CLI refusal (see its docstring), so this needs
+    no new exception handling at the call site to fail closed.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class HarnessCheckoutStatus:
+    """The resolved, verified state of one project's harness checkout."""
+
+    path: Path
+    provisioned: bool
+    head_sha: str
+    branch: str | None
+
+
+def ensure_harness_checkout(
+    git: HarnessCheckoutPort,
+    *,
+    repo_path: Path,
+    harness_path: Path,
+    expected_branch: str | None = None,
+) -> HarnessCheckoutStatus:
+    """VALIDATE-then-provision the harness lane's dedicated checkout.
+
+    INFRA-219 R7 / Sol correction 110ed759 (verbatim): ``cli.py``'s
+    ``_harness_lead_cwd`` "derives a sibling path but explicitly leaves
+    worktree provisioning out of scope" -- nothing ever created or
+    validated that checkout, so a harness lane start silently launched
+    (or resumed) into a directory that might not exist, or might exist
+    as something other than a worktree of THIS repository.
+
+    Strategy, in order:
+
+    1. If ``harness_path`` is already registered in ``git worktree
+       list`` for ``repo_path`` (the same idiom ``worktrees.py`` uses at
+       its own reconciliation/removal checkpoints -- membership in the
+       repo's own worktree list, not a bespoke path comparison) it is a
+       genuine worktree of this repository; validated, never re-created.
+    2. Otherwise, if nothing exists at ``harness_path`` yet, it is
+       PROVISIONED via ``git.worktree_add_detached`` -- the existing
+       worktree-materialization primitive INFRA-198 P2 already uses for
+       exactly this "bounded, detached worktree at an exact commit"
+       shape -- pinned to ``repo_path``'s current HEAD as the stable,
+       operational-only harness head.
+    3. If ``harness_path`` exists but is NOT registered as a worktree of
+       ``repo_path``, this refuses fail-closed with
+       :class:`HarnessCheckoutRefused` -- a foreign directory (a stray
+       clone, an unrelated project, a leftover from another repo) is
+       never silently adopted.
+
+    After validating or provisioning, the resolved checkout's branch
+    (when ``expected_branch`` is supplied) and HEAD (always, against the
+    commit it was provisioned from) are re-proven to agree with what
+    Hermes expects; any disagreement refuses fail-closed rather than
+    launching a harness lead into an unexpected identity.
+    """
+
+    registered = harness_path in {Path(entry) for entry in git.worktree_list(repo_path)}
+    provisioned = False
+    if not registered:
+        if harness_path.exists():
+            raise HarnessCheckoutRefused(
+                f"harness checkout {harness_path} exists but is not a git "
+                f"worktree of {repo_path} -- refusing to adopt a foreign "
+                "directory (INFRA-219 R7 / Sol correction 110ed759)"
+            )
+        expected_head = git.head_sha(repo_path)
+        git.worktree_add_detached(repo_path, harness_path, expected_head)
+        provisioned = True
+        post = {Path(entry) for entry in git.worktree_list(repo_path)}
+        if harness_path not in post:
+            raise HarnessCheckoutRefused(
+                f"provisioning {harness_path} did not register it as a "
+                f"worktree of {repo_path}"
+            )
+        actual_head = git.head_sha(harness_path)
+        if actual_head != expected_head:
+            raise HarnessCheckoutRefused(
+                f"provisioned harness checkout {harness_path} HEAD "
+                f"{actual_head!r} disagrees with the repository HEAD "
+                f"{expected_head!r} it was provisioned from"
+            )
+
+    actual_branch = git.branch(harness_path)
+    if expected_branch is not None and actual_branch != expected_branch:
+        raise HarnessCheckoutRefused(
+            f"harness checkout {harness_path} is on branch "
+            f"{actual_branch!r}, expected {expected_branch!r}"
+        )
+    return HarnessCheckoutStatus(
+        path=harness_path,
+        provisioned=provisioned,
+        head_sha=git.head_sha(harness_path),
+        branch=actual_branch,
+    )
+
 # A fable cap is a weekly-budget exhaustion, but the sanitized Claude
 # stream exposes no reset horizon. The conservative fallback is one full
 # weekly cycle — the documented worst case — never the flat hour that
@@ -179,13 +310,20 @@ class _IssueAlreadyCompleted(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ProjectCell:
-    """One durable persistent lead for a project."""
+    """One durable persistent lead for a project's lane.
+
+    INFRA-219 L1: ``lane_role`` is the durable lane identity
+    (``DEVELOPMENT_LANE`` or ``HARNESS_LANE``) -- every lookup and
+    mutation below is scoped to it, so a harness cell can never
+    interrupt or be confused with its project's development cell.
+    """
 
     cell_id: str
     project_key: str
     state: str
     profile_alias: str
     session_id: UUID
+    lane_role: str = DEVELOPMENT_LANE
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,18 +349,43 @@ _RUNNABLE_ISSUE_STATES = (
     IssueState.BLOCKED.value,
 )
 
-# Project occupancy (INFRA-199 v2 / INFRA-211): a project is "busy" —
-# refusing a DIFFERENT issue's activation — while it has an issue in
-# EITHER of these states. ``in_development`` is the obvious case; the
-# INFRA-211 failure reproduction showed a second issue starting while
-# the first had already moved to ``review`` (the lead had handed off,
-# but the project is not yet free — the reviewer/settlement flow still
-# owns it), so review occupies the project exactly like in_development
+# Project occupancy (INFRA-199 v2 / INFRA-211): an issue is "occupying"
+# its project — counted against the project's development-lane
+# concurrency bound below — while it is in EITHER of these states.
+# ``in_development`` is the obvious case; the INFRA-211 failure
+# reproduction showed a second issue starting while the first had
+# already moved to ``review`` (the lead had handed off, but the
+# project is not yet free — the reviewer/settlement flow still owns
+# it), so review occupies the project exactly like in_development
 # does.
 _OCCUPYING_ISSUE_STATES = (
     IssueState.IN_DEVELOPMENT.value,
     IssueState.REVIEW.value,
 )
+
+# INFRA-219 R6 (Sol correction 110ed759): the operator ruling behind
+# INFRA-219 is that "one Fable project lead owns a single project ...
+# and continuously coordinates up to six explicitly admitted Linear
+# issue lanes when resources and dependency boundaries permit" —
+# concurrency of ADMITTED ISSUES within one project's development
+# lane, not a single-issue-per-project rule. Packet L3 scoped the
+# pre-existing "any other occupying issue refuses" rule to the
+# development lane (correctly excluding the harness lane, which never
+# claims a product issue at all), but Sol's verification of R1-R5
+# found that scoping left the ORIGINAL one-issue-per-project refusal
+# fully intact *within* that lane — a second admitted issue could
+# never activate for the same project even though nothing in the
+# contract limits development to one concurrent issue. It limits it
+# to a bounded COUNT, six per the contract's own words. This constant
+# is that bound: both the coarse pre-check in
+# :meth:`ProjectCellService._dispatch_locked` and the transactional,
+# commit-time re-proof in :func:`_activate_issue_transaction` count
+# distinct OTHER occupying issues (``_OCCUPYING_ISSUE_STATES``,
+# excluding the issue being (re-)dispatched itself) and refuse only
+# once that count has already reached this many — never merely
+# because the count is nonzero. A deliberately plain module constant,
+# not new config surface, exactly as R6 requires.
+MAX_DEVELOPMENT_ISSUE_LANES = 6
 
 
 def admission_priority_ceiling(
@@ -331,6 +494,7 @@ def _activate_issue_transaction(
     assignments: LeadAssignments | None,
     now: Callable[[], datetime],
     guard: Callable[[sqlite3.Connection], bool] | None = None,
+    lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[bool, LeadAssignment | None]:
     """The one durable, LOCAL-ONLY activation transaction every dispatch
     path shares: the full commit-time eligibility recheck, the
@@ -369,9 +533,17 @@ def _activate_issue_transaction(
       states (queued/blocked) and the CAS is ``WHERE state = ?`` with
       that observed value — never merely ``!= done``;
     - ``dependency_ready`` must still hold;
-    - no OTHER issue of the project may occupy it — ``in_development``
-      OR ``review`` (INFRA-211: a lead that already handed off to
-      review still owns the project until settlement clears it);
+    - the project's development-lane issue-lane bound must not already
+      be saturated by OTHER occupying issues — ``in_development`` OR
+      ``review`` (INFRA-211: a lead that already handed off to review
+      still owns its lane until settlement clears it) — counted
+      against :data:`MAX_DEVELOPMENT_ISSUE_LANES` (INFRA-219 R6, Sol
+      correction 110ed759: up to six admitted issue lanes may occupy
+      one project's development lane concurrently; refusal is a
+      bounded-count check, not a "any other occupying issue" check,
+      and re-proving THIS count here — not merely re-reading it — is
+      exactly what keeps two racing dispatches from ever together
+      exceeding the bound);
     - no pending operator decision may exist for the issue;
     - the cell must still be live and its profile lease active
       (the ``project_cells`` CAS with the ``profile_leases`` guard).
@@ -381,10 +553,30 @@ def _activate_issue_transaction(
     (idempotently) ensured, but no second ``issue.started`` is ever
     journaled and no queue transition happens — full replay
     idempotence across effect, transition, event, and assignment.
+
+    INFRA-219 L3: ``lane_role`` scopes PRODUCT-ISSUE occupancy to the
+    development lane, per the operator's ruling that "the harness lead
+    does not select or implement unrelated product issues." When
+    ``lane_role`` is ``HARNESS_LANE`` this transaction skips only the
+    occupancy predicates (runnable-state/dependency/busy/pending-
+    decision) AND never CASes ``admitted_issues`` or journals
+    ``issue.started`` for it — the harness lane activates its own cell
+    lease only, and the issue row it names (whatever operational-test
+    issue backs its dispatch) is left byte-for-byte untouched. The
+    shared ``guard`` (capacity/freshness ceiling, when the daemon path
+    arms it) is a RESOURCE limit, not product-issue occupancy, so it
+    still runs for the harness lane exactly as the ruling requires
+    ("shared profile/resource and one-heavy-test limits continue to
+    apply to both lanes") — harness dispatches get no exemption from
+    it, including on a resumed/already-active harness lease, since
+    ``admitted_issues`` never carries a harness "already in flight"
+    signal to replay-exempt against the way development's own issue
+    transition does.
     """
 
     stamp = now().isoformat()
     assignment: LeadAssignment | None = None
+    harness = lane_role == HARNESS_LANE
     with database.transaction() as connection:
         issue_row = connection.execute(
             "SELECT state, instruction_id, project_key, dependency_ready "
@@ -394,24 +586,42 @@ def _activate_issue_transaction(
         if issue_row is None:
             raise KeyError(issue_id)
         prior_state = str(issue_row["state"])
-        replaying = prior_state == IssueState.IN_DEVELOPMENT.value
-        if not replaying:
+        replaying = (not harness) and prior_state == IssueState.IN_DEVELOPMENT.value
+        if harness:
+            if guard is not None and not guard(connection):
+                return False, None
+        elif not replaying:
             if guard is not None and not guard(connection):
                 return False, None
             if prior_state not in _RUNNABLE_ISSUE_STATES:
                 return False, None
             if not int(issue_row["dependency_ready"]):
                 return False, None
-            busy = connection.execute(
-                "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-                "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+            # INFRA-219 R6 (Sol correction 110ed759): a bounded COUNT of
+            # other occupying issues, re-proven transactionally, on the
+            # very same connection as the CAS below — never a plain
+            # "is any other issue occupying" existence check. This is
+            # what makes two dispatches racing on the same project's
+            # development lane commit-time-safe: each holds this
+            # transaction's exclusive write lock while it counts, so
+            # the count either one observes can never be stale by the
+            # time it CASes ``admitted_issues`` below, and the bound
+            # can never be exceeded no matter how many candidates were
+            # concurrently pre-checked in ``_dispatch_locked``.
+            occupying_count = connection.execute(
+                "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
+                "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
                 (
                     str(issue_row["project_key"]),
                     *_OCCUPYING_ISSUE_STATES,
                     issue_id,
                 ),
             ).fetchone()
-            if busy is not None:
+            if (
+                occupying_count is not None
+                and int(occupying_count["occupying_count"])
+                >= MAX_DEVELOPMENT_ISSUE_LANES
+            ):
                 return False, None
             pending_decision = connection.execute(
                 "SELECT 1 FROM operator_decisions WHERE issue_id = ? "
@@ -431,7 +641,7 @@ def _activate_issue_transaction(
         )
         if activated.rowcount == 0:
             return False, None
-        if not replaying:
+        if not harness and not replaying:
             updated = connection.execute(
                 "UPDATE admitted_issues SET state = ?, updated_at = ? "
                 "WHERE issue_id = ? AND state = ?",
@@ -453,7 +663,7 @@ def _activate_issue_transaction(
                     payload={"cell_id": cell_id},
                 ),
             )
-        if assignments is not None:
+        if not harness and assignments is not None:
             assignment = assignments.publish_in(
                 connection,
                 project_key=project_key,
@@ -466,29 +676,33 @@ def _activate_issue_transaction(
                     f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
                 ),
             )
-        # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
-        # projection record becomes durable in this very commit, BEFORE
-        # any fallible Linear operation can run — no live client is
-        # required to write it. ``LinearClient.project`` later ADOPTS
-        # this exact row (same effect id, byte-identical
-        # ``projection_request`` payload) instead of double-beginning,
-        # so every post-commit failure class — router composition, the
-        # initial issue read, team/mapping/transition validation, the
-        # update itself — leaves exactly ONE pending row for
-        # reconciliation (``reconcile._project_pending_linear_effect``).
-        # On a replay the row already exists (pending or completed) and
-        # is adopted untouched, keeping the journal at exactly one row.
-        ExternalEffectStore.begin_in(
-            connection,
-            _in_development_effect_id(issue_id),
-            target=issue_id,
-            request=projection_request(
-                issue_id,
-                LinearProjection(
-                    status="In Development", assignee_alias="operator"
+        if not harness:
+            # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
+            # projection record becomes durable in this very commit, BEFORE
+            # any fallible Linear operation can run — no live client is
+            # required to write it. ``LinearClient.project`` later ADOPTS
+            # this exact row (same effect id, byte-identical
+            # ``projection_request`` payload) instead of double-beginning,
+            # so every post-commit failure class — router composition, the
+            # initial issue read, team/mapping/transition validation, the
+            # update itself — leaves exactly ONE pending row for
+            # reconciliation (``reconcile._project_pending_linear_effect``).
+            # On a replay the row already exists (pending or completed) and
+            # is adopted untouched, keeping the journal at exactly one row.
+            # INFRA-219 L3: the harness lane never claims a product issue,
+            # so it never opens this Linear "In Development" projection
+            # either -- there is no product-issue transition to project.
+            ExternalEffectStore.begin_in(
+                connection,
+                _in_development_effect_id(issue_id),
+                target=issue_id,
+                request=projection_request(
+                    issue_id,
+                    LinearProjection(
+                        status="In Development", assignee_alias="operator"
+                    ),
                 ),
-            ),
-        )
+            )
     return True, assignment
 
 
@@ -505,6 +719,7 @@ async def activate_admitted_issue(
     issue_id: str,
     now: Callable[[], datetime] = _utc_now,
     guard: Callable[[sqlite3.Connection], bool] | None = None,
+    lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[bool, LeadAssignment | None]:
     """Dispatch one already-admitted issue onto a live cell durably.
 
@@ -531,6 +746,11 @@ async def activate_admitted_issue(
     flip, pending decision, stale guard, lease identity) leaves ZERO
     local writes and Linear is never even attempted — there is nothing
     to project for a candidate that did not activate.
+
+    INFRA-219 L3: ``lane_role`` defaults to ``DEVELOPMENT_LANE`` — the
+    Stop-hook idle dispatcher never touches the harness lane — so
+    every existing zero-argument caller keeps today's occupancy
+    behavior exactly.
     """
 
     activated, assignment = _activate_issue_transaction(
@@ -544,6 +764,7 @@ async def activate_admitted_issue(
         assignments=assignments,
         now=now,
         guard=guard,
+        lane_role=lane_role,
     )
     if not activated:
         return False, None
@@ -581,6 +802,7 @@ class ProjectCellService:
         assignments: LeadAssignments | None = None,
         packets: SubagentPackets | None = None,
         dispatch_freshness_minutes: int | None = None,
+        lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -589,6 +811,15 @@ class ProjectCellService:
         self._runner = runner
         self._linear = linear
         self._project_paths = dict(project_paths)
+        # INFRA-219 L2: a lane-specific worktree override, keyed by
+        # (project_key, lane_role). The harness lane's whole point is
+        # that it never shares the development lead's worktree/session,
+        # so a caller wiring a harness cell hands its own dedicated
+        # checkout here; unset lanes (development, always) fall back to
+        # ``self._project_paths`` -- byte-compatible with pre-L2 wiring.
+        self._lane_project_paths: dict[tuple[str, str], Path] = dict(
+            lane_project_paths or {}
+        )
         self._session_ids = session_ids
         self._cell_ids = cell_ids or (lambda: str(uuid.uuid4()))
         self._now = now
@@ -626,22 +857,95 @@ class ProjectCellService:
 
         self._dispatch_freshness_minutes = int(freshness_minutes)
 
-    def active_projects(self) -> frozenset[str]:
-        """Return projects that already own a live logical lead cell."""
+    def active_projects(
+        self, lane_role: str = DEVELOPMENT_LANE
+    ) -> frozenset[str]:
+        """Return projects that already own a live logical lead cell in
+        ``lane_role``.
+
+        INFRA-219 L1: scoped to one lane (development by default, so
+        every zero-argument caller -- the scheduler wiring in
+        ``runtime.py`` included -- keeps today's behavior unchanged).
+        A harness cell alone never makes this report its project as
+        having an active development lead.
+        """
 
         placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
         rows = self._database.execute(
             f"SELECT DISTINCT project_key FROM project_cells "
-            f"WHERE state IN ({placeholders})",
-            _ACTIVE_CELL_STATES,
+            f"WHERE state IN ({placeholders}) AND lane_role = ?",
+            (*_ACTIVE_CELL_STATES, lane_role),
         ).fetchall()
         return frozenset(str(row["project_key"]) for row in rows)
 
-    async def dispatch(self, issue_id: str) -> DispatchResult:
-        """Start or resume the issue's project lead after explicit admission."""
+    def active_cell(
+        self, project_key: str, lane_role: str = DEVELOPMENT_LANE
+    ) -> ProjectCell | None:
+        """Public read of the project's live cell in ``lane_role``.
 
+        INFRA-219 L2: the launch/recover surface (``cli.py``'s
+        ``start-lane`` and the dashboard) needs the same lane-scoped
+        lookup :meth:`dispatch` uses internally, without reaching into
+        the private :meth:`_find_active_cell`.
+        """
+
+        return self._find_active_cell(project_key, lane_role)
+
+    def _cell_cwd(self, project_key: str, lane_role: str) -> Path:
+        """The worktree a cell in ``lane_role`` launches/resumes into.
+
+        INFRA-219 L2: a harness cell never shares the development
+        lead's worktree -- ``lane_project_paths`` (constructor) is
+        consulted first for an explicit override, keyed by
+        ``(project_key, lane_role)``, and only development (or an
+        unconfigured lane) falls back to the historical
+        ``self._project_paths`` mapping.
+        """
+
+        override = self._lane_project_paths.get((project_key, lane_role))
+        if override is not None:
+            return override
+        return self._project_paths[project_key]
+
+    async def dispatch(
+        self,
+        issue_id: str,
+        *,
+        lane_role: str = DEVELOPMENT_LANE,
+        harness_run: str | None = None,
+    ) -> DispatchResult:
+        """Start or resume the issue's project lead after explicit admission.
+
+        INFRA-219 L2: ``lane_role`` (development by default) scopes
+        every cell lookup/creation this dispatch performs, so a
+        harness-lane dispatch can never find, resume, or collide with
+        the project's development cell, and vice versa.
+
+        INFRA-219 L3: ``harness_run`` is the explicit harness-run
+        request the operator ruling requires — "the harness lane
+        requires an explicit harness-run request bound to
+        ``lane_role='harness'``." It must be a non-empty identifier for
+        a harness-lane dispatch and MUST be absent for a development-
+        lane dispatch (development occupancy is proven by explicit
+        issue admission alone, exactly as today; it must never also
+        gain a harness-shaped request). Either mismatch refuses
+        fail-closed BEFORE the per-lane lock, the queue read, or any
+        other touch of durable state — zero writes, a plain status.
+        This is deliberately a required call-time argument rather than
+        new durable storage: it is enough to prove the caller issued
+        this harness dispatch on purpose, and the L3 packet boundary
+        prefers it explicitly over adding a migration for it.
+        """
+
+        if lane_role == HARNESS_LANE and not harness_run:
+            return DispatchResult(status="harness_run_required", issue_id=issue_id)
+        if lane_role != HARNESS_LANE and harness_run:
+            return DispatchResult(
+                status="harness_run_not_permitted", issue_id=issue_id
+            )
         issue = self._queue.get(issue_id)
-        lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
+        lock_key = f"{issue.project_key}:{lane_role}"
+        lock = self._dispatch_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
             if self._decisions is not None:
                 pending = self._decisions.pending_for_issue(issue_id)
@@ -649,29 +953,47 @@ class ProjectCellService:
                     return DispatchResult(
                         status="awaiting_operator_decision", issue_id=issue_id
                     )
-            return await self._dispatch_locked(issue_id)
+            return await self._dispatch_locked(issue_id, lane_role=lane_role)
 
-    async def _dispatch_locked(self, issue_id: str) -> DispatchResult:
+    async def _dispatch_locked(
+        self, issue_id: str, lane_role: str = DEVELOPMENT_LANE
+    ) -> DispatchResult:
         """Dispatch one issue while holding its project-wide in-process lock."""
 
         issue = self._queue.get(issue_id)
-        # Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT queued
-        # issue never starts while this project already has one mid-flight
-        # in EITHER in_development or review. Dispatching that same
-        # in_development issue itself (resume after restart, reconciliation,
-        # handoff) is untouched — only a distinct issue_id is refused here,
-        # and the refusal is a plain read with zero writes. This is a coarse
-        # pre-check only, purely to avoid launching a Claude lead process for
-        # a candidate that cannot activate; the shared activation
-        # transaction (`_activate_issue_transaction`) re-proves the same
-        # occupancy predicate, transactionally, at commit time.
-        busy = self._database.execute(
-            "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-            "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
-            (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
-        ).fetchone()
-        if busy is not None:
-            return DispatchResult(status="project_busy", issue_id=issue_id)
+        # Project occupancy (INFRA-199 v2 / INFRA-211; bounded per
+        # INFRA-219 R6, Sol correction 110ed759): a DIFFERENT queued
+        # issue is refused here only once this project's development
+        # lane already has ``MAX_DEVELOPMENT_ISSUE_LANES`` OTHER issues
+        # mid-flight in EITHER in_development or review — the contract
+        # is up to six CONCURRENT admitted issue lanes per project, not
+        # one. Dispatching an issue that is already one of those
+        # occupying lanes (resume after restart, reconciliation,
+        # handoff) is untouched — it is excluded from its own count, so
+        # it is never refused by the bound — and this is a coarse
+        # pre-check only, purely to avoid launching a Claude lead
+        # process/turn for a candidate that cannot activate; the shared
+        # activation transaction (`_activate_issue_transaction`)
+        # re-proves the identical bounded-count predicate,
+        # transactionally, at commit time, so this read-only estimate
+        # can never itself let the bound be exceeded.
+        #
+        # INFRA-219 L3: this is a DEVELOPMENT-LANE fact only — the operator
+        # ruling is explicit that "the harness lane never claims a product
+        # issue," so a harness dispatch is never gated by, and this
+        # pre-check never even reads for, product-issue occupancy.
+        if lane_role == DEVELOPMENT_LANE:
+            occupying_count = self._database.execute(
+                "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
+                "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
+                (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
+            ).fetchone()
+            if (
+                occupying_count is not None
+                and int(occupying_count["occupying_count"])
+                >= MAX_DEVELOPMENT_ISSUE_LANES
+            ):
+                return DispatchResult(status="project_busy", issue_id=issue_id)
         # INFRA-199 v2: Linear is never consulted before the local commit.
         # Hermes' durable local lifecycle is authoritative; a pre-commit
         # `linear.validate` here used to gate whether this candidate could
@@ -685,11 +1007,13 @@ class ProjectCellService:
         # before mutating anything — so a routing problem surfaces as a
         # durable pending `external_effects` row for reconciliation, never
         # as a block on local activation.
-        cell = self._find_active_cell(issue.project_key)
+        cell = self._find_active_cell(issue.project_key, lane_role)
         created = False
         if cell is None:
             try:
-                cell, created = self._create_cell(issue.project_key, issue_id)
+                cell, created = self._create_cell(
+                    issue.project_key, issue_id, lane_role=lane_role
+                )
             except _IssueAlreadyCompleted:
                 return DispatchResult(status="already_completed", issue_id=issue_id)
             if cell is None:
@@ -713,7 +1037,7 @@ class ProjectCellService:
 
         request = LeadTurnRequest(
             session_id=cell.session_id,
-            cwd=self._project_paths[issue.project_key],
+            cwd=self._cell_cwd(issue.project_key, lane_role),
             prompt=(
                 f"Work only on Hermes-queued issue {issue_id}. "
                 "Plan it, coordinate safe parallel work, and report checkpoints."
@@ -1222,6 +1546,7 @@ class ProjectCellService:
             reservation = self._profiles.reserve_replacement(
                 current.project_key,
                 current.profile_alias,
+                lane_role=current.lane_role,
             )
             if reservation is None:
                 message = "no different healthy profile is available"
@@ -1238,7 +1563,9 @@ class ProjectCellService:
                     message = f"{message}: {'; '.join(details)}"
                 raise RotationBlocked(message)
             if reservation.profile_alias in attempted_profiles:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
                 raise RotationBlocked(
                     "replacement selection repeated an already attempted profile: "
                     f"{reservation.profile_alias}"
@@ -1290,7 +1617,9 @@ class ProjectCellService:
                                 (reservation.profile_alias, resets_at)
                             )
                             replacement_capped = True
-                            self._profiles.cancel_replacement(current.project_key)
+                            self._profiles.cancel_replacement(
+                                current.project_key, lane_role=current.lane_role
+                            )
                             break
                         elif (
                             event.kind == "handoff.acknowledged"
@@ -1311,16 +1640,22 @@ class ProjectCellService:
                     await stream.aclose()
             except BaseException:
                 if not replacement_capped:
-                    self._profiles.cancel_replacement(current.project_key)
+                    self._profiles.cancel_replacement(
+                        current.project_key, lane_role=current.lane_role
+                    )
                 raise
             if replacement_capped:
                 persisted_session = None
                 continue
             if not session_started:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
                 raise RotationBlocked("replacement session start was not confirmed")
             if not acknowledged:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
                 raise RotationBlocked(
                     "handoff was not acknowledged by the replacement"
                 )
@@ -1353,11 +1688,23 @@ class ProjectCellService:
             # The transfer transaction already committed on a prior pass;
             # only the pool's in-memory affinity may still need resyncing
             # to the durable rows.
-            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.release(
+                current.project_key,
+                reason="rotation_recovered",
+                lane_role=current.lane_role,
+            )
             self._profiles.restore(
-                current.project_key, replacement_profile, self._aware_now()
+                current.project_key,
+                replacement_profile,
+                self._aware_now(),
+                lane_role=current.lane_role,
             )
             return current
+        # No lane scoping needed here either: profile_alias is the
+        # global PRIMARY KEY on profile_leases, so this conflict check
+        # already asks "does ANY lease anywhere hold this profile" --
+        # exactly the global shared-resource limit migration 0055 left
+        # untouched ("one profile serves one lease at a time").
         conflict = self._database.execute(
             "SELECT project_key FROM profile_leases WHERE profile_alias = ?",
             (replacement_profile,),
@@ -1394,18 +1741,38 @@ class ProjectCellService:
             state="active",
             profile_alias=replacement_profile,
             session_id=replacement_session,
+            lane_role=current.lane_role,
         )
         try:
             with self._database.transaction() as connection:
+                # No lane scoping needed here: profile_alias is the
+                # table's own PRIMARY KEY (migration 0055's note),
+                # globally unique across every lane, so it already names
+                # exactly one row -- the rotating cell's own prior lease.
                 connection.execute(
                     "DELETE FROM profile_leases WHERE profile_alias = ?",
                     (current.profile_alias,),
                 )
+                # Sol correction 110ed759 (INFRA-219 R2): migration 0055
+                # (packet L4) gave profile_leases a lane_role column with a
+                # unique index on (project_key, lane_role), but this insert
+                # predates that and always wrote the implicit default
+                # 'development' -- rotating a HARNESS cell silently wrote
+                # its replacement lease into the development lane,
+                # colliding with (or displacing) the real development
+                # lease. The replacement lease must carry the rotating
+                # cell's OWN lane, never an assumed default.
                 connection.execute(
                     "INSERT INTO profile_leases("
-                    "profile_alias, project_key, state, acquired_at"
-                    ") VALUES (?, ?, 'active', ?)",
-                    (rotated.profile_alias, rotated.project_key, now),
+                    "profile_alias, project_key, state, acquired_at, "
+                    "lane_role"
+                    ") VALUES (?, ?, 'active', ?, ?)",
+                    (
+                        rotated.profile_alias,
+                        rotated.project_key,
+                        now,
+                        rotated.lane_role,
+                    ),
                 )
                 connection.execute(
                     "UPDATE project_cells SET state = 'active', "
@@ -1434,20 +1801,30 @@ class ProjectCellService:
                 )
         except BaseException:
             if not recovering:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
             raise
         if recovering:
             # No in-memory reservation exists on recovery: rebuild the
             # pool's affinity from the durable identities instead of
             # committing a reservation that was never re-made.
-            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.release(
+                current.project_key,
+                reason="rotation_recovered",
+                lane_role=current.lane_role,
+            )
             self._profiles.restore(
-                current.project_key, replacement_profile, self._aware_now()
+                current.project_key,
+                replacement_profile,
+                self._aware_now(),
+                lane_role=current.lane_role,
             )
         else:
             self._profiles.commit_rotation(
                 current.project_key,
                 current.profile_alias,
+                lane_role=current.lane_role,
             )
         if self._safety is not None:
             self._safety.invalidate(rotated.cell_id, reason="session_rotated")
@@ -1463,37 +1840,56 @@ class ProjectCellService:
         await self._runner.retire_session(current.session_id)
         return rotated
 
-    def _find_active_cell(self, project_key: str) -> ProjectCell | None:
+    def _find_active_cell(
+        self, project_key: str, lane_role: str = DEVELOPMENT_LANE
+    ) -> ProjectCell | None:
+        """The project's live cell in ``lane_role`` (development by
+        default), or ``None``. INFRA-219 L1: lane-scoped so a harness
+        cell is never returned to a development-lane lookup, or vice
+        versa -- the two lanes' uniqueness and activation never
+        collide.
+        """
+
         placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
         row = self._database.execute(
             f"SELECT * FROM project_cells WHERE project_key = ? "
-            f"AND state IN ({placeholders})",
-            (project_key, *_ACTIVE_CELL_STATES),
+            f"AND lane_role = ? AND state IN ({placeholders})",
+            (project_key, lane_role, *_ACTIVE_CELL_STATES),
         ).fetchone()
         return self._row_to_cell(row) if row is not None else None
 
     def _restore_profile_leases(self) -> None:
+        """Rehydrate durable leases into the pool -- INFRA-219 L4: each
+        row now also names the lane the lease belongs to, so a
+        project's development and harness leases restore into their
+        own distinct ``ProfilePool`` slots rather than colliding on a
+        project-only key.
+        """
+
         rows = self._database.execute(
-            "SELECT profile_alias, project_key, state, acquired_at, cooldown_until "
+            "SELECT profile_alias, project_key, lane_role, state, "
+            "acquired_at, cooldown_until "
             "FROM profile_leases WHERE state IN ('active', 'capped')"
         ).fetchall()
         for row in rows:
             cooldown = row["cooldown_until"]
+            lane_role = str(row["lane_role"])
             if str(row["state"]) == "capped":
                 if not cooldown:
                     raise ValueError("capped profile lease is missing cooldown_until")
                 cooldown_until = datetime.fromisoformat(str(cooldown))
                 active_cell = self._database.execute(
                     "SELECT 1 FROM project_cells WHERE project_key = ? "
-                    "AND profile_alias = ? "
+                    "AND lane_role = ? AND profile_alias = ? "
                     "AND state IN ('starting', 'active', 'handoff_required', 'paused')",
-                    (str(row["project_key"]), str(row["profile_alias"])),
+                    (str(row["project_key"]), lane_role, str(row["profile_alias"])),
                 ).fetchone()
                 if active_cell is not None:
                     self._profiles.restore(
                         project_key=str(row["project_key"]),
                         profile_alias=str(row["profile_alias"]),
                         acquired_at=datetime.fromisoformat(str(row["acquired_at"])),
+                        lane_role=lane_role,
                         cooldown_until=cooldown_until,
                     )
                     continue
@@ -1514,6 +1910,7 @@ class ProjectCellService:
                 project_key=str(row["project_key"]),
                 profile_alias=str(row["profile_alias"]),
                 acquired_at=datetime.fromisoformat(str(row["acquired_at"])),
+                lane_role=lane_role,
                 cooldown_until=(
                     datetime.fromisoformat(str(cooldown)) if cooldown else None
                 ),
@@ -1600,7 +1997,9 @@ class ProjectCellService:
             )
         if cooldown_until is not None:
             self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
-        self._profiles.release(cell.project_key, "lead_start_failed")
+        self._profiles.release(
+            cell.project_key, "lead_start_failed", lane_role=cell.lane_role
+        )
         return True
 
     def _get_cell(self, cell_id: str) -> ProjectCell:
@@ -1616,8 +2015,9 @@ class ProjectCellService:
         self,
         project_key: str,
         issue_id: str,
+        lane_role: str = DEVELOPMENT_LANE,
     ) -> tuple[ProjectCell | None, bool]:
-        lease = self._profiles.acquire(project_key)
+        lease = self._profiles.acquire(project_key, lane_role)
         if lease is None:
             return None, False
         now = self._aware_now().isoformat()
@@ -1627,6 +2027,7 @@ class ProjectCellService:
             state="starting",
             profile_alias=lease.profile_alias,
             session_id=self._session_ids(),
+            lane_role=lane_role,
         )
         try:
             with self._database.transaction() as connection:
@@ -1641,14 +2042,15 @@ class ProjectCellService:
                 connection.execute(
                     "INSERT INTO project_cells("
                     "cell_id, project_key, state, profile_alias, session_id, "
-                    "created_at, updated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "lane_role, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cell.cell_id,
                         cell.project_key,
                         cell.state,
                         cell.profile_alias,
                         str(cell.session_id),
+                        cell.lane_role,
                         now,
                         now,
                     ),
@@ -1661,9 +2063,9 @@ class ProjectCellService:
                 )
                 connection.execute(
                     "INSERT INTO profile_leases("
-                    "profile_alias, project_key, state, acquired_at"
-                    ") VALUES (?, ?, 'active', ?)",
-                    (cell.profile_alias, cell.project_key, now),
+                    "profile_alias, project_key, lane_role, state, acquired_at"
+                    ") VALUES (?, ?, ?, 'active', ?)",
+                    (cell.profile_alias, cell.project_key, cell.lane_role, now),
                 )
                 self._events.append(
                     connection,
@@ -1679,11 +2081,15 @@ class ProjectCellService:
                     ),
                 )
         except _IssueAlreadyCompleted:
-            self._profiles.release(project_key, "issue_already_completed")
+            self._profiles.release(
+                project_key, "issue_already_completed", lane_role=lane_role
+            )
             raise
         except sqlite3.IntegrityError:
-            self._profiles.release(project_key, "cell_creation_conflict")
-            existing = self._find_active_cell(project_key)
+            self._profiles.release(
+                project_key, "cell_creation_conflict", lane_role=lane_role
+            )
+            existing = self._find_active_cell(project_key, lane_role)
             if existing is not None:
                 return existing, False
             raise
@@ -1703,12 +2109,17 @@ class ProjectCellService:
         failure rather than rolling back or retrying the already-
         durable local activation (see its docstring for where that
         failure's durable trace lives).
+
+        INFRA-219 L3: the harness lane never claims a product issue, so
+        it never projects one "In Development" either — activation
+        alone (the cell lease) is all a harness dispatch commits.
         """
 
         activated, assignment = self._activate_issue(cell, issue_id)
         if not activated:
             return False, None
-        await _project_in_development(self._linear, issue_id)
+        if cell.lane_role != HARNESS_LANE:
+            await _project_in_development(self._linear, issue_id)
         return True, assignment
 
     def _activate_issue(
@@ -1732,6 +2143,11 @@ class ProjectCellService:
         stale — or was superseded by a red one — between scheduler
         planning and this commit fails the activation closed instead of
         authorizing it (Sol ec0ed7fe gap 3).
+
+        INFRA-219 L3: ``cell.lane_role`` (the durable lane identity the
+        cell was created/found in) is threaded straight through, so a
+        harness cell's activation is scoped to that lane by construction
+        — never a second inference of which lane this is.
         """
 
         return _activate_issue_transaction(
@@ -1747,6 +2163,7 @@ class ProjectCellService:
             ),
             now=self._aware_now,
             guard=self._capacity_guard(issue_id),
+            lane_role=cell.lane_role,
         )
 
     def _capacity_guard(
@@ -2087,4 +2504,5 @@ class ProjectCellService:
             state=str(row["state"]),
             profile_alias=str(row["profile_alias"]),
             session_id=UUID(str(row["session_id"])),
+            lane_role=str(row["lane_role"]),
         )

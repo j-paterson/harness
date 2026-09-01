@@ -17,6 +17,7 @@ from hermes_orchestrator.dashboard_sources import (
     CodexFact,
     DashboardSnapshot,
     IdleFact,
+    LaneCellFact,
     ProfileLeaseFact,
     ProfileUsage,
     ResourceFact,
@@ -51,9 +52,28 @@ def render_dashboard(
             for usage in snapshot.usage
         ),
         _codex_line(snapshot.codex),
+        *(_lane_line(lane) for lane in snapshot.lanes),
         _status_line(failure),
     ]
     return tuple(_fit(line, width) for line in lines)
+
+
+def _lane_line(lane: LaneCellFact) -> str:
+    """One lead-cell row: lane role, this lane's own issues, and state.
+
+    INFRA-219 L2 / R4 (Sol correction 110ed759): kept deliberately
+    minimal here -- ``render_dashboard`` is a legacy summary block,
+    not the pane `dashboard_refresh.py` actually draws every tick.
+    The full contract display (subagents, head/event, resource
+    pressure, blockers, never cross-attributed) lives in
+    ``render_frame``'s Lanes section below.
+    """
+
+    issue_text = ",".join(lane.issue_ids) if lane.issue_ids else "-"
+    return (
+        f"lane     {lane.project_key}/{lane.lane_role:<11} "
+        f"issue {issue_text:<12} {lane.state}"
+    )
 
 
 def _profile_line(usage: ProfileUsage, lease: ProfileLeaseFact | None) -> str:
@@ -205,8 +225,20 @@ def render_frame(
     length. Sections collapse to fit a small pane: Work is trimmed
     first (down to a `+N more` row), then Detail (when requested),
     then Capacity, then System are dropped whole if there still is not
-    enough room, keeping the header, Attention, and the last-tick line
-    as the floor.
+    enough room, keeping the header, Lanes, Attention, and the
+    last-tick line as the floor.
+
+    INFRA-219 R4 (Sol correction 110ed759): Lanes joins that floor
+    rather than competing for space with Work/Capacity/Detail/System.
+    The contract is "Dashboard shows both leads" -- a lead's identity
+    is exactly the kind of fact an operator cannot afford to lose when
+    the pane gets small, on par with "did the last tick fail" and
+    "what needs attention", so it is never dropped or trimmed whole
+    the way the lower-priority sections are; it renders one row per
+    live lane (development and harness), right after the header, and
+    the ordinary word-boundary ellipsis in `_fit_content` is what
+    absorbs any residual per-row overflow at narrow widths -- not
+    section collapse.
     """
 
     width = max(int(width), 1)
@@ -218,6 +250,10 @@ def render_frame(
 
     header_line = _header_text(snapshot, now)
     tick_line = _status_line(failure)
+
+    lane_block = _lane_block(
+        snapshot.lanes, snapshot.transitions, snapshot.resource, now, width
+    )
 
     attention_block = [
         _divider_text("Attention", width),
@@ -252,7 +288,7 @@ def render_frame(
         ]
         detail_block = [_divider_text("Detail", width), *detail_rows]
 
-    floor = [header_line, *attention_block, tick_line]
+    floor = [header_line, *lane_block, *attention_block, tick_line]
     remaining = height - len(floor)
 
     keep_system = remaining >= len(system_block)
@@ -275,7 +311,7 @@ def render_frame(
         max(remaining, 0),
     )
 
-    body = [header_line, *work_lines]
+    body = [header_line, *lane_block, *work_lines]
     if keep_capacity:
         body.extend(capacity_block)
     if keep_detail:
@@ -968,6 +1004,83 @@ def _system_block(
     if detail:
         lines.append(_system_kind_text(workers))
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Lanes (INFRA-219 R4, Sol correction 110ed759)
+#
+# One row per live lead cell -- development and harness alike -- each
+# carrying only what its OWN cell actually holds: no fact here is ever
+# copied from one lane's row onto the other's (see LaneCellFact and
+# TaskProvider.lane_cells for how issue attribution is kept
+# lane-exclusive). Head/event and resource pressure have no durable
+# lane dimension at all (TransitionProvider is project-scoped,
+# ResourceProvider is host-scoped) -- they are looked up here, by
+# project_key or globally, rather than invented per lane.
+# ---------------------------------------------------------------------------
+
+
+def _lane_row(
+    lane: LaneCellFact,
+    transitions_by_project: dict[str, TransitionFact],
+    resource: ResourceFact | None,
+    now: datetime,
+) -> str:
+    if lane.issue_ids:
+        issues_text = ",".join(lane.issue_ids)
+    elif lane.lane_role == "harness":
+        # A true fact, not a placeholder: harness cells never carry a
+        # product issue (cells._dispatch_locked never publishes an
+        # assignment for a harness dispatch).
+        issues_text = "no product issue"
+    else:
+        issues_text = "no active issue"
+
+    subagents_text = f"{lane.subagents_completed}/{lane.subagents_total}"
+
+    transition = transitions_by_project.get(lane.project_key)
+    if transition is not None:
+        head_text = f"{transition.phrase} ({_age(transition.occurred_at, now)})"
+    else:
+        # Placeholder: TransitionProvider has never seen a whitelisted
+        # event for this project since the daemon started -- there is
+        # no durable head/event fact to show, so we say so explicitly
+        # rather than rendering a stale or invented value.
+        head_text = "no recorded event"
+
+    # Placeholder when no resource_samples row exists yet.
+    pressure_text = (
+        resource.pressure if resource is not None else "no resource sample"
+    )
+
+    blockers_text = (
+        ",".join(lane.blocked_issue_ids) if lane.blocked_issue_ids else "none"
+    )
+
+    return (
+        f"{lane.project_key}/{lane.lane_role:<11} {lane.state:<17} "
+        f"issues {issues_text}  kids {subagents_text}  "
+        f"head {head_text}  pressure {pressure_text}  "
+        f"blockers {blockers_text}"
+    )
+
+
+def _lane_block(
+    lanes: tuple[LaneCellFact, ...],
+    transitions: tuple[TransitionFact, ...],
+    resource: ResourceFact | None,
+    now: datetime,
+    width: int,
+) -> list[str]:
+    if not lanes:
+        return []
+    transitions_by_project = {
+        transition.project_key: transition for transition in transitions
+    }
+    rows = [
+        _lane_row(lane, transitions_by_project, resource, now) for lane in lanes
+    ]
+    return [_divider_text("Lanes", width), *rows]
 
 
 # ---------------------------------------------------------------------------

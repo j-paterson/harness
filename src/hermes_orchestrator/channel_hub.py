@@ -41,7 +41,7 @@ from pathlib import Path
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.control_operations import (
     CONTROL_READY,
-    MAINTENANCE_CONTROL_KINDS,
+    SILENT_MAINTENANCE_CONTROL_KINDS,
     ControlOperations,
 )
 from hermes_orchestrator.db import Database
@@ -483,7 +483,7 @@ class ChannelHub:
         # ``settle_maintenance_for_session`` at the lead's own Stop
         # hook instead of a visible wake.
         maintenance_placeholders = ",".join(
-            "?" * len(MAINTENANCE_CONTROL_KINDS)
+            "?" * len(SILENT_MAINTENANCE_CONTROL_KINDS)
         )
         operations = self._database.execute(
             "SELECT o.operation_id, o.cell_id, o.session_id "
@@ -497,7 +497,7 @@ class ChannelHub:
             "AND e.session_id = o.session_id "
             "AND e.state IN ('acked', 'superseded')"
             ") ORDER BY o.created_at ASC, o.rowid ASC",
-            tuple(MAINTENANCE_CONTROL_KINDS),
+            tuple(SILENT_MAINTENANCE_CONTROL_KINDS),
         ).fetchall()
         for row in operations:
             status = await self.publish(

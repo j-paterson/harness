@@ -350,7 +350,12 @@ def test_the_poll_offers_a_control_operation_and_ack_settles_it(
 def test_the_poll_never_offers_a_maintenance_receipt(
     database: Database,
 ) -> None:
-    """INFRA-201: a maintenance receipt is never offered through the
+    """INFRA-201: a SILENT maintenance receipt is never offered through
+    the poll. INFRA-219 (Sol correction 14bd0c17) narrowed that set --
+    the runtime-lifecycle kinds ARE offered now -- so this uses a kind
+    that is still genuinely silent churn.
+
+    Original wording: a maintenance receipt is never offered through the
     Stop-hook poll; it is settled silently by
     ``settle_maintenance_for_session`` instead."""
 
@@ -361,8 +366,8 @@ def test_the_poll_never_offers_a_maintenance_receipt(
             "operation_id, schema_version, kind, project_key, cell_id, "
             "session_id, dedup_key, result_json, reason, state, "
             "created_at, updated_at, acknowledged_at) VALUES "
-            "(?, 1, 'channel.replayed', 'demo', 'cell-demo', ?, "
-            "'channel.replayed:' || ?, '{\"replay_count\": 0}', NULL, "
+            "(?, 1, 'intake.dedup_repaired', 'demo', 'cell-demo', ?, "
+            "'intake.dedup_repaired:' || ?, '{\"replay_count\": 0}', NULL, "
             "'published', ?, ?, NULL)",
             (OPERATION_ID, SESSION, SESSION, NOW.isoformat(), NOW.isoformat()),
         )
@@ -416,8 +421,8 @@ async def test_the_router_never_announces_a_maintenance_receipt(
             "operation_id, schema_version, kind, project_key, cell_id, "
             "session_id, dedup_key, result_json, reason, state, "
             "created_at, updated_at, acknowledged_at) VALUES "
-            "(?, 1, 'daemon.restarted', 'demo', 'cell-demo', ?, "
-            "'daemon.restarted:' || ?, '{\"interval_seconds\": 30}', "
+            "(?, 1, 'intake.dedup_repaired', 'demo', 'cell-demo', ?, "
+            "'intake.dedup_repaired:' || ?, '{\"interval_seconds\": 30}', "
             "NULL, 'published', ?, ?, NULL)",
             (
                 maintenance_id,
@@ -1034,3 +1039,60 @@ async def test_the_router_fails_closed_residual_deliveries(
     )
     assert str(state) == "superseded"
     assert LeadIntakePoll(database=database).next_offer(SESSION) is None
+
+
+def test_a_runtime_lifecycle_receipt_is_offered_to_its_exact_bound_lead(
+    database: Database,
+) -> None:
+    """INFRA-219 (Sol correction 14bd0c17): the live acceptance failure.
+
+    After a merged-runtime activation the daemon durably recorded
+    ``daemon.restarted`` bound to the exact ACTIVE lead session, but the
+    kind was excluded from offers as maintenance churn, so the lead sat
+    idle until it was woken MANUALLY through cmux. Runtime-lifecycle
+    receipts are now offered through this same existing offer/ACK path
+    -- no new transport -- so the bound lead is woken without any cmux
+    or operator action, and a foreign session is still never offered it.
+    """
+
+    seed_active_cell(database)
+    lifecycle = (
+        ("daemon.restarted", "a" * 32),
+        ("channel.reregistered", "b" * 32),
+        ("channel.replayed", "c" * 32),
+    )
+    for kind, operation_id in lifecycle:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO control_operations("
+                "operation_id, schema_version, kind, project_key, cell_id, "
+                "session_id, dedup_key, result_json, reason, state, "
+                "created_at, updated_at, acknowledged_at) VALUES "
+                "(?, 1, ?, 'demo', 'cell-demo', ?, ? || ':' || ?, "
+                "'{\"activation\": {\"git_sha\": \"8ac98e27\"}}', NULL, "
+                "'published', ?, ?, NULL)",
+                (
+                    operation_id,
+                    kind,
+                    SESSION,
+                    kind,
+                    SESSION,
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                ),
+            )
+        poll = LeadIntakePoll(database=database)
+
+        offer = poll.next_offer(SESSION)
+
+        assert offer is not None, kind
+        assert offer.kind == "HERMES_CONTROL_READY"
+        assert offer.packet_id == operation_id
+        # A foreign session is never offered this lead's receipt.
+        assert poll.next_offer(OTHER_SESSION) is None
+        # Settle it so the next kind is the only outstanding one.
+        database.execute(
+            "UPDATE control_operations SET state = 'acknowledged' "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )

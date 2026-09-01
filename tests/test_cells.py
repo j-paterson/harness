@@ -10,11 +10,14 @@ from uuid import UUID
 import pytest
 
 from hermes_orchestrator.cells import (
+    MAX_DEVELOPMENT_ISSUE_LANES,
+    HarnessCheckoutRefused,
     ProfileCapacityEvidence,
     ProjectCell,
     ProjectCellService,
     RotationBlocked,
     activate_admitted_issue,
+    ensure_harness_checkout,
 )
 from hermes_orchestrator.claude import (
     ClaudeEvent,
@@ -261,55 +264,71 @@ async def test_two_issues_share_one_project_lead(
 
 
 @pytest.mark.asyncio
-async def test_second_issue_refused_while_first_in_development(
+async def test_second_issue_dispatches_concurrently_while_first_in_development(
     cell_service: ProjectCellService,
     queue: QueueService,
     runner: RecordingRunner,
     linear: RecordingLinear,
     database: Database,
 ) -> None:
+    """INFRA-219 R6 (Sol correction 110ed759): the operator's contract is
+    up to ``cells.MAX_DEVELOPMENT_ISSUE_LANES`` (six) admitted issue lanes
+    CONCURRENTLY occupying one project's development lane — a second
+    distinct issue while the first is still ``in_development`` is well
+    under that bound, so it must dispatch and occupy alongside the
+    first, sharing the ONE development lead cell (item 6 of this
+    packet: cell topology is unchanged, only occupancy accounting is).
+    This test replaces the pre-R6 "second issue refused" expectation
+    that this exact scenario used to assert — that was the verified
+    defect Sol's correction requires fixed."""
+
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
 
     first = await cell_service.dispatch("ENG-9")
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
 
-    events_before = database.execute(
-        "SELECT COUNT(*) AS n FROM events"
-    ).fetchone()["n"]
-
     second = await cell_service.dispatch("ENG-10")
 
-    assert second.status == "project_busy"
-    assert second.cell_id is None
-    assert second.session_id is None
-    assert queue.get("ENG-10").state == IssueState.QUEUED
+    assert second.status != "project_busy"
+    assert second.status == "working"
+    assert second.cell_id == first.cell_id
+    assert second.session_id == first.session_id
+    assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
     assert ("demo", "ENG-10") not in linear.validations
     assert runner.start_count == 1
-    assert runner.resume_count == 0
-    events_after = database.execute(
-        "SELECT COUNT(*) AS n FROM events"
-    ).fetchone()["n"]
-    assert events_after == events_before
+    assert runner.resume_count == 1
 
-    # Dispatching (resuming) the ALREADY in_development issue itself is
-    # untouched by the guard: only a DIFFERENT queued issue is refused.
+    # Both issues are durably recorded as occupying at once.
+    occupying = {
+        row["issue_id"]
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = 'demo' "
+            "AND state = ?",
+            (IssueState.IN_DEVELOPMENT.value,),
+        ).fetchall()
+    }
+    assert occupying == {"ENG-9", "ENG-10"}
+
+    # Dispatching (resuming) either ALREADY-occupying issue is untouched.
     resumed = await cell_service.dispatch("ENG-9")
+    assert resumed.status == "working"
     assert resumed.cell_id == first.cell_id
     assert resumed.session_id == first.session_id
-    assert runner.resume_count == 1
 
 
 @pytest.mark.asyncio
-async def test_second_issue_refused_while_first_in_review(
+async def test_second_issue_dispatches_concurrently_while_first_in_review(
     cell_service: ProjectCellService,
     queue: QueueService,
     runner: RecordingRunner,
 ) -> None:
-    """INFRA-211 failure reproduction: a lead that has already handed
-    off to review still occupies the project — a distinct queued issue
-    must never start or deliver an assignment while the first sits in
-    review."""
+    """INFRA-211: a lead that has already handed off to review still
+    counts as occupying its project's development lane (the reviewer/
+    settlement flow still owns it), but per INFRA-219 R6 that only
+    counts against the bounded lane limit — it does not, by itself,
+    refuse a second distinct issue, since one occupying lane is far
+    below ``MAX_DEVELOPMENT_ISSUE_LANES``."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
@@ -321,11 +340,90 @@ async def test_second_issue_refused_while_first_in_review(
 
     second = await cell_service.dispatch("ENG-10")
 
-    assert second.status == "project_busy"
-    assert second.cell_id is None
-    assert second.session_id is None
-    assert queue.get("ENG-10").state == IssueState.QUEUED
-    assert runner.resume_count == 0
+    assert second.status != "project_busy"
+    assert second.status == "working"
+    assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
+    assert runner.resume_count == 1
+
+
+@pytest.mark.asyncio
+async def test_three_distinct_issues_dispatch_concurrently_in_development_lane(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+) -> None:
+    """The headline INFRA-219 R6 acceptance requirement (Sol correction
+    110ed759): "at least three isolated issue worktree lanes progressing
+    concurrently" for one project's development lane. All three must be
+    durably recorded as occupying (``in_development``) at once, sharing
+    the project's single development lead cell."""
+
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+    admit(queue, "ENG-11")
+
+    first = await cell_service.dispatch("ENG-9")
+    second = await cell_service.dispatch("ENG-10")
+    third = await cell_service.dispatch("ENG-11")
+
+    for result in (first, second, third):
+        assert result.status == "working"
+        assert result.cell_id == first.cell_id
+        assert result.session_id == first.session_id
+
+    occupying = {
+        row["issue_id"]
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = 'demo' "
+            "AND state = ?",
+            (IssueState.IN_DEVELOPMENT.value,),
+        ).fetchall()
+    }
+    assert occupying == {"ENG-9", "ENG-10", "ENG-11"}
+    for issue_id in ("ENG-9", "ENG-10", "ENG-11"):
+        assert queue.get(issue_id).state == IssueState.IN_DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuses_beyond_the_bounded_issue_lane_maximum(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+) -> None:
+    """A development dispatch is refused with ``project_busy`` only once
+    the project already has ``MAX_DEVELOPMENT_ISSUE_LANES`` OTHER
+    distinct occupying issues — never merely because one is occupying.
+    The existing occupying lanes must be entirely untouched by the
+    refusal (INFRA-219 R6)."""
+
+    issue_ids = [f"ENG-{n}" for n in range(1, MAX_DEVELOPMENT_ISSUE_LANES + 2)]
+    for issue_id in issue_ids:
+        admit(queue, issue_id)
+
+    results = [
+        await cell_service.dispatch(issue_id)
+        for issue_id in issue_ids[:MAX_DEVELOPMENT_ISSUE_LANES]
+    ]
+    assert all(result.status == "working" for result in results)
+
+    overflow_issue = issue_ids[MAX_DEVELOPMENT_ISSUE_LANES]
+    overflow = await cell_service.dispatch(overflow_issue)
+
+    assert overflow.status == "project_busy"
+    assert overflow.cell_id is None
+    assert overflow.session_id is None
+    assert queue.get(overflow_issue).state == IssueState.QUEUED
+
+    # The six existing lanes are untouched by the refusal.
+    occupying = {
+        row["issue_id"]
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = 'demo' "
+            "AND state = ?",
+            (IssueState.IN_DEVELOPMENT.value,),
+        ).fetchall()
+    }
+    assert occupying == set(issue_ids[:MAX_DEVELOPMENT_ISSUE_LANES])
 
 
 @pytest.mark.asyncio
@@ -736,11 +834,13 @@ async def test_creation_conflict_resumes_the_existing_cell(
     class ConflictService(ProjectCellService):
         hide_existing = True
 
-        def _find_active_cell(self, project_key: str):  # type: ignore[no-untyped-def]
+        def _find_active_cell(  # type: ignore[no-untyped-def]
+            self, project_key: str, lane_role: str = "development"
+        ):
             if self.hide_existing:
                 self.hide_existing = False
                 return None
-            return super()._find_active_cell(project_key)
+            return super()._find_active_cell(project_key, lane_role)
 
     service = ConflictService(
         database=database,
@@ -1952,6 +2052,153 @@ async def test_rotation_thaws_the_retired_session(
     rotated = await cells.rotate("cell-demo", record.handoff_id)
     assert rotated.session_id != SESSION_ID
     assert runner.thaws == [SESSION_ID]
+
+
+def _stub_handoff_document(cell_id: str) -> HandoffDocument:
+    """A minimally valid handoff document for direct ``.rotate()`` tests."""
+
+    return HandoffDocument(
+        cell_id=cell_id,
+        objective="o",
+        status="s",
+        decisions=["d"],
+        branch="b",
+        commits=["c"],
+        pull_request="pr",
+        modified_files=["f"],
+        tests=[HandoffTest(command="t", outcome="ok")],
+        blockers=[],
+        remaining_steps=["r"],
+        commands=["cmd"],
+        environment_notes=["e"],
+        risks=[],
+        next_action="n",
+    )
+
+
+@pytest.mark.asyncio
+async def test_harness_rotation_lane_scopes_replacement_lease_spares_development(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """Sol correction 110ed759 (INFRA-219 R2): ``_finalize_transfer``'s
+    replacement-lease INSERT predates migration 0055's ``lane_role``
+    column and always wrote the implicit 'development' default --
+    rotating a HARNESS cell silently converted its replacement lease
+    into the development lane, colliding with (or displacing) the real
+    development lease. This proves the harness replacement lease is
+    written with ``lane_role='harness'`` and that the development
+    lane's own lease row is byte-identical before and after that
+    rotation."""
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter([SESSION_ID, REPLACEMENT_SESSION])
+    cell_ids = iter(["cell-dev", "cell-harness"])
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cell_ids),
+        handoffs=handoffs,
+        replacement_session_ids=lambda: THIRD_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    dev = await service.dispatch("ENG-9")
+    assert dev.status == "working"
+
+    admit(queue, "ENG-11")
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+    assert harness.status == "working"
+
+    dev_lease_before = database.execute(
+        "SELECT profile_alias, project_key, lane_role, state, acquired_at "
+        "FROM profile_leases WHERE lane_role = 'development'"
+    ).fetchall()
+    assert len(dev_lease_before) == 1
+
+    record = handoffs.submit(_stub_handoff_document("cell-harness"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-harness", record.handoff_id)
+
+    assert rotated.lane_role == "harness"
+    harness_lease = database.execute(
+        "SELECT lane_role FROM profile_leases WHERE profile_alias = ?",
+        (rotated.profile_alias,),
+    ).fetchone()
+    assert harness_lease is not None
+    assert harness_lease["lane_role"] == "harness"
+
+    dev_lease_after = database.execute(
+        "SELECT profile_alias, project_key, lane_role, state, acquired_at "
+        "FROM profile_leases WHERE lane_role = 'development'"
+    ).fetchall()
+    assert [tuple(row) for row in dev_lease_after] == [
+        tuple(row) for row in dev_lease_before
+    ]
+
+
+@pytest.mark.asyncio
+async def test_development_rotation_still_writes_the_development_lane(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """Regression (Sol correction 110ed759, INFRA-219 R2): development-
+    lane rotation -- the only lane that existed before INFRA-219 L4 --
+    must still write its replacement lease with ``lane_role
+    ='development'`` exactly as today, unaffected by threading the
+    rotating cell's OWN lane through the replacement-lease insert."""
+
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    assert (await service.dispatch("ENG-9")).status == "working"
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-demo", record.handoff_id)
+
+    assert rotated.lane_role == "development"
+    lease_lane = database.scalar(
+        "SELECT lane_role FROM profile_leases WHERE profile_alias = ?",
+        (rotated.profile_alias,),
+    )
+    assert lease_lane == "development"
 
 
 @pytest.mark.asyncio
@@ -4230,12 +4477,17 @@ async def test_activate_admitted_issue_projection_failure_leaves_durable_pending
     ids=["in_development", "review"],
 )
 @pytest.mark.asyncio
-async def test_activate_admitted_issue_refuses_when_project_is_occupied(
+async def test_activate_admitted_issue_activates_below_the_bound_while_occupied(
     database: Database, queue: QueueService, occupying_state: IssueState
 ) -> None:
-    """Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT issue
-    already in ``in_development`` OR ``review`` refuses this candidate
-    transactionally, with zero local writes and zero Linear traffic."""
+    """INFRA-219 R6 (Sol correction 110ed759): a single OTHER issue
+    already in ``in_development`` OR ``review`` is far below
+    ``MAX_DEVELOPMENT_ISSUE_LANES`` and must NOT refuse this candidate
+    transactionally — the pre-R6 "any other occupying issue refuses"
+    behavior this test used to assert was exactly the verified defect.
+    Occupancy is still tracked (both issues durably ``in_development``
+    afterward); only saturating the bound (see the sibling saturation
+    test below) refuses."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
@@ -4247,6 +4499,44 @@ async def test_activate_admitted_issue_refuses_when_project_is_occupied(
         )
     linear = RecordingLinear()
 
+    activated, assignment = await _activate(database, linear)
+
+    assert activated is True
+    assert assignment is not None
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_refuses_transactionally_at_the_bound(
+    database: Database, queue: QueueService
+) -> None:
+    """INFRA-219 R6: the SAME bounded-count predicate the coarse
+    ``_dispatch_locked`` pre-check runs is re-proven, transactionally,
+    inside :func:`_activate_issue_transaction` — this test exercises
+    THAT commit-time path directly (:func:`activate_admitted_issue`,
+    not :meth:`ProjectCellService.dispatch`), bypassing the coarse
+    pre-check entirely, so it proves the transactional predicate agrees
+    with the pre-check's bound on its own, not merely because the
+    pre-check already filtered the candidate out."""
+
+    admit(queue, "ENG-9")
+    other_issue_ids = [f"ENG-{n}" for n in range(10, 10 + MAX_DEVELOPMENT_ISSUE_LANES)]
+    for issue_id in other_issue_ids:
+        admit(queue, issue_id)
+    _seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.executemany(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            [
+                (IssueState.IN_DEVELOPMENT.value, issue_id)
+                for issue_id in other_issue_ids
+            ],
+        )
+    linear = RecordingLinear()
+
     refused, assignment = await _activate(database, linear)
 
     assert refused is False
@@ -4255,16 +4545,26 @@ async def test_activate_admitted_issue_refuses_when_project_is_occupied(
     assert _issue_started_count(database) == 0
     assert _assignment_count(database) == 0
     assert linear.targets == []
+    # The bound-saturating lanes are untouched by the refusal.
+    for issue_id in other_issue_ids:
+        assert queue.get(issue_id).state == IssueState.IN_DEVELOPMENT
 
-    # The occupying issue clears; the candidate now activates normally.
+    # One lane clears below the bound; the candidate now activates, and
+    # re-activating (replaying) an ALREADY-occupying issue is still never
+    # refused by the bound, since it excludes itself from its own count.
     with database.transaction() as connection:
         connection.execute(
-            "UPDATE admitted_issues SET state = 'done' WHERE issue_id = 'ENG-10'"
+            "UPDATE admitted_issues SET state = 'done' WHERE issue_id = ?",
+            (other_issue_ids[0],),
         )
     activated, _ = await _activate(database, linear)
     assert activated is True
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
     assert linear.targets == [("ENG-9", "In Development", "operator")]
+
+    replayed, _ = await _activate(database, linear, issue_id="ENG-9")
+    assert replayed is True
+    assert _issue_started_count(database) == 1
 
 
 @pytest.mark.asyncio
@@ -4806,18 +5106,38 @@ async def test_armed_guard_never_blocks_the_replay_of_in_flight_work(
 
 
 @pytest.mark.asyncio
-async def test_daemon_and_idle_racing_activate_at_most_one_issue(
+async def test_daemon_and_idle_racing_activate_at_most_the_bound(
     cell_service: ProjectCellService,
     queue: QueueService,
     database: Database,
 ) -> None:
-    """Concurrent daemon dispatch and idle activation for the same
-    project: the existing project-wide lock, ``BEGIN IMMEDIATE``
-    transaction, and occupancy CAS still admit at most one issue —
-    exactly one ``issue.started``, one issue ``in_development``."""
+    """INFRA-219 R6 (Sol correction 110ed759): concurrent daemon dispatch
+    and idle activation for the same project must never TOGETHER push
+    the project's development lane past ``MAX_DEVELOPMENT_ISSUE_LANES``
+    — this is exactly the "commit-time proof agrees with the pre-check
+    at the bound, so two racing dispatches can never exceed it"
+    requirement. With the lane already one slot short of the bound,
+    racing two more distinct candidates for that ONE remaining slot
+    must admit exactly one of them, never both — the existing
+    project-wide lock, ``BEGIN IMMEDIATE`` transaction, and the bounded
+    occupancy CAS inside :func:`_activate_issue_transaction` still
+    admit at most as many as the bound allows."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
+    already_occupying = [
+        f"ENG-{n}" for n in range(20, 20 + MAX_DEVELOPMENT_ISSUE_LANES - 1)
+    ]
+    for issue_id in already_occupying:
+        admit(queue, issue_id)
+    with database.transaction() as connection:
+        connection.executemany(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            [
+                (IssueState.IN_DEVELOPMENT.value, issue_id)
+                for issue_id in already_occupying
+            ],
+        )
     _seed_active_cell(database)
     idle_linear = RecordingLinear()
 
@@ -4840,7 +5160,7 @@ async def test_daemon_and_idle_racing_activate_at_most_one_issue(
                 "WHERE state = 'in_development'"
             )
         )
-        == 1
+        == MAX_DEVELOPMENT_ISSUE_LANES
     )
 
 
@@ -4866,3 +5186,377 @@ async def test_paused_issue_is_never_touched_by_a_dispatch_of_a_different_issue(
     assert queue.get("ENG-9").state == IssueState.PAUSED
     assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
     assert all(target[0] != "ENG-9" for target in linear.targets)
+
+
+@pytest.mark.asyncio
+async def test_harness_dispatch_is_never_blocked_by_project_occupancy(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 L3 (operator ruling): occupancy is a DEVELOPMENT-LANE
+    fact. An ACTIVE development cell occupying a product issue must
+    never block a harness start — the contract's acceptance ("with the
+    development lead actively working an issue, one Hermes command
+    starts the visible harness lead") now actually holds. Both lane
+    cells coexist with distinct cell_id/session_id, and the harness
+    lead launches into its own worktree, never the development lead's.
+    """
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter(
+        [
+            UUID("22222222-2222-4222-8222-222222222222"),
+            UUID("33333333-3333-4333-8333-333333333333"),
+        ]
+    )
+    cells = iter(["cell-dev", "cell-harness"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    development = await service.dispatch("ENG-9")
+    assert development.status == "working"
+    dev_cell = service.active_cell("demo")
+    assert dev_cell is not None
+
+    admit(queue, "ENG-11")
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+
+    assert harness.status == "working"
+    harness_cell = service.active_cell("demo", "harness")
+    assert harness_cell is not None
+    assert harness_cell.cell_id != dev_cell.cell_id
+    assert harness_cell.session_id != dev_cell.session_id
+    assert harness.cell_id == harness_cell.cell_id
+    assert harness.session_id == harness_cell.session_id
+    assert any(
+        request.cwd == harness_cwd for request in runner.start_requests
+    )
+    assert all(
+        request.cwd != harness_cwd
+        for request in runner.start_requests
+        if request.session_id == dev_cell.session_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_harness_dispatch_never_consumes_or_mutates_development_occupancy(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 L3: a harness dispatch must never consume, activate, or
+    mutate any ``admitted_issues`` occupancy row -- every row (issue_id,
+    state) is byte-identical before and after, including the harness's
+    own backing issue, and the development cell's ``project_cells`` row
+    is untouched."""
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter(
+        [
+            UUID("22222222-2222-4222-8222-222222222222"),
+            UUID("33333333-3333-4333-8333-333333333333"),
+        ]
+    )
+    cells = iter(["cell-dev", "cell-harness"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    development = await service.dispatch("ENG-9")
+    assert development.status == "working"
+    dev_row_before = database.execute(
+        "SELECT cell_id, session_id, state, lane_role FROM project_cells "
+        "WHERE lane_role = 'development'"
+    ).fetchall()
+
+    admit(queue, "ENG-11")
+    issues_before = database.execute(
+        "SELECT issue_id, state FROM admitted_issues ORDER BY issue_id"
+    ).fetchall()
+
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+
+    assert harness.status == "working"
+    issues_after = database.execute(
+        "SELECT issue_id, state FROM admitted_issues ORDER BY issue_id"
+    ).fetchall()
+    assert [tuple(row) for row in issues_after] == [
+        tuple(row) for row in issues_before
+    ]
+    dev_row_after = database.execute(
+        "SELECT cell_id, session_id, state, lane_role FROM project_cells "
+        "WHERE lane_role = 'development'"
+    ).fetchall()
+    assert [tuple(row) for row in dev_row_after] == [
+        tuple(row) for row in dev_row_before
+    ]
+
+
+@pytest.mark.asyncio
+async def test_harness_dispatch_without_explicit_request_refuses_fail_closed(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-219 L3: a harness start without an explicit harness-run
+    request is refused fail-closed -- a clear status, zero writes, no
+    launched process -- rather than silently defaulting to development
+    behavior or launching unauthorized."""
+
+    admit(queue, "ENG-11")
+    events_before = database.execute(
+        "SELECT COUNT(*) AS n FROM events"
+    ).fetchone()["n"]
+    cells_before = database.execute(
+        "SELECT COUNT(*) AS n FROM project_cells"
+    ).fetchone()["n"]
+
+    result = await cell_service.dispatch("ENG-11", lane_role="harness")
+
+    assert result.status == "harness_run_required"
+    assert result.cell_id is None
+    assert result.session_id is None
+    assert queue.get("ENG-11").state == IssueState.QUEUED
+    assert (
+        database.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+        == events_before
+    )
+    assert (
+        database.execute("SELECT COUNT(*) AS n FROM project_cells").fetchone()["n"]
+        == cells_before
+    )
+    assert runner.start_count == 0
+    assert runner.resume_count == 0
+
+
+@pytest.mark.asyncio
+async def test_second_harness_dispatch_resumes_rather_than_duplicating(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 L2 (updated for L3): starting the harness lane twice
+    adopts the live cell (L1's per-lane uniqueness), never a second
+    row.
+
+    INFRA-219 L3: a harness dispatch no longer mutates
+    ``admitted_issues`` at all (it never claims a product issue), so
+    the SAME operational-test issue backs every harness dispatch --
+    the second call resumes the live harness session onto the same
+    cell rather than the coarse project-occupancy refusal L2 relied on
+    (which was itself only accidentally true, from the pre-L3 defect
+    of harness dispatch mutating occupancy)."""
+
+    sessions = iter(
+        [
+            UUID("44444444-4444-4444-8444-444444444444"),
+            UUID("55555555-5555-4555-8555-555555555555"),
+        ]
+    )
+    cells = iter(["cell-harness", "cell-extra"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    first = await service.dispatch("ENG-9", lane_role="harness", harness_run="run-1")
+    second = await service.dispatch("ENG-9", lane_role="harness", harness_run="run-2")
+
+    assert first.status == "working"
+    # The lane is already occupied by its own live cell: the second
+    # dispatch adopts and resumes it rather than creating a second
+    # harness cell (L1's per-lane uniqueness), and never touches the
+    # first as a "busy" refusal.
+    assert second.status == "working"
+    assert second.cell_id == first.cell_id == "cell-harness"
+    assert second.session_id == first.session_id
+    assert runner.start_count == 1
+    assert runner.resume_count == 1
+    rows = database.execute(
+        "SELECT cell_id FROM project_cells WHERE lane_role = 'harness'"
+    ).fetchall()
+    assert [str(row["cell_id"]) for row in rows] == ["cell-harness"]
+
+
+class FakeHarnessGit:
+    """Fake ``HarnessCheckoutPort`` for :func:`ensure_harness_checkout`.
+
+    INFRA-219 R7 / Sol correction 110ed759: mirrors exactly the surface
+    ``hermes_orchestrator.git.WorktreeGit`` exposes for worktree
+    evidence/provisioning, so these regressions prove the VALIDATE-then
+    -provision strategy without ever spawning real git.
+    """
+
+    def __init__(
+        self,
+        *,
+        worktrees: set[Path] = frozenset(),
+        heads: dict[Path, str] | None = None,
+        branches: dict[Path, str | None] | None = None,
+        mismatch_provisioned_head: bool = False,
+    ) -> None:
+        self._worktrees: set[Path] = set(worktrees)
+        self._heads: dict[Path, str] = dict(heads or {})
+        self._branches: dict[Path, str | None] = dict(branches or {})
+        self._mismatch_provisioned_head = mismatch_provisioned_head
+        self.add_calls: list[tuple[Path, Path, str]] = []
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
+        return tuple(str(path) for path in self._worktrees)
+
+    def worktree_add_detached(self, repo_path: Path, path: Path, sha: str) -> None:
+        self.add_calls.append((repo_path, path, sha))
+        self._worktrees.add(path)
+        self._heads[path] = (
+            "f" * 40 if self._mismatch_provisioned_head else sha
+        )
+
+    def head_sha(self, path: Path) -> str:
+        return self._heads.get(path, "a" * 40)
+
+    def branch(self, path: Path) -> str | None:
+        return self._branches.get(path)
+
+
+def test_ensure_harness_checkout_validates_existing_worktree(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: a harness checkout already registered as a git
+    worktree of the project repository is VALIDATED and proceeds --
+    never re-created."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    git = FakeHarnessGit(worktrees={harness_path}, heads={harness_path: "a" * 40})
+
+    status = ensure_harness_checkout(
+        git, repo_path=repo_path, harness_path=harness_path
+    )
+
+    assert status.provisioned is False
+    assert status.path == harness_path
+    assert git.add_calls == []
+
+
+def test_ensure_harness_checkout_provisions_when_absent(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: an absent harness checkout is PROVISIONED
+    through the existing worktree-materialization primitive
+    (``worktree_add_detached``), pinned to the repository's current
+    HEAD as the stable operational-only harness head -- never a bespoke
+    subprocess call."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    repo_head = "b" * 40
+    git = FakeHarnessGit(worktrees=set(), heads={repo_path: repo_head})
+
+    status = ensure_harness_checkout(
+        git, repo_path=repo_path, harness_path=harness_path
+    )
+
+    assert status.provisioned is True
+    assert status.head_sha == repo_head
+    assert git.add_calls == [(repo_path, harness_path, repo_head)]
+
+
+def test_ensure_harness_checkout_refuses_foreign_directory(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: a path that exists but is NOT registered as a
+    worktree of this repository is a foreign directory -- refused
+    fail-closed, never silently adopted."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    harness_path.mkdir()
+    git = FakeHarnessGit(worktrees=set())
+
+    with pytest.raises(HarnessCheckoutRefused):
+        ensure_harness_checkout(git, repo_path=repo_path, harness_path=harness_path)
+
+
+def test_ensure_harness_checkout_refuses_branch_mismatch(tmp_path: Path) -> None:
+    """R7 / Sol 110ed759: an already-registered checkout whose branch
+    disagrees with what Hermes expects refuses fail-closed rather than
+    launching a harness lead into the wrong identity."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    git = FakeHarnessGit(
+        worktrees={harness_path},
+        heads={harness_path: "a" * 40},
+        branches={harness_path: "some-other-branch"},
+    )
+
+    with pytest.raises(HarnessCheckoutRefused):
+        ensure_harness_checkout(
+            git,
+            repo_path=repo_path,
+            harness_path=harness_path,
+            expected_branch="demo-harness-head",
+        )
+
+
+def test_ensure_harness_checkout_refuses_head_mismatch_after_provisioning(
+    tmp_path: Path,
+) -> None:
+    """R7 / Sol 110ed759: even immediately after provisioning, the
+    checkout's actual HEAD is re-proven against the repository HEAD it
+    was provisioned from -- a disagreement refuses fail-closed instead
+    of launching a harness lead onto an unexpected commit."""
+
+    repo_path = tmp_path / "demo"
+    harness_path = tmp_path / "demo-harness"
+    git = FakeHarnessGit(
+        worktrees=set(),
+        heads={repo_path: "c" * 40},
+        mismatch_provisioned_head=True,
+    )
+
+    with pytest.raises(HarnessCheckoutRefused):
+        ensure_harness_checkout(git, repo_path=repo_path, harness_path=harness_path)

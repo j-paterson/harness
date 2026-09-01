@@ -338,13 +338,22 @@ class ClaudeProfileProbe:
         )
 
 
+_DEVELOPMENT_LANE = "development"
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileLease:
-    """One project-to-profile affinity lease."""
+    """One (project, lane)-to-profile affinity lease.
+
+    INFRA-219 L4: ``lane_role`` defaults to ``"development"`` so every
+    call site that predates the dual-lane model keeps constructing (and
+    reading) exactly the lease it always did.
+    """
 
     project_key: str
     profile_alias: str
     acquired_at: datetime
+    lane_role: str = _DEVELOPMENT_LANE
 
 
 # Fable budgets cycle weekly. A non-capped attestation older than one
@@ -391,7 +400,22 @@ class _PoolState:
 
 
 class ProfilePool:
-    """Lease healthy profile slots while preserving project affinity."""
+    """Lease healthy profile slots while preserving (project, lane) affinity.
+
+    INFRA-219 L4: leases were keyed by ``project_key`` alone, so a
+    harness cell dispatched alongside an active development cell for
+    the same project could never hold its own lease -- ``acquire``
+    returned the development lane's existing affinity verbatim, and the
+    harness cell's durable insert then collided with it on
+    ``profile_alias``. Every lease operation below is now keyed by
+    ``(project_key, lane_role)``, with ``lane_role`` defaulting to
+    ``"development"`` so every zero-argument call site that predates the
+    dual-lane model keeps today's exact behavior. The profile-slot
+    states (``_states``, keyed by alias) stay untouched: they are the
+    shared, global resource limit -- one profile serves one lease at a
+    time, across every project and lane -- while only the lease KEY
+    gained a lane dimension.
+    """
 
     def __init__(
         self,
@@ -407,8 +431,8 @@ class ProfilePool:
         # the INFRA-197-C2 wiring keep working unchanged.
         self._capacity_evidence = capacity_evidence
         self._states = {profile.alias: _PoolState() for profile in registry.profiles}
-        self._leases: dict[str, ProfileLease] = {}
-        self._replacement_reservations: dict[str, ProfileLease] = {}
+        self._leases: dict[tuple[str, str], ProfileLease] = {}
+        self._replacement_reservations: dict[tuple[str, str], ProfileLease] = {}
         self._last_refusal: str | None = None
 
     @property
@@ -417,10 +441,19 @@ class ProfilePool:
 
         return self._last_refusal
 
-    def acquire(self, project_key: str) -> ProfileLease | None:
-        """Return the existing affinity or lease the first available slot."""
+    def acquire(
+        self, project_key: str, lane_role: str = _DEVELOPMENT_LANE
+    ) -> ProfileLease | None:
+        """Return the existing affinity or lease the first available slot.
 
-        existing = self._leases.get(project_key)
+        INFRA-219 L4: keyed by ``(project_key, lane_role)`` -- a harness
+        lane never inherits, and never blocks on, the development lane's
+        existing affinity for the same project; it competes for a slot
+        exactly as a distinct project would.
+        """
+
+        key = (project_key, lane_role)
+        existing = self._leases.get(key)
         if existing is not None:
             return existing
 
@@ -431,8 +464,8 @@ class ProfilePool:
                 state.cooldown_until is not None and state.cooldown_until > now
             )
             if state.eligible and not cooling_down and state.active_project_count == 0:
-                lease = ProfileLease(project_key, profile.alias, now)
-                self._leases[project_key] = lease
+                lease = ProfileLease(project_key, profile.alias, now, lane_role)
+                self._leases[key] = lease
                 state.active_project_count += 1
                 return lease
         return None
@@ -443,31 +476,35 @@ class ProfilePool:
         profile_alias: str,
         acquired_at: datetime,
         *,
+        lane_role: str = _DEVELOPMENT_LANE,
         cooldown_until: datetime | None = None,
     ) -> ProfileLease:
         """Rehydrate one durable affinity before new admission begins."""
 
         self._registry.get(profile_alias)
-        existing = self._leases.get(project_key)
+        key = (project_key, lane_role)
+        existing = self._leases.get(key)
         if existing is not None:
             if existing.profile_alias == profile_alias:
                 return existing
-            raise ValueError("project has conflicting durable profile leases")
+            raise ValueError("project lane has conflicting durable profile leases")
         state = self._states[profile_alias]
         if state.active_project_count != 0:
             raise ValueError("profile has conflicting durable project leases")
-        lease = ProfileLease(project_key, profile_alias, acquired_at)
-        self._leases[project_key] = lease
+        lease = ProfileLease(project_key, profile_alias, acquired_at, lane_role)
+        self._leases[key] = lease
         state.active_project_count = 1
         state.cooldown_until = cooldown_until
         return lease
 
-    def release(self, project_key: str, reason: str) -> None:
-        """Release a project affinity with a reason for the caller's journal."""
+    def release(
+        self, project_key: str, reason: str, *, lane_role: str = _DEVELOPMENT_LANE
+    ) -> None:
+        """Release a project lane's affinity with a reason for the journal."""
 
         if not reason:
             raise ValueError("profile release reason is required")
-        lease = self._leases.pop(project_key, None)
+        lease = self._leases.pop((project_key, lane_role), None)
         if lease is not None:
             self._states[lease.profile_alias].active_project_count -= 1
 
@@ -475,6 +512,8 @@ class ProfilePool:
         self,
         project_key: str,
         exclude_alias: str,
+        *,
+        lane_role: str = _DEVELOPMENT_LANE,
     ) -> ProfileLease | None:
         """Reserve another healthy slot while preserving the current lease.
 
@@ -485,10 +524,11 @@ class ProfilePool:
         so the caller's failure message can name the evidence gap.
         """
 
-        existing = self._leases.get(project_key)
+        key = (project_key, lane_role)
+        existing = self._leases.get(key)
         if existing is None or existing.profile_alias != exclude_alias:
-            raise ValueError("project does not hold the excluded profile lease")
-        reserved = self._replacement_reservations.get(project_key)
+            raise ValueError("project lane does not hold the excluded profile lease")
+        reserved = self._replacement_reservations.get(key)
         if reserved is not None:
             return reserved
         now = self._now()
@@ -518,8 +558,8 @@ class ProfilePool:
             return None
 
         self._states[replacement_alias].active_project_count += 1
-        replacement = ProfileLease(project_key, replacement_alias, now)
-        self._replacement_reservations[project_key] = replacement
+        replacement = ProfileLease(project_key, replacement_alias, now, lane_role)
+        self._replacement_reservations[key] = replacement
         return replacement
 
     def _capacity_refusal(self, alias: str, now: datetime) -> str | None:
@@ -554,7 +594,9 @@ class ProfilePool:
             )
         return None
 
-    def reserve_context_only(self, project_key: str) -> ProfileLease:
+    def reserve_context_only(
+        self, project_key: str, *, lane_role: str = _DEVELOPMENT_LANE
+    ) -> ProfileLease:
         """Permit a context-only (session-only) rotation on the same profile.
 
         Retaining the incumbent consumes no other profile's occupancy and
@@ -562,15 +604,17 @@ class ProfilePool:
         only the session's context is being renewed.
         """
 
-        existing = self._leases.get(project_key)
+        existing = self._leases.get((project_key, lane_role))
         if existing is None:
-            raise ValueError("project holds no profile lease to retain")
+            raise ValueError("project lane holds no profile lease to retain")
         return existing
 
-    def cancel_replacement(self, project_key: str) -> None:
+    def cancel_replacement(
+        self, project_key: str, *, lane_role: str = _DEVELOPMENT_LANE
+    ) -> None:
         """Release an uncommitted replacement reservation."""
 
-        reserved = self._replacement_reservations.pop(project_key, None)
+        reserved = self._replacement_reservations.pop((project_key, lane_role), None)
         if reserved is not None:
             self._states[reserved.profile_alias].active_project_count -= 1
 
@@ -578,31 +622,38 @@ class ProfilePool:
         self,
         project_key: str,
         exclude_alias: str,
+        *,
+        lane_role: str = _DEVELOPMENT_LANE,
     ) -> ProfileLease:
         """Transfer affinity to the acknowledged reserved replacement."""
 
-        existing = self._leases.get(project_key)
-        reserved = self._replacement_reservations.get(project_key)
+        key = (project_key, lane_role)
+        existing = self._leases.get(key)
+        reserved = self._replacement_reservations.get(key)
         if existing is None or existing.profile_alias != exclude_alias:
-            raise ValueError("project does not hold the excluded profile lease")
+            raise ValueError("project lane does not hold the excluded profile lease")
         if reserved is None:
-            raise ValueError("project has no replacement reservation")
+            raise ValueError("project lane has no replacement reservation")
         self._states[exclude_alias].active_project_count -= 1
-        self._leases[project_key] = reserved
-        del self._replacement_reservations[project_key]
+        self._leases[key] = reserved
+        del self._replacement_reservations[key]
         return reserved
 
     def rotate(
         self,
         project_key: str,
         exclude_alias: str,
+        *,
+        lane_role: str = _DEVELOPMENT_LANE,
     ) -> ProfileLease | None:
         """Reserve and immediately commit a replacement lease."""
 
-        replacement = self.reserve_replacement(project_key, exclude_alias)
+        replacement = self.reserve_replacement(
+            project_key, exclude_alias, lane_role=lane_role
+        )
         if replacement is None:
             return None
-        return self.commit_rotation(project_key, exclude_alias)
+        return self.commit_rotation(project_key, exclude_alias, lane_role=lane_role)
 
     def set_cooldown(self, alias: str, cooldown_until: datetime | None) -> None:
         """Prevent new leases on a capped profile until the supplied time."""

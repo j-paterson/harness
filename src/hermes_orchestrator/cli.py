@@ -23,7 +23,13 @@ from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
 from hermes_orchestrator.acceptance import AcceptanceGates
-from hermes_orchestrator.cells import ProfileCapacityEvidence, ProjectCellService
+from hermes_orchestrator.cells import (
+    DEVELOPMENT_LANE,
+    HARNESS_LANE,
+    ProfileCapacityEvidence,
+    ProjectCellService,
+    ensure_harness_checkout,
+)
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
     hub_socket_path,
@@ -53,8 +59,10 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
+from hermes_orchestrator.emission import EmissionBlocked, ResolvedLane, resolve_lane
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
+from hermes_orchestrator.git import GitError, WorktreeGit
 from hermes_orchestrator.handoffs import (
     HandoffRecord,
     HandoffRejected,
@@ -133,6 +141,7 @@ from hermes_orchestrator.stalls import (
 )
 from hermes_orchestrator.subagent_packets import SubagentPackets
 from hermes_orchestrator.supervisor import Supervisor
+from hermes_orchestrator.worktrees import WorktreeLeases
 
 
 def _watch_interval(raw: str) -> int:
@@ -512,6 +521,40 @@ def _parser() -> argparse.ArgumentParser:
     )
     rotate_lead.add_argument("--cell", required=True)
     rotate_lead.add_argument("--json", action="store_true")
+
+    start_lane = commands.add_parser(
+        "start-lane",
+        help=(
+            "start or recover a project's visible lead cell in one lane "
+            "(development or harness) through Hermes' existing cell "
+            "creation/launch path -- idempotent: a live cell in that "
+            "lane is adopted and reported, never duplicated "
+            "(INFRA-219 L2)"
+        ),
+    )
+    start_lane.add_argument("--project", required=True)
+    start_lane.add_argument(
+        "--lane", choices=("development", "harness"), default="development"
+    )
+    start_lane.add_argument(
+        "--issue",
+        default=None,
+        help=(
+            "explicit issue to launch a NEW cell against; omit to only "
+            "recover an already-running cell in this lane"
+        ),
+    )
+    start_lane.add_argument(
+        "--harness-run",
+        default=None,
+        help=(
+            "explicit harness-run identity; REQUIRED with --lane harness "
+            "(and refused with --lane development) -- mirrors "
+            "ProjectCellService.dispatch's own harness_run contract "
+            "(Sol correction 110ed759 / INFRA-219 L3, R1)"
+        ),
+    )
+    start_lane.add_argument("--json", action="store_true")
 
     submit_handoff = commands.add_parser(
         "submit-handoff",
@@ -1118,8 +1161,32 @@ class _NoDispatchLinear:
         raise AssertionError("lead rotation never projects a Linear status")
 
 
+def _harness_lead_cwd(lead_cwd: Path) -> Path:
+    """The harness lane's dedicated worktree for a project's ``lead_cwd``.
+
+    INFRA-219 L2: a sibling checkout, never the development lead's own
+    directory -- ``start-lane --lane harness`` never launches or
+    resumes a lead in the same worktree a development lead uses, so
+    the two lanes' sessions can never collide on working-tree state.
+    The path is a deterministic convention (no new config surface).
+
+    INFRA-219 R7 / Sol correction 110ed759: L2 left provisioning the
+    actual worktree here out of scope -- this naming convention alone
+    never created or validated the checkout. ``_open_rotation_collaborators``
+    now runs :func:`hermes_orchestrator.cells.ensure_harness_checkout`
+    against exactly this path before a harness lane ever launches into
+    it.
+    """
+
+    return lead_cwd.parent / f"{lead_cwd.name}-harness"
+
+
 def _open_rotation_collaborators(
-    settings: Settings, runtime: Runtime
+    settings: Settings,
+    runtime: Runtime,
+    *,
+    lane_role: str = DEVELOPMENT_LANE,
+    harness_project_key: str | None = None,
 ) -> tuple[ProjectCellService, CmuxLeadSeater]:
     """Compose the project cell service and classic seater rotation needs.
 
@@ -1135,6 +1202,22 @@ def _open_rotation_collaborators(
     ``ValueError`` with an actionable message when a required local file
     (``config/profiles.yaml``) is missing; the caller turns that into a
     clean refusal rather than a traceback.
+
+    INFRA-219 R7 / Sol correction 110ed759: when ``lane_role`` is
+    ``HARNESS_LANE`` and ``harness_project_key`` names the project being
+    started, the dedicated harness checkout
+    (:func:`_harness_lead_cwd`) is VALIDATED (or PROVISIONED, if absent)
+    against the project's real repository through
+    :func:`ensure_harness_checkout` -- the worktree machinery
+    ``WorktreeGit`` already provides, never a bespoke subprocess call --
+    before the seater/cell service are ever composed to launch into it.
+    :class:`hermes_orchestrator.cells.HarnessCheckoutRefused` is a
+    ``ValueError`` subclass, so a mismatched or foreign checkout flows
+    through this function's existing ``ValueError`` refusal path with no
+    new exception handling here. ``harness_project_key`` is ``None`` for
+    every pre-R7 caller (development rotation, and the direct unit tests
+    that call this function without a project) so this check runs only
+    when a caller opts a specific project into it.
     """
 
     assert settings.cmux is not None
@@ -1196,8 +1279,20 @@ def _open_rotation_collaborators(
     # ``managed_repo_paths`` above — the seater and cell service must
     # launch into exactly the directory bootstrap already trusted.
     project_paths: Mapping[str, Path] = {
-        alias: project.lead_cwd for alias, project in settings.projects.items()
+        alias: (
+            _harness_lead_cwd(project.lead_cwd)
+            if lane_role == HARNESS_LANE
+            else project.lead_cwd
+        )
+        for alias, project in settings.projects.items()
     }
+    if lane_role == HARNESS_LANE and harness_project_key is not None:
+        harness_project = settings.projects[harness_project_key]
+        ensure_harness_checkout(
+            WorktreeGit(),
+            repo_path=harness_project.repo_path,
+            harness_path=_harness_lead_cwd(harness_project.lead_cwd),
+        )
     cmux_port = CmuxCliAdapter(
         settings.cmux.cli,
         base_env=environment,
@@ -1226,9 +1321,15 @@ def _open_rotation_collaborators(
     )
     if runtime.cells is not None:
         return runtime.cells, seater
+    # INFRA-219 R7 / Sol correction 110ed759: an operational-only prompt,
+    # distinct from the development lead's ``claude-lead.md`` -- the
+    # harness lane owns restart/rotation/wake-confirm/recovery/dedup/
+    # acceptance testing only and never selects or implements product
+    # issues (see ``prompts/claude-harness.md``).
+    prompt_name = "claude-harness.md" if lane_role == HARNESS_LANE else "claude-lead.md"
     runner = ClaudeRunner(
         registry,
-        prompt_file=settings.repo_root / "prompts" / "claude-lead.md",
+        prompt_file=settings.repo_root / "prompts" / prompt_name,
         base_env=environment,
         processes=runtime.processes,
         freeze_dir=settings.state_dir / "freezes",
@@ -1255,7 +1356,167 @@ def _open_rotation_collaborators(
     return cells, seater
 
 
-async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
+#: DispatchResult statuses that mean "a lead is genuinely running (or
+#: just ran a turn) in this lane" -- the only outcomes ``start-lane``
+#: may report as success. This is an explicit ALLOW-list, not a deny
+#: -list, by deliberate Sol correction 110ed759 / INFRA-219 R1 design:
+#: the prior code (``return 0 if result.status not in (...) else 1``)
+#: was a deny-list that treated every *unrecognized* status -- including
+#: the harness-run refusals L3 later added -- as success. An allow-list
+#: cannot repeat that inversion: a new refusal status ``dispatch`` grows
+#: in the future is nonzero by construction, with zero further changes
+#: here. The two members reflect the two ways ``_dispatch_locked`` ends
+#: with a lead actually seated/run: ``"seated"`` (the classic-seats path
+#: activates the visible pane lead) and ``"working"`` (the streaming
+#: path completed a turn with the session durably confirmed). Every
+#: other status -- ``already_completed``, ``handoff_required``,
+#: ``seat_failed``, ``start_reconciliation_required``,
+#: ``start_unconfirmed``, ``project_busy``, ``awaiting_operator_decision``,
+#: ``harness_run_required``, ``harness_run_not_permitted``, and
+#: ``waiting_for_profile``/``start_failed`` (the two the old deny-list
+#: already caught) -- is a refusal or a non-start terminal state, and
+#: exits nonzero here.
+_LANE_DISPATCH_SUCCESS_STATUSES = frozenset({"seated", "working"})
+
+
+def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
+    """``start-lane``: launch or recover one project's lead cell in one
+    lane through Hermes' existing cell creation/launch path.
+
+    INFRA-219 L2. Reuses :func:`_open_rotation_collaborators` --
+    exactly the collaborators (profile pool, ``ClaudeRunner``,
+    ``CmuxLeadSeater``) ``rotate-lead`` already composes -- so this
+    command is never a bespoke launcher, only a thin wire onto
+    :meth:`ProjectCellService.dispatch`. Idempotent: an already-live
+    cell in the requested lane is adopted and reported (L1's
+    ``(project_key, lane_role)`` uniqueness refuses a duplicate row
+    before this command would ever attempt one), never a traceback.
+
+    Sol correction 110ed759 / INFRA-219 R1: L3 made ``harness_run`` a
+    MANDATORY ``ProjectCellService.dispatch`` argument for a harness
+    dispatch (``HARNESS_LANE`` without it refuses
+    ``harness_run_required``; a development dispatch that supplies one
+    refuses ``harness_run_not_permitted``), but L2 wrote this command
+    before L3 existed and never passed it -- so every harness start
+    refused, and the old exit line mapped only
+    ``waiting_for_profile``/``start_failed`` to nonzero, so the refusal
+    silently exited 0. This command now (1) carries an explicit
+    ``--harness-run`` argument and mirrors ``dispatch``'s own
+    lane/harness_run validation at the CLI boundary -- fail-closed
+    before ever calling ``dispatch``, so the dispatch-level refusal is
+    never the only guard -- and (2) maps exit codes through the
+    :data:`_LANE_DISPATCH_SUCCESS_STATUSES` ALLOW-list instead of a
+    deny-list, so any refusal status, present or future, exits nonzero.
+    """
+
+    if settings.cmux is None or runtime.cmux_bindings is None:
+        _print(
+            {"error": "cmux is not configured"},
+            json_output=args.json,
+            human="cmux is not configured (config/cmux.yaml).",
+        )
+        return 1
+    if settings.projects.get(args.project) is None:
+        _print(
+            {"error": "unknown project"},
+            json_output=args.json,
+            human=f"unknown project {args.project!r}.",
+        )
+        return 1
+    lane_role = HARNESS_LANE if args.lane == "harness" else DEVELOPMENT_LANE
+    try:
+        cells, _seater = _open_rotation_collaborators(
+            settings,
+            runtime,
+            lane_role=lane_role,
+            # INFRA-219 R7 / Sol correction 110ed759: only a harness
+            # start ever needs its dedicated checkout validated or
+            # provisioned; a development start passes no project here
+            # and ``_open_rotation_collaborators`` skips the check.
+            harness_project_key=args.project if lane_role == HARNESS_LANE else None,
+        )
+    except (OSError, ValueError, GitError) as error:
+        _print({"error": str(error)}, json_output=args.json, human=f"{error}.")
+        return 1
+
+    existing = cells.active_cell(args.project, lane_role)
+    if existing is not None:
+        _print(
+            {
+                "status": "already_running",
+                "lane": lane_role,
+                "cell_id": existing.cell_id,
+                "session_id": str(existing.session_id),
+            },
+            json_output=args.json,
+            human=(
+                f"{lane_role} lane already running for {args.project}: "
+                f"cell {existing.cell_id} (session {existing.session_id}) "
+                "-- adopted, not duplicated."
+            ),
+        )
+        return 0
+
+    if not args.issue:
+        _print(
+            {"error": "no live cell in this lane and no --issue to start one"},
+            json_output=args.json,
+            human=(
+                f"no live {lane_role} lane cell for {args.project}; pass "
+                "--issue to start one."
+            ),
+        )
+        return 1
+
+    # Sol correction 110ed759 / INFRA-219 R1: mirror ProjectCellService
+    # .dispatch's own lane/harness_run validation HERE, at the CLI
+    # boundary, before ever calling dispatch -- fail-closed with a
+    # clear message and a nonzero exit, rather than letting the
+    # dispatch-level refusal (``harness_run_required`` /
+    # ``harness_run_not_permitted``) be the only guard against a
+    # harness start that never launches anything.
+    if lane_role == HARNESS_LANE and not args.harness_run:
+        _print(
+            {"error": "harness_run_required"},
+            json_output=args.json,
+            human=(
+                "--lane harness requires --harness-run: the harness lane "
+                "requires an explicit harness-run request bound to "
+                "lane_role='harness' (Sol correction 110ed759 / "
+                "INFRA-219 L3)."
+            ),
+        )
+        return 1
+    if lane_role != HARNESS_LANE and args.harness_run:
+        _print(
+            {"error": "harness_run_not_permitted"},
+            json_output=args.json,
+            human=(
+                "--lane development refuses --harness-run: development "
+                "occupancy is proven by explicit issue admission alone "
+                "(Sol correction 110ed759 / INFRA-219 L3)."
+            ),
+        )
+        return 1
+
+    result = asyncio.run(
+        cells.dispatch(args.issue, lane_role=lane_role, harness_run=args.harness_run)
+    )
+    payload = dataclasses.asdict(result)
+    _print(
+        payload,
+        json_output=args.json,
+        human=(
+            f"{lane_role} lane for {args.project}: {result.status} "
+            f"(cell {result.cell_id}, session {result.session_id})."
+        ),
+    )
+    return 0 if result.status in _LANE_DISPATCH_SUCCESS_STATUSES else 1
+
+
+async def _candidate_ready(
+    flow: MergeFlow, args: Any, resolved_lane: ResolvedLane
+) -> dict[str, Any]:
     verification: list[tuple[str, str]] = []
     for entry in args.verified:
         command, separator, result = entry.partition("=")
@@ -1271,9 +1532,11 @@ async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
             verification=tuple(verification),
             blockers=tuple(args.blocker),
             status=args.status,
-            # The lead runs candidate-ready from its own checkout; the
-            # emitter validates it belongs to the project repository.
-            lead_checkout=Path.cwd(),
+            # INFRA-219 L5: publication is targeted to the requested
+            # issue's OWN live worktree lease -- resolved below, before
+            # the flow is even opened -- never whatever checkout the
+            # lead currently occupies.
+            resolved_lane=resolved_lane,
         )
         thread_status: str | None = None
         if emitted.delivery.thread_id is not None:
@@ -3915,6 +4178,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return 0
 
+        if args.command == "start-lane":
+            return _start_lane(args, settings, runtime)
+
         if args.command == "submit-handoff":
             return _submit_handoff(args, settings, runtime, database)
 
@@ -4351,9 +4617,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            # INFRA-219 L5: resolve the requested issue's own live
+            # worktree lease BEFORE the merge flow is even opened, so an
+            # unbound issue never reaches manifest write or wake
+            # publication -- fails closed exactly like the invalid-input
+            # checks above.
+            leases = WorktreeLeases(
+                runtime.database, events=EventStore(runtime.database)
+            )
+            try:
+                resolved_lane = resolve_lane(leases, args.project, args.issue_id)
+            except EmissionBlocked as error:
+                print(str(error), file=sys.stderr)
+                return 1
             try:
                 flow = _open_merge_flow(settings, runtime)
-                payload = asyncio.run(_candidate_ready(flow, args))
+                payload = asyncio.run(_candidate_ready(flow, args, resolved_lane))
             except (ValueError, RuntimeError) as error:
                 print(str(error), file=sys.stderr)
                 return 1
