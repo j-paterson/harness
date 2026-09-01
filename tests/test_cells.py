@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from hermes_orchestrator.cells import (
+    MAX_DEVELOPMENT_ISSUE_LANES,
     ProfileCapacityEvidence,
     ProjectCell,
     ProjectCellService,
@@ -261,55 +262,71 @@ async def test_two_issues_share_one_project_lead(
 
 
 @pytest.mark.asyncio
-async def test_second_issue_refused_while_first_in_development(
+async def test_second_issue_dispatches_concurrently_while_first_in_development(
     cell_service: ProjectCellService,
     queue: QueueService,
     runner: RecordingRunner,
     linear: RecordingLinear,
     database: Database,
 ) -> None:
+    """INFRA-219 R6 (Sol correction 110ed759): the operator's contract is
+    up to ``cells.MAX_DEVELOPMENT_ISSUE_LANES`` (six) admitted issue lanes
+    CONCURRENTLY occupying one project's development lane — a second
+    distinct issue while the first is still ``in_development`` is well
+    under that bound, so it must dispatch and occupy alongside the
+    first, sharing the ONE development lead cell (item 6 of this
+    packet: cell topology is unchanged, only occupancy accounting is).
+    This test replaces the pre-R6 "second issue refused" expectation
+    that this exact scenario used to assert — that was the verified
+    defect Sol's correction requires fixed."""
+
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
 
     first = await cell_service.dispatch("ENG-9")
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
 
-    events_before = database.execute(
-        "SELECT COUNT(*) AS n FROM events"
-    ).fetchone()["n"]
-
     second = await cell_service.dispatch("ENG-10")
 
-    assert second.status == "project_busy"
-    assert second.cell_id is None
-    assert second.session_id is None
-    assert queue.get("ENG-10").state == IssueState.QUEUED
+    assert second.status != "project_busy"
+    assert second.status == "working"
+    assert second.cell_id == first.cell_id
+    assert second.session_id == first.session_id
+    assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
     assert ("demo", "ENG-10") not in linear.validations
     assert runner.start_count == 1
-    assert runner.resume_count == 0
-    events_after = database.execute(
-        "SELECT COUNT(*) AS n FROM events"
-    ).fetchone()["n"]
-    assert events_after == events_before
+    assert runner.resume_count == 1
 
-    # Dispatching (resuming) the ALREADY in_development issue itself is
-    # untouched by the guard: only a DIFFERENT queued issue is refused.
+    # Both issues are durably recorded as occupying at once.
+    occupying = {
+        row["issue_id"]
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = 'demo' "
+            "AND state = ?",
+            (IssueState.IN_DEVELOPMENT.value,),
+        ).fetchall()
+    }
+    assert occupying == {"ENG-9", "ENG-10"}
+
+    # Dispatching (resuming) either ALREADY-occupying issue is untouched.
     resumed = await cell_service.dispatch("ENG-9")
+    assert resumed.status == "working"
     assert resumed.cell_id == first.cell_id
     assert resumed.session_id == first.session_id
-    assert runner.resume_count == 1
 
 
 @pytest.mark.asyncio
-async def test_second_issue_refused_while_first_in_review(
+async def test_second_issue_dispatches_concurrently_while_first_in_review(
     cell_service: ProjectCellService,
     queue: QueueService,
     runner: RecordingRunner,
 ) -> None:
-    """INFRA-211 failure reproduction: a lead that has already handed
-    off to review still occupies the project — a distinct queued issue
-    must never start or deliver an assignment while the first sits in
-    review."""
+    """INFRA-211: a lead that has already handed off to review still
+    counts as occupying its project's development lane (the reviewer/
+    settlement flow still owns it), but per INFRA-219 R6 that only
+    counts against the bounded lane limit — it does not, by itself,
+    refuse a second distinct issue, since one occupying lane is far
+    below ``MAX_DEVELOPMENT_ISSUE_LANES``."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
@@ -321,11 +338,90 @@ async def test_second_issue_refused_while_first_in_review(
 
     second = await cell_service.dispatch("ENG-10")
 
-    assert second.status == "project_busy"
-    assert second.cell_id is None
-    assert second.session_id is None
-    assert queue.get("ENG-10").state == IssueState.QUEUED
-    assert runner.resume_count == 0
+    assert second.status != "project_busy"
+    assert second.status == "working"
+    assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
+    assert runner.resume_count == 1
+
+
+@pytest.mark.asyncio
+async def test_three_distinct_issues_dispatch_concurrently_in_development_lane(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+) -> None:
+    """The headline INFRA-219 R6 acceptance requirement (Sol correction
+    110ed759): "at least three isolated issue worktree lanes progressing
+    concurrently" for one project's development lane. All three must be
+    durably recorded as occupying (``in_development``) at once, sharing
+    the project's single development lead cell."""
+
+    admit(queue, "ENG-9")
+    admit(queue, "ENG-10")
+    admit(queue, "ENG-11")
+
+    first = await cell_service.dispatch("ENG-9")
+    second = await cell_service.dispatch("ENG-10")
+    third = await cell_service.dispatch("ENG-11")
+
+    for result in (first, second, third):
+        assert result.status == "working"
+        assert result.cell_id == first.cell_id
+        assert result.session_id == first.session_id
+
+    occupying = {
+        row["issue_id"]
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = 'demo' "
+            "AND state = ?",
+            (IssueState.IN_DEVELOPMENT.value,),
+        ).fetchall()
+    }
+    assert occupying == {"ENG-9", "ENG-10", "ENG-11"}
+    for issue_id in ("ENG-9", "ENG-10", "ENG-11"):
+        assert queue.get(issue_id).state == IssueState.IN_DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuses_beyond_the_bounded_issue_lane_maximum(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+) -> None:
+    """A development dispatch is refused with ``project_busy`` only once
+    the project already has ``MAX_DEVELOPMENT_ISSUE_LANES`` OTHER
+    distinct occupying issues — never merely because one is occupying.
+    The existing occupying lanes must be entirely untouched by the
+    refusal (INFRA-219 R6)."""
+
+    issue_ids = [f"ENG-{n}" for n in range(1, MAX_DEVELOPMENT_ISSUE_LANES + 2)]
+    for issue_id in issue_ids:
+        admit(queue, issue_id)
+
+    results = [
+        await cell_service.dispatch(issue_id)
+        for issue_id in issue_ids[:MAX_DEVELOPMENT_ISSUE_LANES]
+    ]
+    assert all(result.status == "working" for result in results)
+
+    overflow_issue = issue_ids[MAX_DEVELOPMENT_ISSUE_LANES]
+    overflow = await cell_service.dispatch(overflow_issue)
+
+    assert overflow.status == "project_busy"
+    assert overflow.cell_id is None
+    assert overflow.session_id is None
+    assert queue.get(overflow_issue).state == IssueState.QUEUED
+
+    # The six existing lanes are untouched by the refusal.
+    occupying = {
+        row["issue_id"]
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = 'demo' "
+            "AND state = ?",
+            (IssueState.IN_DEVELOPMENT.value,),
+        ).fetchall()
+    }
+    assert occupying == set(issue_ids[:MAX_DEVELOPMENT_ISSUE_LANES])
 
 
 @pytest.mark.asyncio
@@ -4379,12 +4475,17 @@ async def test_activate_admitted_issue_projection_failure_leaves_durable_pending
     ids=["in_development", "review"],
 )
 @pytest.mark.asyncio
-async def test_activate_admitted_issue_refuses_when_project_is_occupied(
+async def test_activate_admitted_issue_activates_below_the_bound_while_occupied(
     database: Database, queue: QueueService, occupying_state: IssueState
 ) -> None:
-    """Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT issue
-    already in ``in_development`` OR ``review`` refuses this candidate
-    transactionally, with zero local writes and zero Linear traffic."""
+    """INFRA-219 R6 (Sol correction 110ed759): a single OTHER issue
+    already in ``in_development`` OR ``review`` is far below
+    ``MAX_DEVELOPMENT_ISSUE_LANES`` and must NOT refuse this candidate
+    transactionally — the pre-R6 "any other occupying issue refuses"
+    behavior this test used to assert was exactly the verified defect.
+    Occupancy is still tracked (both issues durably ``in_development``
+    afterward); only saturating the bound (see the sibling saturation
+    test below) refuses."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
@@ -4396,6 +4497,44 @@ async def test_activate_admitted_issue_refuses_when_project_is_occupied(
         )
     linear = RecordingLinear()
 
+    activated, assignment = await _activate(database, linear)
+
+    assert activated is True
+    assert assignment is not None
+    assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
+    assert _issue_started_count(database) == 1
+    assert _assignment_count(database) == 1
+    assert linear.targets == [("ENG-9", "In Development", "operator")]
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_refuses_transactionally_at_the_bound(
+    database: Database, queue: QueueService
+) -> None:
+    """INFRA-219 R6: the SAME bounded-count predicate the coarse
+    ``_dispatch_locked`` pre-check runs is re-proven, transactionally,
+    inside :func:`_activate_issue_transaction` — this test exercises
+    THAT commit-time path directly (:func:`activate_admitted_issue`,
+    not :meth:`ProjectCellService.dispatch`), bypassing the coarse
+    pre-check entirely, so it proves the transactional predicate agrees
+    with the pre-check's bound on its own, not merely because the
+    pre-check already filtered the candidate out."""
+
+    admit(queue, "ENG-9")
+    other_issue_ids = [f"ENG-{n}" for n in range(10, 10 + MAX_DEVELOPMENT_ISSUE_LANES)]
+    for issue_id in other_issue_ids:
+        admit(queue, issue_id)
+    _seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.executemany(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            [
+                (IssueState.IN_DEVELOPMENT.value, issue_id)
+                for issue_id in other_issue_ids
+            ],
+        )
+    linear = RecordingLinear()
+
     refused, assignment = await _activate(database, linear)
 
     assert refused is False
@@ -4404,16 +4543,26 @@ async def test_activate_admitted_issue_refuses_when_project_is_occupied(
     assert _issue_started_count(database) == 0
     assert _assignment_count(database) == 0
     assert linear.targets == []
+    # The bound-saturating lanes are untouched by the refusal.
+    for issue_id in other_issue_ids:
+        assert queue.get(issue_id).state == IssueState.IN_DEVELOPMENT
 
-    # The occupying issue clears; the candidate now activates normally.
+    # One lane clears below the bound; the candidate now activates, and
+    # re-activating (replaying) an ALREADY-occupying issue is still never
+    # refused by the bound, since it excludes itself from its own count.
     with database.transaction() as connection:
         connection.execute(
-            "UPDATE admitted_issues SET state = 'done' WHERE issue_id = 'ENG-10'"
+            "UPDATE admitted_issues SET state = 'done' WHERE issue_id = ?",
+            (other_issue_ids[0],),
         )
     activated, _ = await _activate(database, linear)
     assert activated is True
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
     assert linear.targets == [("ENG-9", "In Development", "operator")]
+
+    replayed, _ = await _activate(database, linear, issue_id="ENG-9")
+    assert replayed is True
+    assert _issue_started_count(database) == 1
 
 
 @pytest.mark.asyncio
@@ -4955,18 +5104,38 @@ async def test_armed_guard_never_blocks_the_replay_of_in_flight_work(
 
 
 @pytest.mark.asyncio
-async def test_daemon_and_idle_racing_activate_at_most_one_issue(
+async def test_daemon_and_idle_racing_activate_at_most_the_bound(
     cell_service: ProjectCellService,
     queue: QueueService,
     database: Database,
 ) -> None:
-    """Concurrent daemon dispatch and idle activation for the same
-    project: the existing project-wide lock, ``BEGIN IMMEDIATE``
-    transaction, and occupancy CAS still admit at most one issue —
-    exactly one ``issue.started``, one issue ``in_development``."""
+    """INFRA-219 R6 (Sol correction 110ed759): concurrent daemon dispatch
+    and idle activation for the same project must never TOGETHER push
+    the project's development lane past ``MAX_DEVELOPMENT_ISSUE_LANES``
+    — this is exactly the "commit-time proof agrees with the pre-check
+    at the bound, so two racing dispatches can never exceed it"
+    requirement. With the lane already one slot short of the bound,
+    racing two more distinct candidates for that ONE remaining slot
+    must admit exactly one of them, never both — the existing
+    project-wide lock, ``BEGIN IMMEDIATE`` transaction, and the bounded
+    occupancy CAS inside :func:`_activate_issue_transaction` still
+    admit at most as many as the bound allows."""
 
     admit(queue, "ENG-9")
     admit(queue, "ENG-10")
+    already_occupying = [
+        f"ENG-{n}" for n in range(20, 20 + MAX_DEVELOPMENT_ISSUE_LANES - 1)
+    ]
+    for issue_id in already_occupying:
+        admit(queue, issue_id)
+    with database.transaction() as connection:
+        connection.executemany(
+            "UPDATE admitted_issues SET state = ? WHERE issue_id = ?",
+            [
+                (IssueState.IN_DEVELOPMENT.value, issue_id)
+                for issue_id in already_occupying
+            ],
+        )
     _seed_active_cell(database)
     idle_linear = RecordingLinear()
 
@@ -4989,7 +5158,7 @@ async def test_daemon_and_idle_racing_activate_at_most_one_issue(
                 "WHERE state = 'in_development'"
             )
         )
-        == 1
+        == MAX_DEVELOPMENT_ISSUE_LANES
     )
 
 

@@ -227,18 +227,43 @@ _RUNNABLE_ISSUE_STATES = (
     IssueState.BLOCKED.value,
 )
 
-# Project occupancy (INFRA-199 v2 / INFRA-211): a project is "busy" —
-# refusing a DIFFERENT issue's activation — while it has an issue in
-# EITHER of these states. ``in_development`` is the obvious case; the
-# INFRA-211 failure reproduction showed a second issue starting while
-# the first had already moved to ``review`` (the lead had handed off,
-# but the project is not yet free — the reviewer/settlement flow still
-# owns it), so review occupies the project exactly like in_development
+# Project occupancy (INFRA-199 v2 / INFRA-211): an issue is "occupying"
+# its project — counted against the project's development-lane
+# concurrency bound below — while it is in EITHER of these states.
+# ``in_development`` is the obvious case; the INFRA-211 failure
+# reproduction showed a second issue starting while the first had
+# already moved to ``review`` (the lead had handed off, but the
+# project is not yet free — the reviewer/settlement flow still owns
+# it), so review occupies the project exactly like in_development
 # does.
 _OCCUPYING_ISSUE_STATES = (
     IssueState.IN_DEVELOPMENT.value,
     IssueState.REVIEW.value,
 )
+
+# INFRA-219 R6 (Sol correction 110ed759): the operator ruling behind
+# INFRA-219 is that "one Fable project lead owns a single project ...
+# and continuously coordinates up to six explicitly admitted Linear
+# issue lanes when resources and dependency boundaries permit" —
+# concurrency of ADMITTED ISSUES within one project's development
+# lane, not a single-issue-per-project rule. Packet L3 scoped the
+# pre-existing "any other occupying issue refuses" rule to the
+# development lane (correctly excluding the harness lane, which never
+# claims a product issue at all), but Sol's verification of R1-R5
+# found that scoping left the ORIGINAL one-issue-per-project refusal
+# fully intact *within* that lane — a second admitted issue could
+# never activate for the same project even though nothing in the
+# contract limits development to one concurrent issue. It limits it
+# to a bounded COUNT, six per the contract's own words. This constant
+# is that bound: both the coarse pre-check in
+# :meth:`ProjectCellService._dispatch_locked` and the transactional,
+# commit-time re-proof in :func:`_activate_issue_transaction` count
+# distinct OTHER occupying issues (``_OCCUPYING_ISSUE_STATES``,
+# excluding the issue being (re-)dispatched itself) and refuse only
+# once that count has already reached this many — never merely
+# because the count is nonzero. A deliberately plain module constant,
+# not new config surface, exactly as R6 requires.
+MAX_DEVELOPMENT_ISSUE_LANES = 6
 
 
 def admission_priority_ceiling(
@@ -386,9 +411,17 @@ def _activate_issue_transaction(
       states (queued/blocked) and the CAS is ``WHERE state = ?`` with
       that observed value — never merely ``!= done``;
     - ``dependency_ready`` must still hold;
-    - no OTHER issue of the project may occupy it — ``in_development``
-      OR ``review`` (INFRA-211: a lead that already handed off to
-      review still owns the project until settlement clears it);
+    - the project's development-lane issue-lane bound must not already
+      be saturated by OTHER occupying issues — ``in_development`` OR
+      ``review`` (INFRA-211: a lead that already handed off to review
+      still owns its lane until settlement clears it) — counted
+      against :data:`MAX_DEVELOPMENT_ISSUE_LANES` (INFRA-219 R6, Sol
+      correction 110ed759: up to six admitted issue lanes may occupy
+      one project's development lane concurrently; refusal is a
+      bounded-count check, not a "any other occupying issue" check,
+      and re-proving THIS count here — not merely re-reading it — is
+      exactly what keeps two racing dispatches from ever together
+      exceeding the bound);
     - no pending operator decision may exist for the issue;
     - the cell must still be live and its profile lease active
       (the ``project_cells`` CAS with the ``profile_leases`` guard).
@@ -442,16 +475,31 @@ def _activate_issue_transaction(
                 return False, None
             if not int(issue_row["dependency_ready"]):
                 return False, None
-            busy = connection.execute(
-                "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-                "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+            # INFRA-219 R6 (Sol correction 110ed759): a bounded COUNT of
+            # other occupying issues, re-proven transactionally, on the
+            # very same connection as the CAS below — never a plain
+            # "is any other issue occupying" existence check. This is
+            # what makes two dispatches racing on the same project's
+            # development lane commit-time-safe: each holds this
+            # transaction's exclusive write lock while it counts, so
+            # the count either one observes can never be stale by the
+            # time it CASes ``admitted_issues`` below, and the bound
+            # can never be exceeded no matter how many candidates were
+            # concurrently pre-checked in ``_dispatch_locked``.
+            occupying_count = connection.execute(
+                "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
+                "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
                 (
                     str(issue_row["project_key"]),
                     *_OCCUPYING_ISSUE_STATES,
                     issue_id,
                 ),
             ).fetchone()
-            if busy is not None:
+            if (
+                occupying_count is not None
+                and int(occupying_count["occupying_count"])
+                >= MAX_DEVELOPMENT_ISSUE_LANES
+            ):
                 return False, None
             pending_decision = connection.execute(
                 "SELECT 1 FROM operator_decisions WHERE issue_id = ? "
@@ -791,28 +839,38 @@ class ProjectCellService:
         """Dispatch one issue while holding its project-wide in-process lock."""
 
         issue = self._queue.get(issue_id)
-        # Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT queued
-        # issue never starts while this project already has one mid-flight
-        # in EITHER in_development or review. Dispatching that same
-        # in_development issue itself (resume after restart, reconciliation,
-        # handoff) is untouched — only a distinct issue_id is refused here,
-        # and the refusal is a plain read with zero writes. This is a coarse
-        # pre-check only, purely to avoid launching a Claude lead process for
-        # a candidate that cannot activate; the shared activation
-        # transaction (`_activate_issue_transaction`) re-proves the same
-        # occupancy predicate, transactionally, at commit time.
+        # Project occupancy (INFRA-199 v2 / INFRA-211; bounded per
+        # INFRA-219 R6, Sol correction 110ed759): a DIFFERENT queued
+        # issue is refused here only once this project's development
+        # lane already has ``MAX_DEVELOPMENT_ISSUE_LANES`` OTHER issues
+        # mid-flight in EITHER in_development or review — the contract
+        # is up to six CONCURRENT admitted issue lanes per project, not
+        # one. Dispatching an issue that is already one of those
+        # occupying lanes (resume after restart, reconciliation,
+        # handoff) is untouched — it is excluded from its own count, so
+        # it is never refused by the bound — and this is a coarse
+        # pre-check only, purely to avoid launching a Claude lead
+        # process/turn for a candidate that cannot activate; the shared
+        # activation transaction (`_activate_issue_transaction`)
+        # re-proves the identical bounded-count predicate,
+        # transactionally, at commit time, so this read-only estimate
+        # can never itself let the bound be exceeded.
         #
         # INFRA-219 L3: this is a DEVELOPMENT-LANE fact only — the operator
         # ruling is explicit that "the harness lane never claims a product
         # issue," so a harness dispatch is never gated by, and this
         # pre-check never even reads for, product-issue occupancy.
         if lane_role == DEVELOPMENT_LANE:
-            busy = self._database.execute(
-                "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-                "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+            occupying_count = self._database.execute(
+                "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
+                "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
                 (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
             ).fetchone()
-            if busy is not None:
+            if (
+                occupying_count is not None
+                and int(occupying_count["occupying_count"])
+                >= MAX_DEVELOPMENT_ISSUE_LANES
+            ):
                 return DispatchResult(status="project_busy", issue_id=issue_id)
         # INFRA-199 v2: Linear is never consulted before the local commit.
         # Hermes' durable local lifecycle is authoritative; a pre-commit
