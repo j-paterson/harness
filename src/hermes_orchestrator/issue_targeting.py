@@ -15,9 +15,9 @@ letting issue, session, cell, or lease state drift before publication.
 This revision:
 
 * :func:`target_issue` re-proves every mutable predicate — issue
-  admission state, dependency readiness, project occupancy (another
-  issue already ``in_development``/``review``), a pending operator
-  decision, the named cell's identity/liveness, the named session's
+  admission state, dependency readiness, the canonical
+  development-lane capacity bound, a pending operator decision, the
+  named cell's exact identity/lane/liveness, the named session's
   currency, and the cell's active profile lease — INSIDE the exact
   ``BEGIN IMMEDIATE`` transaction (``Database.transaction()``) that
   publishes the packet through the EXISTING
@@ -25,35 +25,33 @@ This revision:
   ``admitted_issues`` or journal any projection: publication alone is
   not the transition (that was the base-revision bug), and premature
   advancement before the exact-session ACK would be a new one.
-* :func:`acknowledge_target` is the ACK-gated transition. It consumes
-  the exact-session ACK through the EXISTING
-  ``LeadAssignments.acknowledge`` compare-and-swap (bound to the exact
-  assignment id and session; anything else — wrong session, wrong
-  packet, a stale/superseded offer, a duplicate ACK — changes nothing
-  and refuses). Only once that CAS lands does it call the CANONICAL
-  activation transaction, ``cells.activate_admitted_issue`` — the same
-  shared service backing ``ProjectCellService`` explicit dispatch and
-  the Stop-hook idle dispatcher — passing ``assignments=None`` so it
-  advances ``admitted_issues``, journals ``issue.started``, and begins
-  the existing idempotent In Development projection effect WITHOUT
-  re-publishing a second packet for the same offer. Every dependency/
-  occupancy/decision/lease predicate is therefore re-proven a SECOND
-  time, transactionally, at ACK-consumption, exactly as required.
+* :func:`acknowledge_target` is the ACK-gated transition, ordered so
+  the confirmation is CONSUMED ONLY AFTER activation has committed
+  (Sol correction 9944530c packet 1 — see that function's docstring
+  for why this is recoverable rather than atomic).
 
-Dependency-eligibility reuse gap (report to the coordinator): the
-non-mutating predicate block ``cells.py`` uses at commit time
-(``prior_state in _RUNNABLE_ISSUE_STATES``, ``dependency_ready``,
-occupancy, pending operator decision — see
-``_activate_issue_transaction``, cells.py ~lines 396-422) is NOT
-exposed as a public, side-effect-free callable; only the private
-module function and the public-but-MUTATING
-``activate_admitted_issue`` exist. Because publication must not
-mutate ``admitted_issues`` (ACK-gating), :func:`target_issue` cannot
-call either one for its publish-time recheck and instead re-reads the
-identical predicates directly (duplicated below). If the coordinator
-exposes a public ``cells.activation_eligible(connection, issue_id,
-project_key) -> bool`` factored out of that block, this duplication
-goes away.
+Sol correction 9944530c (this revision) landed three fixes:
+
+1. **Exactly-once transition.** The previous revision consumed the
+   ACK in its own committed transaction and only then called the
+   canonical activation in a second one: an activation failure — or
+   eligibility that changed in between — left a permanently consumed
+   confirmation that duplicate-ACK refusal could never retry. The
+   consume now runs LAST; see :func:`acknowledge_target`.
+2. **Occupancy.** The publish-time occupancy check was a duplicated
+   "any other active issue refuses" rule, contradicting the merged
+   canonical development model (up to
+   :data:`cells.MAX_DEVELOPMENT_ISSUE_LANES` concurrent issue lanes
+   per project). The duplicate is deleted; this module now calls the
+   canonical predicate, ``cells.development_lane_saturated`` — the
+   same bounded COUNT over ``_OCCUPYING_ISSUE_STATES`` that
+   ``_activate_issue_transaction`` re-proves at commit time.
+3. **Cell selection.** The active-cell query selected an arbitrary
+   project cell and compared the id afterwards, so the dual-lane model
+   could reject the valid named development cell purely on row order
+   (a harness cell, or a stale failed row, coming back first). The
+   exact ``cell_id``, the required ``lane_role = 'development'``, and
+   the active-state predicate are all in the SQL now.
 
 Provenance (INFRA-220 requirement 3): the published packet's
 ``instruction_id`` is always the ADMITTED ISSUE's own durable
@@ -65,23 +63,28 @@ given a durable column of its own — there is no migration in scope
 for this correction (the HARD BOUNDARY forbids one) to add one to
 ``lead_assignments``.
 
-Outstanding: lane-role / visible-session eligibility (INFRA-219) is
-explicitly OUT of scope here. INFRA-219's durable development-lane and
-visible-session identity (``project_cells.lane_role``, lane-scoped
-leases and cmux bindings) lives only on the unmerged
-``feature/infra-219`` branch and is not available on this base; no
-local lane model is invented in its place. Once INFRA-219 merges, both
-:func:`target_issue` and the canonical activation path it defers to
-must additionally require the named session to be that project's
-lane-scoped, visible session.
+Lane role: INFRA-219's durable dual-lane model IS merged on this base
+(``project_cells.lane_role``, lane-scoped profile leases), so the
+named cell must be the project's DEVELOPMENT-lane cell — a harness
+cell never claims a product issue and can never be targeted. Visible-
+session identity (the lane-scoped cmux binding) remains outstanding:
+targeting still proves only that the named session is the named
+development cell's current session.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Collection
 from dataclasses import dataclass
 
-from hermes_orchestrator.cells import LinearProjector, activate_admitted_issue
+from hermes_orchestrator.cells import (
+    DEVELOPMENT_LANE,
+    MAX_DEVELOPMENT_ISSUE_LANES,
+    LinearProjector,
+    activate_admitted_issue,
+    development_lane_saturated,
+)
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
@@ -90,7 +93,6 @@ from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 _ADMITTED_STATES = (IssueState.QUEUED.value, IssueState.BLOCKED.value)
 _CURRENT_SESSION_STATES = ("starting", "active")
-_OCCUPYING_ISSUE_STATES = (IssueState.IN_DEVELOPMENT.value, IssueState.REVIEW.value)
 
 
 class IssueTargetingRefused(ValueError):
@@ -159,14 +161,19 @@ def target_issue(
                 f"issue {issue_id!r} is not dependency-ready"
             )
 
-        occupied = connection.execute(
-            "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-            "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
-            (project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
-        ).fetchone()
-        if occupied is not None:
+        # Packet 2: the CANONICAL development-lane capacity predicate,
+        # re-proven on this transaction's own connection. NOT a local
+        # "is any other issue active" rule — the merged development
+        # model permits up to MAX_DEVELOPMENT_ISSUE_LANES concurrent
+        # issue lanes per project, and this is the very predicate
+        # ``_activate_issue_transaction`` will re-prove again when the
+        # ACK is consumed.
+        if development_lane_saturated(
+            connection, project_key=project_key, issue_id=issue_id
+        ):
             raise IssueTargetingRefused(
-                f"project {project_key!r} is already occupied by another issue"
+                f"project {project_key!r}'s development lane already holds "
+                f"{MAX_DEVELOPMENT_ISSUE_LANES} other occupying issues"
             )
 
         pending_decision = connection.execute(
@@ -179,25 +186,31 @@ def target_issue(
                 f"issue {issue_id!r} has a pending operator decision"
             )
 
+        # Packet 3: the EXACT named cell, its required development
+        # lane_role, and its liveness are all predicates of this one
+        # query. Selecting an arbitrary project row and comparing the
+        # id afterwards let row order decide the answer: under the
+        # dual-lane model a harness cell (or a stale terminal row)
+        # could come back first and the valid named development cell
+        # was refused.
         cell_row = connection.execute(
-            "SELECT cell_id, profile_alias FROM project_cells "
-            "WHERE project_key = ? AND state IN "
-            f"({','.join('?' for _ in _ACTIVE_CELL_STATES)})",
-            (project_key, *_ACTIVE_CELL_STATES),
+            "SELECT profile_alias, session_id, state FROM project_cells "
+            "WHERE cell_id = ? AND project_key = ? AND lane_role = ? "
+            f"AND state IN ({','.join('?' for _ in _ACTIVE_CELL_STATES)})",
+            (cell_id, project_key, DEVELOPMENT_LANE, *_ACTIVE_CELL_STATES),
         ).fetchone()
-        if cell_row is None or str(cell_row["cell_id"]) != cell_id:
+        if cell_row is None:
             raise IssueTargetingRefused(
-                f"cell {cell_id!r} is not the active cell for project {project_key!r}"
+                f"cell {cell_id!r} is not a live development cell for "
+                f"project {project_key!r}"
             )
         profile_alias = str(cell_row["profile_alias"])
 
-        session_row = connection.execute(
-            "SELECT session_id FROM project_cells WHERE cell_id = ? "
-            "AND state IN (?, ?)",
-            (cell_id, *_CURRENT_SESSION_STATES),
-        ).fetchone()
         current_session_id = (
-            None if session_row is None else str(session_row["session_id"])
+            None
+            if cell_row["session_id"] is None
+            or str(cell_row["state"]) not in _CURRENT_SESSION_STATES
+            else str(cell_row["session_id"])
         )
         if current_session_id is None or current_session_id != str(session_id):
             raise IssueTargetingRefused(
@@ -267,38 +280,95 @@ async def acknowledge_target(
     session_id: str,
 ) -> TargetAckResult:
     """Consume the exact-session ACK for one published targeting packet
-    and, only then, advance the target and journal the projection.
+    and advance the target — exactly once, and never consuming the
+    confirmation before the activation it gates has committed.
 
-    Step 1 — the ACK itself runs through the EXISTING
-    ``LeadAssignments.acknowledge`` compare-and-swap: it must bind the
-    exact assignment id, the exact bound session, and the ``published``
-    state. A missing assignment, the wrong session, a stale/superseded
-    offer, or a duplicate ACK all change nothing and this function
-    returns with ``activated=False`` — zero further writes are
-    attempted.
+    Sol correction 9944530c packet 1. The previous revision ran the
+    ``LeadAssignments.acknowledge`` compare-and-swap in its OWN
+    committed transaction and only then called activation in a second
+    one. Anything that made activation fail in between — a flipped
+    dependency, a saturated lane, a pending operator decision, a lost
+    cell lease, a crash — left the packet permanently ``acknowledged``
+    with the issue still queued, and every retry then died on the
+    duplicate-ACK refusal: an unrecoverable half-transition.
 
-    Step 2 — only once that CAS lands does this call the CANONICAL
-    activation transaction, ``cells.activate_admitted_issue`` (the same
-    shared service backing explicit dispatch and the Stop-hook idle
-    dispatcher), with ``assignments=None`` so it advances
-    ``admitted_issues`` to ``in_development``, journals
-    ``issue.started``, and begins the existing idempotent In
-    Development projection effect WITHOUT publishing a second packet
-    for this same offer. Every dependency/occupancy/decision/lease
-    predicate is re-proved a second time there, transactionally.
+    RECOVERABLE, not atomic, and deliberately so. The canonical
+    activation transaction (``cells._activate_issue_transaction``, via
+    :func:`cells.activate_admitted_issue`) owns its own ``BEGIN
+    IMMEDIATE`` on the single shared connection; SQLite has no nesting
+    here, so the only ways to make the two writes one commit would be
+    to re-implement the activation state machine inside this module —
+    exactly the divergence this module must never introduce — or to
+    let the confirmation be consumed by a hook that runs BEFORE the
+    activation predicates and therefore commits even when they refuse,
+    which is the very bug. Instead the ORDER carries the guarantee:
 
-    A retried ACK for an assignment already ``acknowledged`` fails the
-    step-1 CAS and never reaches step 2 — no second effective
-    assignment or activation is ever created by a retry.
+    1. Re-read the packet and refuse anything that is not the exact,
+       still-``published``, exactly-session-bound confirmation. Zero
+       writes, and a duplicate ACK after a successful transition stops
+       here (the packet is ``acknowledged`` by then) — so the
+       activation transaction is not even entered a second time.
+    2. Call the CANONICAL activation, ``activate_admitted_issue``,
+       with ``assignments=None`` (it advances ``admitted_issues``,
+       journals ``issue.started``, and begins the existing idempotent
+       In Development projection effect without publishing a second
+       packet for this same offer) and with a ``guard`` that re-proves
+       the confirmation's exactness TRANSACTIONALLY, on the activation
+       transaction's own connection, alongside every dependency /
+       lane-capacity / operator-decision / cell-lease predicate. A
+       refusal there leaves ZERO writes — including the packet, still
+       ``published`` and still pending for its session, hence
+       retryable.
+    3. Only once activation has COMMITTED is the confirmation consumed,
+       through the EXISTING ``LeadAssignments.acknowledge`` CAS.
+
+    Exactly-once across the crash window between (2) and (3): the
+    packet is still ``published`` and the issue is already
+    ``in_development``, so a retry re-enters activation, which takes
+    its replay branch — the cell lease is re-confirmed but
+    ``admitted_issues`` is NOT re-CASed, no second ``issue.started`` is
+    journaled, and the existing projection effect row is adopted, not
+    re-begun — and the ACK CAS then lands. One transition, one event,
+    one effect, one consumed confirmation, however many times this is
+    retried. Concurrent duplicates race on that single CAS: the loser
+    reports ``activated=False`` and has added no effect of its own.
     """
 
-    acked = assignments.acknowledge(assignment_id, session_id=session_id)
-    if not acked:
+    try:
+        assignment = assignments.get(assignment_id)
+    except KeyError:
         return TargetAckResult(
             assignment_id=assignment_id, issue_id="", activated=False
         )
+    if (
+        assignment.session_id != str(session_id)
+        or assignment.state != "published"
+    ):
+        return TargetAckResult(
+            assignment_id=assignment_id,
+            issue_id=assignment.issue_id,
+            activated=False,
+        )
 
-    assignment = assignments.get(assignment_id)
+    def confirmation_is_exact(connection: sqlite3.Connection) -> bool:
+        """Re-prove the exact confirmation inside the activation
+        transaction, before it writes anything."""
+
+        row = connection.execute(
+            "SELECT 1 FROM lead_assignments WHERE assignment_id = ? "
+            "AND session_id = ? AND project_key = ? AND issue_id = ? "
+            "AND cell_id = ? AND profile_alias = ? AND state = 'published'",
+            (
+                assignment_id,
+                str(session_id),
+                assignment.project_key,
+                assignment.issue_id,
+                assignment.cell_id,
+                assignment.profile_alias,
+            ),
+        ).fetchone()
+        return row is not None
+
     activated, _ = await activate_admitted_issue(
         database=database,
         events=events,
@@ -307,11 +377,24 @@ async def acknowledge_target(
         cell_id=assignment.cell_id,
         project_key=assignment.project_key,
         profile_alias=assignment.profile_alias,
-        session_id=session_id,
+        session_id=str(session_id),
         issue_id=assignment.issue_id,
+        guard=confirmation_is_exact,
+    )
+    if not activated:
+        # The packet was NOT consumed: it is still published and still
+        # pending for its session, so this exact target stays retryable.
+        return TargetAckResult(
+            assignment_id=assignment_id,
+            issue_id=assignment.issue_id,
+            activated=False,
+        )
+
+    consumed = assignments.acknowledge(
+        assignment_id, session_id=str(session_id)
     )
     return TargetAckResult(
         assignment_id=assignment_id,
         issue_id=assignment.issue_id,
-        activated=activated,
+        activated=consumed,
     )

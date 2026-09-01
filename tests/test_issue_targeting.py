@@ -1,5 +1,5 @@
 """Tests for the INFRA-220 ``target_issue`` / ``acknowledge_target``
-transition (Sol correction 7ecf4a57)."""
+transition (Sol corrections 7ecf4a57 and 9944530c)."""
 
 from __future__ import annotations
 
@@ -9,10 +9,16 @@ from pathlib import Path
 
 import pytest
 
+from hermes_orchestrator.cells import (
+    DEVELOPMENT_LANE,
+    HARNESS_LANE,
+    MAX_DEVELOPMENT_ISSUE_LANES,
+)
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.issue_targeting import (
     IssueTargetingRefused,
+    acknowledge_target,
     target_issue,
 )
 from hermes_orchestrator.lead_assignments import LeadAssignments
@@ -88,28 +94,80 @@ def _seed_cell(
     session_id: str = SESSION_ID,
     profile_alias: str = "max-c",
     state: str = "active",
+    lane_role: str = DEVELOPMENT_LANE,
+    lease: bool = True,
 ) -> None:
     with database.transaction() as connection:
         connection.execute(
             "INSERT INTO project_cells("
             "cell_id, project_key, state, profile_alias, session_id, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "lane_role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 cell_id,
                 project_key,
                 state,
                 profile_alias,
                 session_id,
+                lane_role,
                 "2026-08-01T00:00:00+00:00",
                 "2026-08-01T00:00:00+00:00",
             ),
         )
+        if lease:
+            connection.execute(
+                "INSERT INTO profile_leases("
+                "profile_alias, project_key, state, lane_role, acquired_at) "
+                "VALUES (?, ?, 'active', ?, ?)",
+                (
+                    profile_alias,
+                    project_key,
+                    lane_role,
+                    "2026-08-01T00:00:00+00:00",
+                ),
+            )
+
+
+def _set_lease_state(
+    database: Database, *, profile_alias: str = "max-c", state: str
+) -> None:
+    with database.transaction() as connection:
         connection.execute(
-            "INSERT INTO profile_leases("
-            "profile_alias, project_key, state, acquired_at) "
-            "VALUES (?, ?, 'active', ?)",
-            (profile_alias, project_key, "2026-08-01T00:00:00+00:00"),
+            "UPDATE profile_leases SET state = ? WHERE profile_alias = ?",
+            (state, profile_alias),
         )
+
+
+def _assignment_row(database: Database, assignment_id: str) -> tuple[str, object]:
+    row = database.execute(
+        "SELECT state, acknowledged_at FROM lead_assignments "
+        "WHERE assignment_id = ?",
+        (assignment_id,),
+    ).fetchone()
+    return str(row["state"]), row["acknowledged_at"]
+
+
+def _issue_state(database: Database, issue_id: str) -> str:
+    row = database.execute(
+        "SELECT state FROM admitted_issues WHERE issue_id = ?", (issue_id,)
+    ).fetchone()
+    return str(row["state"])
+
+
+def _event_count(database: Database, event_type: str, aggregate_id: str) -> int:
+    row = database.execute(
+        "SELECT COUNT(*) AS n FROM events "
+        "WHERE event_type = ? AND aggregate_id = ?",
+        (event_type, aggregate_id),
+    ).fetchone()
+    return int(row["n"])
+
+
+def _cell_touch(database: Database, cell_id: str = CELL_ID) -> tuple[str, str]:
+    row = database.execute(
+        "SELECT state, updated_at FROM project_cells WHERE cell_id = ?",
+        (cell_id,),
+    ).fetchone()
+    return str(row["state"]), str(row["updated_at"])
 
 
 def _admitted_snapshot(database: Database) -> list[tuple[object, ...]]:
@@ -273,6 +331,309 @@ def test_refuses_empty_instruction_with_zero_writes(
             cell_id=CELL_ID,
             session_id=SESSION_ID,
             instruction="   ",
+            known_projects={"demo"},
+        )
+
+    assert _assignment_count(database) == 0
+
+
+# ---------------------------------------------------------------------------
+# Sol correction 9944530c packet 1 -- exactly-once confirmation/activation.
+# ---------------------------------------------------------------------------
+
+
+def _publish(
+    database: Database,
+    assignments: LeadAssignments,
+    events: EventStore,
+    *,
+    issue_id: str = "INFRA-9",
+) -> str:
+    result = target_issue(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id=issue_id,
+        project_key="demo",
+        cell_id=CELL_ID,
+        session_id=SESSION_ID,
+        instruction=f"focus on {issue_id}",
+        known_projects={"demo"},
+    )
+    return result.assignment.assignment_id
+
+
+@pytest.mark.asyncio
+async def test_activation_failure_after_exact_confirmation_stays_retryable(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 1: an activation that refuses must NOT have burned the
+    confirmation -- the packet stays published, pending, and retryable."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    # The cell's profile lease drops between publication and the ACK, so
+    # the canonical activation transaction refuses with zero writes.
+    _set_lease_state(database, state="released")
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=_RecordingLinear(),
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is False
+    assert _assignment_row(database, assignment_id) == ("published", None)
+    assert _issue_state(database, "INFRA-9") == "queued"
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    pending = assignments.pending_for_session(SESSION_ID)
+    assert [row.assignment_id for row in pending] == [assignment_id]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_recovery_activates_exactly_once(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 1: once the transient failure clears, the SAME retryable
+    confirmation activates -- once, and is only then consumed."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    _set_lease_state(database, state="released")
+    linear = _RecordingLinear()
+
+    first = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+    _set_lease_state(database, state="active")
+    second = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert first.activated is False
+    assert second.activated is True
+    assert second.issue_id == "INFRA-9"
+    assert _issue_state(database, "INFRA-9") == "in_development"
+    assert _event_count(database, "issue.started", "INFRA-9") == 1
+    state, acknowledged_at = _assignment_row(database, assignment_id)
+    assert state == "acknowledged"
+    assert acknowledged_at is not None
+    assert _assignment_count(database) == 1
+    assert assignments.pending_for_session(SESSION_ID) == ()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_confirmation_after_success_has_no_second_effect(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 1: the consumed confirmation can never activate twice --
+    the duplicate refuses without even entering activation."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    linear = _RecordingLinear()
+
+    first = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+    after_success = (
+        _admitted_snapshot(database),
+        _cell_touch(database),
+        _assignment_row(database, assignment_id),
+    )
+    duplicate = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert first.activated is True
+    assert duplicate.activated is False
+    assert _event_count(database, "issue.started", "INFRA-9") == 1
+    assert _assignment_count(database) == 1
+    assert linear.projected == ["INFRA-9"]
+    assert (
+        _admitted_snapshot(database),
+        _cell_touch(database),
+        _assignment_row(database, assignment_id),
+    ) == after_success
+
+
+# ---------------------------------------------------------------------------
+# Sol correction 9944530c packet 2 -- the canonical development-lane bound.
+# ---------------------------------------------------------------------------
+
+
+def _seed_occupying(database: Database, count: int) -> None:
+    """``count`` OTHER issues already occupying the project's
+    development lane, alternating the two occupying states."""
+
+    for index in range(count):
+        _seed_admitted(
+            database,
+            issue_id=f"INFRA-OCC-{index}",
+            state="review" if index % 2 else "in_development",
+        )
+
+
+def test_safe_lanes_below_the_canonical_limit_permit_targeting(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 2: the canonical model allows up to
+    MAX_DEVELOPMENT_ISSUE_LANES concurrent issue lanes, so existing
+    active issues below that bound must NOT refuse a new target."""
+
+    _seed_occupying(database, MAX_DEVELOPMENT_ISSUE_LANES - 1)
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+
+    result = target_issue(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id="INFRA-9",
+        project_key="demo",
+        cell_id=CELL_ID,
+        session_id=SESSION_ID,
+        instruction="focus on INFRA-9",
+        known_projects={"demo"},
+    )
+
+    assert result.idempotent is False
+    assert result.assignment.issue_id == "INFRA-9"
+    assert _assignment_count(database) == 1
+
+
+def test_canonical_lane_limit_refuses_an_additional_target_without_writes(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 2: at the canonical bound the target is refused, and the
+    refusal writes nothing and reorders nothing in the queue."""
+
+    _seed_occupying(database, MAX_DEVELOPMENT_ISSUE_LANES)
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    before = _admitted_snapshot(database)
+
+    with pytest.raises(IssueTargetingRefused):
+        target_issue(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-9",
+            project_key="demo",
+            cell_id=CELL_ID,
+            session_id=SESSION_ID,
+            instruction="focus on INFRA-9",
+            known_projects={"demo"},
+        )
+
+    assert _assignment_count(database) == 0
+    assert _admitted_snapshot(database) == before
+
+
+# ---------------------------------------------------------------------------
+# Sol correction 9944530c packet 3 -- exact named development cell.
+# ---------------------------------------------------------------------------
+
+
+def test_named_development_cell_is_selected_regardless_of_row_order(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 3: the named development cell is found by an exact
+    cell_id + lane_role + active-state query, not by whichever project
+    row the database happens to return first."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    # Both of these are inserted BEFORE the named development cell, so
+    # an unordered "any active cell for this project" select returns one
+    # of them first: a terminal harness-run row, then the live HARNESS
+    # lane cell that legitimately coexists with the development lane.
+    _seed_cell(
+        database,
+        cell_id="cell-failed",
+        session_id=OTHER_SESSION_ID,
+        profile_alias="max-failed",
+        state="failed",
+        lease=False,
+    )
+    _seed_cell(
+        database,
+        cell_id="cell-harness",
+        session_id=OTHER_SESSION_ID,
+        profile_alias="max-harness",
+        state="active",
+        lane_role=HARNESS_LANE,
+    )
+    _seed_cell(database)
+
+    result = target_issue(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id="INFRA-9",
+        project_key="demo",
+        cell_id=CELL_ID,
+        session_id=SESSION_ID,
+        instruction="focus on INFRA-9",
+        known_projects={"demo"},
+    )
+
+    assert result.assignment.cell_id == CELL_ID
+    assert result.assignment.profile_alias == "max-c"
+    assert result.assignment.session_id == SESSION_ID
+
+
+def test_harness_cell_is_never_an_eligible_target(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 3: naming the harness lane's own cell must refuse -- the
+    lane_role predicate is in the query, not a post-hoc comparison."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(
+        database,
+        cell_id="cell-harness",
+        session_id=OTHER_SESSION_ID,
+        profile_alias="max-harness",
+        state="active",
+        lane_role=HARNESS_LANE,
+    )
+
+    with pytest.raises(IssueTargetingRefused):
+        target_issue(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-9",
+            project_key="demo",
+            cell_id="cell-harness",
+            session_id=OTHER_SESSION_ID,
+            instruction="focus on INFRA-9",
             known_projects={"demo"},
         )
 

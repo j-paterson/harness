@@ -407,6 +407,51 @@ _LANE_BINDABLE_ISSUE_STATES = (
 MAX_DEVELOPMENT_ISSUE_LANES = 6
 
 
+def development_lane_saturated(
+    reader: Database | sqlite3.Connection,
+    *,
+    project_key: str,
+    issue_id: str,
+) -> bool:
+    """The ONE development-lane capacity predicate, side-effect free.
+
+    True exactly when ``project_key``'s development lane already holds
+    :data:`MAX_DEVELOPMENT_ISSUE_LANES` OTHER occupying issues —
+    distinct ``admitted_issues`` rows in ``in_development`` OR
+    ``review`` (INFRA-211: a lead that handed off to review still owns
+    its lane until settlement clears it), with ``issue_id`` itself
+    always excluded so a resume/replay of an already-occupying issue is
+    never refused by its own lane.
+
+    Factored out of :func:`_activate_issue_transaction` (INFRA-220, Sol
+    correction 9944530c packet 2) so that every caller — the coarse
+    pre-check in :meth:`ProjectCellService._dispatch_locked`, the
+    transactional commit-time re-proof in the activation transaction,
+    and the publish-time re-proof in
+    ``issue_targeting.target_issue`` — shares this single bounded-COUNT
+    rule instead of re-implementing it. A duplicated copy in
+    ``issue_targeting`` had drifted into the pre-INFRA-219 "any other
+    occupying issue refuses" shape and rejected targeting whenever the
+    project held even one active issue.
+
+    ``reader`` is whatever connection the caller is already using: pass
+    the open transaction's ``sqlite3.Connection`` where the count must
+    be a transactional re-proof (the exclusive write lock is what makes
+    two racing dispatches unable to together exceed the bound), or the
+    :class:`Database` for a read-only pre-check.
+    """
+
+    row = reader.execute(
+        "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
+        "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
+        (project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
+    ).fetchone()
+    return (
+        row is not None
+        and int(row["occupying_count"]) >= MAX_DEVELOPMENT_ISSUE_LANES
+    )
+
+
 def issue_lane_branch(issue_id: str) -> str:
     """The lane branch this project uses for an admitted issue."""
 
@@ -685,19 +730,10 @@ def _activate_issue_transaction(
             # time it CASes ``admitted_issues`` below, and the bound
             # can never be exceeded no matter how many candidates were
             # concurrently pre-checked in ``_dispatch_locked``.
-            occupying_count = connection.execute(
-                "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
-                "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
-                (
-                    str(issue_row["project_key"]),
-                    *_OCCUPYING_ISSUE_STATES,
-                    issue_id,
-                ),
-            ).fetchone()
-            if (
-                occupying_count is not None
-                and int(occupying_count["occupying_count"])
-                >= MAX_DEVELOPMENT_ISSUE_LANES
+            if development_lane_saturated(
+                connection,
+                project_key=str(issue_row["project_key"]),
+                issue_id=issue_id,
             ):
                 return False, None
             pending_decision = connection.execute(
@@ -1074,18 +1110,10 @@ class ProjectCellService:
         # ruling is explicit that "the harness lane never claims a product
         # issue," so a harness dispatch is never gated by, and this
         # pre-check never even reads for, product-issue occupancy.
-        if lane_role == DEVELOPMENT_LANE:
-            occupying_count = self._database.execute(
-                "SELECT COUNT(*) AS occupying_count FROM admitted_issues "
-                "WHERE project_key = ? AND state IN (?, ?) AND issue_id != ?",
-                (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
-            ).fetchone()
-            if (
-                occupying_count is not None
-                and int(occupying_count["occupying_count"])
-                >= MAX_DEVELOPMENT_ISSUE_LANES
-            ):
-                return DispatchResult(status="project_busy", issue_id=issue_id)
+        if lane_role == DEVELOPMENT_LANE and development_lane_saturated(
+            self._database, project_key=issue.project_key, issue_id=issue_id
+        ):
+            return DispatchResult(status="project_busy", issue_id=issue_id)
         # INFRA-199 v2: Linear is never consulted before the local commit.
         # Hermes' durable local lifecycle is authoritative; a pre-commit
         # `linear.validate` here used to gate whether this candidate could
