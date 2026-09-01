@@ -260,6 +260,92 @@ def test_atomic_replacement_preserves_permissions_and_foreign_hooks(
     ]
 
 
+def test_a_legacy_shim_entry_is_retired_without_touching_neighbours(
+    tmp_path: Path,
+) -> None:
+    """INFRA-204: the superseded ``.hermes/intake-poll-hook.sh`` entry
+    is removed wherever a profile still references it — under our own
+    events and under foreign ones — while every unrelated hook in the
+    same profile (including one sharing the very same entry) survives,
+    and exactly one hook per event remains."""
+
+    config_dir = tmp_path / "max-g"
+    config_dir.mkdir()
+    legacy = "/Users/someone/.hermes/intake-poll-hook.sh"
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {"type": "command", "command": legacy}
+                            ],
+                        }
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"bash {legacy}",
+                                },
+                                {
+                                    "type": "command",
+                                    "command": "/usr/local/bin/audit.sh",
+                                },
+                            ],
+                        }
+                    ],
+                    "Notification": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {"type": "command", "command": legacy}
+                            ],
+                        }
+                    ],
+                }
+            }
+        )
+    )
+
+    [report] = installer({"max-g": config_dir}).install()
+
+    assert sorted(report.retired) == ["Notification", "PreToolUse", "Stop"]
+    assert report.changed
+    settings = read_settings(config_dir)
+    # The unrelated hook that shared the legacy entry survives intact.
+    assert bindings_for(settings, "PreToolUse") == [
+        ("Bash", "/usr/local/bin/audit.sh"),
+    ]
+    # Nothing anywhere still references the retired shim.
+    everything = [
+        command
+        for event in settings["hooks"]
+        for _matcher, command in bindings_for(settings, event)
+    ]
+    assert not [c for c in everything if "intake-poll-hook.sh" in c]
+    # Exactly one canonical hook per event, and the event whose only
+    # content was the shim is gone rather than left empty.
+    assert bindings_for(settings, "Stop") == [("*", COMMANDS.stop)]
+    assert bindings_for(settings, "SubagentStop") == [
+        ("*", COMMANDS.subagent_stop)
+    ]
+    assert bindings_for(settings, "SubagentStart") == [
+        ("*", COMMANDS.child_start)
+    ]
+    assert "Notification" not in settings["hooks"]
+    for event in settings["hooks"]:
+        assert len(bindings_for(settings, event)) == 1
+
+    # A second run finds nothing left to retire.
+    [again] = installer({"max-g": config_dir}).install()
+    assert not again.changed
+
+
 def test_a_missing_settings_file_is_created_privately(
     tmp_path: Path,
 ) -> None:

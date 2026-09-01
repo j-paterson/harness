@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import subprocess
 import sys
 import types
@@ -3262,6 +3263,286 @@ async def test_daemon_starts_when_intake_probes_fail(
             "SELECT count(*) FROM lead_corrections WHERE state = 'pending'"
         )
         assert int(pending) == 1
+    finally:
+        database.close()
+
+
+def write_profiles(repo_root: Path, config_root: Path) -> list[Path]:
+    """A four-slot profile registry, as hooks-install requires."""
+
+    directories = [config_root / f"max-{slot}" for slot in "abcd"]
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+    document = "profiles:\n" + "".join(
+        f"  - alias: max-{slot}\n"
+        f"    config_dir: {config_root / f'max-{slot}'}\n"
+        for slot in "abcd"
+    )
+    (repo_root / "config" / "profiles.yaml").write_text(
+        document, encoding="utf-8"
+    )
+    return directories
+
+
+def render_launcher(state_dir: Path) -> Path:
+    """The stable deployed launcher the hooks must bind to."""
+
+    launcher = state_dir / "bin" / "hermes-orchestrator"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text(
+        '#!/bin/sh\nexec uv run --project "$ACTIVE" '
+        'hermes-orchestrator "$@"\n',
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return launcher
+
+
+def installed_hook_commands(config_dir: Path) -> dict[str, list[str]]:
+    settings = json.loads(
+        (config_dir / "settings.json").read_text(encoding="utf-8")
+    )
+    return {
+        event: [
+            hook["command"]
+            for entry in entries
+            for hook in entry.get("hooks", [])
+            if hook.get("type") == "command"
+        ]
+        for event, entries in settings.get("hooks", {}).items()
+    }
+
+
+def test_hooks_install_binds_every_event_to_the_stable_launcher(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-204: Stop, SubagentStop and SubagentStart all run the
+    stable ``<state-dir>/bin/hermes-orchestrator`` launcher — never
+    ``uv run --project <mutable checkout>`` (the observed live failure)
+    and never a commit-specific ``runtimes/<sha>`` path, so the
+    installed settings survive branch drift and runtime replacement
+    without ever being rewritten."""
+
+    repo_root, state_dir = configured_repo
+    directories = write_profiles(repo_root, state_dir / "profiles")
+    launcher = render_launcher(state_dir)
+
+    result = invoke([*base_arguments(configured_repo), "hooks-install"])
+
+    assert result.exit_code == 0
+    expected = {
+        "Stop": [
+            f"{launcher} --repo-root {repo_root} "
+            f"--state-dir {state_dir} intake-poll"
+        ],
+        "SubagentStop": [
+            f"{launcher} --repo-root {repo_root} "
+            f"--state-dir {state_dir} child-stop"
+        ],
+        "SubagentStart": [
+            f"{launcher} --repo-root {repo_root} "
+            f"--state-dir {state_dir} child-start"
+        ],
+    }
+    for directory in directories:
+        commands = installed_hook_commands(directory)
+        assert commands == expected
+        for event_commands in commands.values():
+            for command in event_commands:
+                assert "uv run --project" not in command
+                assert "runtimes/" not in command
+                assert re.search(r"\b[0-9a-f]{40}\b", command) is None
+                assert command.startswith(f"{launcher} ")
+
+
+def test_hooks_install_refuses_when_the_stable_launcher_is_absent(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """A missing launcher REFUSES the install, naming the path, and
+    writes no profile. Silently falling back to ``uv run --project``
+    is the defect itself, not a recovery."""
+
+    repo_root, state_dir = configured_repo
+    directories = write_profiles(repo_root, state_dir / "profiles")
+    launcher = state_dir / "bin" / "hermes-orchestrator"
+    assert not launcher.exists()
+
+    result = invoke([*base_arguments(configured_repo), "hooks-install"])
+
+    assert result.exit_code != 0
+    assert str(launcher) in result.stderr
+    assert "uv run --project" not in result.stdout
+    for directory in directories:
+        assert not (directory / "settings.json").exists()
+
+
+def durable_snapshot(state_dir: Path) -> dict[str, list[tuple[object, ...]]]:
+    """Every row of every table, so 'nothing durable' is provable."""
+
+    import sqlite3
+
+    connection = sqlite3.connect(state_dir / "state.db")
+    try:
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        return {
+            table: sorted(
+                connection.execute(f"SELECT * FROM {table}").fetchall()
+            )
+            for table in tables
+        }
+    finally:
+        connection.close()
+
+
+def hook_invoke(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    payload: dict[str, object],
+) -> CliResult:
+    """Run a hook subcommand exactly as Claude Code runs it: the whole
+    identity arrives as a JSON hook payload on stdin."""
+
+    from hermes_orchestrator import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module.sys, "stdin", StringIO(json.dumps(payload))
+    )
+    try:
+        return invoke(arguments)
+    finally:
+        monkeypatch.undo()
+
+
+UNBOUND_SESSION = "12121212-3434-4545-8656-767676767676"
+
+
+@pytest.mark.parametrize(
+    ("command", "payload"),
+    [
+        (
+            "intake-poll",
+            {
+                "session_id": UNBOUND_SESSION,
+                "hook_event_name": "Stop",
+            },
+        ),
+        (
+            "child-start",
+            {"session_id": UNBOUND_SESSION, "agent_id": "agent-x"},
+        ),
+        (
+            "child-stop",
+            {"session_id": UNBOUND_SESSION, "agent_id": "agent-x"},
+        ),
+    ],
+)
+def test_a_hook_from_an_unbound_session_is_silent_and_inert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    payload: dict[str, object],
+) -> None:
+    """INFRA-204: the hooks are installed profile-wide, so they fire in
+    every Claude session using that profile — including ordinary human
+    sessions the orchestrator does not manage. A session bound to NO
+    active managed cell must leave the hook with exit 0, no output on
+    either stream, and not one durable row changed."""
+
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import seed_active_cell
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    database = Database.open(state_dir / "state.db")
+    try:
+        # A different session IS bound; the unbound one must still be
+        # inert, so the quiet exit is about identity, not emptiness.
+        seed_active_cell(database)
+    finally:
+        database.close()
+    before = durable_snapshot(state_dir)
+
+    result = hook_invoke(
+        monkeypatch, ["--state-dir", str(state_dir), command], payload
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert durable_snapshot(state_dir) == before
+
+
+def test_a_bound_session_still_continues_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inert unbound path must not have cost the bound lead its
+    one continuation: a child start, a Stop boundary and the settling
+    child completion still fire exactly one ``children.completed``,
+    and a replayed completion adds none."""
+
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import SESSION, seed_active_cell
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    database = Database.open(state_dir / "state.db")
+    try:
+        seed_active_cell(database)
+    finally:
+        database.close()
+    base = ["--state-dir", str(state_dir)]
+    identity: dict[str, object] = {
+        "session_id": SESSION,
+        "agent_id": "agent-1",
+    }
+
+    assert (
+        hook_invoke(monkeypatch, [*base, "child-start"], identity).exit_code
+        == 0
+    )
+    stop = hook_invoke(
+        monkeypatch,
+        [*base, "intake-poll"],
+        {"session_id": SESSION, "hook_event_name": "Stop"},
+    )
+    assert stop.exit_code == 0
+    assert (
+        hook_invoke(monkeypatch, [*base, "child-stop"], identity).exit_code
+        == 0
+    )
+    # A replayed completion is a durable no-op.
+    assert (
+        hook_invoke(monkeypatch, [*base, "child-stop"], identity).exit_code
+        == 0
+    )
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assert (
+            int(  # type: ignore[arg-type]
+                database.scalar(
+                    "SELECT COUNT(*) FROM control_operations "
+                    "WHERE kind = 'children.completed'"
+                )
+            )
+            == 1
+        )
+        assert (
+            str(
+                database.scalar(
+                    "SELECT state FROM lead_continuations "
+                    "WHERE session_id = ?",
+                    (SESSION,),
+                )
+            )
+            == "reactivated"
+        )
     finally:
         database.close()
 

@@ -87,13 +87,13 @@ def test_a_duplicated_completion_never_reactivates_early(
 def test_replayed_hooks_record_exactly_one_start_and_completion(
     database: Database, tracker: LeadChildTracker
 ) -> None:
+    seed_active_cell(database)
     assert tracker.child_started(SESSION, "child-a") is True
     assert tracker.child_started(SESSION, "child-a") is False
     assert (
         database.scalar("SELECT COUNT(*) FROM lead_children") == 1
     )
 
-    seed_active_cell(database)
     assert tracker.child_completed(SESSION, "child-a") is None
     state = database.scalar(
         "SELECT state FROM lead_children WHERE child_id = 'child-a'"
@@ -223,6 +223,7 @@ def test_the_hook_cli_keys_strictly_on_the_shared_agent_id(
     """SubagentStart and SubagentStop share agent_id; a PreToolUse
     tool_use_id can never replace or satisfy the lifecycle identity."""
 
+    seed_active_cell(database)
     start = {"session_id": SESSION, "agent_id": "agent-1"}
     stop = {"session_id": SESSION, "agent_id": "agent-1"}
     assert run_child_event(tmp_path, monkeypatch, start, completed=False) == 0

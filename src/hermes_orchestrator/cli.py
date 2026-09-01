@@ -2789,9 +2789,24 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
-    """Install the Hermes hooks into every classic profile, idempotently."""
+    """Install the Hermes hooks into every classic profile, idempotently.
 
-    import shutil
+    INFRA-204: every hook binds to the STABLE deployed launcher at
+    ``<state-dir>/bin/hermes-orchestrator`` — never ``uv run --project
+    <checkout>`` and never a commit-specific ``runtimes/<sha>/…``
+    path. ``uv run --project`` ran the hooks out of the MUTABLE config
+    checkout, which was observed live to lack the command entirely and
+    to error the Stop hook into unrelated Claude sessions; a
+    ``runtimes/<sha>`` path would pin the settings to one activation
+    and go stale on the next. The launcher resolves ``runtimes/ACTIVE``
+    itself, so the installed settings survive branch drift and runtime
+    replacement without ever being rewritten.
+
+    A missing launcher REFUSES the install, naming the path, and writes
+    no profile at all: falling back to ``uv run`` is the exact defect
+    this refusal exists to prevent, and a hook bound to a binary that
+    is not there is worse than no hook.
+    """
 
     from hermes_orchestrator.hook_install import (
         HookCommandSet,
@@ -2805,11 +2820,21 @@ def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
             "hooks-install requires config/profiles.yaml", file=sys.stderr
         )
         return 1
+    launcher = settings.state_dir / "bin" / "hermes-orchestrator"
+    if not launcher.exists():
+        print(
+            "hooks-install refused: the stable launcher "
+            f"{launcher} does not exist. Deploy the runtime "
+            "(`hermes-orchestrator deploy-install`) so the launcher is "
+            "rendered, then re-run hooks-install. No profile was "
+            "written; hooks are never bound to `uv run --project` "
+            "against a mutable checkout.",
+            file=sys.stderr,
+        )
+        return 1
     registry = ProfileRegistry.load(profile_path)
-    uv_binary = shutil.which("uv") or "uv"
     base = (
-        f"{uv_binary} run --project {settings.repo_root} "
-        f"hermes-orchestrator --repo-root {settings.repo_root} "
+        f"{launcher} --repo-root {settings.repo_root} "
         f"--state-dir {settings.state_dir}"
     )
     installer = HookInstaller(
