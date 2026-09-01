@@ -51,7 +51,7 @@ from hermes_orchestrator.cmux import CmuxControlPort
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.control_operations import (
     CONTROL_READY,
-    MAINTENANCE_CONTROL_KINDS,
+    SILENT_MAINTENANCE_CONTROL_KINDS,
 )
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.lead_assignments import ASSIGNMENT_READY
@@ -419,19 +419,25 @@ class LeadIntakePoll:
                     str(row["assignment_id"]),
                 )
             )
-        # INFRA-201: maintenance kinds are settled silently by the
-        # lead's own Stop hook (``settle_maintenance_for_session``)
-        # and never offered here — only lead-actionable facts reach
-        # the Stop-hook offer.
+        # INFRA-201: pure transport/dedup churn is settled silently
+        # by the lead's own Stop hook
+        # (``settle_maintenance_for_session``) and never offered
+        # here. INFRA-219 (Sol correction 14bd0c17) narrows that
+        # exclusion to SILENT_MAINTENANCE_CONTROL_KINDS: the
+        # runtime-lifecycle kinds (daemon.restarted,
+        # channel.reregistered, channel.replayed) ARE offered, so a
+        # merged-runtime activation wakes the exact bound lead
+        # through this existing offer/ACK path instead of leaving it
+        # idle until manual cmux intervention.
         maintenance_placeholders = ",".join(
-            "?" * len(MAINTENANCE_CONTROL_KINDS)
+            "?" * len(SILENT_MAINTENANCE_CONTROL_KINDS)
         )
         for row in self._database.execute(
             "SELECT operation_id, created_at FROM control_operations "
             "WHERE session_id = ? AND state = 'published' "
             f"AND kind NOT IN ({maintenance_placeholders}) "
             "ORDER BY created_at ASC, rowid ASC",
-            (session_id, *MAINTENANCE_CONTROL_KINDS),
+            (session_id, *SILENT_MAINTENANCE_CONTROL_KINDS),
         ).fetchall():
             candidates.append(
                 (
@@ -692,7 +698,7 @@ class LeadIntakeRouter:
         # INFRA-201: maintenance kinds are never announced on the seat
         # — they are settled silently by the lead's own Stop hook.
         maintenance_placeholders = ",".join(
-            "?" * len(MAINTENANCE_CONTROL_KINDS)
+            "?" * len(SILENT_MAINTENANCE_CONTROL_KINDS)
         )
         operations = self._database.execute(
             "SELECT o.operation_id, o.cell_id, o.session_id "
@@ -706,7 +712,7 @@ class LeadIntakeRouter:
             "AND d.session_id = o.session_id "
             "AND d.state IN ('announced', 'offered', 'delivered', 'superseded')"
             ") ORDER BY o.created_at ASC, o.rowid ASC",
-            tuple(MAINTENANCE_CONTROL_KINDS),
+            tuple(SILENT_MAINTENANCE_CONTROL_KINDS),
         ).fetchall()
         for row in operations:
             await self._route(

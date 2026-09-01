@@ -71,7 +71,32 @@ MAINTENANCE_CONTROL_KINDS = frozenset(
         "channel.confirm_claimed",
     }
 )
-LEAD_ACTIONABLE_CONTROL_KINDS = CONTROL_KINDS - MAINTENANCE_CONTROL_KINDS
+#: INFRA-219 (Sol correction 14bd0c17): the runtime-lifecycle subset of
+#: the maintenance kinds. INFRA-201 correctly classified transport churn
+#: as silent, but a MERGED-RUNTIME activation is not churn: it is the one
+#: moment an ACTIVE lead must be told its runtime changed. Observed live
+#: — after PR #52 activated runtime 8ac98e2757ba these three sat
+#: ``published``, bound to the exact idle lead, and the lead had to be
+#: woken manually through cmux. They are therefore OFFERED through the
+#: existing offer/ACK path (no new transport), while the genuinely churny
+#: remainder stays silent exactly as INFRA-201 intended.
+LIFECYCLE_CONTROL_KINDS = frozenset(
+    {
+        "daemon.restarted",
+        "channel.reregistered",
+        "channel.replayed",
+    }
+)
+
+#: The maintenance kinds still settled silently by the lead's own Stop
+#: hook: pure transport/dedup churn with nothing for a lead to act on.
+SILENT_MAINTENANCE_CONTROL_KINDS = (
+    MAINTENANCE_CONTROL_KINDS - LIFECYCLE_CONTROL_KINDS
+)
+
+LEAD_ACTIONABLE_CONTROL_KINDS = (
+    CONTROL_KINDS - SILENT_MAINTENANCE_CONTROL_KINDS
+)
 
 
 def is_maintenance_kind(kind: str) -> bool:
@@ -341,7 +366,11 @@ class ControlOperations:
         """Acknowledge this session's published maintenance receipts.
 
         Scoped to exactly ``session_id`` and to
-        ``MAINTENANCE_CONTROL_KINDS``: an actionable receipt, or a
+        ``SILENT_MAINTENANCE_CONTROL_KINDS`` (INFRA-219 Sol
+        correction 14bd0c17: the runtime-lifecycle kinds are OFFERED
+        to the lead now, never settled silently here, so a
+        merged-runtime activation cannot leave an ACTIVE lead idle):
+        an actionable receipt, or a
         maintenance receipt bound to another session, is never
         touched. Settlement goes through the same exact-session
         :meth:`acknowledge` used everywhere else, so the durable row
@@ -351,13 +380,15 @@ class ControlOperations:
         ``published`` and returns an empty tuple.
         """
 
-        placeholders = ",".join("?" * len(MAINTENANCE_CONTROL_KINDS))
+        placeholders = ",".join(
+            "?" * len(SILENT_MAINTENANCE_CONTROL_KINDS)
+        )
         rows = self._database.execute(
             "SELECT operation_id FROM control_operations "
             "WHERE session_id = ? AND state = 'published' "
             f"AND kind IN ({placeholders}) "
             "ORDER BY created_at ASC, rowid ASC",
-            (session_id, *MAINTENANCE_CONTROL_KINDS),
+            (session_id, *SILENT_MAINTENANCE_CONTROL_KINDS),
         ).fetchall()
         settled: list[str] = []
         for row in rows:

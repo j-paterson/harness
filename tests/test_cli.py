@@ -3124,8 +3124,8 @@ def test_intake_poll_settles_a_maintenance_receipt_silently(
                 "operation_id, schema_version, kind, project_key, "
                 "cell_id, session_id, dedup_key, result_json, reason, "
                 "state, created_at, updated_at, acknowledged_at) VALUES "
-                "(?, 1, 'daemon.restarted', 'demo', 'cell-demo', ?, "
-                "'daemon.restarted:' || ?, '{\"interval_seconds\": 30}', "
+                "(?, 1, 'intake.dedup_repaired', 'demo', 'cell-demo', ?, "
+                "'intake.dedup_repaired:' || ?, '{\"interval_seconds\": 30}', "
                 "NULL, 'published', ?, ?, NULL)",
                 (operation_id, SESSION, SESSION, now, now),
             )
