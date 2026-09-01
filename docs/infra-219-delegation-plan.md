@@ -207,3 +207,61 @@ publishable lane.
 
 Sequenced AFTER L4 so the two packets never share files. L5 lands
 before INFRA-219's final gate and candidate.
+
+## Sol correction 110ed759 (Critical) — verified rework scope
+
+Sol rejected candidate `0e2bb54`: the authoritative two-lane slice is
+incomplete and the supported acceptance path in places CANNOT RUN.
+The lead independently verified the three most damaging claims against
+this exact tree before planning — all three are accurate:
+
+1. **`start-lane` cannot start a harness lane, and reports success.**
+   `_start_lane` (cli.py) calls `cells.dispatch(args.issue,
+   lane_role=lane_role)` with NO `harness_run`, but L3 made that
+   argument mandatory for the harness lane — so the dispatch returns
+   `harness_run_required`, and the exit line returns nonzero only for
+   `waiting_for_profile`/`start_failed`, so the refusal **exits 0**.
+   L2 wrote this command BEFORE L3 added the requirement, and the
+   lead did not re-check the CLI when integrating L3.
+2. **The real dashboard frame ignores the lane rows.**
+   `render_dashboard` consumes `snapshot.lanes`, but `render_frame` —
+   the function `dashboard_refresh` actually draws — does not. The
+   earlier "dashboard shows both lanes" claim is false for the
+   production render path.
+3. **Stale-manifest rejection is optional in production.**
+   `build_merge_flow` composes `CandidateEmitter` without
+   `durable_wake`, so L5's mandatory-wake gate never binds in the
+   real composition.
+
+Further defects Sol names (accepted, not yet independently re-proven):
+replacement profile leases are inserted without `lane_role` (defaults
+to development, so harness rotation silently converts the lane);
+`CmuxBinding` carries no lane identity, so daemon recovery cannot
+restore a harness binding to its dedicated worktree; harness worktree
+provisioning is unimplemented; the lane source attributes the
+project's development issue to both lanes; and project-wide
+development occupancy still refuses a second active issue, so the
+contract's "one lead coordinating at least three admitted isolated
+issue lanes" is not implemented at all.
+
+**Lead assessment.** The correction is correct and the severity is
+right. The prior "acceptance bar met" claim rested on module-level
+behavior and focused tests; it was never proven through the
+production composition or the CLI, which is exactly where these
+defects live. Focused suites passing is not evidence a supported path
+runs.
+
+| Packet | Boundary | Files | Tier |
+|---|---|---|---|
+| R1 | `start-lane` carries an explicit harness-run identity and every non-start outcome exits nonzero | `cli.py`, `tests/test_cli.py` | Sonnet |
+| R2 | Replacement profile leases retain `lane_role`; harness rotation never disturbs the development lease | `cells.py`, `tests/test_cells.py` | Sonnet |
+| R3 | `durable_wake` mandatory in the production emitter composition | `merge_flow.py`, `tests/test_merge_flow.py` | Sonnet |
+| R4 | `render_frame` renders lane-keyed issue/subagent/head/event/pressure/blocker facts without cross-lane attribution | `dashboard_render.py`, `dashboard_sources.py`, tests | Sonnet |
+| R5 | Lane identity through cmux binding, daemon composition, recovery, cleanup | `cmux_surfaces.py`, `runtime.py`, migration, tests | Sonnet |
+| R6 | Multiple admitted development issue lanes under one lead | `cells.py`, `scheduler.py`, tests | Sonnet |
+| R7 | Harness worktree/head provisioning + operational-only prompt | `cells.py`/`cli.py`/prompts, tests | Sonnet |
+| R8 | Live dual-lane acceptance receipt | docs | **Lead — not delegable** |
+
+R1–R3 are small, disjoint, and unblock the supported path; they go
+first. R6 revisits L3's occupancy model and is the largest. R8 cannot
+be produced by a subagent and requires live fleet operation.
