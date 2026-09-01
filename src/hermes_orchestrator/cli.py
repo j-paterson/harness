@@ -46,6 +46,7 @@ from hermes_orchestrator.claude import (
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
     CHANNEL_ENTRY,
+    CmuxDeadLeadSweep,
     CmuxHibernationDriver,
     CmuxLeadSeater,
     CmuxSurfaceReconciler,
@@ -857,6 +858,7 @@ async def _run_daemon(
     wake_delivery: LeadWakeDelivery | None = None,
     wake_reconciler: LeadWakeReconciler | None = None,
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
+    cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
     lead_intake: LeadIntakeRouter | None = None,
     channel_hub: ChannelHub | None = None,
@@ -874,6 +876,13 @@ async def _run_daemon(
     session: MergerSession | None = None
 
     async def _maintenance() -> None:
+        if cmux_dead_lead_sweep is not None:
+            # INFRA-198: the cmux reconciler runs once at startup, so a
+            # lead that died mid-run stayed active until the next daemon
+            # restart and blocked its replacement. This re-probes on
+            # every tick and retires ONLY an authoritatively absent
+            # seat: an unreachable socket retires nothing.
+            await cmux_dead_lead_sweep.tick()
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
         if session is not None:
@@ -923,7 +932,8 @@ async def _run_daemon(
         maintenance=(
             None
             if (
-                cmux_hibernation is None
+                cmux_dead_lead_sweep is None
+                and cmux_hibernation is None
                 and lead_intake is None
                 and channel_hub is None
                 and dashboard_refresh is None
@@ -4599,6 +4609,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         )
                     ),
                     cmux_reconciler=runtime.cmux_reconciler,
+                    cmux_dead_lead_sweep=runtime.cmux_dead_lead_sweep,
                     cmux_hibernation=runtime.cmux_hibernation,
                     lead_intake=runtime.lead_intake,
                     channel_hub=runtime.channel_hub,

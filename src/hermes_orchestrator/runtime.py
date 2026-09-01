@@ -41,6 +41,7 @@ from hermes_orchestrator.cmux import (
 )
 from hermes_orchestrator.cmux_surfaces import (
     ChannelTrustConfirmer,
+    CmuxDeadLeadSweep,
     CmuxHibernationDriver,
     CmuxHibernationGate,
     CmuxLeadSeater,
@@ -217,6 +218,7 @@ class Runtime:
     lead_wakes: LeadTerminalWakes | None = None
     cmux_bindings: CmuxSurfaceBindings | None = None
     cmux_reconciler: CmuxSurfaceReconciler | None = None
+    cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None
     cmux_hibernation: CmuxHibernationDriver | None = None
     orchestrator_workspace: OrchestratorWorkspaceOwner | None = None
     lead_intake: LeadIntakeRouter | None = None
@@ -610,6 +612,7 @@ def open_runtime(
         post_merge: PostMergeAdvance | None = None
         profile_health: tuple[ProfileHealth, ...] = ()
         cmux_reconciler: CmuxSurfaceReconciler | None = None
+        cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None
         cmux_hibernation: CmuxHibernationDriver | None = None
         orchestrator_workspace: OrchestratorWorkspaceOwner | None = None
         lead_intake: LeadIntakeRouter | None = None
@@ -825,6 +828,24 @@ def open_runtime(
                     # runs before durable state calls the seat usable.
                     channel_trust=channel_confirmer,
                 )
+                # INFRA-198: the reconciler above runs ONCE at startup,
+                # so a lead that dies mid-run stayed active until the
+                # next daemon restart and blocked its replacement. This
+                # is the same fail-closed probe on the per-tick path,
+                # retiring only an authoritatively absent seat.
+                cmux_dead_lead_sweep = CmuxDeadLeadSweep(
+                    bindings=cmux_bindings,
+                    port=cmux_port,
+                    database=database,
+                    events=events,
+                    control=control_operations,
+                    leases=worktree_leases,
+                    # Sol correction cde70842: the durable lease and the
+                    # pool's in-memory affinity are released together,
+                    # or the replacement start-lane conflicts on a lease
+                    # whose cell no longer exists.
+                    profiles=pool,
+                )
                 cmux_hibernation = CmuxHibernationDriver(
                     gate=CmuxHibernationGate(
                         database=database,
@@ -985,6 +1006,7 @@ def open_runtime(
             lead_wakes=lead_wakes,
             cmux_bindings=cmux_bindings,
             cmux_reconciler=cmux_reconciler,
+            cmux_dead_lead_sweep=cmux_dead_lead_sweep,
             cmux_hibernation=cmux_hibernation,
             orchestrator_workspace=orchestrator_workspace,
             lead_intake=lead_intake,

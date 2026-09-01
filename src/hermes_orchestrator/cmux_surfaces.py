@@ -39,6 +39,7 @@ from hermes_orchestrator.cmux import (
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.worktrees import CleanupBlocked, WorktreeLeases
 
 CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID"
 CMUX_SURFACE_ID_ENV = "CMUX_SURFACE_ID"
@@ -1584,6 +1585,256 @@ async def _resolve_residual_bindings(
         bindings.mark_closed(binding.binding_id, reason="residual_reclaimed")
         if reclaimed is not None:
             reclaimed.append(binding.binding_id)
+
+
+#: The project-cell state a dead lead's cell is retired FROM, and the
+#: state it is retired INTO. 'failed' is the vocabulary's existing
+#: non-occupying terminal (``ProjectCellService._fail_unconfirmed_start``
+#: writes exactly it), so retiring into it releases the
+#: one-active-cell-per-lane index and a deliberate ``start-lane`` can
+#: seat the replacement.
+_DEAD_LEAD_CELL_STATE = "active"
+_DEAD_LEAD_RETIRED_CELL_STATE = "failed"
+#: The binding-closure reason a dead worker's seat carries, so the
+#: journal distinguishes this retirement from a rotation or a close.
+_DEAD_LEAD_BINDING_REASON = "dead_worker_surface_missing"
+
+
+class CmuxDeadLeadSweep:
+    """Retire lead seats whose cmux surface provably no longer exists.
+
+    INFRA-198: :meth:`CmuxSurfaceReconciler.reconcile` runs exactly once,
+    before the supervisor starts, so a lead whose workspace was closed
+    (or whose Claude process exited) MID-RUN stayed durably active until
+    the next daemon restart — observed live as a cell and binding still
+    reading ``active`` on a dead workspace more than two ticks later,
+    blocking the replacement launch. This is the per-tick sweep that
+    closes that gap, and it retires rather than relaunches: startup
+    recovery deliberately keeps replacing a missing seat, while the
+    mid-run case hands the cell back so ``start-lane`` seats the
+    replacement.
+
+    Every step fails closed, in the same order and for the same reason
+    the reconciler's pass does:
+
+    * ``ping()`` first. On :class:`CmuxError` NOTHING is retired — an
+      unreachable or denying socket must never read as "every worker
+      died", which would tear down healthy seats on a transient hiccup.
+    * Absence must come from a SUCCESSFUL ``surface_alive`` probe, never
+      from an exception, and a live surface is left completely untouched.
+    * A provably absent surface retires that exact identity and only it:
+      its binding is closed, its cell leaves ``active`` under a
+      compare-and-swap on the exact cell id AND the state just observed
+      (so a concurrent transition is never clobbered), any cleanup claim
+      held on that cell's issue worktree lease is released, and one
+      durable control receipt names the retired cell, binding and
+      workspace.
+    * A :class:`CmuxError` mid-pass ends the sweep with the remaining
+      bindings untouched; the next tick re-derives everything.
+    """
+
+    def __init__(
+        self,
+        *,
+        bindings: CmuxSurfaceBindings,
+        port: CmuxControlPort,
+        database: Database,
+        events: EventStore,
+        control: ControlOperations | None = None,
+        leases: WorktreeLeases | None = None,
+        profiles: Any | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._bindings = bindings
+        self._port = port
+        self._database = database
+        self._events = events
+        self._control = control
+        self._leases = leases
+        self._profiles = profiles
+        self._now = now or (lambda: datetime.now(UTC))
+
+    async def tick(self) -> tuple[str, ...]:
+        """Retire every active lead binding whose surface is gone."""
+
+        try:
+            await self._port.ping()
+        except CmuxError:
+            # Denial or unavailability fails closed: durable bindings are
+            # the truth and stay untouched until cmux is reachable.
+            return ()
+        retired: list[str] = []
+        try:
+            for binding in self._bindings.active():
+                if binding.role != "lead":
+                    continue
+                if await self._port.surface_alive(binding.ref):
+                    continue
+                self._retire(binding)
+                retired.append(binding.binding_id)
+        except CmuxError:
+            # cmux failed mid-pass. Absence is only ever a successful
+            # probe's answer, so every unprobed binding keeps its durable
+            # state and the next tick retries.
+            return tuple(retired)
+        return tuple(retired)
+
+    def _retire(self, binding: CmuxBinding) -> None:
+        """Retire one exact dead identity, in the fail-closed order."""
+
+        project_key = str(binding.project_key)
+        cell_id = str(binding.cell_id)
+        session_id = str(binding.session_id)
+        self._bindings.mark_closed(
+            binding.binding_id, reason=_DEAD_LEAD_BINDING_REASON
+        )
+        cell_retired = self._retire_cell(cell_id, binding)
+        lease_id = self._release_issue_lease(project_key, cell_id, session_id)
+        if self._control is None:
+            return
+        with suppress(Exception):
+            self._control.record(
+                kind="lead.dead_worker_retired",
+                project_key=project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                result={
+                    "cell_id": cell_id,
+                    "binding_id": binding.binding_id,
+                    "workspace_uuid": binding.workspace_uuid,
+                    "surface_uuid": binding.surface_uuid,
+                    "lane_role": binding.lane_role,
+                    "cell_retired": cell_retired,
+                    "worktree_lease_released": lease_id,
+                },
+                reason=(
+                    "the lead's cmux surface is provably gone; its "
+                    "binding is closed and the cell released so a "
+                    "deliberate start-lane can seat the replacement"
+                ),
+            )
+
+    def _retire_cell(self, cell_id: str, binding: CmuxBinding) -> bool:
+        """Move the dead lead's cell out of 'active', CAS'd exactly.
+
+        The state is read first and then required to be unchanged by the
+        UPDATE, so a rotation, handoff or failure that landed between the
+        probe and this write wins instead of being clobbered.
+        """
+
+        row = self._database.execute(
+            "SELECT state, project_key, profile_alias, lane_role "
+            "FROM project_cells WHERE cell_id = ?",
+            (cell_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        observed = str(row["state"])
+        if observed != _DEAD_LEAD_CELL_STATE:
+            # Only an occupied cell is retired; anything else is already
+            # someone else's transition and stays exactly as found.
+            return False
+        cell_project_key = str(row["project_key"])
+        cell_profile_alias = str(row["profile_alias"] or "")
+        cell_lane_role = str(row["lane_role"] or "development")
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE project_cells SET state = ?, updated_at = ? "
+                "WHERE cell_id = ? AND state = ?",
+                (_DEAD_LEAD_RETIRED_CELL_STATE, stamp, cell_id, observed),
+            )
+            if cursor.rowcount != 1:
+                return False
+            # Sol correction cde70842: retiring the cell alone is not
+            # enough. The profile lease outlives it, so the replacement
+            # _create_cell() reuses the same (project, lane) affinity,
+            # its own lease insert then conflicts, and with no active
+            # cell left to recover, start-lane FAILS instead of seating
+            # the replacement -- defeating the entire point of the
+            # sweep. The exact project/lane lease is released here, in
+            # the same transaction that retires the cell, so the two can
+            # never disagree.
+            connection.execute(
+                "DELETE FROM profile_leases WHERE project_key = ? "
+                "AND profile_alias = ? AND lane_role = ?",
+                (cell_project_key, cell_profile_alias, cell_lane_role),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="project_cell.dead_worker_retired",
+                    aggregate_type="project_cell",
+                    aggregate_id=cell_id,
+                    payload={
+                        "project_key": binding.project_key,
+                        "session_id": binding.session_id,
+                        "lane_role": binding.lane_role,
+                        "binding_id": binding.binding_id,
+                        "workspace_uuid": binding.workspace_uuid,
+                        "previous_state": observed,
+                        "state": _DEAD_LEAD_RETIRED_CELL_STATE,
+                    },
+                ),
+            )
+        # The in-memory pool must agree with the durable row it just
+        # lost, or the next _create_cell() hands back the retired
+        # affinity from cache and conflicts all over again.
+        if self._profiles is not None and cell_profile_alias:
+            with suppress(Exception):
+                self._profiles.release(
+                    cell_project_key,
+                    _DEAD_LEAD_BINDING_REASON,
+                    lane_role=cell_lane_role,
+                )
+        return True
+
+    def _release_issue_lease(
+        self, project_key: str, cell_id: str, session_id: str
+    ) -> str | None:
+        """Release the cleanup claim held on this cell's issue lane.
+
+        The lane lease itself is NOT reclaimed: reclamation requires a
+        checkpoint plus a proven remote (:class:`WorktreeCustodian`), and
+        a dead worker is exactly the case whose work may be unpushed, so
+        inventing a release here would destroy it. What a dead worker CAN
+        leave behind is a cleanup claim — while a lease is 'reclaiming'
+        the registry refuses every new attachment to its path, so the
+        replacement lead could not use the lane at all. That claim is
+        released back to 'checkpointed' through the same
+        ``release_cleanup`` transition the custodian's own failure paths
+        use, under the owner token durably recorded on the row.
+        """
+
+        if self._leases is None:
+            return None
+        row = self._database.execute(
+            "SELECT issue_id FROM lead_assignments "
+            "WHERE cell_id = ? AND session_id = ? AND state != 'superseded' "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (cell_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        issue_id = str(row["issue_id"])
+        for lease in self._leases.active(project_key):
+            if lease.issue_id != issue_id:
+                continue
+            owner = lease.cleanup_owner
+            if lease.state != "reclaiming" or not owner:
+                return None
+            try:
+                self._leases.release_cleanup(
+                    lease.lease_id,
+                    owner=owner,
+                    reason=_DEAD_LEAD_BINDING_REASON,
+                )
+            except CleanupBlocked:
+                # The claim moved under us; whoever holds it now owns
+                # the outcome and nothing here overrides them.
+                return None
+            return lease.lease_id
+        return None
 
 
 def live_claude_argv(session_id: str) -> list[str]:

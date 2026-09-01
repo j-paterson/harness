@@ -26,6 +26,7 @@ from hermes_orchestrator.cmux_surfaces import (
     SKIP_PERMISSIONS_FLAG,
     ChannelTrustConfirmer,
     CmuxBindingConflict,
+    CmuxDeadLeadSweep,
     CmuxHibernationGate,
     CmuxSurfaceBindings,
     CmuxSurfaceReconciler,
@@ -3170,3 +3171,132 @@ class TestReconcilerChannelTrust:
         # Only the surface identity differs — a genuinely new workspace.
         assert normal_seen.ref == LEAD
         assert recovery_seen.ref == FRESH
+
+
+def _dead_lead_sweep(
+    database: Database,
+    bindings: CmuxSurfaceBindings,
+    port: FakePort,
+    *,
+    control: ControlOperations | None = None,
+    leases: object | None = None,
+) -> CmuxDeadLeadSweep:
+    return CmuxDeadLeadSweep(
+        bindings=bindings,
+        port=port,
+        database=database,
+        events=EventStore(database),
+        control=control,
+        leases=leases,
+    )
+
+
+def _cell_state(database: Database, cell_id: str) -> str:
+    row = database.execute(
+        "SELECT state FROM project_cells WHERE cell_id = ?", (cell_id,)
+    ).fetchone()
+    return str(row["state"])
+
+
+@pytest.mark.asyncio
+async def test_dead_lead_sweep_retires_the_exact_dead_seat(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """INFRA-198 (observed live 2026-09-01): harness workspace
+    87B8378D was closed and its Claude PID exited, yet more than two
+    daemon ticks later cell 8369559d and its binding were still
+    ``active``, so no replacement could be launched. The cmux
+    reconciler probes for exactly this, but runs ONCE at daemon
+    startup, so a lead that dies mid-run stays active until the next
+    restart. The per-tick sweep retires the exact dead identity."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    port = FakePort()
+    binding = bind_demo_lead(bindings)
+    # The surface is absent: the workspace was closed and the PID exited.
+    assert LEAD not in port.live
+
+    retired = await _dead_lead_sweep(
+        database, bindings, port, control=control
+    ).tick()
+
+    assert retired == (binding.binding_id,)
+    assert bindings.active_lead("cell-demo") is None
+    assert _cell_state(database, "cell-demo") == "failed"
+    assert control_operation_kinds(database) == ["lead.dead_worker_retired"]
+
+
+@pytest.mark.asyncio
+async def test_dead_lead_sweep_retires_nothing_when_cmux_is_unreachable(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """The regression that matters most: absence must be a SUCCESSFUL
+    probe's answer. A denied or unreachable socket must never read as
+    "every worker died" -- that would tear down healthy seats on a
+    transient cmux hiccup, on every tick."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    port = FakePort(deny=True)
+    binding = bind_demo_lead(bindings)
+
+    retired = await _dead_lead_sweep(
+        database, bindings, port, control=control
+    ).tick()
+
+    assert retired == ()
+    live = bindings.active_lead("cell-demo")
+    assert live is not None
+    assert live.binding_id == binding.binding_id
+    assert _cell_state(database, "cell-demo") == "active"
+    assert control_operation_kinds(database) == []
+
+
+@pytest.mark.asyncio
+async def test_dead_lead_sweep_leaves_a_live_seat_untouched(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """A seat whose surface answers the probe is healthy and must be
+    left exactly as found -- the sweep repairs residue, it does not
+    recycle working leads."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    port = FakePort(live={LEAD})
+    binding = bind_demo_lead(bindings)
+
+    retired = await _dead_lead_sweep(
+        database, bindings, port, control=control
+    ).tick()
+
+    assert retired == ()
+    live = bindings.active_lead("cell-demo")
+    assert live is not None
+    assert live.binding_id == binding.binding_id
+    assert _cell_state(database, "cell-demo") == "active"
+    assert control_operation_kinds(database) == []
+
+
+@pytest.mark.asyncio
+async def test_dead_lead_sweep_stops_on_a_mid_pass_cmux_failure(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """cmux failing partway through is not evidence about anything it
+    never probed: the pass ends and every unprobed binding keeps its
+    durable state for the next tick."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    port = FakePort(fail={"surface_alive": CmuxError("cmux went away")})
+    binding = bind_demo_lead(bindings)
+
+    retired = await _dead_lead_sweep(
+        database, bindings, port, control=control
+    ).tick()
+
+    assert retired == ()
+    live = bindings.active_lead("cell-demo")
+    assert live is not None
+    assert live.binding_id == binding.binding_id
+    assert _cell_state(database, "cell-demo") == "active"

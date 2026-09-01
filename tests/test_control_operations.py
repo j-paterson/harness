@@ -326,6 +326,10 @@ def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
         # reason rebind's is -- the seat could not auto-confirm and an
         # operator must clear the dialog manually.
         "channel.adopt_refused",
+        # INFRA-198: the dead-lead sweep's retirement receipt is
+        # lead-actionable -- it is the operator's evidence that a seat
+        # and its cell were released and need a deliberate start-lane.
+        "lead.dead_worker_retired",
         "daemon.restarted",
         "channel.reregistered",
         "channel.replayed",

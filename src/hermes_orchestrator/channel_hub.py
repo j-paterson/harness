@@ -421,9 +421,22 @@ class ChannelHub:
             "WHERE state = 'pending' ORDER BY created_at ASC, rowid ASC"
         ).fetchall()
         for row in corrections:
+            # INFRA-198 (observed live 2026-09-01): correction cde70842
+            # for a product candidate was announced to the DEAD HARNESS
+            # session. This picked the most recently updated active cell
+            # of ANY lane, and the harness cell's row happened to be
+            # touched last, so the harness lane won the correction.
+            #
+            # A correction answers a product candidate, and only the
+            # development lane ever publishes one -- the harness lane
+            # neither owns nor can act on it. Scoping the target to that
+            # lane fixes the misroute at its cause: stale active-cell
+            # selection made it manifest here, but even a perfectly live
+            # harness cell must never be handed a product correction.
             target = self._database.execute(
                 "SELECT cell_id, session_id FROM project_cells "
                 "WHERE project_key = ? AND state = 'active' "
+                "AND lane_role = 'development' "
                 "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
                 (str(row["project_key"]),),
             ).fetchone()

@@ -8,7 +8,7 @@ import stat
 import tempfile
 from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -645,6 +645,65 @@ class TestDirectRouting:
         assert event["op"] == "event"
         assert event["kind"] == "HERMES_WORK_READY"
         assert event["session_id"] == SESSION
+        await sidecar.close()
+
+    async def test_a_correction_never_targets_a_more_recent_harness_cell(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        """INFRA-198 (observed live 2026-09-01): correction cde70842 for
+        a product candidate was announced to the DEAD HARNESS session.
+
+        The target was the most recently updated active cell of ANY
+        lane, and the harness cell's row happened to be touched last, so
+        the harness lane won a correction it neither owns nor can act
+        on. Only the development lane publishes product candidates, so
+        only it can answer a correction about one. The harness cell here
+        is deliberately the FRESHER row -- under the old ordering it
+        won."""
+
+        seat(bindings)
+        seed_active_cell(database)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, lane_role, state, profile_alias, "
+                "session_id, created_at, updated_at) VALUES "
+                "('cell-harness', 'demo', 'harness', 'active', 'max-b', "
+                "?, ?, ?)",
+                (
+                    "99999999-9999-4999-8999-999999999999",
+                    NOW.isoformat(),
+                    # Strictly newer than the development cell.
+                    (NOW + timedelta(minutes=5)).isoformat(),
+                ),
+            )
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO lead_corrections("
+                "correction_id, project_key, issue_id, source, repository, "
+                "branch, pr_number, reviewed_sha, packets_json, state, "
+                "created_at) VALUES (?, 'demo', 'ENG-9', 'codex_review', "
+                "'owner/demo', 'feature/x', 7, 'abc', '[]', 'pending', ?)",
+                (CORRECTION_ID, NOW.isoformat()),
+            )
+        sidecar = await registered_sidecar(hub, capabilities)
+
+        published = await hub.publish_pending()
+
+        assert published == (f"HERMES_CORRECTION_READY {CORRECTION_ID}",)
+        event = await sidecar.receive()
+        assert event["kind"] == "HERMES_CORRECTION_READY"
+        # The development lead, never the fresher harness seat.
+        assert event["session_id"] == SESSION
+        row = database.execute(
+            "SELECT session_id FROM channel_events WHERE packet_id = ?",
+            (CORRECTION_ID,),
+        ).fetchone()
+        assert str(row["session_id"]) == SESSION
         await sidecar.close()
 
     async def test_a_journalled_correction_reaches_the_channel_directly(

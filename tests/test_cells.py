@@ -5893,3 +5893,111 @@ async def test_bind_missing_issue_lanes_catches_up_an_already_active_issue(
     service.bind_missing_issue_lanes("demo", issue_id="ENG-9")
     assert len(git.created) == 1
     assert resolve_lane(leases, "demo", "ENG-9").path == lane.path
+
+
+@pytest.mark.asyncio
+async def test_dead_seat_sweep_lets_start_lane_seat_the_replacement(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """Sol correction cde70842: the sweep's whole purpose is that a
+    replacement can then be seated.
+
+    Retiring the cell alone left its ``profile_leases`` row and the
+    pool's in-memory affinity intact, so the replacement
+    ``_create_cell()`` reused that affinity, its own lease insert
+    conflicted, and with no active cell left to recover, ``start-lane``
+    FAILED instead of seating the replacement. The end-to-end path is
+    the only thing that proves the fix -- retiring and re-seating are
+    each individually green while the pair is broken."""
+
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import (
+        CmuxDeadLeadSweep,
+        CmuxSurfaceBindings,
+    )
+
+    sessions = iter(
+        [
+            UUID("44444444-4444-4444-8444-444444444444"),
+            UUID("55555555-5555-4555-8555-555555555555"),
+        ]
+    )
+    cells = iter(["cell-harness", "cell-harness-2"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    first = await service.dispatch("ENG-9", lane_role="harness", harness_run="run-1")
+    assert first.status == "working"
+    assert first.cell_id == "cell-harness"
+    lease = database.execute(
+        "SELECT profile_alias FROM profile_leases "
+        "WHERE project_key = 'demo' AND lane_role = 'harness'"
+    ).fetchone()
+    assert lease is not None
+
+    # The worker dies: its surface is gone and the sweep retires it.
+    bindings = CmuxSurfaceBindings(database=database, events=EventStore(database))
+    ref = CmuxSurfaceRef(
+        workspace_uuid="87B8378D-EBE5-4B5F-A317-1C5198FB8DBE",
+        surface_uuid="87B8378D-EBE5-4B5F-A317-1C5198FB8DBF",
+    )
+    bindings.bind_lead(
+        ref=ref,
+        project_key="demo",
+        cell_id="cell-harness",
+        session_id=str(first.session_id),
+        profile_alias="max-a",
+    )
+    sweep = CmuxDeadLeadSweep(
+        bindings=bindings,
+        port=_DeadSurfacePort(),
+        database=database,
+        events=EventStore(database),
+        profiles=profiles,
+    )
+
+    assert await sweep.tick() != ()
+
+    # The exact lane lease is gone, durably AND in the pool.
+    assert (
+        database.execute(
+            "SELECT profile_alias FROM profile_leases "
+            "WHERE project_key = 'demo' AND lane_role = 'harness'"
+        ).fetchone()
+        is None
+    )
+
+    # The whole point: a replacement now seats successfully.
+    replacement = await service.dispatch(
+        "ENG-9", lane_role="harness", harness_run="run-2"
+    )
+
+    assert replacement.status == "working", replacement
+    assert replacement.cell_id == "cell-harness-2"
+    assert replacement.session_id != first.session_id
+
+
+class _DeadSurfacePort:
+    """Reachable cmux whose surfaces are all provably gone."""
+
+    async def ping(self) -> None:
+        return None
+
+    async def surface_alive(self, ref: object) -> bool:
+        return False

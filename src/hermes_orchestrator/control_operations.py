@@ -46,6 +46,11 @@ CONTROL_KINDS = frozenset(
         # has no anchor and the project's proven one could not be
         # carried onto it, so the operator must confirm manually.
         "channel.adopt_refused",
+        # INFRA-198: a lead whose cmux surface is provably gone was
+        # retired mid-run by the per-tick dead-lead sweep -- the seat,
+        # its cell and its lane are released, and a deliberate
+        # start-lane seats the replacement.
+        "lead.dead_worker_retired",
     }
 )
 

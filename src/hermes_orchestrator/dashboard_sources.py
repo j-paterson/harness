@@ -76,6 +76,9 @@ _CONTROL_OPERATION_ATTENTION_KINDS = frozenset(
         "lead.launch_failed",
         "signal.failed",
         "channel.blocked",
+        # INFRA-198: a mid-run dead lead was retired and its cell
+        # released; the operator has to seat the replacement.
+        "lead.dead_worker_retired",
     }
 )
 
