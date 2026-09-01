@@ -3634,15 +3634,174 @@ def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+class _SeatLaneUnresolved(Exception):
+    """The seat's assigned issue does not name exactly one live lane.
+
+    Carries the facts each caller needs to name what was missing —
+    the issue the seat is bound to, and how many active worktree leases
+    that issue actually has — without fixing the caller's wording.
+    """
+
+    def __init__(self, issue_id: str, live_leases: int) -> None:
+        super().__init__(issue_id)
+        self.issue_id = issue_id
+        self.live_leases = live_leases
+
+    @property
+    def detail(self) -> str:
+        """The lease-count clause both refusals embed verbatim."""
+
+        return (
+            "has no active worktree lease"
+            if not self.live_leases
+            else f"has {self.live_leases} active worktree leases"
+        )
+
+
+def _seat_lane(
+    database: Database, *, project_key: str, cell_id: str, session_id: str
+) -> ResolvedLane | None:
+    """The ONE live worktree lease bound to this exact seat's own issue.
+
+    INFRA-198: the seat, not the project, names the tree. The cell's
+    latest lead assignment for its exact ``cell_id`` + ``session_id``
+    identifies the issue it is actually working, and that issue's single
+    active worktree lease identifies the checkout — the coordinator's
+    ``project.lead_cwd`` is frequently detached and frequently dirtied
+    by unrelated work, so it describes no lane in particular.
+
+    The assignment row's ``state`` is deliberately NOT filtered.
+    Supersession is per-ISSUE, not per-cell: a later assignment of the
+    same issue to a DIFFERENT cell marks this row ``superseded`` while
+    saying nothing about whether THIS cell is still bound and working,
+    so excluding superseded rows discards the one durable fact
+    identifying the seat. Freshness for the seat comes from the ordering
+    instead, which guarantees a newer assignment for this same
+    cell/session wins. Scoping to cell_id AND session_id is also what
+    keeps another cell's lease from ever qualifying here.
+
+    Returns ``None`` when no assignment names this exact cell and
+    session — the genuinely unassigned caller. Raises
+    :class:`_SeatLaneUnresolved` when the seat IS assigned but its issue
+    binds zero or several live lanes: an unresolvable lane fails closed
+    rather than silently falling back to some other checkout.
+    """
+
+    assignment = database.execute(
+        "SELECT issue_id FROM lead_assignments "
+        "WHERE cell_id = ? AND session_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (cell_id, session_id),
+    ).fetchone()
+    if assignment is None:
+        return None
+    issue_id = str(assignment["issue_id"])
+    # ``resolve_lane`` is the codebase's fail-closed reader for "this
+    # issue's ONE active worktree lease": zero leases and several leases
+    # both refuse rather than guess, and it is scoped to the project and
+    # the issue, so a lease bound to any other issue never qualifies.
+    leases = WorktreeLeases(database, events=EventStore(database))
+    try:
+        return resolve_lane(leases, project_key, issue_id)
+    except EmissionBlocked:
+        live = [
+            lease for lease in leases.active(project_key) if lease.issue_id == issue_id
+        ]
+        raise _SeatLaneUnresolved(issue_id, len(live)) from None
+
+
+def _rotation_worktree(
+    database: Database, *, project: Any, project_key: str, cell_id: str | None
+) -> Path:
+    """The worktree the rotation precondition must measure for ONE seat.
+
+    INFRA-198: the precondition used to close over ``project.lead_cwd``
+    unconditionally, so every cell of a project was judged by one shared
+    checkout — a third party dirtying an unrelated tree blocked a clean
+    lane's rotation, and a coordinator left detached made the
+    head-vs-origin comparison meaningless. The rotating cell's OWN bound
+    lane is selected instead, by the same derivation ``_submit_handoff``
+    uses (:func:`_seat_lane`).
+
+    The legacy ``project.lead_cwd`` probe is preserved for exactly one
+    case: a genuinely unassigned caller in a project with at most one
+    active issue. A cell with no durable row or no incumbent session
+    also keeps it — ``LeadRotation``'s own precondition is the boundary
+    that names those, and this selector must not pre-empt its message.
+
+    Raises ``ValueError`` (which both call sites already surface as one
+    actionable message) on zero, ambiguous, or mismatched identity.
+    """
+
+    if cell_id is None:
+        return project.lead_cwd
+    row = database.execute(
+        "SELECT project_key, session_id FROM project_cells WHERE cell_id = ?",
+        (cell_id,),
+    ).fetchone()
+    if row is None or row["session_id"] is None:
+        return project.lead_cwd
+    if str(row["project_key"]) != project_key:
+        raise ValueError(
+            f"lead rotation refused: cell {cell_id!r} belongs to project "
+            f"{str(row['project_key'])!r}, not {project_key!r}, so the "
+            "rotating seat's worktree cannot be derived"
+        )
+    try:
+        lane = _seat_lane(
+            database,
+            project_key=project_key,
+            cell_id=cell_id,
+            session_id=str(row["session_id"]),
+        )
+    except _SeatLaneUnresolved as unresolved:
+        raise ValueError(
+            f"lead rotation refused: cell {cell_id!r} is assigned issue "
+            f"{unresolved.issue_id!r}, but that issue {unresolved.detail} in "
+            f"project {project_key!r}, so the rotating seat's worktree cannot "
+            f"be derived; leave exactly one active worktree lease for "
+            f"{unresolved.issue_id} and rotate again"
+        ) from None
+    if lane is not None:
+        return lane.path
+    active = [
+        str(row["issue_id"])
+        for row in database.execute(
+            "SELECT issue_id FROM admitted_issues WHERE project_key = ? "
+            "AND state IN ('in_development', 'review') ORDER BY issue_id",
+            (project_key,),
+        ).fetchall()
+    ]
+    if len(active) > 1:
+        raise ValueError(
+            f"lead rotation refused: cell {cell_id!r} has no live lead "
+            f"assignment and project {project_key!r} has {len(active)} active "
+            f"issues ({', '.join(active)}), so the rotating seat's worktree "
+            "cannot be derived; assign the cell its issue before rotating"
+        )
+    return project.lead_cwd
+
+
 def _compose_lead_rotation(
-    settings: Any, runtime: Any, database: Database, project: Any
+    settings: Any,
+    runtime: Any,
+    database: Database,
+    project: Any,
+    *,
+    project_key: str,
+    cell_id: str | None,
 ) -> Any:
     """Build the one-shot ``LeadRotation`` exactly as ``rotate-lead`` does.
 
     Shared by ``rotate-lead`` and the ``submit-handoff`` continuation so
     both drive the SAME durable transition with identical collaborators.
+    Both callers name the cell being rotated, because the worktree the
+    precondition measures is a property of that SEAT, not of the project
+    (INFRA-198; see :func:`_rotation_worktree`).
+
     Raises ``OSError``/``ValueError`` when the collaborators cannot be
-    opened (surfaced by the caller as one actionable message).
+    opened or the seat's own worktree cannot be named (surfaced by the
+    caller as one actionable message).
     """
 
     from hermes_orchestrator.lead_rotation import LeadRotation
@@ -3651,12 +3810,13 @@ def _compose_lead_rotation(
     # Leads and candidates work in a dedicated worktree when the
     # project configures one; ``repo_path`` itself must stay the stable
     # primary checkout (see the linked-worktree rejection in
-    # ``load_settings``), so the rotation probe validates the lead's
-    # actual candidate tree instead. Sol correction c5600e31: derived
-    # from the same canonical ``project.lead_cwd`` the seater/cell
-    # composition and bootstrap trust in
-    # ``_open_rotation_collaborators`` use.
-    lead_worktree = project.lead_cwd
+    # ``load_settings``). INFRA-198: for an ASSIGNED seat that tree is
+    # the cell's own bound issue lane, and only an unassigned single-lane
+    # caller still falls back to the canonical ``project.lead_cwd`` Sol
+    # correction c5600e31 established for the seater/cell composition.
+    lead_worktree = _rotation_worktree(
+        database, project=project, project_key=project_key, cell_id=cell_id
+    )
     return LeadRotation(
         database=database,
         handoffs=HandoffService(database),
@@ -3712,58 +3872,31 @@ def _submit_handoff(
         (project_key,),
     ).fetchall()
     # INFRA-198: derive the issue and the git position from the SEAT
-    # being handed off, not from the project as a whole. The cell's
-    # latest lead assignment names its issue unambiguously even when
-    # the project has several active issues, and that issue's own
-    # active worktree lease names the tree to probe -- the coordinator's
-    # ``project.lead_cwd`` checkout is frequently detached, which is
-    # what made ``branch`` empty and the field "incomplete".
-    #
-    # The row's ``state`` is deliberately NOT filtered. Supersession is
-    # per-ISSUE, not per-cell: a later assignment of the same issue to a
-    # DIFFERENT cell marks this row ``superseded`` while saying nothing
-    # about whether THIS cell is still bound and working, so excluding
-    # superseded rows discarded the one durable fact identifying the
-    # seat. Freshness for the seat comes from the ordering below, which
-    # guarantees a newer assignment for this same cell/session wins.
-    assignment = database.execute(
-        "SELECT issue_id FROM lead_assignments "
-        "WHERE cell_id = ? AND session_id = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        (args.cell, str(cell["session_id"])),
-    ).fetchone()
-    if assignment is not None:
-        issue_id = str(assignment["issue_id"])
-        # ``resolve_lane`` is the codebase's fail-closed reader for
-        # "this issue's ONE active worktree lease": zero leases and
-        # several leases both refuse rather than guess.
-        leases = WorktreeLeases(database, events=EventStore(database))
-        try:
-            lane = resolve_lane(leases, project_key, issue_id)
-        except EmissionBlocked:
-            live = [
-                lease
-                for lease in leases.active(project_key)
-                if lease.issue_id == issue_id
-            ]
-            detail = (
-                "has no active worktree lease"
-                if not live
-                else f"has {len(live)} active worktree leases"
-            )
-            message = (
-                f"handoff refused: cell {args.cell!r} is assigned issue "
-                f"{issue_id!r}, but that issue {detail} in project "
-                f"{project_key!r}, so the handoff's branch cannot be "
-                f"derived; leave exactly one active worktree lease for "
-                f"{issue_id} and submit again"
-            )
-            _print(
-                {"error": message},
-                json_output=args.json,
-                human=f"{message}.",
-            )
-            return 1
+    # being handed off, not from the project as a whole -- the shared
+    # ``_seat_lane`` derivation the rotation precondition now uses too.
+    try:
+        lane = _seat_lane(
+            database,
+            project_key=project_key,
+            cell_id=args.cell,
+            session_id=str(cell["session_id"]),
+        )
+    except _SeatLaneUnresolved as unresolved:
+        message = (
+            f"handoff refused: cell {args.cell!r} is assigned issue "
+            f"{unresolved.issue_id!r}, but that issue {unresolved.detail} in "
+            f"project {project_key!r}, so the handoff's branch cannot be "
+            f"derived; leave exactly one active worktree lease for "
+            f"{unresolved.issue_id} and submit again"
+        )
+        _print(
+            {"error": message},
+            json_output=args.json,
+            human=f"{message}.",
+        )
+        return 1
+    if lane is not None:
+        issue_id = lane.issue_id
         worktree = _worktree_state(lane.path)
         issue_state = next(
             (
@@ -3835,7 +3968,14 @@ def _submit_handoff(
         continuation_note = "cmux is not configured; no rotation was resumed"
     else:
         try:
-            rotation = _compose_lead_rotation(settings, runtime, database, project)
+            rotation = _compose_lead_rotation(
+                settings,
+                runtime,
+                database,
+                project,
+                project_key=project_key,
+                cell_id=args.cell,
+            )
         except (OSError, ValueError) as error:
             continuation_note = f"rotation collaborators unavailable: {error}"
         else:
@@ -4331,7 +4471,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 return 1
             try:
                 rotation = _compose_lead_rotation(
-                    settings, runtime, database, project
+                    settings,
+                    runtime,
+                    database,
+                    project,
+                    project_key=project_key,
+                    cell_id=args.cell,
                 )
             except (OSError, ValueError) as error:
                 _print(

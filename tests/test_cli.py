@@ -5929,6 +5929,291 @@ def test_submit_handoff_keeps_the_single_active_issue_fallback(
     assert "issue INFRA-212 is in_development" in document["status"]
 
 
+def _install_seat_lane_probe(
+    monkeypatch: pytest.MonkeyPatch, lanes: dict[Path, Any]
+) -> list[str]:
+    """Probe git per PATH, with the COORDINATOR's tree left unusable.
+
+    Every path named in ``lanes`` reports the given state; every other
+    checkout -- notably ``project.lead_cwd`` -- reports the live INFRA-198
+    coordinator shape: detached (no branch, no readable ``origin/<branch>``)
+    AND dirty from an unrelated third party's untracked workspace. Any
+    rotation that measures the coordinator therefore refuses, so a passing
+    rotation proves the seat's own lane was measured. Returns the probed
+    paths, in order.
+
+    Installed AFTER ``_install_rotation_process_and_probe_fakes``, whose
+    unconditional clean probe this deliberately replaces.
+    """
+
+    import hermes_orchestrator.cli as cli_module
+
+    probed: list[str] = []
+    states = {str(path): state for path, state in lanes.items()}
+
+    def _probe(path: Path) -> Any:
+        probed.append(str(path))
+        return states.get(
+            str(path),
+            cli_module.WorktreeState(
+                branch="", head="ec7ade4", origin_head="", dirty=True
+            ),
+        )
+
+    monkeypatch.setattr(cli_module, "_worktree_state", _probe)
+    return probed
+
+
+def _lane_state(
+    *, head: str = "2a85585", origin_head: str = "2a85585", dirty: bool = False
+) -> Any:
+    """One lane's probe result; clean, pushed, and on its own branch by
+    default -- the shape the live INFRA-198 harness lease actually had."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    return cli_module.WorktreeState(
+        branch="feature/infra-198-harness-trust",
+        head=head,
+        origin_head=origin_head,
+        dirty=dirty,
+    )
+
+
+def _rotate_lead_for_demo_cell(
+    configured_repo: tuple[Path, Path],
+) -> CliResult:
+    return invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+
+
+def test_rotate_lead_measures_the_bound_seat_worktree_not_the_coordinator(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live INFRA-198 defect: the rotation precondition closed over
+    ``project.lead_cwd``, so the harness cell was judged by the
+    COORDINATOR's checkout -- detached and dirtied by an unrelated
+    third-party workspace -- and refused with "project HEAD does not
+    match the pushed origin branch head". The cell's own bound issue
+    lease names a clean, pushed lane, so the rotation proceeds past the
+    precondition and completes; the coordinator's tree is never probed."""
+
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane,
+        branch="feature/infra-198-harness-trust",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    probed = _install_seat_lane_probe(monkeypatch, {lane: _lane_state()})
+
+    result = _rotate_lead_for_demo_cell(configured_repo)
+
+    payload = json.loads(result.stdout)
+    # The precondition is the subject here: rotation must get PAST it on
+    # the bound seat's clean, pushed lane. Whether a replacement profile
+    # happens to be available is a different precondition entirely, and
+    # standing a healthy pool up would test that instead of this.
+    assert payload["phase"] != "precondition", payload
+    # The leased lane was measured -- never the project coordinator.
+    assert probed == [str(lane)]
+    assert str(repo_root) not in probed
+
+
+def test_rotate_lead_refuses_a_dirty_bound_seat_worktree(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only WHICH tree is measured changed: the existing cleanliness
+    assertion still refuses when the seat's OWN bound lane is dirty, and
+    nothing rotates."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane,
+        branch="feature/infra-198-harness-trust",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_seat_lane_probe(monkeypatch, {lane: _lane_state(dirty=True)})
+
+    result = _rotate_lead_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "precondition"
+    assert payload["failure"] == (
+        "project worktree has uncommitted changes; rotation refused"
+    )
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["profile_alias"]) == "max-b"
+    finally:
+        database.close()
+
+
+def test_rotate_lead_refuses_an_origin_mismatched_bound_seat_worktree(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The head-vs-origin assertion is unchanged too: an unpushed
+    commit on the seat's own bound lane still refuses."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane,
+        branch="feature/infra-198-harness-trust",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_seat_lane_probe(monkeypatch, {lane: _lane_state(head="9f1c2d3")})
+
+    result = _rotate_lead_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "precondition"
+    assert payload["failure"] == (
+        "project HEAD does not match the pushed origin branch head; "
+        "push before rotating"
+    )
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["profile_alias"]) == "max-b"
+    finally:
+        database.close()
+
+
+def test_rotate_lead_never_adopts_another_cells_lease(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean, pushed lane belonging to some OTHER seat never stands in
+    for this one. Neither an assignment naming a different cell/session,
+    nor a lease bound to an issue this cell is not assigned, qualifies:
+    both fail closed naming exactly what was missing, and the tempting
+    clean lane is never probed."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    other_lane = repo_root / "lane-212"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-212",
+        path=other_lane,
+        branch="feature/infra-212-lane",
+    )
+    _seed_lead_assignment(
+        state_dir,
+        issue_id="INFRA-212",
+        cell_id="cell-other",
+        session_id="66666666-6666-4666-8666-666666666666",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    probed = _install_seat_lane_probe(
+        monkeypatch, {other_lane: _lane_state()}
+    )
+
+    unassigned = _rotate_lead_for_demo_cell(configured_repo)
+
+    assert unassigned.exit_code == 1
+    message = json.loads(unassigned.stdout)["error"]
+    assert "cell 'cell-demo' has no live lead assignment" in message
+    assert "2 active issues (INFRA-212, INFRA-215)" in message
+    assert "assign the cell its issue before rotating" in message
+
+    # Now the cell IS assigned -- but to the issue whose lane nobody
+    # leased. The other cell's clean lease still never qualifies.
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+
+    mismatched = _rotate_lead_for_demo_cell(configured_repo)
+
+    assert mismatched.exit_code == 1
+    message = json.loads(mismatched.stdout)["error"]
+    assert "cell 'cell-demo' is assigned issue 'INFRA-215'" in message
+    assert "has no active worktree lease" in message
+    assert "leave exactly one active worktree lease for INFRA-215" in message
+    assert "and rotate again" in message
+
+    assert probed == []
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["profile_alias"]) == "max-b"
+    finally:
+        database.close()
+
+
+def test_rotate_lead_keeps_the_unassigned_single_lane_fallback(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserved: a genuinely unassigned cell in a project with at most
+    one active issue is still judged by ``project.lead_cwd``, exactly as
+    before -- the seat-bound selection widens nothing for single-lane
+    callers."""
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212")
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    probed = _install_seat_lane_probe(
+        monkeypatch, {repo_root: _lane_state()}
+    )
+
+    result = _rotate_lead_for_demo_cell(configured_repo)
+
+    payload = json.loads(result.stdout)
+    assert payload["phase"] != "precondition", payload
+    # ``project.lead_cwd`` is ``repo_path`` for this project, and it is
+    # the ONLY tree the precondition measured.
+    assert probed == [str(repo_root)]
+
+
 def test_open_rotation_collaborators_validates_or_provisions_harness_checkout(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
