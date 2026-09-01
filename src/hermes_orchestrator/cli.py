@@ -54,7 +54,7 @@ from hermes_orchestrator.cmux_surfaces import (
     managed_claude_worker_alive,
 )
 from hermes_orchestrator.codex_queue import CANDIDATE_QUEUED
-from hermes_orchestrator.config import Settings, load_settings
+from hermes_orchestrator.config import ProjectConfig, Settings, load_settings
 from hermes_orchestrator.context import ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_pane import FramePane
@@ -63,10 +63,16 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
-from hermes_orchestrator.emission import EmissionBlocked, ResolvedLane, resolve_lane
+from hermes_orchestrator.emission import (
+    EmissionBlocked,
+    FreezeFacts,
+    ResolvedLane,
+    resolve_lane,
+    run_freeze_gate,
+)
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
-from hermes_orchestrator.git import GitError, WorktreeGit
+from hermes_orchestrator.git import GitError, GitRunner, WorktreeGit
 from hermes_orchestrator.handoffs import (
     HandoffRecord,
     HandoffRejected,
@@ -334,6 +340,30 @@ def _parser() -> argparse.ArgumentParser:
     candidate.add_argument("--blocker", action="append", default=[])
     candidate.add_argument("--status", default="FABLE_READY")
     candidate.add_argument("--json", action="store_true")
+
+    # INFRA-203: the deterministic entry point over the SAME publication.
+    # The issue is the whole input: the lane, the checkout, the exact
+    # HEAD, the branch, the base and the changed files are all derived
+    # from durable state, so there is no verification flag, manifest
+    # path, evidence document, or attribution to accept. The mechanical
+    # fields ``_candidate_ready`` reads are supplied as defaults, which
+    # is what keeps this one entry point rather than a second emitter.
+    candidate_submit = commands.add_parser(
+        "candidate",
+        help=(
+            "submit the candidate bound to an issue: freezes that issue's "
+            "own leased worktree at its exact HEAD, with no caller-supplied "
+            "identity or evidence"
+        ),
+    )
+    candidate_submit.add_argument("action", choices=("submit",))
+    candidate_submit.add_argument("issue_id")
+    candidate_submit.add_argument("--json", action="store_true")
+    candidate_submit.set_defaults(
+        verified=[CANDIDATE_SUBMIT_VERIFICATION],
+        blocker=[],
+        status="FABLE_READY",
+    )
 
     merger_turn = commands.add_parser(
         "merger-turn",
@@ -1672,6 +1702,115 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
     return 0 if result.status in _LANE_DISPATCH_SUCCESS_STATUSES else 1
 
 
+# INFRA-203: the single verification entry ``candidate submit`` records.
+# The manifest is an internal transport artifact that Fable neither
+# authors nor audits, so the submitting command supplies this fixed,
+# evidence-free entry instead of accepting one from the caller. It is
+# written in the same ``COMMAND=RESULT`` form ``--verified`` takes so
+# both entry points parse it through the one code path below.
+CANDIDATE_SUBMIT_VERIFICATION = (
+    "hermes-orchestrator candidate submit=deterministic submission of the "
+    "bound lane's exact HEAD"
+)
+
+
+def _pending_operator_decision(database: Database, issue_id: str) -> str | None:
+    """The outstanding operator decision blocking publication, if any.
+
+    Shared by both publication entry points so ``candidate submit``
+    cannot become a way around a hold ``candidate-ready`` honours.
+    """
+
+    pending = OperatorDecisions(database).pending_for_issue(issue_id)
+    return pending[0].decision_id if pending else None
+
+
+def _candidate_submit_lane(database: Database, issue_id: str) -> ResolvedLane:
+    """The lane ``candidate submit <issue>`` publishes, from durable state.
+
+    INFRA-203: the issue is the whole input, so even the project is read
+    from the durable binding rather than supplied. The one live
+    ``worktree_leases`` row for the issue is resolved by
+    :func:`resolve_lane` — the codebase's fail-closed "this issue's ONE
+    live lease" reader, the same one ``candidate-ready`` and
+    :func:`_seat_lane` already publish and hand off through. Nothing
+    here consults ``Path.cwd()`` or ``project.lead_cwd``: the caller's
+    checkout is never candidate identity.
+    """
+
+    leases = WorktreeLeases(database, events=EventStore(database))
+    projects = sorted(
+        {lease.project_key for lease in leases.active() if lease.issue_id == issue_id}
+    )
+    if not projects:
+        raise EmissionBlocked(
+            f"candidate submission refused: no live worktree lease binds "
+            f"issue {issue_id!r}, so there is no bound tree to freeze; bind "
+            f"the lane (reconcile --bind-issue-lane PROJECT:{issue_id}) and "
+            "submit again"
+        )
+    if len(projects) > 1:
+        raise EmissionBlocked(
+            f"candidate submission refused: issue {issue_id!r} holds live "
+            f"worktree leases in {len(projects)} projects "
+            f"({', '.join(projects)}), so its lane is not unambiguous; leave "
+            "exactly one and submit again"
+        )
+    return resolve_lane(leases, projects[0], issue_id)
+
+
+def _candidate_submit_gate(
+    git: GitRunner, project: ProjectConfig, lane: ResolvedLane
+) -> FreezeFacts:
+    """Prove the bound lane's HEAD is publishable, before anything is written.
+
+    INFRA-203: exactly two refusals belong to this command — a dirty
+    bound worktree (intended work would be silently omitted from the
+    candidate) and a HEAD that is not pushed and reachable on the
+    remote (nothing downstream could fetch the candidate). Both are
+    decided by :func:`run_freeze_gate`, the one mandatory candidate gate
+    the emitter itself runs, measured in the LANE's worktree; running it
+    here just moves the same decision ahead of the merge flow, so a
+    refusal writes no manifest and delivers no wake.
+    """
+
+    def run(*args: str) -> str:
+        try:
+            result = git.run(("git", *args), lane.path)
+        except GitError as error:
+            raise EmissionBlocked(str(error)) from error
+        if result.returncode != 0:
+            raise EmissionBlocked(
+                f"git {args[0]} failed with exit code {result.returncode}"
+            )
+        return result.stdout
+
+    try:
+        return run_freeze_gate(run, project, expect_pushed=True)
+    except EmissionBlocked as blocked:
+        raise EmissionBlocked(_candidate_submit_refusal(blocked, lane)) from None
+
+
+def _candidate_submit_refusal(blocked: EmissionBlocked, lane: ResolvedLane) -> str:
+    """One concise, actionable line for each of the two gates."""
+
+    reason = str(blocked)
+    if "not clean" in reason:
+        return (
+            f"candidate submission refused: the worktree bound to "
+            f"{lane.issue_id} at {lane.path} has uncommitted changes, so the "
+            "candidate would omit them; commit or discard them there, push, "
+            "and submit again"
+        )
+    if "pushed branch head" in reason or "fetch failed" in reason:
+        return (
+            f"candidate submission refused: the HEAD of the worktree bound "
+            f"to {lane.issue_id} at {lane.path} is not the head of "
+            f"origin/{lane.branch}; push that branch and submit again"
+        )
+    return f"candidate submission refused: {reason}"
+
+
 async def _candidate_ready(
     flow: MergeFlow, args: Any, resolved_lane: ResolvedLane
 ) -> dict[str, Any]:
@@ -1681,12 +1820,18 @@ async def _candidate_ready(
         if not separator or not command.strip() or not result.strip():
             raise ValueError("--verified expects COMMAND=RESULT")
         verification.append((command.strip(), result.strip()))
-    if not await _start_merge_flow(flow, [args.project]):
+    # The lane IS the publication target: ``resolve_lane`` returned it
+    # for this exact project and issue, so reading both from the lane
+    # keeps one emission path for a caller that names the project
+    # (``candidate-ready``) and one that derives it (``candidate
+    # submit``).
+    project_key = resolved_lane.project_key
+    if not await _start_merge_flow(flow, [project_key]):
         raise RuntimeError("codex app-server unavailable")
     try:
         emitted = await flow.emitter.emit(
-            args.project,
-            args.issue_id,
+            project_key,
+            resolved_lane.issue_id,
             verification=tuple(verification),
             blockers=tuple(args.blocker),
             status=args.status,
@@ -5091,15 +5236,60 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return 0
 
-        if args.command == "candidate-ready":
-            pending = OperatorDecisions(runtime.database).pending_for_issue(
-                args.issue_id
-            )
-            if pending:
+        if args.command == "candidate":
+            # INFRA-203: ``candidate submit <issue>`` -- one deterministic
+            # entry point over the SAME emission. Everything is derived
+            # from durable state: the lane, its checkout, and that
+            # checkout's exact HEAD. Both gates run before the merge flow
+            # opens, so a refusal writes nothing.
+            from hermes_orchestrator.git import SubprocessGitRunner
+
+            decision = _pending_operator_decision(runtime.database, args.issue_id)
+            if decision is not None:
                 print(
-                    f"awaiting operator decision {pending[0].decision_id}; "
-                    "candidate publication is blocked until the operator "
-                    "resolves it",
+                    f"awaiting operator decision {decision}; candidate "
+                    "publication is blocked until the operator resolves it",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                submit_lane = _candidate_submit_lane(runtime.database, args.issue_id)
+                submit_project = settings.projects.get(submit_lane.project_key)
+                if submit_project is None:
+                    raise EmissionBlocked(
+                        "candidate submission refused: the lane bound to "
+                        f"{args.issue_id} names project "
+                        f"{submit_lane.project_key!r}, which is not configured"
+                    )
+                _candidate_submit_gate(
+                    SubprocessGitRunner(), submit_project, submit_lane
+                )
+            except EmissionBlocked as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            try:
+                flow = _open_merge_flow(settings, runtime)
+                payload = asyncio.run(_candidate_ready(flow, args, submit_lane))
+            except (ValueError, RuntimeError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print(
+                payload,
+                json_output=args.json,
+                human=(
+                    f"Candidate {payload['candidate_sha'][:12]} for "
+                    f"{payload['issue_id']} from {submit_lane.path}: "
+                    f"{payload['delivery_reason']}."
+                ),
+            )
+            return 0 if payload["delivered"] else 1
+
+        if args.command == "candidate-ready":
+            decision = _pending_operator_decision(runtime.database, args.issue_id)
+            if decision is not None:
+                print(
+                    f"awaiting operator decision {decision}; candidate "
+                    "publication is blocked until the operator resolves it",
                     file=sys.stderr,
                 )
                 return 1

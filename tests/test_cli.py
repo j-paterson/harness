@@ -7147,3 +7147,278 @@ def test_target_issue_requires_every_binding_flag(
 
     assert result.exit_code == 2
     assert "--cell" in result.output
+
+# --- INFRA-203: one deterministic candidate submission ----------------------
+
+
+SUBMIT_NOW = datetime(2026, 8, 31, 9, tzinfo=UTC)
+
+
+def _rev_parse(repository: Path, revision: str) -> str:
+    return subprocess.run(
+        ("git", "rev-parse", revision),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _bound_candidate_lane(
+    tmp_path: Path, *, push: bool = True
+) -> tuple[tuple[Path, Path], Path, Path]:
+    """A real bound lane: project checkout, origin, and the issue's worktree.
+
+    The lane carries a commit the coordinator checkout does NOT have, on
+    a branch the coordinator checkout is not on, so a candidate frozen
+    from the caller's directory is always distinguishable from one
+    frozen from the bound tree.
+    """
+
+    configured = _configured_git_project(tmp_path)
+    assert invoke([*base_arguments(configured), "init", "--json"]).exit_code == 0
+    _admit_through_cli(configured, "ENG-9")
+    bound = invoke(
+        [
+            *base_arguments(configured),
+            "reconcile",
+            "--bind-issue-lane",
+            "demo:ENG-9",
+            "--json",
+        ]
+    )
+    assert bound.exit_code == 0, bound.output
+    lane_path = tmp_path / "project-issue-ENG-9"
+    (lane_path / "lane.py").write_text("value = 1\n", encoding="utf-8")
+    _git(lane_path, "add", "lane.py")
+    _git(lane_path, "commit", "-m", "lane work")
+    if push:
+        _git(lane_path, "push", "-u", "origin", "feature/eng-9")
+    return configured, tmp_path / "project", lane_path
+
+
+class _SubmitDeliverer:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, Any]] = []
+
+    async def deliver(self, project_key: str, event: Any) -> Any:
+        from hermes_orchestrator.codex_queue import QueueDeliveryResult
+
+        self.events.append((project_key, event))
+        return QueueDeliveryResult(
+            delivered=True,
+            attempts=1,
+            thread_id="thr_demo",
+            generation=1,
+            reason="delivered",
+        )
+
+
+class _SubmitRpc:
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class _SubmitMerger:
+    async def ensure_thread(self, project_key: str) -> str:
+        return "thr_demo"
+
+    async def thread_status(self, thread_id: str) -> str:
+        return "idle"
+
+
+def _submit_flow(repository: Path, state_dir: Path, deliverer: _SubmitDeliverer) -> Any:
+    """The real emitter behind a stub app-server, exactly as the CLI wires it."""
+
+    from hermes_orchestrator.config import ProjectConfig
+    from hermes_orchestrator.emission import CandidateEmitter
+    from hermes_orchestrator.git import SubprocessGitRunner
+
+    root = state_dir / "manifests"
+    root.mkdir(parents=True, exist_ok=True)
+    emitter = CandidateEmitter(
+        projects={
+            "demo": ProjectConfig(
+                linear_team="ENG",
+                repo_path=repository,
+                integration_branch="main",
+                github_repo="owner/demo",
+            )
+        },
+        git=SubprocessGitRunner(),
+        manifest_root=root,
+        delivery=deliverer,
+        now=lambda: SUBMIT_NOW,
+    )
+    return types.SimpleNamespace(
+        emitter=emitter, rpc=_SubmitRpc(), merger=_SubmitMerger()
+    )
+
+
+def test_candidate_submit_freezes_the_bound_lane_not_the_callers_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE regression: the caller's working directory is never identity.
+
+    Submitting from an unrelated checkout -- here the coordinator's own
+    tree, sitting on ``main``, which is exactly the tree the twice-fixed
+    wrong-tree defect measured -- still produces the BOUND lane's exact
+    HEAD, branch and base. Taking identity from ``Path.cwd()`` cannot
+    satisfy this: that tree is on the integration branch and carries a
+    different HEAD entirely.
+    """
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.manifests import read_manifest
+
+    configured, repository, lane_path = _bound_candidate_lane(tmp_path)
+    _repo_root, state_dir = configured
+    deliverer = _SubmitDeliverer()
+    monkeypatch.setattr(
+        cli_module,
+        "_open_merge_flow",
+        lambda settings, runtime: _submit_flow(repository, state_dir, deliverer),
+    )
+    monkeypatch.chdir(repository)
+
+    result = invoke(
+        [*base_arguments(configured), "candidate", "submit", "ENG-9", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    lane_head = _rev_parse(lane_path, "HEAD")
+    caller_head = _rev_parse(repository, "HEAD")
+    assert lane_head != caller_head
+    assert payload["candidate_sha"] == lane_head
+    assert payload["base_sha"] == caller_head
+    manifest = read_manifest(
+        Path(payload["manifest_path"]), root=state_dir / "manifests"
+    )
+    assert manifest.branch == "feature/eng-9"
+    assert manifest.changed_files == ("lane.py",)
+    assert [event.candidate_sha for _project, event in deliverer.events] == [lane_head]
+
+
+def _refuse_to_open(settings: object, runtime: object) -> object:
+    raise AssertionError("a refused submission must never open the merge flow")
+
+
+def test_candidate_submit_refuses_a_dirty_bound_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_orchestrator.cli as cli_module
+
+    configured, _repository, lane_path = _bound_candidate_lane(tmp_path)
+    _repo_root, state_dir = configured
+    (lane_path / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+    monkeypatch.setattr(cli_module, "_open_merge_flow", _refuse_to_open)
+
+    result = invoke([*base_arguments(configured), "candidate", "submit", "ENG-9"])
+
+    assert result.exit_code == 1
+    assert "has uncommitted changes" in result.stderr
+    assert str(lane_path) in result.stderr
+    # Zero durable writes: no manifest was written and no wake published.
+    assert not (state_dir / "manifests").exists()
+
+
+@pytest.mark.parametrize("pushed_then_advanced", [False, True])
+def test_candidate_submit_refuses_an_unpushed_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pushed_then_advanced: bool
+) -> None:
+    """Neither an unpushed branch nor a branch ahead of origin publishes."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    configured, _repository, lane_path = _bound_candidate_lane(
+        tmp_path, push=pushed_then_advanced
+    )
+    _repo_root, state_dir = configured
+    if pushed_then_advanced:
+        (lane_path / "lane.py").write_text("value = 2\n", encoding="utf-8")
+        _git(lane_path, "commit", "-am", "unpushed follow-up")
+    monkeypatch.setattr(cli_module, "_open_merge_flow", _refuse_to_open)
+
+    result = invoke([*base_arguments(configured), "candidate", "submit", "ENG-9"])
+
+    assert result.exit_code == 1
+    assert "is not the head of origin/feature/eng-9" in result.stderr
+    assert not (state_dir / "manifests").exists()
+
+
+def test_candidate_submit_takes_only_the_issue() -> None:
+    """No verification flag, no project, no evidence -- and none accepted."""
+
+    from hermes_orchestrator.cli import CANDIDATE_SUBMIT_VERIFICATION, _parser
+
+    args = _parser().parse_args(["candidate", "submit", "ENG-9"])
+    assert args.command == "candidate"
+    assert args.action == "submit"
+    assert args.issue_id == "ENG-9"
+    assert args.verified == [CANDIDATE_SUBMIT_VERIFICATION]
+    assert args.blocker == []
+    assert args.status == "FABLE_READY"
+    for rejected in (
+        ["--verified", "uv run pytest -q=ok"],
+        ["--project", "demo"],
+        ["--manifest", "/tmp/manifest.json"],
+        ["--evidence", "/tmp/evidence.md"],
+    ):
+        with pytest.raises(SystemExit) as refused:
+            _parser().parse_args(["candidate", "submit", "ENG-9", *rejected])
+        assert refused.value.code == 2
+
+
+def test_candidate_submit_emits_the_same_durable_record_as_candidate_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One transition, not a fork.
+
+    For the same commit the deterministic entry point and the existing
+    ``candidate-ready`` path land on the SAME immutable manifest and the
+    same wake event -- the second publication reuses the first record
+    rather than writing a second one.
+    """
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.cli import CANDIDATE_SUBMIT_VERIFICATION
+
+    configured, repository, _lane_path = _bound_candidate_lane(tmp_path)
+    _repo_root, state_dir = configured
+    deliverer = _SubmitDeliverer()
+    flow = _submit_flow(repository, state_dir, deliverer)
+    monkeypatch.setattr(cli_module, "_open_merge_flow", lambda settings, runtime: flow)
+
+    submitted = invoke(
+        [*base_arguments(configured), "candidate", "submit", "ENG-9", "--json"]
+    )
+    assert submitted.exit_code == 0, submitted.output
+    ready = invoke(
+        [
+            *base_arguments(configured),
+            "candidate-ready",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--verified",
+            CANDIDATE_SUBMIT_VERIFICATION,
+            "--json",
+        ]
+    )
+    assert ready.exit_code == 0, ready.output
+
+    first = json.loads(submitted.stdout)
+    second = json.loads(ready.stdout)
+    assert first["reused_manifest"] is False
+    assert second["reused_manifest"] is True
+    assert second["manifest_path"] == first["manifest_path"]
+    assert second["event_id"] == first["event_id"]
+    assert second["candidate_sha"] == first["candidate_sha"]
+    assert second["base_sha"] == first["base_sha"]
+    # One immutable record, and both publications woke the same event.
+    assert len(list((state_dir / "manifests").glob("*.json"))) == 1
+    assert deliverer.events[0][1] == deliverer.events[1][1]
