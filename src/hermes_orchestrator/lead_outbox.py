@@ -341,17 +341,90 @@ def packet_to_dict(packet: CorrectionPacket) -> dict[str, Any]:
     }
 
 
+#: The exact durable ``CorrectionPacket`` schema written by
+#: :func:`packet_to_dict`. A stored packet must carry these keys, with
+#: these types, and no others — see :func:`packet_schema_violation`.
+_PACKET_TEXT_FIELDS = (
+    "severity",
+    "repository",
+    "branch",
+    "reviewed_sha",
+    "evidence",
+    "acceptance_criterion",
+    "required_correction",
+)
+_PACKET_FIELDS = frozenset({*_PACKET_TEXT_FIELDS, "pr_number", "required_tests"})
+
+
+def packet_schema_violation(value: Any) -> str | None:
+    """Describe how ``value`` departs from the durable packet schema.
+
+    ``None`` means ``value`` is exactly the object :func:`packet_to_dict`
+    writes: every field present, every field of exactly the right type,
+    and not one key more. Nothing is coerced or normalized here, because
+    coercion is a third way to be wrong — neither a parse error nor the
+    stored record, but a silent rewrite of it. A ``required_tests``
+    string is rejected rather than iterated into single characters, a
+    stringified ``pr_number`` is rejected rather than parsed, and an
+    unknown stored key is rejected rather than dropped, so a fetched
+    packet is the stored packet and never a repair of it.
+    """
+
+    if not isinstance(value, dict):
+        return f"is not an object (got {type(value).__name__})"
+    keys = set(value)
+    missing = sorted(_PACKET_FIELDS - keys)
+    if missing:
+        return "is incomplete: missing " + ", ".join(missing)
+    unknown = sorted(keys - _PACKET_FIELDS)
+    if unknown:
+        return "has unknown field(s): " + ", ".join(unknown)
+    for field in _PACKET_TEXT_FIELDS:
+        if not isinstance(value[field], str):
+            return (
+                f"field {field} must be a string, got "
+                f"{type(value[field]).__name__}"
+            )
+    pr_number = value["pr_number"]
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int):
+        return f"field pr_number must be an integer, got {type(pr_number).__name__}"
+    required_tests = value["required_tests"]
+    if not isinstance(required_tests, list | tuple) or isinstance(
+        required_tests, str | bytes
+    ):
+        return (
+            "field required_tests must be a list of strings, got "
+            f"{type(required_tests).__name__}"
+        )
+    for position, item in enumerate(required_tests):
+        if not isinstance(item, str):
+            return (
+                f"field required_tests[{position}] must be a string, got "
+                f"{type(item).__name__}"
+            )
+    return None
+
+
 def packet_from_dict(value: dict[str, Any]) -> CorrectionPacket:
+    """Rebuild one stored packet, or refuse the whole packet.
+
+    Validation runs before anything is constructed, and the accepted
+    values are used as stored — no ``str()``/``int()`` coercion.
+    """
+
+    violation = packet_schema_violation(value)
+    if violation is not None:
+        raise CorrectionPayloadError(f"stored packet {violation}")
     return CorrectionPacket(
-        severity=str(value["severity"]),
-        repository=str(value["repository"]),
-        branch=str(value["branch"]),
-        pr_number=int(value["pr_number"]),
-        reviewed_sha=str(value["reviewed_sha"]),
-        evidence=str(value["evidence"]),
-        acceptance_criterion=str(value["acceptance_criterion"]),
-        required_correction=str(value["required_correction"]),
-        required_tests=tuple(str(item) for item in value["required_tests"]),
+        severity=value["severity"],
+        repository=value["repository"],
+        branch=value["branch"],
+        pr_number=value["pr_number"],
+        reviewed_sha=value["reviewed_sha"],
+        evidence=value["evidence"],
+        acceptance_criterion=value["acceptance_criterion"],
+        required_correction=value["required_correction"],
+        required_tests=tuple(value["required_tests"]),
     )
 
 
@@ -373,15 +446,14 @@ def _parse_packets(correction_id: str, raw: Any) -> tuple[CorrectionPacket, ...]
         raise refuse("unparseable JSON", error) from error
     if not isinstance(decoded, list) or not decoded:
         raise refuse("the packets column is not a non-empty list")
-    packets: list[CorrectionPacket] = []
+    # Validate the whole stored payload against the exact schema BEFORE
+    # any packet is constructed or any digest computed: a violation
+    # anywhere yields no document at all, never a coerced one.
     for index, item in enumerate(decoded):
-        if not isinstance(item, dict):
-            raise refuse(f"packet {index} is not an object")
-        try:
-            packets.append(packet_from_dict(item))
-        except (KeyError, TypeError, ValueError) as error:
-            raise refuse(f"packet {index} is incomplete", error) from error
-    return tuple(packets)
+        violation = packet_schema_violation(item)
+        if violation is not None:
+            raise refuse(f"packet {index} {violation}")
+    return tuple(packet_from_dict(item) for item in decoded)
 
 
 def _row_to_correction(row: Any) -> LeadCorrection:

@@ -271,6 +271,126 @@ def test_fetch_fails_closed_on_a_malformed_stored_payload(
     assert acknowledged_events(database) == 0
 
 
+def stored_packet_dicts() -> list[dict[str, object]]:
+    """The exact durable form of a one-packet correction."""
+
+    return list(json.loads(canonical_packets_json((packet(),))))
+
+
+def test_fetch_fails_closed_on_a_coerced_required_tests_string(
+    outbox: LeadCorrectionOutbox, database: Database
+) -> None:
+    """A `required_tests` STRING is refused, never split into characters.
+
+    Coercion is the third way to be wrong: neither a parse error nor the
+    stored record, but a silent rewrite of it. `"test_x"` must not become
+    the six single-character "tests" `["t","e","s","t","_","x"]`.
+    """
+
+    delivered = outbox.deliver("ENG-9", (packet(),))
+    corrupted = stored_packet_dicts()
+    corrupted[0]["required_tests"] = "test_x"
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_corrections SET packets_json = ? WHERE correction_id = ?",
+            (json.dumps(corrupted), delivered.correction_id),
+        )
+
+    with pytest.raises(CorrectionPayloadError) as refusal:
+        outbox.fetch(delivered.correction_id)
+    message = str(refusal.value)
+    assert "required_tests must be a list of strings" in message
+    assert "no partial record is returned" in message
+    # Zero partial document: nothing is returned, and the corruption the
+    # coercing reconstruction produced never reaches a caller.
+    assert "['t', 'e', 's', 't', '_', 'x']" not in message
+    # get() and pending() fail closed identically, and no confirmation is
+    # possible over the rewritten payload.
+    with pytest.raises(CorrectionPayloadError):
+        outbox.get(delivered.correction_id)
+    with pytest.raises(CorrectionPayloadError):
+        outbox.pending("demo")
+    with pytest.raises(CorrectionPayloadError):
+        outbox.acknowledge(
+            delivered.correction_id, observed_count=1, payload_sha256="0" * 64
+        )
+    assert acknowledged_events(database) == 0
+
+
+def test_fetch_fails_closed_on_an_unknown_stored_packet_field(
+    outbox: LeadCorrectionOutbox, database: Database
+) -> None:
+    """An extra stored field is refused, never silently dropped.
+
+    A field present in the durable row but absent from the fetched
+    document would make the fetch a lossy summary of the record the lead
+    delegates from.
+    """
+
+    delivered = outbox.deliver("ENG-9", (packet(),))
+    corrupted = stored_packet_dicts()
+    corrupted[0]["reviewer_note"] = "F5-unknown-field"
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_corrections SET packets_json = ? WHERE correction_id = ?",
+            (json.dumps(corrupted), delivered.correction_id),
+        )
+
+    with pytest.raises(CorrectionPayloadError) as refusal:
+        outbox.fetch(delivered.correction_id)
+    message = str(refusal.value)
+    assert "unknown field(s): reviewer_note" in message
+    assert "no partial record is returned" in message
+
+    with pytest.raises(CorrectionPayloadError):
+        outbox.get(delivered.correction_id)
+    with pytest.raises(CorrectionPayloadError):
+        outbox.pending("demo")
+    with pytest.raises(CorrectionPayloadError):
+        outbox.acknowledge(
+            delivered.correction_id, observed_count=1, payload_sha256="0" * 64
+        )
+    assert acknowledged_events(database) == 0
+
+
+def test_fetch_fails_closed_on_wrong_stored_scalar_types(
+    outbox: LeadCorrectionOutbox, database: Database
+) -> None:
+    """Wrong scalar types are rejected, not normalized into the record."""
+
+    delivered = outbox.deliver("ENG-9", (packet(),))
+
+    def store_field(field: str, value: object) -> None:
+        corrupted = stored_packet_dicts()
+        corrupted[0][field] = value
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE lead_corrections SET packets_json = ? "
+                "WHERE correction_id = ?",
+                (json.dumps(corrupted), delivered.correction_id),
+            )
+
+    store_field("pr_number", "14")
+    with pytest.raises(CorrectionPayloadError, match="pr_number must be an integer"):
+        outbox.fetch(delivered.correction_id)
+
+    store_field("severity", 3)
+    with pytest.raises(CorrectionPayloadError, match="field severity must be a string"):
+        outbox.fetch(delivered.correction_id)
+
+    store_field("required_tests", ["test_ok", 7])
+    with pytest.raises(
+        CorrectionPayloadError, match=r"required_tests\[1\] must be a string"
+    ):
+        outbox.fetch(delivered.correction_id)
+
+    store_field("required_tests", {"0": "test_ok"})
+    with pytest.raises(
+        CorrectionPayloadError, match="required_tests must be a list of strings"
+    ):
+        outbox.fetch(delivered.correction_id)
+
+
 def test_delivery_requires_one_bound_candidate(outbox: LeadCorrectionOutbox) -> None:
     with pytest.raises(ValueError, match="at least one"):
         outbox.deliver("ENG-9", ())
