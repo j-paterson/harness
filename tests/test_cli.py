@@ -6340,13 +6340,6 @@ def test_start_lane_harness_checkout_refusal_exits_nonzero(
 
     monkeypatch.setattr(cli_module, "ensure_harness_checkout", _refusing)
 
-def test_target_issue_refuses_an_unknown_issue_without_writes(
-    configured_repo: tuple[Path, Path],
-) -> None:
-    # INFRA-220: the CLI surface reaches the strict transition and its
-    # fail-closed refusal exits non-zero without publishing anything.
-    invoke([*base_arguments(configured_repo), "init"])
-
     result = invoke(
         [
             *base_arguments(configured_repo),
@@ -6360,7 +6353,23 @@ def test_target_issue_refuses_an_unknown_issue_without_writes(
             "--harness-run",
             "run-1",
             "--json",
+        ]
+    )
 
+    assert result.exit_code == 1
+    assert "not a worktree" in json.loads(result.stdout)["error"]
+
+
+def test_target_issue_refuses_an_unknown_issue_without_writes(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    # INFRA-220: the CLI surface reaches the strict transition and its
+    # fail-closed refusal exits non-zero without publishing anything.
+    invoke([*base_arguments(configured_repo), "init"])
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
             "target-issue",
             "ENG-404",
             "--project",
@@ -6375,7 +6384,7 @@ def test_target_issue_refuses_an_unknown_issue_without_writes(
     )
 
     assert result.exit_code == 1
-    assert "not a worktree" in json.loads(result.stdout)["error"]
+    assert result.output.strip()
 
 
 def test_open_rotation_collaborators_selects_prompt_by_lane(

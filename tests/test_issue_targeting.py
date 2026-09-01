@@ -1,4 +1,5 @@
-"""Tests for the INFRA-220 ``target_issue`` transition."""
+"""Tests for the INFRA-220 ``target_issue`` / ``acknowledge_target``
+transition (Sol correction 7ecf4a57)."""
 
 from __future__ import annotations
 
@@ -22,6 +23,17 @@ SESSION_ID = "11111111-2222-4333-8444-555555555555"
 OTHER_SESSION_ID = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 
 
+class _RecordingLinear:
+    """Minimal ``LinearProjector`` test double: never blocks activation."""
+
+    def __init__(self) -> None:
+        self.projected: list[str] = []
+
+    async def project(self, issue_id: str, target: object, effect_id: str) -> object:
+        self.projected.append(issue_id)
+        return object()
+
+
 @pytest.fixture
 def database(tmp_path: Path) -> Iterator[Database]:
     value = Database.open(tmp_path / "state.db")
@@ -32,8 +44,13 @@ def database(tmp_path: Path) -> Iterator[Database]:
 
 
 @pytest.fixture
-def assignments(database: Database) -> LeadAssignments:
-    return LeadAssignments(database, events=EventStore(database), now=lambda: NOW)
+def events(database: Database) -> EventStore:
+    return EventStore(database)
+
+
+@pytest.fixture
+def assignments(database: Database, events: EventStore) -> LeadAssignments:
+    return LeadAssignments(database, events=events, now=lambda: NOW)
 
 
 def _seed_admitted(
@@ -109,7 +126,8 @@ def _assignment_count(database: Database) -> int:
 
 
 def test_happy_path_publishes_only_the_targeted_issue(
-    database: Database, assignments: LeadAssignments
+    database: Database, assignments: LeadAssignments,
+    events: EventStore
 ) -> None:
     # Two older, equal-priority queued rows the scheduler preview would
     # otherwise pick first; target-issue must leave both untouched.
@@ -137,6 +155,7 @@ def test_happy_path_publishes_only_the_targeted_issue(
     result = target_issue(
         database,
         assignments=assignments,
+        events=events,
         issue_id="INFRA-9",
         project_key="demo",
         cell_id=CELL_ID,
@@ -154,7 +173,8 @@ def test_happy_path_publishes_only_the_targeted_issue(
 
 
 def test_repeat_while_pending_is_idempotent(
-    database: Database, assignments: LeadAssignments
+    database: Database, assignments: LeadAssignments,
+    events: EventStore
 ) -> None:
     _seed_admitted(database, issue_id="INFRA-9")
     _seed_cell(database)
@@ -162,6 +182,7 @@ def test_repeat_while_pending_is_idempotent(
     first = target_issue(
         database,
         assignments=assignments,
+        events=events,
         issue_id="INFRA-9",
         project_key="demo",
         cell_id=CELL_ID,
@@ -172,6 +193,7 @@ def test_repeat_while_pending_is_idempotent(
     second = target_issue(
         database,
         assignments=assignments,
+        events=events,
         issue_id="INFRA-9",
         project_key="demo",
         cell_id=CELL_ID,
@@ -186,7 +208,8 @@ def test_repeat_while_pending_is_idempotent(
 
 
 def test_refuses_session_mismatch_with_zero_writes(
-    database: Database, assignments: LeadAssignments
+    database: Database, assignments: LeadAssignments,
+    events: EventStore
 ) -> None:
     _seed_admitted(database, issue_id="INFRA-9")
     _seed_cell(database)
@@ -196,6 +219,7 @@ def test_refuses_session_mismatch_with_zero_writes(
         target_issue(
             database,
             assignments=assignments,
+            events=events,
             issue_id="INFRA-9",
             project_key="demo",
             cell_id=CELL_ID,
@@ -209,7 +233,8 @@ def test_refuses_session_mismatch_with_zero_writes(
 
 
 def test_refuses_unadmitted_issue_with_zero_writes(
-    database: Database, assignments: LeadAssignments
+    database: Database, assignments: LeadAssignments,
+    events: EventStore
 ) -> None:
     _seed_cell(database)
     before = _admitted_snapshot(database)
@@ -218,6 +243,7 @@ def test_refuses_unadmitted_issue_with_zero_writes(
         target_issue(
             database,
             assignments=assignments,
+            events=events,
             issue_id="INFRA-404",
             project_key="demo",
             cell_id=CELL_ID,
@@ -231,7 +257,8 @@ def test_refuses_unadmitted_issue_with_zero_writes(
 
 
 def test_refuses_empty_instruction_with_zero_writes(
-    database: Database, assignments: LeadAssignments
+    database: Database, assignments: LeadAssignments,
+    events: EventStore
 ) -> None:
     _seed_admitted(database, issue_id="INFRA-9")
     _seed_cell(database)
@@ -240,6 +267,7 @@ def test_refuses_empty_instruction_with_zero_writes(
         target_issue(
             database,
             assignments=assignments,
+            events=events,
             issue_id="INFRA-9",
             project_key="demo",
             cell_id=CELL_ID,
