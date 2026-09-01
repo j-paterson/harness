@@ -967,6 +967,16 @@ class ReviewService:
             raise ReconciliationRequired(
                 "the merged pull request reports no merge commit"
             )
+        if has_identity_chain:
+            self._merge.prove_landed(
+                project_key,
+                candidate_sha=manifest.candidate_sha,
+                candidate_branch=manifest.branch,
+                pr_number=pr_number,
+                merge_sha=proven_merge,
+                base_sha=manifest.base_sha,
+                exact_pr_binding=False,
+            )
         proven = self._merge.prove_landed(
             project_key,
             candidate_sha=proven_candidate,

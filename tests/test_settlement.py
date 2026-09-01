@@ -24,6 +24,7 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import AmbiguousHunkError, GitError
 from hermes_orchestrator.github import MergeResult
 from hermes_orchestrator.manifests import read_manifest_snapshot
+from hermes_orchestrator.merge import ReconciliationRequired
 from hermes_orchestrator.settlement import (
     MergeSettlements,
     SettlementBinding,
@@ -988,6 +989,7 @@ class TestExternalReconciliation:
         manifest = _manifest_for(acceptance, event)
         final_sha = THIRD
         merge_sha = merge_sha_for(final_sha)
+        merge_parent = "9" * 40
         acceptance.github.full_pulls[number] = open_pull(
             number=number,
             head_sha=final_sha,
@@ -998,9 +1000,16 @@ class TestExternalReconciliation:
             merge_commit_sha=merge_sha,
         )
         acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        acceptance.git.ancestor[(GOOD, merge_sha)] = False
         acceptance.git.ancestor[(final_sha, merge_sha)] = False
         acceptance.git.trees[merge_sha] = "tree-final"
         acceptance.git.trees[final_sha] = "tree-final"
+        acceptance.git.trees[GOOD] = "tree-submitted"
+        acceptance.git.parents[merge_sha] = merge_parent
+        acceptance.git.ancestor[(BASE, merge_parent)] = True
+        acceptance.git.paths[(BASE, GOOD)] = ("src/app.py",)
+        acceptance.git.paths[(merge_parent, merge_sha)] = ("src/app.py",)
+        acceptance.git.applied_trees[(BASE, GOOD, merge_parent)] = "tree-final"
 
         outcome = await acceptance.service.reconcile_external_merge(
             project_key="demo",
@@ -1028,6 +1037,69 @@ class TestExternalReconciliation:
         assert payload["final_integration_sha"] == final_sha
         assert payload["merge_sha"] == merge_sha
 
+    @pytest.mark.parametrize(
+        ("merge_paths", "apply_error", "fragment"),
+        [
+            (("src/other.py",), None, "merge changed paths differ"),
+            (
+                ("src/app.py",),
+                AmbiguousHunkError("ambiguous submitted patch"),
+                "ambiguous submitted patch",
+            ),
+        ],
+    )
+    async def test_reviewer_fix_chain_refuses_an_unproven_submitted_candidate(
+        self,
+        acceptance: Any,
+        merge_paths: tuple[str, ...],
+        apply_error: GitError | None,
+        fragment: str,
+    ) -> None:
+        event, _, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        manifest = _manifest_for(acceptance, event)
+        final_sha = THIRD
+        merge_sha = merge_sha_for(final_sha)
+        merge_parent = "9" * 40
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=final_sha,
+            head_ref="sol/eng-9-integration",
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+        acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        acceptance.git.ancestor[(final_sha, merge_sha)] = False
+        acceptance.git.trees[merge_sha] = "tree-final"
+        acceptance.git.trees[final_sha] = "tree-final"
+        acceptance.git.ancestor[(GOOD, merge_sha)] = False
+        acceptance.git.trees[GOOD] = "tree-submitted"
+        acceptance.git.parents[merge_sha] = merge_parent
+        acceptance.git.ancestor[(BASE, merge_parent)] = True
+        acceptance.git.paths[(BASE, GOOD)] = ("src/app.py",)
+        acceptance.git.paths[(merge_parent, merge_sha)] = merge_paths
+        acceptance.git.apply_to_tree_error = apply_error
+
+        with pytest.raises(ReconciliationRequired, match=fragment):
+            await acceptance.service.reconcile_external_merge(
+                project_key="demo",
+                issue_id="ENG-9",
+                manifest=manifest,
+                pr_number=number,
+                submitted_sha=GOOD,
+                final_integration_sha=final_sha,
+                merge_sha=merge_sha,
+            )
+
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM reviews") == 0
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM merge_settlements"
+        ) == 0
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM github_merge_effects"
+        ) == 0
+
     async def test_reviewer_fix_chain_resumes_after_a_claimed_crash(
         self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1045,6 +1117,7 @@ class TestExternalReconciliation:
             merge_commit_sha=merge_sha,
         )
         acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        acceptance.git.ancestor[(GOOD, merge_sha)] = True
         acceptance.git.ancestor[(final_sha, merge_sha)] = False
         acceptance.git.trees[merge_sha] = "tree-final"
         acceptance.git.trees[final_sha] = "tree-final"

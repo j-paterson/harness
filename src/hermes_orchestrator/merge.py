@@ -230,6 +230,7 @@ class IntegrationMerge:
         merge_sha: str,
         merge_method: str = "squash",
         base_sha: str | None = None,
+        exact_pr_binding: bool = True,
     ) -> ProvenMerge:
         """Prove an externally performed merge landed the reviewed work.
 
@@ -240,15 +241,10 @@ class IntegrationMerge:
         :class:`ReconciliationRequired` and nothing may be
         reconstructed from it.
 
-        Every caller of this method (``reconcile_external_merge`` and
-        ``_drive_merge``'s direct-Sol-merge branch) independently proves
-        the exact GitHub PR binding -- reviewed head SHA equal to the
-        candidate SHA, the pull request merged, base matching, and a
-        merge commit present -- before ever reaching here, so ``_prove``
-        is told to trust that binding (INFRA-198): a squash/rebase whose
-        fourth-relation hunk reconstruction hits only the narrow
-        ambiguous-duplicate-hunk class still yields a proof instead of
-        :class:`ReconciliationRequired`.
+        Callers normally prove the exact GitHub PR binding before reaching
+        here, so the narrow ambiguous-duplicate-hunk fallback is enabled by
+        default. A caller proving a submitted SHA behind a later PR head
+        passes ``exact_pr_binding=False``; ambiguity then fails closed.
         """
 
         project = self._projects.get(project_key)
@@ -260,7 +256,7 @@ class IntegrationMerge:
             merge_sha,
             merge_method,
             base_sha=base_sha,
-            trust_exact_binding=True,
+            trust_exact_binding=exact_pr_binding,
         )
         return ProvenMerge(
             project_key=project_key,
