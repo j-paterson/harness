@@ -756,6 +756,14 @@ class ReviewService:
                 f"linear:{record.issue_id}:after-merge:{record.review_id}"
             )
             try:
+                self._queue.transition(
+                    record.issue_id,
+                    IssueState.QA
+                    if record.projection.status == "QA"
+                    else IssueState.DONE,
+                    actor="codex_merger",
+                    reason=f"merged {record.merge_sha}",
+                )
                 self._effects.begin(
                     effect_id,
                     target=record.issue_id,
@@ -870,6 +878,21 @@ class ReviewService:
                 continue
             if project_key is not None and record.project_key != project_key:
                 continue
+            current_effect_id = (
+                f"linear:{record.issue_id}:after-merge:{record.review_id}"
+            )
+            if effect_id != current_effect_id:
+                self._complete_post_merge_effect(effect_id)
+                replayed.append(effect_id)
+                continue
+            if record.projection is None or target != record.projection:
+                print(
+                    "post-merge projection recovery target does not match "
+                    f"the current merged review {record.review_id!r}; left "
+                    "pending",
+                    file=sys.stderr,
+                )
+                continue
             if self._acceptance is not None and self._acceptance.pending(issue_id):
                 # INFRA-218 Sol correction 44eb2806 (b): a gate now
                 # requires a hold — suppress the stale stored Done/QA
@@ -889,8 +912,9 @@ class ReviewService:
                     )
                 continue
             try:
-                await self._linear.project(issue_id, target, effect_id=effect_id)
-                self._complete_post_merge_effect(effect_id)
+                await self._apply_after_merge_target(
+                    issue_id, target, effect_id
+                )
                 replayed.append(effect_id)
             except Exception as error:  # fail soft: the durable row retries later
                 print(

@@ -23,6 +23,11 @@ from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import AmbiguousHunkError, GitError
 from hermes_orchestrator.github import MergeResult
+from hermes_orchestrator.linear import (
+    ExternalEffectStore,
+    LinearClient,
+    LinearProjection,
+)
 from hermes_orchestrator.manifests import read_manifest_snapshot
 from hermes_orchestrator.merge import ReconciliationRequired
 from hermes_orchestrator.settlement import (
@@ -37,6 +42,7 @@ from tests.integration.test_codex_merge_acceptance import (
     Acceptance,
     merge_sha_for,
 )
+from tests.test_linear import RecordingLinearTransport
 from tests.test_merge import open_pull
 
 NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
@@ -1383,6 +1389,157 @@ class TestPostMergeProjectionRecovery:
     -- riding the identical ``resume_settlements`` recovery boundary as
     ``reconcile_acceptance`` -- replays whatever is left pending.
     """
+
+    async def test_recovery_walks_a_pending_done_target_through_review(
+        self, acceptance: Any
+    ) -> None:
+        _record, effect_id, _real_project = await self._merge_with_linear_outage(
+            acceptance
+        )
+        transport = RecordingLinearTransport()
+        transport.issue(
+            status="In Development",
+            state_id="state-development",
+            assignee_id="user-operator",
+            revision="development-r1",
+        )
+        acceptance.service._linear = LinearClient(
+            transport=transport,
+            effects=ExternalEffectStore(acceptance.database),
+            status_ids={
+                "Todo": "state-todo",
+                "In Development": "state-development",
+                "Review": "state-review",
+                "QA": "state-qa",
+                "Done": "state-done",
+            },
+            assignee_ids={
+                "operator": "user-operator",
+                "ryan": "user-ryan",
+            },
+            expected_team_id="team-engineering",
+        )
+
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        updates = [
+            item["input"]["stateId"]
+            for operation, item in zip(
+                transport.operations, transport.variables, strict=True
+            )
+            if operation == "IssueUpdate"
+        ]
+        assert updates == ["state-review", "state-done"]
+        assert acceptance.database.scalar(
+            "SELECT state FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        ) == "completed"
+
+    async def test_post_settle_crash_recovers_queue_and_linear_once(
+        self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        event, branch, number = acceptance.prepare("ENG-9", GOOD)
+        admitted = acceptance.admission.admit(
+            "demo", event, received_generation=1
+        )
+        record = await acceptance.service.record_verdict(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+        original = acceptance.settlements.mark_settled
+
+        def crash_after_settle(settlement_id: str, *, token: str) -> None:
+            original(settlement_id, token=token)
+            raise RuntimeError("process died after terminal settlement")
+
+        monkeypatch.setattr(
+            acceptance.settlements, "mark_settled", crash_after_settle
+        )
+        with pytest.raises(RuntimeError, match="process died"):
+            await acceptance.service.merge_approved(record.review_id)
+
+        assert acceptance.settlements.get(record.review_id).state == "settled"
+        assert acceptance.queue.get("ENG-9").state is IssueState.REVIEW
+        monkeypatch.setattr(acceptance.settlements, "mark_settled", original)
+        merge_calls = len(acceptance.github.merge_calls)
+
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        assert acceptance.queue.get("ENG-9").state is IssueState.DONE
+        assert acceptance.linear.targets[-1] == (
+            "ENG-9",
+            "Done",
+            "operator",
+        )
+        assert len(acceptance.github.merge_calls) == merge_calls
+        targets = list(acceptance.linear.targets)
+        assert await acceptance.service.resume_settlements("demo") == ()
+        assert acceptance.linear.targets == targets
+
+    async def test_recovery_suppresses_an_older_reviews_pending_target(
+        self, acceptance: Any
+    ) -> None:
+        old_record, old_effect_id, real_project = (
+            await self._merge_with_linear_outage(acceptance)
+        )
+        acceptance.linear.project = real_project
+        newer_review_id = "review:demo:evt-2"
+        newer_merge_sha = merge_sha_for(THIRD)
+        projection = LinearProjection(
+            status="QA", assignee_alias="operator"
+        )
+        with acceptance.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reviews("
+                "review_id, project_key, issue_id, event_id, repository, "
+                "branch, pr_number, reviewed_sha, state, merge_sha, reason, "
+                "projection_json, created_at, updated_at"
+                ") VALUES (?, 'demo', 'ENG-9', 'evt-2', ?, "
+                "'feature/eng-9-v2', 15, ?, 'merged', ?, 'merged v2', ?, "
+                "'2026-08-28T12:01:00+00:00', "
+                "'2026-08-28T12:01:00+00:00')",
+                (
+                    newer_review_id,
+                    "j-paterson/demo",
+                    THIRD,
+                    newer_merge_sha,
+                    projection.model_dump_json(),
+                ),
+            )
+            acceptance.settlements.record_in(
+                connection,
+                SettlementBinding(
+                    settlement_id=newer_review_id,
+                    project_key="demo",
+                    issue_id="ENG-9",
+                    event_id="evt-2",
+                    repository="j-paterson/demo",
+                    branch="feature/eng-9-v2",
+                    pr_number=15,
+                    base_sha=BASE,
+                    candidate_sha=THIRD,
+                    thread_id="thread-1",
+                    thread_generation=1,
+                    manifest_version=1,
+                ),
+            )
+        token = acceptance.settlements.claim(newer_review_id)
+        assert token is not None
+        acceptance.settlements.mark_merged(
+            newer_review_id, token=token, merge_sha=newer_merge_sha
+        )
+        acceptance.settlements.mark_settled(newer_review_id, token=token)
+        targets_before = list(acceptance.linear.targets)
+
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        assert acceptance.linear.targets[len(targets_before) :] == [
+            ("ENG-9", "QA", "operator")
+        ]
+        assert acceptance.database.scalar(
+            "SELECT state FROM external_effects WHERE effect_id = ?",
+            (old_effect_id,),
+        ) == "completed"
+        assert old_record.review_id != newer_review_id
 
     async def _merge_with_linear_outage(
         self, acceptance: Any
