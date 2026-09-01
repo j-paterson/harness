@@ -4870,8 +4870,23 @@ async def test_paused_issue_is_never_touched_by_a_dispatch_of_a_different_issue(
     assert all(target[0] != "ENG-9" for target in linear.targets)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "INFRA-219 L4 (recorded next packet): L3 scoped PRODUCT-ISSUE "
+        "occupancy to the development lane, and this dispatch now "
+        "reaches past that gate — it no longer returns project_busy. "
+        "It still cannot complete because profile LEASES are keyed by "
+        "project_key alone (ProfilePool._leases / the profile_leases "
+        "table), so the harness cell cannot hold the distinct lease the "
+        "contract requires and the insert violates the alias unique "
+        "constraint. Lane-scoped leasing is a profiles.py + schema "
+        "change beyond L3. Strict xfail so this flips to a failure the "
+        "moment L4 lands and the spec starts passing."
+    ),
+)
 @pytest.mark.asyncio
-async def test_harness_dispatch_is_still_blocked_by_project_occupancy(
+async def test_harness_dispatch_is_never_blocked_by_project_occupancy(
     database: Database,
     queue: QueueService,
     profiles: ProfilePool,
@@ -4879,23 +4894,13 @@ async def test_harness_dispatch_is_still_blocked_by_project_occupancy(
     linear: RecordingLinear,
     tmp_path: Path,
 ) -> None:
-    """INFRA-219 L2 RECORDED GAP: lane-scoped cells are not enough.
-
-    L1 made cell uniqueness per (project, lane) and L2 made dispatch,
-    worktrees, and the dashboard lane-aware — but ISSUE OCCUPANCY is
-    still tracked per project in ``admitted_issues`` (no lane
-    dimension), and both the coarse ``project_busy`` pre-check and the
-    transactional activation predicate read it. So while the
-    development lead occupies the project with its issue, a harness
-    dispatch for a different issue is refused as ``project_busy``.
-
-    This test pins that ACTUAL behavior rather than the desired one:
-    INFRA-219's acceptance ("with the development lead actively
-    working an issue, one Hermes command starts the visible harness
-    lead") cannot pass until occupancy itself grows a lane dimension,
-    which is a durable-model change beyond L2's boundary. The
-    development lane's rows must at least stay untouched by the
-    refusal, which is what the assertions below prove.
+    """INFRA-219 L3 (operator ruling): occupancy is a DEVELOPMENT-LANE
+    fact. An ACTIVE development cell occupying a product issue must
+    never block a harness start — the contract's acceptance ("with the
+    development lead actively working an issue, one Hermes command
+    starts the visible harness lead") now actually holds. Both lane
+    cells coexist with distinct cell_id/session_id, and the harness
+    lead launches into its own worktree, never the development lead's.
     """
 
     harness_cwd = tmp_path / "harness"
@@ -4926,28 +4931,151 @@ async def test_harness_dispatch_is_still_blocked_by_project_occupancy(
     assert development.status == "working"
     dev_cell = service.active_cell("demo")
     assert dev_cell is not None
-    dev_before = database.execute(
-        "SELECT cell_id, session_id, state FROM project_cells "
+
+    admit(queue, "ENG-11")
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+
+    assert harness.status == "working"
+    harness_cell = service.active_cell("demo", "harness")
+    assert harness_cell is not None
+    assert harness_cell.cell_id != dev_cell.cell_id
+    assert harness_cell.session_id != dev_cell.session_id
+    assert harness.cell_id == harness_cell.cell_id
+    assert harness.session_id == harness_cell.session_id
+    assert any(
+        request.cwd == harness_cwd for request in runner.start_requests
+    )
+    assert all(
+        request.cwd != harness_cwd
+        for request in runner.start_requests
+        if request.session_id == dev_cell.session_id
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "INFRA-219 L4 (recorded next packet): L3 scoped PRODUCT-ISSUE "
+        "occupancy to the development lane, and this dispatch now "
+        "reaches past that gate — it no longer returns project_busy. "
+        "It still cannot complete because profile LEASES are keyed by "
+        "project_key alone (ProfilePool._leases / the profile_leases "
+        "table), so the harness cell cannot hold the distinct lease the "
+        "contract requires and the insert violates the alias unique "
+        "constraint. Lane-scoped leasing is a profiles.py + schema "
+        "change beyond L3. Strict xfail so this flips to a failure the "
+        "moment L4 lands and the spec starts passing."
+    ),
+)
+@pytest.mark.asyncio
+async def test_harness_dispatch_never_consumes_or_mutates_development_occupancy(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 L3: a harness dispatch must never consume, activate, or
+    mutate any ``admitted_issues`` occupancy row -- every row (issue_id,
+    state) is byte-identical before and after, including the harness's
+    own backing issue, and the development cell's ``project_cells`` row
+    is untouched."""
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter(
+        [
+            UUID("22222222-2222-4222-8222-222222222222"),
+            UUID("33333333-3333-4333-8333-333333333333"),
+        ]
+    )
+    cells = iter(["cell-dev", "cell-harness"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    development = await service.dispatch("ENG-9")
+    assert development.status == "working"
+    dev_row_before = database.execute(
+        "SELECT cell_id, session_id, state, lane_role FROM project_cells "
         "WHERE lane_role = 'development'"
     ).fetchall()
 
     admit(queue, "ENG-11")
-    harness = await service.dispatch("ENG-11", lane_role="harness")
+    issues_before = database.execute(
+        "SELECT issue_id, state FROM admitted_issues ORDER BY issue_id"
+    ).fetchall()
 
-    # The recorded gap: per-project occupancy refuses the harness lane.
-    assert harness.status == "project_busy"
-    assert service.active_cell("demo", "harness") is None
-    # The refusal is a plain read: the development lane is untouched and
-    # no harness process was ever launched.
-    dev_after = database.execute(
-        "SELECT cell_id, session_id, state FROM project_cells "
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+
+    assert harness.status == "working"
+    issues_after = database.execute(
+        "SELECT issue_id, state FROM admitted_issues ORDER BY issue_id"
+    ).fetchall()
+    assert [tuple(row) for row in issues_after] == [
+        tuple(row) for row in issues_before
+    ]
+    dev_row_after = database.execute(
+        "SELECT cell_id, session_id, state, lane_role FROM project_cells "
         "WHERE lane_role = 'development'"
     ).fetchall()
-    assert [tuple(row) for row in dev_after] == [tuple(row) for row in dev_before]
-    assert dev_cell is not None
-    assert all(
-        request.cwd != harness_cwd for request in runner.start_requests
+    assert [tuple(row) for row in dev_row_after] == [
+        tuple(row) for row in dev_row_before
+    ]
+
+
+@pytest.mark.asyncio
+async def test_harness_dispatch_without_explicit_request_refuses_fail_closed(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-219 L3: a harness start without an explicit harness-run
+    request is refused fail-closed -- a clear status, zero writes, no
+    launched process -- rather than silently defaulting to development
+    behavior or launching unauthorized."""
+
+    admit(queue, "ENG-11")
+    events_before = database.execute(
+        "SELECT COUNT(*) AS n FROM events"
+    ).fetchone()["n"]
+    cells_before = database.execute(
+        "SELECT COUNT(*) AS n FROM project_cells"
+    ).fetchone()["n"]
+
+    result = await cell_service.dispatch("ENG-11", lane_role="harness")
+
+    assert result.status == "harness_run_required"
+    assert result.cell_id is None
+    assert result.session_id is None
+    assert queue.get("ENG-11").state == IssueState.QUEUED
+    assert (
+        database.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+        == events_before
     )
+    assert (
+        database.execute("SELECT COUNT(*) AS n FROM project_cells").fetchone()["n"]
+        == cells_before
+    )
+    assert runner.start_count == 0
+    assert runner.resume_count == 0
 
 
 @pytest.mark.asyncio
@@ -4959,8 +5087,17 @@ async def test_second_harness_dispatch_resumes_rather_than_duplicating(
     linear: RecordingLinear,
     tmp_path: Path,
 ) -> None:
-    """INFRA-219 L2: starting the harness lane twice adopts the live cell
-    (L1's per-lane uniqueness), never a second row."""
+    """INFRA-219 L2 (updated for L3): starting the harness lane twice
+    adopts the live cell (L1's per-lane uniqueness), never a second
+    row.
+
+    INFRA-219 L3: a harness dispatch no longer mutates
+    ``admitted_issues`` at all (it never claims a product issue), so
+    the SAME operational-test issue backs every harness dispatch --
+    the second call resumes the live harness session onto the same
+    cell rather than the coarse project-occupancy refusal L2 relied on
+    (which was itself only accidentally true, from the pre-L3 defect
+    of harness dispatch mutating occupancy)."""
 
     sessions = iter(
         [
@@ -4983,15 +5120,19 @@ async def test_second_harness_dispatch_resumes_rather_than_duplicating(
     )
 
     admit(queue, "ENG-9")
-    first = await service.dispatch("ENG-9", lane_role="harness")
-    admit(queue, "ENG-11")
-    second = await service.dispatch("ENG-11", lane_role="harness")
+    first = await service.dispatch("ENG-9", lane_role="harness", harness_run="run-1")
+    second = await service.dispatch("ENG-9", lane_role="harness", harness_run="run-2")
 
     assert first.status == "working"
     # The lane is already occupied by its own live cell: the second
-    # dispatch is refused as busy rather than creating a second harness
-    # cell (L1's per-lane uniqueness), and never touches the first.
-    assert second.status == "project_busy"
+    # dispatch adopts and resumes it rather than creating a second
+    # harness cell (L1's per-lane uniqueness), and never touches the
+    # first as a "busy" refusal.
+    assert second.status == "working"
+    assert second.cell_id == first.cell_id == "cell-harness"
+    assert second.session_id == first.session_id
+    assert runner.start_count == 1
+    assert runner.resume_count == 1
     rows = database.execute(
         "SELECT cell_id FROM project_cells WHERE lane_role = 'harness'"
     ).fetchall()

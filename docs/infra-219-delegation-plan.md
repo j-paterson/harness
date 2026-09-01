@@ -112,3 +112,52 @@ Also deferred from the contract's dashboard requirement: per-lead
 subagents, current head/event, resource pressure, and blockers.
 Harness worktree PROVISIONING (creating `<lead_cwd>-harness`) is a
 convention here, not yet automated.
+
+## L3: lane-scoped occupancy (operator ruling, 2026-09-01)
+
+The operator resolved the gap from the authoritative contract rather
+than leaving it open — the contract already specifies it, so no
+further input is needed:
+
+- **Development lanes occupy explicitly admitted product issues**,
+  exactly as today. Occupancy becomes lane-scoped, so a development
+  lane's occupancy is a development-lane fact.
+- **The harness lane never claims a product issue.** It requires an
+  explicit harness-run request bound to `lane_role='harness'` (the
+  contract: "the harness lead does not select or implement unrelated
+  product issues"; it owns operational testing only).
+- **Shared limits still bind both lanes**: resource/profile leases and
+  one-heavy-test-at-a-time are global, not per lane.
+
+| Packet | Boundary | Files | Tier | Wave |
+|---|---|---|---|---|
+| L3 | Lane-scoped occupancy: the `project_busy` pre-check and the transactional activation predicate become development-lane facts; a harness dispatch is never gated by, and never consumes or mutates, product-issue occupancy; the harness lane instead requires an explicit harness-run request bound to `lane_role='harness'`; shared profile/resource and one-heavy-test limits continue to apply to both lanes | `src/hermes_orchestrator/cells.py`, `tests/test_cells.py` (+ one migration ONLY if the harness-run request needs durable storage) | Sonnet | 3 |
+
+L3 replaces `test_harness_dispatch_is_still_blocked_by_project_occupancy`
+(the deliberate gap-pinning regression) with tests proving the
+contract: an active development issue does not block harness start,
+and no harness action consumes or mutates development occupancy.
+
+### L3 integration record and the next blocker (L4)
+
+L3 landed as specified: the `project_busy` pre-check and the
+occupancy predicates are development-lane facts; a harness dispatch
+requires an explicit `harness_run` request (`harness_run_required`
+refusal without it, `harness_run_not_permitted` if a development
+dispatch supplies one) and never reads or mutates product-issue
+occupancy; the capacity guard stays a shared RESOURCE limit binding
+both lanes, as does profile leasing.
+
+**L4 — lane-scoped profile leases.** The two contract acceptance
+tests now get PAST occupancy and fail one layer deeper: profile
+leases are keyed by `project_key` alone (`ProfilePool._leases` and
+the `profile_leases` table), so a harness cell cannot hold the
+distinct lease the contract requires ("each cell has a distinct lane
+role, worktree, Claude session, cmux workspace, profile lease, and
+durable binding") and the insert trips the alias unique constraint.
+Both tests are kept as STRICT xfail executable specifications, so
+they flip to failures the moment L4 makes them pass. L4's boundary:
+`src/hermes_orchestrator/profiles.py`, `cells.py`'s lease
+reservation/restore call sites, and a migration keying
+`profile_leases` by (project_key, lane_role). Shared capacity and
+one-heavy-test limits stay global.

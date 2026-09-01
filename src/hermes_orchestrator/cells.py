@@ -347,6 +347,7 @@ def _activate_issue_transaction(
     assignments: LeadAssignments | None,
     now: Callable[[], datetime],
     guard: Callable[[sqlite3.Connection], bool] | None = None,
+    lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[bool, LeadAssignment | None]:
     """The one durable, LOCAL-ONLY activation transaction every dispatch
     path shares: the full commit-time eligibility recheck, the
@@ -397,10 +398,30 @@ def _activate_issue_transaction(
     (idempotently) ensured, but no second ``issue.started`` is ever
     journaled and no queue transition happens — full replay
     idempotence across effect, transition, event, and assignment.
+
+    INFRA-219 L3: ``lane_role`` scopes PRODUCT-ISSUE occupancy to the
+    development lane, per the operator's ruling that "the harness lead
+    does not select or implement unrelated product issues." When
+    ``lane_role`` is ``HARNESS_LANE`` this transaction skips only the
+    occupancy predicates (runnable-state/dependency/busy/pending-
+    decision) AND never CASes ``admitted_issues`` or journals
+    ``issue.started`` for it — the harness lane activates its own cell
+    lease only, and the issue row it names (whatever operational-test
+    issue backs its dispatch) is left byte-for-byte untouched. The
+    shared ``guard`` (capacity/freshness ceiling, when the daemon path
+    arms it) is a RESOURCE limit, not product-issue occupancy, so it
+    still runs for the harness lane exactly as the ruling requires
+    ("shared profile/resource and one-heavy-test limits continue to
+    apply to both lanes") — harness dispatches get no exemption from
+    it, including on a resumed/already-active harness lease, since
+    ``admitted_issues`` never carries a harness "already in flight"
+    signal to replay-exempt against the way development's own issue
+    transition does.
     """
 
     stamp = now().isoformat()
     assignment: LeadAssignment | None = None
+    harness = lane_role == HARNESS_LANE
     with database.transaction() as connection:
         issue_row = connection.execute(
             "SELECT state, instruction_id, project_key, dependency_ready "
@@ -410,8 +431,11 @@ def _activate_issue_transaction(
         if issue_row is None:
             raise KeyError(issue_id)
         prior_state = str(issue_row["state"])
-        replaying = prior_state == IssueState.IN_DEVELOPMENT.value
-        if not replaying:
+        replaying = (not harness) and prior_state == IssueState.IN_DEVELOPMENT.value
+        if harness:
+            if guard is not None and not guard(connection):
+                return False, None
+        elif not replaying:
             if guard is not None and not guard(connection):
                 return False, None
             if prior_state not in _RUNNABLE_ISSUE_STATES:
@@ -447,7 +471,7 @@ def _activate_issue_transaction(
         )
         if activated.rowcount == 0:
             return False, None
-        if not replaying:
+        if not harness and not replaying:
             updated = connection.execute(
                 "UPDATE admitted_issues SET state = ?, updated_at = ? "
                 "WHERE issue_id = ? AND state = ?",
@@ -469,7 +493,7 @@ def _activate_issue_transaction(
                     payload={"cell_id": cell_id},
                 ),
             )
-        if assignments is not None:
+        if not harness and assignments is not None:
             assignment = assignments.publish_in(
                 connection,
                 project_key=project_key,
@@ -482,29 +506,33 @@ def _activate_issue_transaction(
                     f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
                 ),
             )
-        # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
-        # projection record becomes durable in this very commit, BEFORE
-        # any fallible Linear operation can run — no live client is
-        # required to write it. ``LinearClient.project`` later ADOPTS
-        # this exact row (same effect id, byte-identical
-        # ``projection_request`` payload) instead of double-beginning,
-        # so every post-commit failure class — router composition, the
-        # initial issue read, team/mapping/transition validation, the
-        # update itself — leaves exactly ONE pending row for
-        # reconciliation (``reconcile._project_pending_linear_effect``).
-        # On a replay the row already exists (pending or completed) and
-        # is adopted untouched, keeping the journal at exactly one row.
-        ExternalEffectStore.begin_in(
-            connection,
-            _in_development_effect_id(issue_id),
-            target=issue_id,
-            request=projection_request(
-                issue_id,
-                LinearProjection(
-                    status="In Development", assignee_alias="operator"
+        if not harness:
+            # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
+            # projection record becomes durable in this very commit, BEFORE
+            # any fallible Linear operation can run — no live client is
+            # required to write it. ``LinearClient.project`` later ADOPTS
+            # this exact row (same effect id, byte-identical
+            # ``projection_request`` payload) instead of double-beginning,
+            # so every post-commit failure class — router composition, the
+            # initial issue read, team/mapping/transition validation, the
+            # update itself — leaves exactly ONE pending row for
+            # reconciliation (``reconcile._project_pending_linear_effect``).
+            # On a replay the row already exists (pending or completed) and
+            # is adopted untouched, keeping the journal at exactly one row.
+            # INFRA-219 L3: the harness lane never claims a product issue,
+            # so it never opens this Linear "In Development" projection
+            # either -- there is no product-issue transition to project.
+            ExternalEffectStore.begin_in(
+                connection,
+                _in_development_effect_id(issue_id),
+                target=issue_id,
+                request=projection_request(
+                    issue_id,
+                    LinearProjection(
+                        status="In Development", assignee_alias="operator"
+                    ),
                 ),
-            ),
-        )
+            )
     return True, assignment
 
 
@@ -521,6 +549,7 @@ async def activate_admitted_issue(
     issue_id: str,
     now: Callable[[], datetime] = _utc_now,
     guard: Callable[[sqlite3.Connection], bool] | None = None,
+    lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[bool, LeadAssignment | None]:
     """Dispatch one already-admitted issue onto a live cell durably.
 
@@ -547,6 +576,11 @@ async def activate_admitted_issue(
     flip, pending decision, stale guard, lease identity) leaves ZERO
     local writes and Linear is never even attempted — there is nothing
     to project for a candidate that did not activate.
+
+    INFRA-219 L3: ``lane_role`` defaults to ``DEVELOPMENT_LANE`` — the
+    Stop-hook idle dispatcher never touches the harness lane — so
+    every existing zero-argument caller keeps today's occupancy
+    behavior exactly.
     """
 
     activated, assignment = _activate_issue_transaction(
@@ -560,6 +594,7 @@ async def activate_admitted_issue(
         assignments=assignments,
         now=now,
         guard=guard,
+        lane_role=lane_role,
     )
     if not activated:
         return False, None
@@ -703,7 +738,11 @@ class ProjectCellService:
         return self._project_paths[project_key]
 
     async def dispatch(
-        self, issue_id: str, *, lane_role: str = DEVELOPMENT_LANE
+        self,
+        issue_id: str,
+        *,
+        lane_role: str = DEVELOPMENT_LANE,
+        harness_run: str | None = None,
     ) -> DispatchResult:
         """Start or resume the issue's project lead after explicit admission.
 
@@ -711,8 +750,29 @@ class ProjectCellService:
         every cell lookup/creation this dispatch performs, so a
         harness-lane dispatch can never find, resume, or collide with
         the project's development cell, and vice versa.
+
+        INFRA-219 L3: ``harness_run`` is the explicit harness-run
+        request the operator ruling requires — "the harness lane
+        requires an explicit harness-run request bound to
+        ``lane_role='harness'``." It must be a non-empty identifier for
+        a harness-lane dispatch and MUST be absent for a development-
+        lane dispatch (development occupancy is proven by explicit
+        issue admission alone, exactly as today; it must never also
+        gain a harness-shaped request). Either mismatch refuses
+        fail-closed BEFORE the per-lane lock, the queue read, or any
+        other touch of durable state — zero writes, a plain status.
+        This is deliberately a required call-time argument rather than
+        new durable storage: it is enough to prove the caller issued
+        this harness dispatch on purpose, and the L3 packet boundary
+        prefers it explicitly over adding a migration for it.
         """
 
+        if lane_role == HARNESS_LANE and not harness_run:
+            return DispatchResult(status="harness_run_required", issue_id=issue_id)
+        if lane_role != HARNESS_LANE and harness_run:
+            return DispatchResult(
+                status="harness_run_not_permitted", issue_id=issue_id
+            )
         issue = self._queue.get(issue_id)
         lock_key = f"{issue.project_key}:{lane_role}"
         lock = self._dispatch_locks.setdefault(lock_key, asyncio.Lock())
@@ -741,13 +801,19 @@ class ProjectCellService:
         # a candidate that cannot activate; the shared activation
         # transaction (`_activate_issue_transaction`) re-proves the same
         # occupancy predicate, transactionally, at commit time.
-        busy = self._database.execute(
-            "SELECT 1 FROM admitted_issues WHERE project_key = ? "
-            "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
-            (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
-        ).fetchone()
-        if busy is not None:
-            return DispatchResult(status="project_busy", issue_id=issue_id)
+        #
+        # INFRA-219 L3: this is a DEVELOPMENT-LANE fact only — the operator
+        # ruling is explicit that "the harness lane never claims a product
+        # issue," so a harness dispatch is never gated by, and this
+        # pre-check never even reads for, product-issue occupancy.
+        if lane_role == DEVELOPMENT_LANE:
+            busy = self._database.execute(
+                "SELECT 1 FROM admitted_issues WHERE project_key = ? "
+                "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+                (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
+            ).fetchone()
+            if busy is not None:
+                return DispatchResult(status="project_busy", issue_id=issue_id)
         # INFRA-199 v2: Linear is never consulted before the local commit.
         # Hermes' durable local lifecycle is authoritative; a pre-commit
         # `linear.validate` here used to gate whether this candidate could
@@ -1794,12 +1860,17 @@ class ProjectCellService:
         failure rather than rolling back or retrying the already-
         durable local activation (see its docstring for where that
         failure's durable trace lives).
+
+        INFRA-219 L3: the harness lane never claims a product issue, so
+        it never projects one "In Development" either — activation
+        alone (the cell lease) is all a harness dispatch commits.
         """
 
         activated, assignment = self._activate_issue(cell, issue_id)
         if not activated:
             return False, None
-        await _project_in_development(self._linear, issue_id)
+        if cell.lane_role != HARNESS_LANE:
+            await _project_in_development(self._linear, issue_id)
         return True, assignment
 
     def _activate_issue(
@@ -1823,6 +1894,11 @@ class ProjectCellService:
         stale — or was superseded by a red one — between scheduler
         planning and this commit fails the activation closed instead of
         authorizing it (Sol ec0ed7fe gap 3).
+
+        INFRA-219 L3: ``cell.lane_role`` (the durable lane identity the
+        cell was created/found in) is threaded straight through, so a
+        harness cell's activation is scoped to that lane by construction
+        — never a second inference of which lane this is.
         """
 
         return _activate_issue_transaction(
@@ -1838,6 +1914,7 @@ class ProjectCellService:
             ),
             now=self._aware_now,
             guard=self._capacity_guard(issue_id),
+            lane_role=cell.lane_role,
         )
 
     def _capacity_guard(
