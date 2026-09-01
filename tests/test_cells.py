@@ -736,11 +736,13 @@ async def test_creation_conflict_resumes_the_existing_cell(
     class ConflictService(ProjectCellService):
         hide_existing = True
 
-        def _find_active_cell(self, project_key: str):  # type: ignore[no-untyped-def]
+        def _find_active_cell(  # type: ignore[no-untyped-def]
+            self, project_key: str, lane_role: str = "development"
+        ):
             if self.hide_existing:
                 self.hide_existing = False
                 return None
-            return super()._find_active_cell(project_key)
+            return super()._find_active_cell(project_key, lane_role)
 
     service = ConflictService(
         database=database,

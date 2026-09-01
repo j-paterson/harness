@@ -19,7 +19,17 @@ class AdmissionSnapshot(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PlannedAction:
-    """An explainable action that may remain observation-only."""
+    """An explainable action that may remain observation-only.
+
+    INFRA-219 L1: ``lane_role`` names which lane the action plans for.
+    The scheduler only ever ranks ``admitted_issues`` -- which carry no
+    lane of their own -- so every action it produces is for the
+    development lane today; the field exists so the plan's own
+    per-cycle uniqueness (see :meth:`Scheduler.plan`) is already keyed
+    by (project, lane) ahead of a lane-aware harness plan landing in
+    wave 2 (INFRA-219 L2), without changing any observable output while
+    no harness lane is planned.
+    """
 
     kind: str
     project_key: str | None
@@ -27,10 +37,19 @@ class PlannedAction:
     reason: str
     execute: bool
     evidence: dict[str, Any]
+    lane_role: str | None = "development"
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+# INFRA-219 L1: the scheduler plans only against ``admitted_issues``, which
+# carries no lane of its own -- every action this module produces is for the
+# development lane until a lane-aware harness plan lands in wave 2
+# (INFRA-219 L2). Kept local (not imported from ``cells.py``) to keep this
+# module's dependency surface unchanged.
+_DEVELOPMENT_LANE = "development"
 
 
 class Scheduler:
@@ -70,20 +89,26 @@ class Scheduler:
                     reason="resource policy does not permit new work",
                     execute=False,
                     evidence={"pressure": str(pressure)},
+                    lane_role=None,
                 )
             ]
 
         actions: list[PlannedAction] = []
-        planned_projects: set[str] = set()
+        # INFRA-219 L1: keyed by (project, lane) -- today always paired with
+        # ``_DEVELOPMENT_LANE`` since issues carry no lane of their own -- so
+        # a future lane-aware harness plan for the same project can never be
+        # deduplicated away by this development-lane plan, or vice versa.
+        planned_projects: set[tuple[str, str]] = set()
         active_projects = frozenset(self._active_projects())
         held: list[str] = []
         for issue in self._queue.list_ranked(self._now()):
-            if issue.project_key in planned_projects:
+            plan_key = (issue.project_key, _DEVELOPMENT_LANE)
+            if plan_key in planned_projects:
                 continue
             if issue.linear_priority > max_priority:
                 held.append(issue.issue_id)
                 continue
-            planned_projects.add(issue.project_key)
+            planned_projects.add(plan_key)
             active = issue.project_key in active_projects
             actions.append(
                 PlannedAction(
@@ -103,6 +128,7 @@ class Scheduler:
                         "priority": issue.linear_priority,
                         "dependency_ready": issue.dependency_ready,
                     },
+                    lane_role=_DEVELOPMENT_LANE,
                 )
             )
         if held:
@@ -117,6 +143,7 @@ class Scheduler:
                     ),
                     execute=False,
                     evidence={"pressure": str(pressure), "held_issues": held},
+                    lane_role=None,
                 )
             )
         return actions

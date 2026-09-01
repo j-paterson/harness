@@ -34,6 +34,15 @@ from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
+# INFRA-219 L1: the durable lane-role model. A project cell now belongs to
+# exactly one lane; ``DEVELOPMENT_LANE`` is the historical, sole lane every
+# existing row and caller defaults to, so a project with no harness cell is
+# byte-compatible with pre-INFRA-219 behavior. The harness lane's launch/
+# rotate/recover surface is wave 2 (INFRA-219 L2) -- this packet only makes
+# the durable identity lane-aware.
+DEVELOPMENT_LANE = "development"
+HARNESS_LANE = "harness"
+
 # A fable cap is a weekly-budget exhaustion, but the sanitized Claude
 # stream exposes no reset horizon. The conservative fallback is one full
 # weekly cycle — the documented worst case — never the flat hour that
@@ -179,13 +188,20 @@ class _IssueAlreadyCompleted(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ProjectCell:
-    """One durable persistent lead for a project."""
+    """One durable persistent lead for a project's lane.
+
+    INFRA-219 L1: ``lane_role`` is the durable lane identity
+    (``DEVELOPMENT_LANE`` or ``HARNESS_LANE``) -- every lookup and
+    mutation below is scoped to it, so a harness cell can never
+    interrupt or be confused with its project's development cell.
+    """
 
     cell_id: str
     project_key: str
     state: str
     profile_alias: str
     session_id: UUID
+    lane_role: str = DEVELOPMENT_LANE
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,14 +642,24 @@ class ProjectCellService:
 
         self._dispatch_freshness_minutes = int(freshness_minutes)
 
-    def active_projects(self) -> frozenset[str]:
-        """Return projects that already own a live logical lead cell."""
+    def active_projects(
+        self, lane_role: str = DEVELOPMENT_LANE
+    ) -> frozenset[str]:
+        """Return projects that already own a live logical lead cell in
+        ``lane_role``.
+
+        INFRA-219 L1: scoped to one lane (development by default, so
+        every zero-argument caller -- the scheduler wiring in
+        ``runtime.py`` included -- keeps today's behavior unchanged).
+        A harness cell alone never makes this report its project as
+        having an active development lead.
+        """
 
         placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
         rows = self._database.execute(
             f"SELECT DISTINCT project_key FROM project_cells "
-            f"WHERE state IN ({placeholders})",
-            _ACTIVE_CELL_STATES,
+            f"WHERE state IN ({placeholders}) AND lane_role = ?",
+            (*_ACTIVE_CELL_STATES, lane_role),
         ).fetchall()
         return frozenset(str(row["project_key"]) for row in rows)
 
@@ -1394,6 +1420,7 @@ class ProjectCellService:
             state="active",
             profile_alias=replacement_profile,
             session_id=replacement_session,
+            lane_role=current.lane_role,
         )
         try:
             with self._database.transaction() as connection:
@@ -1463,12 +1490,21 @@ class ProjectCellService:
         await self._runner.retire_session(current.session_id)
         return rotated
 
-    def _find_active_cell(self, project_key: str) -> ProjectCell | None:
+    def _find_active_cell(
+        self, project_key: str, lane_role: str = DEVELOPMENT_LANE
+    ) -> ProjectCell | None:
+        """The project's live cell in ``lane_role`` (development by
+        default), or ``None``. INFRA-219 L1: lane-scoped so a harness
+        cell is never returned to a development-lane lookup, or vice
+        versa -- the two lanes' uniqueness and activation never
+        collide.
+        """
+
         placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
         row = self._database.execute(
             f"SELECT * FROM project_cells WHERE project_key = ? "
-            f"AND state IN ({placeholders})",
-            (project_key, *_ACTIVE_CELL_STATES),
+            f"AND lane_role = ? AND state IN ({placeholders})",
+            (project_key, lane_role, *_ACTIVE_CELL_STATES),
         ).fetchone()
         return self._row_to_cell(row) if row is not None else None
 
@@ -1616,6 +1652,7 @@ class ProjectCellService:
         self,
         project_key: str,
         issue_id: str,
+        lane_role: str = DEVELOPMENT_LANE,
     ) -> tuple[ProjectCell | None, bool]:
         lease = self._profiles.acquire(project_key)
         if lease is None:
@@ -1627,6 +1664,7 @@ class ProjectCellService:
             state="starting",
             profile_alias=lease.profile_alias,
             session_id=self._session_ids(),
+            lane_role=lane_role,
         )
         try:
             with self._database.transaction() as connection:
@@ -1641,14 +1679,15 @@ class ProjectCellService:
                 connection.execute(
                     "INSERT INTO project_cells("
                     "cell_id, project_key, state, profile_alias, session_id, "
-                    "created_at, updated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "lane_role, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cell.cell_id,
                         cell.project_key,
                         cell.state,
                         cell.profile_alias,
                         str(cell.session_id),
+                        cell.lane_role,
                         now,
                         now,
                     ),
@@ -1683,7 +1722,7 @@ class ProjectCellService:
             raise
         except sqlite3.IntegrityError:
             self._profiles.release(project_key, "cell_creation_conflict")
-            existing = self._find_active_cell(project_key)
+            existing = self._find_active_cell(project_key, lane_role)
             if existing is not None:
                 return existing, False
             raise
@@ -2087,4 +2126,5 @@ class ProjectCellService:
             state=str(row["state"]),
             profile_alias=str(row["profile_alias"]),
             session_id=UUID(str(row["session_id"])),
+            lane_role=str(row["lane_role"]),
         )
