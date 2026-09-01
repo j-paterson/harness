@@ -380,3 +380,60 @@ def test_probe_without_bootstrap_keeps_prior_auth_only_behavior(
 
     assert health.eligible is True
     assert health.reason == "eligible"
+
+
+def test_two_lanes_of_one_project_hold_distinct_profiles(
+    registry: ProfileRegistry,
+) -> None:
+    """INFRA-219 L4: leases are keyed by (project, lane).
+
+    The contract requires each cell to hold a DISTINCT profile lease.
+    Before L4 the pool was keyed by project alone, so a harness
+    acquisition returned the development lane's lease verbatim and its
+    durable insert collided on the profile-alias primary key.
+    """
+
+    pool = eligible_pool(registry)
+
+    development = pool.acquire("demo")
+    harness = pool.acquire("demo", "harness")
+
+    assert development is not None and harness is not None
+    assert development.profile_alias != harness.profile_alias
+    # Each lane keeps its own affinity across repeated acquisitions.
+    assert pool.acquire("demo").profile_alias == development.profile_alias
+    assert (
+        pool.acquire("demo", "harness").profile_alias == harness.profile_alias
+    )
+
+
+def test_a_harness_lane_never_steals_the_development_lease(
+    registry: ProfileRegistry,
+) -> None:
+    """The alias limit stays global: no second profile, no harness lease.
+
+    INFRA-219 L4: lane scoping changes only the lease KEY. One profile
+    still serves one lease at a time, so when every other profile is
+    ineligible the harness lane fails cleanly rather than sharing or
+    stealing the development lane's seat.
+    """
+
+    pool = eligible_pool(registry)
+    development = pool.acquire("demo")
+    assert development is not None
+    for profile in registry.profiles:
+        if profile.alias != development.profile_alias:
+            pool.record_health(
+                ProfileHealth(
+                    profile_alias=profile.alias,
+                    eligible=False,
+                    reason="auth expired",
+                    last_checked_at=datetime(2026, 8, 26, tzinfo=UTC),
+                )
+            )
+
+    harness = pool.acquire("demo", "harness")
+
+    assert harness is None
+    # The development lane is untouched by the refused acquisition.
+    assert pool.acquire("demo").profile_alias == development.profile_alias

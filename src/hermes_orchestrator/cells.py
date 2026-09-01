@@ -1366,6 +1366,7 @@ class ProjectCellService:
             reservation = self._profiles.reserve_replacement(
                 current.project_key,
                 current.profile_alias,
+                lane_role=current.lane_role,
             )
             if reservation is None:
                 message = "no different healthy profile is available"
@@ -1382,7 +1383,9 @@ class ProjectCellService:
                     message = f"{message}: {'; '.join(details)}"
                 raise RotationBlocked(message)
             if reservation.profile_alias in attempted_profiles:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
                 raise RotationBlocked(
                     "replacement selection repeated an already attempted profile: "
                     f"{reservation.profile_alias}"
@@ -1434,7 +1437,9 @@ class ProjectCellService:
                                 (reservation.profile_alias, resets_at)
                             )
                             replacement_capped = True
-                            self._profiles.cancel_replacement(current.project_key)
+                            self._profiles.cancel_replacement(
+                                current.project_key, lane_role=current.lane_role
+                            )
                             break
                         elif (
                             event.kind == "handoff.acknowledged"
@@ -1455,16 +1460,22 @@ class ProjectCellService:
                     await stream.aclose()
             except BaseException:
                 if not replacement_capped:
-                    self._profiles.cancel_replacement(current.project_key)
+                    self._profiles.cancel_replacement(
+                        current.project_key, lane_role=current.lane_role
+                    )
                 raise
             if replacement_capped:
                 persisted_session = None
                 continue
             if not session_started:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
                 raise RotationBlocked("replacement session start was not confirmed")
             if not acknowledged:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
                 raise RotationBlocked(
                     "handoff was not acknowledged by the replacement"
                 )
@@ -1497,9 +1508,16 @@ class ProjectCellService:
             # The transfer transaction already committed on a prior pass;
             # only the pool's in-memory affinity may still need resyncing
             # to the durable rows.
-            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.release(
+                current.project_key,
+                reason="rotation_recovered",
+                lane_role=current.lane_role,
+            )
             self._profiles.restore(
-                current.project_key, replacement_profile, self._aware_now()
+                current.project_key,
+                replacement_profile,
+                self._aware_now(),
+                lane_role=current.lane_role,
             )
             return current
         conflict = self._database.execute(
@@ -1579,20 +1597,30 @@ class ProjectCellService:
                 )
         except BaseException:
             if not recovering:
-                self._profiles.cancel_replacement(current.project_key)
+                self._profiles.cancel_replacement(
+                    current.project_key, lane_role=current.lane_role
+                )
             raise
         if recovering:
             # No in-memory reservation exists on recovery: rebuild the
             # pool's affinity from the durable identities instead of
             # committing a reservation that was never re-made.
-            self._profiles.release(current.project_key, reason="rotation_recovered")
+            self._profiles.release(
+                current.project_key,
+                reason="rotation_recovered",
+                lane_role=current.lane_role,
+            )
             self._profiles.restore(
-                current.project_key, replacement_profile, self._aware_now()
+                current.project_key,
+                replacement_profile,
+                self._aware_now(),
+                lane_role=current.lane_role,
             )
         else:
             self._profiles.commit_rotation(
                 current.project_key,
                 current.profile_alias,
+                lane_role=current.lane_role,
             )
         if self._safety is not None:
             self._safety.invalidate(rotated.cell_id, reason="session_rotated")
@@ -1627,27 +1655,37 @@ class ProjectCellService:
         return self._row_to_cell(row) if row is not None else None
 
     def _restore_profile_leases(self) -> None:
+        """Rehydrate durable leases into the pool -- INFRA-219 L4: each
+        row now also names the lane the lease belongs to, so a
+        project's development and harness leases restore into their
+        own distinct ``ProfilePool`` slots rather than colliding on a
+        project-only key.
+        """
+
         rows = self._database.execute(
-            "SELECT profile_alias, project_key, state, acquired_at, cooldown_until "
+            "SELECT profile_alias, project_key, lane_role, state, "
+            "acquired_at, cooldown_until "
             "FROM profile_leases WHERE state IN ('active', 'capped')"
         ).fetchall()
         for row in rows:
             cooldown = row["cooldown_until"]
+            lane_role = str(row["lane_role"])
             if str(row["state"]) == "capped":
                 if not cooldown:
                     raise ValueError("capped profile lease is missing cooldown_until")
                 cooldown_until = datetime.fromisoformat(str(cooldown))
                 active_cell = self._database.execute(
                     "SELECT 1 FROM project_cells WHERE project_key = ? "
-                    "AND profile_alias = ? "
+                    "AND lane_role = ? AND profile_alias = ? "
                     "AND state IN ('starting', 'active', 'handoff_required', 'paused')",
-                    (str(row["project_key"]), str(row["profile_alias"])),
+                    (str(row["project_key"]), lane_role, str(row["profile_alias"])),
                 ).fetchone()
                 if active_cell is not None:
                     self._profiles.restore(
                         project_key=str(row["project_key"]),
                         profile_alias=str(row["profile_alias"]),
                         acquired_at=datetime.fromisoformat(str(row["acquired_at"])),
+                        lane_role=lane_role,
                         cooldown_until=cooldown_until,
                     )
                     continue
@@ -1668,6 +1706,7 @@ class ProjectCellService:
                 project_key=str(row["project_key"]),
                 profile_alias=str(row["profile_alias"]),
                 acquired_at=datetime.fromisoformat(str(row["acquired_at"])),
+                lane_role=lane_role,
                 cooldown_until=(
                     datetime.fromisoformat(str(cooldown)) if cooldown else None
                 ),
@@ -1754,7 +1793,9 @@ class ProjectCellService:
             )
         if cooldown_until is not None:
             self._profiles.set_cooldown(cell.profile_alias, cooldown_until)
-        self._profiles.release(cell.project_key, "lead_start_failed")
+        self._profiles.release(
+            cell.project_key, "lead_start_failed", lane_role=cell.lane_role
+        )
         return True
 
     def _get_cell(self, cell_id: str) -> ProjectCell:
@@ -1772,7 +1813,7 @@ class ProjectCellService:
         issue_id: str,
         lane_role: str = DEVELOPMENT_LANE,
     ) -> tuple[ProjectCell | None, bool]:
-        lease = self._profiles.acquire(project_key)
+        lease = self._profiles.acquire(project_key, lane_role)
         if lease is None:
             return None, False
         now = self._aware_now().isoformat()
@@ -1818,9 +1859,9 @@ class ProjectCellService:
                 )
                 connection.execute(
                     "INSERT INTO profile_leases("
-                    "profile_alias, project_key, state, acquired_at"
-                    ") VALUES (?, ?, 'active', ?)",
-                    (cell.profile_alias, cell.project_key, now),
+                    "profile_alias, project_key, lane_role, state, acquired_at"
+                    ") VALUES (?, ?, ?, 'active', ?)",
+                    (cell.profile_alias, cell.project_key, cell.lane_role, now),
                 )
                 self._events.append(
                     connection,
@@ -1836,10 +1877,14 @@ class ProjectCellService:
                     ),
                 )
         except _IssueAlreadyCompleted:
-            self._profiles.release(project_key, "issue_already_completed")
+            self._profiles.release(
+                project_key, "issue_already_completed", lane_role=lane_role
+            )
             raise
         except sqlite3.IntegrityError:
-            self._profiles.release(project_key, "cell_creation_conflict")
+            self._profiles.release(
+                project_key, "cell_creation_conflict", lane_role=lane_role
+            )
             existing = self._find_active_cell(project_key, lane_role)
             if existing is not None:
                 return existing, False

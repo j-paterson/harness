@@ -9,12 +9,12 @@ def test_database_applies_migration_once(tmp_path: Path) -> None:
     database_path = tmp_path / "state.db"
 
     database = Database.open(database_path)
-    assert database.schema_version() == 54
+    assert database.schema_version() == 55
     database.close()
 
     reopened = Database.open(database_path)
     try:
-        assert reopened.schema_version() == 54
+        assert reopened.schema_version() == 55
         assert reopened.scalar("PRAGMA integrity_check") == "ok"
         assert reopened.scalar("PRAGMA foreign_keys") == 1
         assert reopened.scalar("PRAGMA journal_mode") == "wal"
@@ -82,7 +82,7 @@ def test_migration_0050_applies_on_a_schema_49_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 54
+        assert database.schema_version() == 55
         assert database.scalar("PRAGMA integrity_check") == "ok"
         assert (
             database.scalar(
@@ -146,7 +146,7 @@ def test_migration_0051_applies_on_a_schema_50_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 54
+        assert database.schema_version() == 55
         assert database.scalar("PRAGMA integrity_check") == "ok"
         row = database.execute(
             "SELECT state, replacement_session_id, replacement_profile_alias "
@@ -229,7 +229,7 @@ def test_migration_0052_applies_on_a_schema_51_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 54
+        assert database.schema_version() == 55
         assert database.scalar("PRAGMA integrity_check") == "ok"
         assert (
             database.scalar(

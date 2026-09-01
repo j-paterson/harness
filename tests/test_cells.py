@@ -4870,21 +4870,6 @@ async def test_paused_issue_is_never_touched_by_a_dispatch_of_a_different_issue(
     assert all(target[0] != "ENG-9" for target in linear.targets)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "INFRA-219 L4 (recorded next packet): L3 scoped PRODUCT-ISSUE "
-        "occupancy to the development lane, and this dispatch now "
-        "reaches past that gate — it no longer returns project_busy. "
-        "It still cannot complete because profile LEASES are keyed by "
-        "project_key alone (ProfilePool._leases / the profile_leases "
-        "table), so the harness cell cannot hold the distinct lease the "
-        "contract requires and the insert violates the alias unique "
-        "constraint. Lane-scoped leasing is a profiles.py + schema "
-        "change beyond L3. Strict xfail so this flips to a failure the "
-        "moment L4 lands and the spec starts passing."
-    ),
-)
 @pytest.mark.asyncio
 async def test_harness_dispatch_is_never_blocked_by_project_occupancy(
     database: Database,
@@ -4954,21 +4939,6 @@ async def test_harness_dispatch_is_never_blocked_by_project_occupancy(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "INFRA-219 L4 (recorded next packet): L3 scoped PRODUCT-ISSUE "
-        "occupancy to the development lane, and this dispatch now "
-        "reaches past that gate — it no longer returns project_busy. "
-        "It still cannot complete because profile LEASES are keyed by "
-        "project_key alone (ProfilePool._leases / the profile_leases "
-        "table), so the harness cell cannot hold the distinct lease the "
-        "contract requires and the insert violates the alias unique "
-        "constraint. Lane-scoped leasing is a profiles.py + schema "
-        "change beyond L3. Strict xfail so this flips to a failure the "
-        "moment L4 lands and the spec starts passing."
-    ),
-)
 @pytest.mark.asyncio
 async def test_harness_dispatch_never_consumes_or_mutates_development_occupancy(
     database: Database,
