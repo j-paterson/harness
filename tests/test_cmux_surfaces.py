@@ -13,6 +13,7 @@ import pytest
 from hermes_orchestrator.channel_trust import (
     APPROVED_PROMPT_PATTERN,
     ChannelTrustAnchors,
+    ChannelTrustGate,
     TrustVerdict,
 )
 from hermes_orchestrator.cmux import (
@@ -3431,3 +3432,367 @@ async def test_dead_lead_sweep_stops_on_a_mid_pass_cmux_failure(
     assert live is not None
     assert live.binding_id == binding.binding_id
     assert _cell_state(database, "cell-demo") == "active"
+
+
+# -- relaunched trusted seat restoration (INFRA-198) ---------------------
+
+
+def restoring_reconciler(
+    bindings: CmuxSurfaceBindings,
+    port: FakePort,
+    *,
+    worker_alive: Callable[[str], bool | None],
+) -> CmuxSurfaceReconciler:
+    return CmuxSurfaceReconciler(
+        bindings=bindings,
+        port=port,
+        project_paths={"demo": Path("/repos/demo")},
+        profile_dirs=FakeProfileDirs({"max-a": Path("/profiles/max-a")}),
+        environ={},
+        worker_alive=worker_alive,
+    )
+
+
+def relaunched_seat_shape(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> tuple[str, str]:
+    """The observed post-reboot shape (2026-09-01): the relaunched
+    seat's own binding is stale, the recovery attempt's successor is
+    lost as channel_trust_unconfirmed, and no active lead remains --
+    while the cell still names exactly this session and profile."""
+
+    seed_cell(database)
+    original = bind_demo_lead(bindings)
+    successor = bindings.replace(
+        original.binding_id, FRESH, reason="surface_missing"
+    )
+    bindings.mark_lost(
+        successor.binding_id, reason="channel_trust_unconfirmed"
+    )
+    return str(original.binding_id), str(successor.binding_id)
+
+
+#: The reboot re-mints only the workspace uuid around the surviving
+#: surface (observed live 2026-09-01: workspace 29DBF6DA... became
+#: A6011199... while surface A9289997... survived).
+REBOOTED_WORKSPACE = CmuxSurfaceRef(
+    workspace_uuid="bbbbbbbb-cccc-4ccc-8ccc-cccccccccccc",
+    surface_uuid=LEAD.surface_uuid,
+)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_restores_relaunched_trusted_seat(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """A reboot-relaunched seat whose pane, process, and proven anchor
+    all still hold is restored to active without any relaunch, new
+    workspace, or capability regeneration — even though the reboot
+    re-minted the workspace uuid around the surviving surface — so its
+    existing sidecar registers with the generation it already carries."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, lost_id = relaunched_seat_shape(database, bindings)
+    port = FakePort(live={REBOOTED_WORKSPACE})
+    report = await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+    active = bindings.active_lead("cell-demo")
+    assert active is not None
+    assert active.binding_id == original_id
+    assert active.generation == 1
+    assert active.ref == REBOOTED_WORKSPACE
+    assert original_id in report.replaced
+    assert bindings.get(lost_id).state == "lost"
+    assert port.created == []
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_without_live_worker(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(database, bindings)
+    port = FakePort(live={LEAD})
+    for verdict in (False, None):
+        await restoring_reconciler(
+            bindings, port, worker_alive=lambda _session, v=verdict: v
+        ).reconcile()
+        assert bindings.active_lead("cell-demo") is None
+    def raising(_session: str) -> bool:
+        raise RuntimeError("ps unavailable")
+    await restoring_reconciler(
+        bindings, port, worker_alive=raising
+    ).reconcile()
+    assert bindings.active_lead("cell-demo") is None
+    assert bindings.get(original_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_without_matching_proven_anchor(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """An anchor bound to a DIFFERENT surface (or a dead pane) is not
+    this seat's proof: nothing is restored."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry, surface_uuid=FRESH.surface_uuid)
+    original_id, _lost_id = relaunched_seat_shape(database, bindings)
+    port = FakePort(live={LEAD})
+    await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+    assert bindings.active_lead("cell-demo") is None
+    assert bindings.get(original_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_when_its_pane_is_gone(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(database, bindings)
+    port = FakePort(live=set())
+    await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+    assert bindings.active_lead("cell-demo") is None
+    assert bindings.get(original_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_restored_seat_registers_at_its_rebooted_workspace(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """Sol finding 1: restoration re-mints the binding's workspace, so
+    the proven anchor must follow it -- otherwise the trust gate keeps
+    comparing against the pre-reboot workspace and the restored seat is
+    unregisterable by either route."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    relaunched_seat_shape(database, bindings)
+    port = FakePort(live={REBOOTED_WORKSPACE})
+    await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+
+    gate = ChannelTrustGate(
+        database,
+        EventStore(database),
+        ChannelTrustAnchors(database, events=EventStore(database)),
+        ControlOperations(database, events=EventStore(database)),
+        lambda: DIALOG_TEXT,
+        lambda: None,
+    )
+    verdict = gate.evaluate(
+        cell_id="cell-demo",
+        session_id=SESSION,
+        workspace_uuid=REBOOTED_WORKSPACE.workspace_uuid,
+        surface_uuid=REBOOTED_WORKSPACE.surface_uuid,
+        profile_alias="max-a",
+        entry_path=entry,
+        package_root=entry.parents[2],
+        launch_argv=list(CHANNEL_ARGV),
+        screen_text=DIALOG_TEXT,
+    )
+    assert verdict.confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_restored_seat_refuses_any_other_workspace(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """The re-mint narrows trust rather than widening it: the pre-reboot
+    workspace and any unrelated one are both refused afterwards."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    relaunched_seat_shape(database, bindings)
+    port = FakePort(live={REBOOTED_WORKSPACE})
+    await restoring_reconciler(
+        bindings, port, worker_alive=lambda _session: True
+    ).reconcile()
+
+    gate = ChannelTrustGate(
+        database,
+        EventStore(database),
+        ChannelTrustAnchors(database, events=EventStore(database)),
+        ControlOperations(database, events=EventStore(database)),
+        lambda: DIALOG_TEXT,
+        lambda: None,
+    )
+    for workspace_uuid in (LEAD.workspace_uuid, FRESH.workspace_uuid):
+        verdict = gate.evaluate(
+            cell_id="cell-demo",
+            session_id=SESSION,
+            workspace_uuid=workspace_uuid,
+            surface_uuid=REBOOTED_WORKSPACE.surface_uuid,
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            launch_argv=list(CHANNEL_ARGV),
+            screen_text=DIALOG_TEXT,
+        )
+        assert verdict.confirmed is False
+        assert verdict.first_failure == "workspace_uuid"
+
+
+@pytest.mark.asyncio
+async def test_relaunched_seat_stays_stale_when_its_cell_moved_on(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """Sol finding 2: a stale anchored session and its live process can
+    outlive the cell that named them. A cell that has rotated to another
+    session/profile/lane, or gone inactive, must not have an obsolete
+    binding restored as its active owner."""
+
+    drifts = (
+        "UPDATE project_cells SET session_id = "
+        "'11111111-2222-4222-8222-333333333333' WHERE cell_id = 'cell-demo'",
+        "UPDATE project_cells SET profile_alias = 'max-b' "
+        "WHERE cell_id = 'cell-demo'",
+        "UPDATE project_cells SET lane_role = 'harness' "
+        "WHERE cell_id = 'cell-demo'",
+        "UPDATE project_cells SET state = 'archived' "
+        "WHERE cell_id = 'cell-demo'",
+    )
+    for index, drift in enumerate(drifts):
+        entry = trust_package(tmp_path / str(index))
+        capture_trust_anchor(database, entry)
+        original_id, _lost_id = relaunched_seat_shape(database, bindings)
+        database.execute(drift)
+        port = FakePort(live={REBOOTED_WORKSPACE})
+        await restoring_reconciler(
+            bindings, port, worker_alive=lambda _session: True
+        ).reconcile()
+        assert bindings.active_lead("cell-demo") is None
+        assert bindings.get(original_id).state == "stale"
+        assert (
+            ChannelTrustAnchors(database, events=EventStore(database))
+            .active_for_cell("cell-demo")
+            .workspace_uuid
+            == LEAD.workspace_uuid
+        )
+        database.execute("DELETE FROM project_cells")
+        database.execute("DELETE FROM cmux_surface_bindings")
+        database.execute("DELETE FROM channel_trust_anchors")
+
+
+def test_restore_lead_refuses_a_racing_owner_or_rotation(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """A change committed between selection and the restore write is
+    re-proved under the write lock, so restoration can never produce two
+    active owners or an obsolete one -- and the anchor never moves."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(database, bindings)
+    [(selected, anchor_id)] = bindings.restorable_relaunched_leads()
+    assert selected.binding_id == original_id
+    racing = bind_demo_lead(bindings, FRESH)
+    with pytest.raises(CmuxBindingConflict):
+        bindings.restore_lead(
+            original_id,
+            ref=REBOOTED_WORKSPACE,
+            reason="relaunched",
+            anchor_id=anchor_id,
+        )
+    bindings.mark_lost(str(racing.binding_id), reason="raced")
+    database.execute(
+        "UPDATE project_cells SET profile_alias = 'max-b' "
+        "WHERE cell_id = 'cell-demo'"
+    )
+    with pytest.raises(CmuxBindingConflict):
+        bindings.restore_lead(
+            original_id,
+            ref=REBOOTED_WORKSPACE,
+            reason="relaunched",
+            anchor_id=anchor_id,
+        )
+    assert bindings.get(original_id).state == "stale"
+    anchor = ChannelTrustAnchors(
+        database, events=EventStore(database)
+    ).active_for_cell("cell-demo")
+    assert anchor is not None
+    assert anchor.workspace_uuid == LEAD.workspace_uuid
+
+
+def test_restore_lead_refuses_when_the_selected_anchor_was_replaced(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """The restore must consume the exact anchor selected with the stale seat."""
+
+    entry = trust_package(tmp_path)
+    anchors = ChannelTrustAnchors(database, events=EventStore(database))
+    selected_anchor = capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(database, bindings)
+    anchors.rebind(
+        cell_id="cell-demo",
+        profile_alias="max-a",
+        entry_path=entry,
+        package_root=entry.parents[2],
+        channel_entry="server:hermes-control",
+        launch_argv_template=CHANNEL_ARGV,
+        workspace_uuid=FRESH.workspace_uuid,
+        surface_uuid=FRESH.surface_uuid,
+        session_id=SESSION,
+    )
+
+    with pytest.raises(CmuxBindingConflict):
+        bindings.restore_lead(
+            original_id,
+            ref=REBOOTED_WORKSPACE,
+            reason="relaunched",
+            anchor_id=selected_anchor.anchor_id,
+        )
+
+    assert bindings.get(original_id).state == "stale"
+    active_anchor = anchors.active_for_cell("cell-demo")
+    assert active_anchor is not None
+    assert active_anchor.anchor_id != selected_anchor.anchor_id
+    assert active_anchor.workspace_uuid == FRESH.workspace_uuid
+
+
+def test_an_anchor_remint_rolls_back_with_its_caller(
+    database: Database, tmp_path: Path
+) -> None:
+    """Sol 7f7fd46f: the restore path has to commit the anchor re-mint
+    and the binding write TOGETHER, so the re-mint rides the caller's
+    transaction. When that transaction rolls back the anchor must still
+    name its original workspace — otherwise a failure after the re-mint
+    leaves the anchor moved and the binding stale, which is exactly the
+    disagreement this correction exists to prevent."""
+
+    entry = trust_package(tmp_path)
+    capture_trust_anchor(database, entry)
+    anchors = ChannelTrustAnchors(database, events=EventStore(database))
+    before = anchors.active_for_cell("cell-demo")
+    assert before is not None
+
+    with (
+        pytest.raises(RuntimeError),
+        database.transaction() as connection,
+    ):
+            anchors._rebind_in(
+                connection,
+                cell_id="cell-demo",
+                profile_alias=before.profile_alias,
+                entry_path=entry,
+                package_root=entry.parents[2],
+                channel_entry=before.channel_entry,
+                launch_argv_template=before.launch_argv_template,
+                workspace_uuid=REBOOTED_WORKSPACE.workspace_uuid,
+                surface_uuid=before.surface_uuid,
+                session_id=before.session_id,
+            )
+            raise RuntimeError("the caller's own write failed")
+
+    after = anchors.active_for_cell("cell-demo")
+    assert after is not None
+    assert after.anchor_id == before.anchor_id
+    assert after.workspace_uuid == before.workspace_uuid

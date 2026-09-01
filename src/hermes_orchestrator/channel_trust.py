@@ -49,6 +49,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import uuid
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -581,6 +582,38 @@ class ChannelTrustAnchors:
         surface_uuid: str,
         session_id: str,
     ) -> ChannelTrustAnchor:
+        """Rotate one anchor in a transaction of its own; the contract
+        lives in :meth:`_rebind_in`, which a caller that must commit
+        this rotation WITH its own write calls on its open connection."""
+
+        with self._database.transaction() as connection:
+            return self._rebind_in(
+                connection,
+                cell_id=cell_id,
+                profile_alias=profile_alias,
+                entry_path=entry_path,
+                package_root=package_root,
+                channel_entry=channel_entry,
+                launch_argv_template=launch_argv_template,
+                workspace_uuid=workspace_uuid,
+                surface_uuid=surface_uuid,
+                session_id=session_id,
+            )
+
+    def _rebind_in(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        cell_id: str,
+        profile_alias: str,
+        entry_path: Path,
+        package_root: Path,
+        channel_entry: str,
+        launch_argv_template: Sequence[str],
+        workspace_uuid: str,
+        surface_uuid: str,
+        session_id: str,
+    ) -> ChannelTrustAnchor:
         """Carry an already-proven anchor forward across a managed
         rotation that changes only the seat's identity/location facts
         (session, surface, workspace, and — on a generation bump — the
@@ -731,89 +764,88 @@ class ChannelTrustAnchors:
 
         anchor_id = self._ids()
         stamp = self._now().isoformat()
-        with self._database.transaction() as connection:
-            # The same live double-check pattern capture() uses: a
-            # concurrent retire or rebind of this exact predecessor
-            # between the read above and this transaction fails closed
-            # rather than silently retiring the wrong row.
-            live = connection.execute(
-                "SELECT anchor_id FROM channel_trust_anchors "
-                "WHERE cell_id = ? AND state = 'active'",
-                (cell_id,),
-            ).fetchone()
-            if live is None or str(live["anchor_id"]) != predecessor.anchor_id:
-                raise TrustRefused(
-                    f"cell {cell_id!r}'s active anchor changed "
-                    "concurrently; refusing to rebind"
-                )
-            cursor = connection.execute(
-                "UPDATE channel_trust_anchors SET state = 'retired', "
-                "retired_at = ? WHERE anchor_id = ? AND state = 'active'",
-                (stamp, predecessor.anchor_id),
+        # The same live double-check pattern capture() uses: a
+        # concurrent retire or rebind of this exact predecessor
+        # between the read above and this transaction fails closed
+        # rather than silently retiring the wrong row.
+        live = connection.execute(
+            "SELECT anchor_id FROM channel_trust_anchors "
+            "WHERE cell_id = ? AND state = 'active'",
+            (cell_id,),
+        ).fetchone()
+        if live is None or str(live["anchor_id"]) != predecessor.anchor_id:
+            raise TrustRefused(
+                f"cell {cell_id!r}'s active anchor changed "
+                "concurrently; refusing to rebind"
             )
-            if cursor.rowcount != 1:
-                raise TrustRefused(
-                    f"anchor {predecessor.anchor_id!r} is not retireable"
-                )
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="channel_trust_anchor.retired",
-                    aggregate_type="channel_trust_anchor",
-                    aggregate_id=predecessor.anchor_id,
-                    payload={},
+        cursor = connection.execute(
+            "UPDATE channel_trust_anchors SET state = 'retired', "
+            "retired_at = ? WHERE anchor_id = ? AND state = 'active'",
+            (stamp, predecessor.anchor_id),
+        )
+        if cursor.rowcount != 1:
+            raise TrustRefused(
+                f"anchor {predecessor.anchor_id!r} is not retireable"
+            )
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="channel_trust_anchor.retired",
+                aggregate_type="channel_trust_anchor",
+                aggregate_id=predecessor.anchor_id,
+                payload={},
+            ),
+        )
+        connection.execute(
+            "INSERT INTO channel_trust_anchors("
+            "anchor_id, cell_id, profile_alias, canonical_entry_path, "
+            "entry_owner_uid, entry_sha256, dist_tree_sha256, "
+            "manifest_name, manifest_version, channel_entry, "
+            "build_mtime, launch_argv_template_json, workspace_uuid, "
+            "surface_uuid, session_id, prompt_pattern, state, "
+            "created_at, retired_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "'active', ?, NULL)",
+            (
+                anchor_id,
+                cell_id,
+                profile_alias,
+                str(entry_path),
+                entry_owner_uid,
+                entry_sha256,
+                dist_tree_sha256,
+                manifest_name,
+                manifest_version,
+                channel_entry,
+                build_mtime,
+                json.dumps(
+                    list(predecessor.launch_argv_template), sort_keys=True
                 ),
-            )
-            connection.execute(
-                "INSERT INTO channel_trust_anchors("
-                "anchor_id, cell_id, profile_alias, canonical_entry_path, "
-                "entry_owner_uid, entry_sha256, dist_tree_sha256, "
-                "manifest_name, manifest_version, channel_entry, "
-                "build_mtime, launch_argv_template_json, workspace_uuid, "
-                "surface_uuid, session_id, prompt_pattern, state, "
-                "created_at, retired_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "'active', ?, NULL)",
-                (
-                    anchor_id,
-                    cell_id,
-                    profile_alias,
-                    str(entry_path),
-                    entry_owner_uid,
-                    entry_sha256,
-                    dist_tree_sha256,
-                    manifest_name,
-                    manifest_version,
-                    channel_entry,
-                    build_mtime,
-                    json.dumps(
-                        list(predecessor.launch_argv_template), sort_keys=True
-                    ),
-                    workspace_uuid,
-                    surface_uuid,
-                    canonical_session,
-                    predecessor.prompt_pattern,
-                    stamp,
-                ),
-            )
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="channel_trust_anchor.rebound",
-                    aggregate_type="channel_trust_anchor",
-                    aggregate_id=anchor_id,
-                    payload={
-                        "cell_id": cell_id,
-                        "profile_alias": profile_alias,
-                        "canonical_entry_path": str(entry_path),
-                        "session_id": canonical_session,
-                        "predecessor_anchor_id": predecessor.anchor_id,
-                        "predecessor_profile_alias": predecessor.profile_alias,
-                        "selected_binding_id": selected_binding_id,
-                        "selected_intent_id": selected_intent_id,
-                    },
-                ),
-            )
+                workspace_uuid,
+                surface_uuid,
+                canonical_session,
+                predecessor.prompt_pattern,
+                stamp,
+            ),
+        )
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="channel_trust_anchor.rebound",
+                aggregate_type="channel_trust_anchor",
+                aggregate_id=anchor_id,
+                payload={
+                    "cell_id": cell_id,
+                    "profile_alias": profile_alias,
+                    "canonical_entry_path": str(entry_path),
+                    "session_id": canonical_session,
+                    "predecessor_anchor_id": predecessor.anchor_id,
+                    "predecessor_profile_alias": predecessor.profile_alias,
+                    "selected_binding_id": selected_binding_id,
+                    "selected_intent_id": selected_intent_id,
+                },
+            ),
+        )
         return self.get(anchor_id)
 
     def adopt(
