@@ -641,12 +641,15 @@ async def test_repeated_recovery_produces_one_replacement_and_one_execution(
         "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
     ) == str(REPLACEMENT_SESSION)
 
-    # Boundary 3: recovery completes seating; a further call is a no-op.
+    # Boundary 3: recovery completes seating. A further call is a NEW
+    # rotation request; the consumed handoff refuses it (Sol 3c1651df).
     second = await rotation.rotate("cell-demo")
     assert second.ok is True
     assert second.phase == "complete"
     third = await rotation.rotate("cell-demo")
-    assert third == second
+    assert third.ok is False
+    assert third.phase == "precondition"
+    assert "stale acknowledged handoff" in (third.failure or "")
 
     # One replacement lead, one effective handoff execution.
     assert runner.start_count == 1  # the initial dispatch only
@@ -690,6 +693,7 @@ async def test_resume_after_crash_cell_rotated_seat_still_incumbent(
     )
     handoff_id = submit_handoff(handoffs)
     runner.emit_handoff_ack = True
+    journal_rotation_attempt(database, handoff_id)
     rotated = await cells.rotate("cell-demo", handoff_id)
     assert rotated.session_id == REPLACEMENT_SESSION
     start_count_after_transfer = runner.start_count
@@ -711,7 +715,7 @@ async def test_resume_after_crash_cell_rotated_seat_still_incumbent(
 
 
 @pytest.mark.asyncio
-async def test_fully_rotated_and_seated_is_a_noop_success(
+async def test_completed_rotation_handoff_never_satisfies_a_new_request(
     database: Database,
     queue: QueueService,
     cells: ProjectCellService,
@@ -720,6 +724,11 @@ async def test_fully_rotated_and_seated_is_a_noop_success(
     seater: RecordingSeater,
     runner: RecordingRunner,
 ) -> None:
+    """Sol 3c1651df: after a rotation reports ``complete``, its handoff is
+    consumed. A later rotate-lead call is a NEW request and must fail
+    closed instead of returning a free no-op success — the live defect
+    reused exactly such a stale handoff while nothing rotated."""
+
     await start_cell(cells, queue)
     submit_handoff(handoffs)
     runner.emit_handoff_ack = True
@@ -733,11 +742,69 @@ async def test_fully_rotated_and_seated_is_a_noop_success(
 
     second = await rotation.rotate("cell-demo")
 
-    assert second == first
-    # A fully rotated and seated cell is a durable no-op: no second ack
-    # turn, no second lease, and no second seat activation call.
+    assert second.ok is False
+    assert second.phase == "precondition"
+    assert "stale acknowledged handoff" in (second.failure or "")
+    assert "fresh handoff" in (second.failure or "")
+    # Nothing moved: no second ack turn, lease, or seat activation.
     assert runner.start_count == start_count_after_first
     assert len(seater.calls) == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_pre_journal_stale_handoff_fails_closed(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """The live-defect shape itself: an acknowledged handoff whose
+    replacement already equals the durable incumbent, with NO journaled
+    attempt (it predates the attempt journal — e.g. handoff c194833f).
+    rotate-lead must refuse, not report ok, and must not transfer."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    handoffs.acknowledge(
+        handoff_id,
+        SESSION_ID,
+        "stale: replacement is the incumbent",
+        profile_alias="max-a",
+    )
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "precondition"
+    assert "stale acknowledged handoff" in (report.failure or "")
+    assert runner.start_count == 1  # only the initial dispatch
+    assert seater.calls == []
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+
+def journal_rotation_attempt(database: Database, handoff_id: str) -> None:
+    """Lay down the write-ahead ``lead_rotation.attempt`` a crashed real
+    run would have journaled before its transactional transfer."""
+
+    from hermes_orchestrator.events import EventInput, EventStore
+
+    events = EventStore(database)
+    with database.transaction() as connection:
+        events.append(
+            connection,
+            EventInput(
+                event_type="lead_rotation.attempt",
+                aggregate_type="handoff",
+                aggregate_id=handoff_id,
+                payload={"cell_id": "cell-demo"},
+            ),
+        )
 
 
 def null_out_replacement_profile(database: Database, handoff_id: str) -> None:

@@ -36,6 +36,7 @@ from hermes_orchestrator.cmux_surfaces import (
     classic_resume_command,
 )
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.handoffs import HandoffService
 
 # Mirrors cells._ACTIVE_CELL_STATES: the lifecycle states in which a
@@ -125,6 +126,7 @@ class LeadRotation:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._database = database
+        self._events = EventStore(database)
         self._handoffs = handoffs
         self._cells = cells
         self._bindings = bindings
@@ -136,7 +138,9 @@ class LeadRotation:
     async def rotate(self, cell_id: str) -> RotationReport:
         """Advance one cell's lead rotation exactly as far as durable
         state allows, resuming idempotently from wherever a prior run
-        (or this same run, replayed) left off."""
+        (or this same run, replayed) left off — up to, but not through,
+        a completed rotation's own terminal report (Sol correction
+        3c1651df; see the ``transfer_already_committed`` branch below)."""
 
         row = self._cell_row(cell_id)
         if row is None:
@@ -198,20 +202,50 @@ class LeadRotation:
             if handoff.replacement_session_id is not None
             else None
         )
-        already_rotated = (
+        transfer_already_committed = (
             handoff.state == "acknowledged"
             and replacement_from_handoff is not None
             and replacement_from_handoff == incumbent_session
         )
-        if already_rotated:
-            # cells.rotate() already committed its transactional transfer
-            # on a prior run: the durable session/profile ARE the
-            # replacement's. Calling rotate() again would try to reserve
-            # a replacement to exclude the profile the cell already
-            # holds, which is not the transition rotate() performs.
+        if transfer_already_committed:
+            # cells.rotate()'s transactional transfer already committed
+            # on a prior pass: the durable cell session/profile ARE this
+            # handoff's replacement. The cell/handoff rows alone cannot
+            # say WHICH pass produced that shape — an in-flight rotation
+            # resuming after a crash or a registration wait looks
+            # byte-identical to an old, fully reported rotation whose
+            # handoff merely remains the newest row (Sol correction
+            # 3c1651df: the live defect — a stale acknowledged handoff
+            # returned ok=true for a brand-new rotate-lead request while
+            # nothing rotated). The attempt journal is the durable
+            # discriminator: every rotation journals
+            # ``lead_rotation.attempt`` (write-ahead, before the
+            # transfer) and closes it with ``lead_rotation.completed``
+            # alongside the one ``complete`` report. An OPEN attempt for
+            # this handoff means the in-flight rotation may resume
+            # through the seat/registration phases below; no open
+            # attempt means the handoff was already consumed (or predates
+            # the attempt journal) and can never satisfy a new request —
+            # fail closed and demand a fresh handoff.
+            if not self._attempt_open(handoff_id):
+                return self._blocked(
+                    cell_id,
+                    handoff_id,
+                    phase="precondition",
+                    failure=(
+                        f"handoff {handoff_id!r} already completed a "
+                        "rotation onto the current incumbent "
+                        f"({incumbent_profile!r} / {incumbent_session}); a "
+                        "stale acknowledged handoff cannot satisfy a new "
+                        "rotation request. Submit a fresh handoff naming "
+                        "a new replacement for this cell, then retry "
+                        "rotate-lead"
+                    ),
+                )
             replacement_session = incumbent_session
             profile_alias = incumbent_profile
         else:
+            self._journal_attempt(cell_id, handoff_id)
             try:
                 rotated = await self._cells.rotate(cell_id, handoff_id)
             except RotationBlocked as error:
@@ -308,6 +342,7 @@ class LeadRotation:
         above and re-checks the registration."""
 
         if await self._replacement_is_registered(replacement_session):
+            self._journal_completed(cell_id, handoff_id, replacement_session)
             return RotationReport(
                 ok=True,
                 phase="complete",
@@ -351,6 +386,61 @@ class LeadRotation:
                 return False
             await self._sleep(1.0)
             elapsed += 1.0
+
+    def _attempt_open(self, handoff_id: str) -> bool:
+        """True while a journaled ``lead_rotation.attempt`` for
+        ``handoff_id`` has no matching ``lead_rotation.completed``. Only
+        such an open attempt may resume through the seat and
+        registration phases; a handoff without one — including every
+        handoff consumed before the attempt journal existed — never
+        satisfies a new rotation request (Sol correction 3c1651df)."""
+
+        return self._database.execute(
+            "SELECT 1 FROM events WHERE event_type = 'lead_rotation.attempt' "
+            "AND aggregate_id = ? AND NOT EXISTS ("
+            "SELECT 1 FROM events AS closed "
+            "WHERE closed.event_type = 'lead_rotation.completed' "
+            "AND closed.aggregate_id = ?) LIMIT 1",
+            (handoff_id, handoff_id),
+        ).fetchone() is not None
+
+    def _journal_attempt(self, cell_id: str, handoff_id: str) -> None:
+        """Write-ahead: bind this rotation attempt to its handoff before
+        the transactional transfer, exactly once per open attempt."""
+
+        if self._attempt_open(handoff_id):
+            return
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="lead_rotation.attempt",
+                    aggregate_type="handoff",
+                    aggregate_id=handoff_id,
+                    payload={"cell_id": cell_id},
+                ),
+            )
+
+    def _journal_completed(
+        self, cell_id: str, handoff_id: str, replacement_session: str
+    ) -> None:
+        """Close the attempt with the one ``complete`` report, once."""
+
+        if not self._attempt_open(handoff_id):
+            return
+        with self._database.transaction() as connection:
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="lead_rotation.completed",
+                    aggregate_type="handoff",
+                    aggregate_id=handoff_id,
+                    payload={
+                        "cell_id": cell_id,
+                        "replacement_session": replacement_session,
+                    },
+                ),
+            )
 
     def _cell_row(self, cell_id: str) -> object | None:
         return self._database.execute(

@@ -2190,12 +2190,11 @@ def test_rotate_lead_resumes_an_acknowledged_replacement_when_the_seat_was_lost(
 def test_rotate_lead_retry_after_seating_the_recovery_reuses_the_same_binding(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Once the recovered replacement's seat is durably bound, a retry
-    must resume through the very same derivation (durable cell, not the
-    binding) and report the identical effective replacement without a
-    second transfer or a second seat activation: ``already_rotated``
-    short-circuits the transfer, and the seat phase's own durable
-    binding check short-circuits activation."""
+    """Recovery completes and reports once; re-running rotate-lead after
+    that complete report is a NEW rotation request, and the consumed
+    handoff refuses it fail-closed with no second transfer or seat
+    activation (Sol 3c1651df — the in-flight dedup window before the
+    complete report is pinned by the lead-rotation suite instead)."""
 
     import hermes_orchestrator.cli as cli_module
     from hermes_orchestrator.cmux import CmuxSurfaceRef
@@ -2267,14 +2266,15 @@ def test_rotate_lead_retry_after_seating_the_recovery_reuses_the_same_binding(
         ]
     )
 
-    assert second.exit_code == 0
+    # Sol 3c1651df: the first invocation REPORTED complete, consuming the
+    # handoff. The retry is a new rotation request and must fail closed on
+    # the stale handoff instead of returning a free no-op success.
+    assert second.exit_code == 1
     second_payload = json.loads(second.stdout)
-    assert second_payload["phase"] == "complete"
-    assert second_payload["replacement_session"] == first_payload["replacement_session"]
-    assert second_payload["profile"] == "max-c"
-    assert second_payload["binding_id"] == first_payload["binding_id"]
-    assert second_payload["failure"] is None
-    # Seat activation ran exactly once across both invocations.
+    assert second_payload["ok"] is False
+    assert second_payload["phase"] == "precondition"
+    assert "stale acknowledged handoff" in (second_payload["failure"] or "")
+    # Seat activation still ran exactly once across both invocations.
     assert ensure_calls == [first_payload["replacement_session"]]
 
     database = Database.open(state_dir / "state.db")
