@@ -289,6 +289,21 @@ class MergerTurnService:
         missing leaves the row untouched and selection is unchanged.
         Reconciled rows are skipped in the same pass, so the next
         genuinely outstanding wake surfaces without a second call.
+
+        INFRA-218 S2: a second, independent retirement reason runs in the
+        same scan, mirroring the shape above exactly -- ``_reconcile_
+        superseded_wake`` retires an OBSOLETE older wake for the SAME
+        issue (unreviewed, or reviewed with corrections and no longer
+        live) once a strictly newer wake for that issue carries a
+        candidate SHA proven -- via ``ReviewService.
+        is_descendant_candidate`` -- to be a git descendant of the older
+        wake's ``candidate_sha``. Different issues never supersede each
+        other, a wake with a live submitted/settling verdict is never
+        retired, and the newest wake for an issue has no newer row to be
+        superseded by, so it is never retired either. Skipped rows are
+        the same terminal ``'completed'`` vocabulary written above, so
+        the surviving newest wake for the issue surfaces in this same
+        pass without a second call.
         """
 
         for state in ("admitted", "delivered"):
@@ -301,6 +316,8 @@ class MergerTurnService:
             ).fetchall()
             for row in rows:
                 if self._reconcile_settled_wake(project_key, state, row):
+                    continue
+                if self._reconcile_superseded_wake(project_key, state, row):
                     continue
                 return _row_to_event(row), state
         return None
@@ -361,6 +378,187 @@ class MergerTurnService:
                                 "review already merged and merge settlement "
                                 "already settled; reconciled before "
                                 "outstanding-wake selection (INFRA-216 R2)"
+                            ),
+                        },
+                    ),
+                )
+        return cursor.rowcount == 1
+
+    def _obsolete_wake_reason(
+        self,
+        project_key: str,
+        event_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> str | None:
+        """``'unreviewed'``/``'correction-completed'`` iff obsolete, else ``None``.
+
+        INFRA-218 S2: the two -- and only two -- ways an older wake can be
+        obsolete. ``unreviewed``: no ``submitted_verdicts`` row exists at
+        all for this exact event_id -- nothing was ever submitted for it.
+        ``correction-completed``: this event's own ``reviews`` row is
+        terminal at ``'corrections_required'`` -- its verdict returned
+        corrections and settled there; it is not merging and nothing
+        further is live for it. Anything else -- a live ``'submitted'``
+        row awaiting settlement, or a review that is ``'approved'``,
+        ``'merged'``, or otherwise still in flight -- is NOT obsolete and
+        answers ``None``, so it can never be retired here.
+
+        INFRA-218 Sol correction 44eb2806 (c): accepts an optional
+        transaction ``connection`` so ``_reconcile_superseded_wake`` can
+        RE-PROVE this exact predicate on the same connection immediately
+        before its retiring UPDATE -- a true compare-and-set read,
+        never a stale read taken before the transaction started.
+        Defaults to ``self._database`` (an out-of-transaction read) for
+        every other caller, unchanged.
+        """
+
+        executor = connection if connection is not None else self._database
+        submitted = executor.execute(
+            "SELECT 1 FROM submitted_verdicts WHERE project_key = ? "
+            "AND event_id = ? LIMIT 1",
+            (project_key, event_id),
+        ).fetchone()
+        if submitted is None:
+            return "unreviewed"
+        review = executor.execute(
+            "SELECT state FROM reviews WHERE project_key = ? AND event_id = ? "
+            "LIMIT 1",
+            (project_key, event_id),
+        ).fetchone()
+        if review is not None and str(review["state"]) == "corrections_required":
+            return "correction-completed"
+        return None
+
+    def _reconcile_superseded_wake(
+        self, project_key: str, state: str, row: sqlite3.Row
+    ) -> bool:
+        """Retire one OBSOLETE older wake proven superseded by a newer one.
+
+        INFRA-218 S2 (Linear clause 1): "A newer candidate for the same
+        issue whose commit is a descendant of an older candidate
+        supersedes that issue's obsolete unreviewed or
+        correction-completed wakes, so a stale wake can never hold
+        intake." Mirrors ``_reconcile_settled_wake`` exactly -- same
+        terminal ``'completed'`` state, same conditional UPDATE shape,
+        same single journaled event -- with a different, independent
+        retirement predicate:
+
+        1. This row's own wake must be obsolete (``_obsolete_wake_reason``);
+           a live submitted/settling verdict is never obsolete and this
+           returns ``False`` immediately.
+        2. Some OTHER admitted/delivered wake for the SAME
+           ``project_key`` and ``issue_id`` must exist strictly newer
+           than this row (later ``created_at``, tie-broken by rowid) --
+           different issues never supersede each other, and a row with
+           no strictly-newer sibling (including the newest wake for the
+           issue) is left untouched.
+        3. That newer wake's ``candidate_sha`` must be a PROVEN
+           descendant of this row's ``candidate_sha`` via
+           ``ReviewService.is_descendant_candidate`` -- fail-closed by
+           construction, so an unprovable or unrelated ancestry never
+           retires anything.
+
+        Returns ``True`` iff the row was retired (the caller keeps
+        scanning past it); ``False`` leaves it exactly as it was, still
+        outstanding. Idempotent: once retired the row is no longer
+        ``admitted``/``delivered`` and a later pass never reconsiders it.
+
+        INFRA-218 Sol correction 44eb2806 (c): steps 1-3 above classify
+        obsolescence and prove descendant ancestry OUTSIDE any
+        transaction, and the retiring UPDATE below used to guard only on
+        the wake's own ``state`` -- so a verdict submitted for this
+        EXACT event, concurrently with this method's read window, could
+        be orphaned: its wake would complete underneath it (state
+        ``'completed'``) with nothing left outstanding to settle it,
+        even though the verdict now genuinely needs settlement. Retiring
+        a wake is now a transactional compare-and-set: immediately
+        before the UPDATE, inside the SAME transaction, the obsolete
+        predicate is RE-PROVEN from ``_obsolete_wake_reason`` against
+        that transaction's own connection. Only an identical
+        classification to the one this call started with (no live
+        ``submitted`` row now exists for this event, and the review
+        state is still the one that made it obsolete) proceeds to
+        retirement; any drift -- most critically a verdict submitted in
+        the interim -- refuses retirement outright and leaves the wake
+        exactly as it was, still outstanding, so its now-live verdict is
+        never orphaned.
+        """
+
+        event_id = str(row["event_id"])
+        issue_id = str(row["issue_id"])
+        candidate_sha = str(row["candidate_sha"])
+        reason = self._obsolete_wake_reason(project_key, event_id)
+        if reason is None:
+            return False
+        anchor = self._database.execute(
+            "SELECT created_at, rowid AS rid FROM wake_deliveries "
+            "WHERE project_key = ? AND event_id = ?",
+            (project_key, event_id),
+        ).fetchone()
+        if anchor is None:
+            return False
+        newer_rows = self._database.execute(
+            "SELECT candidate_sha FROM wake_deliveries WHERE project_key = ? "
+            "AND issue_id = ? AND state IN ('admitted', 'delivered') "
+            "AND event_id != ? "
+            "AND (created_at > ? OR (created_at = ? AND rowid > ?)) "
+            "ORDER BY created_at ASC, rowid ASC",
+            (
+                project_key,
+                issue_id,
+                event_id,
+                anchor["created_at"],
+                anchor["created_at"],
+                anchor["rid"],
+            ),
+        ).fetchall()
+        superseded_by: str | None = None
+        for newer in newer_rows:
+            newer_sha = str(newer["candidate_sha"])
+            if self._reviews.is_descendant_candidate(
+                project_key, newer_sha=newer_sha, older_sha=candidate_sha
+            ):
+                superseded_by = newer_sha
+                break
+        if superseded_by is None:
+            return False
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            # INFRA-218 Sol correction 44eb2806 (c): the transactional
+            # compare-and-set re-proof -- refuse retirement if a
+            # concurrently submitted verdict (or any other drift) has
+            # made this wake no longer obsolete for the reason it was
+            # classified under, above.
+            live_reason = self._obsolete_wake_reason(
+                project_key, event_id, connection=connection
+            )
+            if live_reason != reason:
+                return False
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET state = 'completed', "
+                "updated_at = ? WHERE project_key = ? AND event_id = ? "
+                "AND state = ?",
+                (stamp, project_key, event_id, state),
+            )
+            if cursor.rowcount == 1:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="wake_delivery.reconciled_complete",
+                        aggregate_type="wake_delivery",
+                        aggregate_id=f"wake:{project_key}:{event_id}",
+                        correlation_id=event_id,
+                        actor="merger_turns",
+                        payload={
+                            "project_key": project_key,
+                            "issue_id": issue_id,
+                            "candidate_sha": candidate_sha,
+                            "prior_state": state,
+                            "reason": (
+                                f"superseded by proven descendant candidate "
+                                f"{superseded_by} for the same issue "
+                                f"({reason}; INFRA-218 S2)"
                             ),
                         },
                     ),

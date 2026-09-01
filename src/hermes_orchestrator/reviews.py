@@ -16,6 +16,7 @@ the lead. CircleCI is never polled here.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -33,9 +34,17 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import MergeBlocked, MergeEffectJournal
 from hermes_orchestrator.lead_assignments import LeadAssignments
-from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.linear import (
+    _ALLOWED_STATUS_TRANSITIONS as _LINEAR_STATUS_TRANSITIONS,
+)
+from hermes_orchestrator.linear import (
+    ExternalEffectStore,
+    LinearProjection,
+    projection_request,
+)
 from hermes_orchestrator.manifests import CandidateManifest
 from hermes_orchestrator.merge import (
     IntegrationMerge,
@@ -69,6 +78,46 @@ _LIVE_STATES = (
     "blocked",
     "reconciliation_required",
 )
+
+# INFRA-218 Sol correction d65491fe (defect 2): ``LinearClient.project``
+# raises exactly this message (see linear.py's transition-legality check)
+# when the live current status and the requested target status are not a
+# legal single-hop pair. Parsed here so a replay can recover the actual
+# live current status without a second read of its own -- the message is
+# the only channel the ``LinearProjector`` protocol exposes for it.
+_TRANSITION_NOT_ALLOWED = re.compile(
+    r"^Linear status transition (?P<current>.+) -> (?P<target>.+) is not allowed$"
+)
+
+
+def _legal_status_path(current: str, target: str) -> tuple[str, ...] | None:
+    """The shortest legal hop sequence from ``current`` to ``target``.
+
+    Walks ``linear._ALLOWED_STATUS_TRANSITIONS`` breadth-first so a stored
+    target unreachable in a single hop (e.g. "In Development" -> "Done")
+    is instead reached through its legal intermediate states ("In
+    Development" -> "Review" -> "Done"). Returns the hop statuses AFTER
+    ``current``, ending with ``target`` -- empty when they already match.
+    ``None`` when no legal walk exists at all.
+    """
+
+    if current == target:
+        return ()
+    frontier: list[tuple[str, tuple[str, ...]]] = [(current, ())]
+    seen = {current}
+    while frontier:
+        next_frontier: list[tuple[str, tuple[str, ...]]] = []
+        for status, path in frontier:
+            for from_status, to_status in _LINEAR_STATUS_TRANSITIONS:
+                if from_status != status or to_status in seen:
+                    continue
+                hop_path = (*path, to_status)
+                if to_status == target:
+                    return hop_path
+                seen.add(to_status)
+                next_frontier.append((to_status, hop_path))
+        frontier = next_frontier
+    return None
 
 
 class LinearProjector(Protocol):
@@ -186,6 +235,17 @@ class ReviewService:
         self._lead = lead
         self._settlements = settlements
         self._merge_journal = merge_journal
+        # INFRA-218 Sol correction deb5ec49: the same target-only durable
+        # journal activation already relies on (``ExternalEffectStore``,
+        # adopted via ``begin``/``begin_in`` in ``cells.py``), built over
+        # this same ``database`` so it reads and writes the identical
+        # ``external_effects`` rows a real ``LinearClient`` would use.
+        # ``_project_after_merge`` journals the exact ordinary post-merge
+        # Linear target here BEFORE its first live read, and
+        # ``reconcile_post_merge_projections`` replays whatever is left
+        # pending from the same recovery boundary as
+        # ``reconcile_acceptance``.
+        self._effects = ExternalEffectStore(database)
         # INFRA-198 J1: optional post-merge acceptance policy. When wired
         # and a pending gate exists, a proven merge holds the issue in
         # ``post_merge_acceptance`` instead of completing it; ``None``
@@ -450,6 +510,14 @@ class ReviewService:
         # An unexpected exception leaves the settlement 'merging' under
         # its lease: nothing is released (the mutation state is
         # unknown) and exactly one resumer re-drives after expiry.
+        #
+        # INFRA-218 Sol correction 44eb2806 (a): captured BEFORE the
+        # drive, so it reflects whether this call is the fresh merge
+        # (the review entered ``approved``) or a resumed convergence of
+        # an already-``merged`` review — the exact ``reconciling``
+        # distinction ``_project_after_merge`` requires, now threaded
+        # from here instead of from inside ``_drive_merge``.
+        was_already_merged = record.state == "merged"
         outcome = await self._drive_merge(review_id)
         if outcome.state == "merged":
             self._settlements.mark_merged(
@@ -463,6 +531,22 @@ class ReviewService:
                 ),
             )
             self._settlements.mark_settled(review_id, token=token)
+            # INFRA-218 Sol correction 44eb2806 (a): the durable
+            # settlement is now TERMINAL — ``merged`` and ``settled``,
+            # carrying the real ``merge_sha`` — before the post-merge
+            # Linear projection is attempted at all. No projection call
+            # is ever awaited while the ``merging`` lease is open, so a
+            # cancellation, a killed process, or an indefinitely hung
+            # Linear call can no longer strand a proven merge behind a
+            # non-terminal settlement: the worst it can do now is leave
+            # the ALREADY-terminal settlement's projection pending,
+            # which ``reconcile_post_merge_projections`` (riding the
+            # same ``resume_settlements`` boundary) replays from the
+            # intent ``_project_after_merge`` journals before its first
+            # live Linear read (Sol correction deb5ec49).
+            await self._project_fail_soft(
+                self._get(review_id), reconciling=was_already_merged
+            )
         elif outcome.state in ("deferred", STALE_SETTLEMENT):
             # Nothing external happened under the claim: a stale
             # pre-mutation revalidation releases back to ``recorded`` so
@@ -493,6 +577,11 @@ class ReviewService:
         # composing the pass here reaches every recovery entry without
         # touching those callers.
         await self.reconcile_acceptance(project_key)
+        # INFRA-218 Sol correction deb5ec49: rides the identical recovery
+        # boundary as ``reconcile_acceptance`` above to replay any
+        # ordinary (non-acceptance-gated) post-merge Linear projection
+        # left durably pending by a first-read outage.
+        await self.reconcile_post_merge_projections(project_key)
         return tuple(outcomes)
 
     async def reconcile_acceptance(
@@ -615,6 +704,219 @@ class ReviewService:
                 )
         return tuple(repairs)
 
+
+    def _reconstruct_missing_after_merge_intents(
+        self, project_key: str | None
+    ) -> None:
+        """Re-journal an after-merge intent lost to a post-settle crash.
+
+        INFRA-218 Sol correction d65491fe. Selects every settled
+        settlement whose review is proven merged and which has NO
+        after-merge effect row (neither pending nor completed), and
+        re-creates the exact intent the fresh path would have written.
+        Deterministic by construction: the effect id and the target both
+        come from the merged review row, so this is idempotent against
+        any real intent and against itself. A review with no stored
+        projection is skipped — there is nothing to reconstruct and
+        inventing a target would be a guess.
+        """
+
+        rows = self._database.execute(
+            "SELECT r.issue_id AS issue_id, r.review_id AS review_id "
+            "FROM reviews r JOIN merge_settlements s "
+            "  ON s.settlement_id = r.review_id "
+            "WHERE r.state = 'merged' AND r.merge_sha IS NOT NULL "
+            "  AND s.state = 'settled' "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM external_effects e "
+            "    WHERE e.effect_id = 'linear:' || r.issue_id "
+            "      || ':after-merge:' || r.review_id"
+            "  )"
+        ).fetchall()
+        for row in rows:
+            record = self._merged_review(str(row["issue_id"]))
+            if record is None or record.projection is None:
+                continue
+            if project_key is not None and record.project_key != project_key:
+                continue
+            if (
+                self._acceptance is not None
+                and self._acceptance.get(record.issue_id) is not None
+            ):
+                # Acceptance-GATED issues are not ours to reconstruct.
+                # Their post-merge projection is owned end to end by the
+                # gate path (hold, then its own satisfaction convergence)
+                # under DIFFERENT effect identities, so a missing
+                # after-merge row there means the ordinary branch never
+                # ran -- not that an intent was lost. Reconstructing one
+                # would re-apply a Done the gate path already converged,
+                # which is exactly the duplicate this guard prevents.
+                continue
+            effect_id = (
+                f"linear:{record.issue_id}:after-merge:{record.review_id}"
+            )
+            try:
+                self._effects.begin(
+                    effect_id,
+                    target=record.issue_id,
+                    request=projection_request(
+                        record.issue_id, record.projection
+                    ),
+                )
+            except Exception as error:  # pragma: no cover - infra guard
+                print(
+                    "post-merge intent reconstruction failed for "
+                    f"{effect_id!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+
+    async def reconcile_post_merge_projections(
+        self, project_key: str | None = None
+    ) -> tuple[str, ...]:
+        """Replay every ordinary post-merge Linear projection left pending.
+
+        INFRA-218 Sol correction deb5ec49: S1(a)/S3 made every post-merge
+        projection fail soft (``_project_fail_soft``) so a durably-proven
+        merge or settlement always reaches its terminal state even when
+        Linear raises. But Sol's finding is that a successfully settled
+        ORDINARY (non-acceptance-gated) merge is never returned by
+        ``resume_settlements`` again once ``settled``, and
+        ``reconcile_acceptance`` only repairs acceptance-GATED issues —
+        so if the very FIRST Linear read for that projection failed
+        (``LinearClient.project`` only journals its own pending row
+        AFTER that read succeeds), nothing durable survived to retry and
+        Linear could stay permanently stale despite a fully converged
+        Git/GitHub settlement.
+
+        The fix lives in two halves. ``_project_after_merge``'s ordinary
+        branch now journals the exact target — issue, status, assignee
+        alias, and this effect's id — through ``self._effects`` (the
+        same target-only ``ExternalEffectStore`` primitive activation
+        already uses via ``ExternalEffectStore.begin_in`` in
+        ``cells._activate_issue_transaction``) BEFORE calling
+        ``self._linear.project``, so a pending row always survives even
+        a first-read outage. This method is the other half: it rides the
+        same ``resume_settlements`` recovery boundary as
+        ``reconcile_acceptance`` and re-drives every such pending row
+        against the journaled target — no new GitHub merge, no new
+        protocol, just an idempotent replay of the same
+        ``LinearClient.project`` call. A row already completed (by the
+        live projector or by :meth:`_complete_post_merge_effect`) is
+        never selected again, so a repeated recovery pass is a stable
+        no-op, and each failure here is reported and left for the next
+        boundary exactly like ``reconcile_acceptance`` already does per
+        gate.
+
+        INFRA-218 Sol correction 44eb2806 (b): a stored pending target
+        can predate a NEW acceptance gate created after the ordinary
+        (non-gated) projection was journaled — the gate pending at
+        merge time always wins in ``_project_after_merge``, but a LATE
+        gate arriving after journaling has no way to intercept a
+        replay of the already-stored target, which would otherwise
+        project the stale Done/QA target and override the required
+        acceptance hold. Before replaying any stored target, this loop
+        re-evaluates current acceptance policy with the exact same
+        read ``_project_after_merge`` uses for a fresh merge
+        (``self._acceptance.pending(issue_id)``) — the same predicate
+        ``reconcile_acceptance`` polices from the gate's side. When a
+        gate now requires a hold, the stale stored target is suppressed
+        entirely (never projected) and replaced with the required
+        ``_hold_for_acceptance`` projection (post_merge_acceptance /
+        In Development) instead, then the original pending effect is
+        marked completed so it is never reconsidered — the hold is the
+        durable terminal projection for this merge now, exactly as if
+        the gate had existed at merge time.
+        """
+
+        # INFRA-218 Sol correction d65491fe (defect 1): the previous
+        # correction moved the projection AFTER the terminal
+        # ``mark_settled`` write so nothing is ever awaited under the
+        # merge lease — but that opened a narrow window of its own. A
+        # crash between that terminal write and
+        # ``_project_after_merge``'s ``self._effects.begin`` leaves a
+        # SETTLED settlement whose review is merged and NO after-merge
+        # effect row at all, so the pending scan below finds nothing and
+        # the projection is lost permanently. Reverting to projecting
+        # under the lease is not the fix (it restores the stranding
+        # defect), so the missing intent is instead reconstructed here,
+        # deterministically, from the merged review itself: the same
+        # ``linear:<issue>:after-merge:<review>`` effect id and the same
+        # stored ``record.projection`` target the fresh path would have
+        # journaled. Because the id is identical, a reconstruction can
+        # never double-apply against a real one, and a later pass finds
+        # the row already present.
+        self._reconstruct_missing_after_merge_intents(project_key)
+        rows = self._database.execute(
+            "SELECT effect_id, request_json FROM external_effects "
+            "WHERE adapter = 'linear' AND operation = 'project' "
+            "AND state = 'pending' AND effect_id LIKE 'linear:%:after-merge:%'"
+        ).fetchall()
+        replayed: list[str] = []
+        for row in rows:
+            effect_id = str(row["effect_id"])
+            try:
+                request = json.loads(row["request_json"])
+                issue_id = str(request["issue_id"])
+                target = LinearProjection.model_validate(request["target"])
+            except (KeyError, TypeError, ValueError) as error:
+                print(
+                    "post-merge projection recovery could not parse "
+                    f"{effect_id!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            record = self._merged_review(issue_id)
+            if record is None:
+                continue
+            if project_key is not None and record.project_key != project_key:
+                continue
+            if self._acceptance is not None and self._acceptance.pending(issue_id):
+                # INFRA-218 Sol correction 44eb2806 (b): a gate now
+                # requires a hold — suppress the stale stored Done/QA
+                # target and replace it with the required hold instead
+                # of replaying stale completion over it.
+                try:
+                    await self._hold_for_acceptance(record, reconciling=True)
+                    self._complete_post_merge_effect(effect_id)
+                    replayed.append(effect_id)
+                except Exception as error:  # fail soft: retries later
+                    print(
+                        "post-merge acceptance-hold recovery for "
+                        f"{effect_id!r} failed and will retry at the "
+                        f"next recovery boundary: {type(error).__name__}: "
+                        f"{error}",
+                        file=sys.stderr,
+                    )
+                continue
+            try:
+                await self._linear.project(issue_id, target, effect_id=effect_id)
+                self._complete_post_merge_effect(effect_id)
+                replayed.append(effect_id)
+            except Exception as error:  # fail soft: the durable row retries later
+                print(
+                    "post-merge projection recovery for "
+                    f"{effect_id!r} failed and will retry at the next "
+                    f"recovery boundary: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+        return tuple(replayed)
+
+    def _complete_post_merge_effect(self, effect_id: str) -> None:
+        """Complete a post-merge Linear effect a live client left pending.
+
+        A real ``LinearClient.project`` already completes its own
+        journal row internally before returning successfully, so this
+        is a no-op against production. It exists only for a
+        :class:`LinearProjector` that never touches the journal (a bare
+        test double), so a successful call still leaves the durable row
+        completed and ``reconcile_post_merge_projections`` never
+        re-selects it.
+        """
+
+        effect = self._effects.get(effect_id)
+        if effect is not None and effect.state != "completed":
+            self._effects.complete(effect_id, {"completed": True})
+
     def _merged_review(self, issue_id: str) -> ReviewRecord | None:
         """The newest proven merged review for ``issue_id``, if any."""
 
@@ -646,7 +948,26 @@ class ReviewService:
             # acknowledged) assignment instead of opening a fresh
             # dispatch epoch that supersedes one the lead already
             # acknowledged.
-            await self._project_after_merge(record, reconciling=True)
+            #
+            # INFRA-218 (a): the merge itself was already proven on the
+            # pass that first recorded ``merged`` — this branch's own
+            # job is convergence of the settlement row, not projection.
+            # A downstream projection failure (Linear, the acceptance
+            # hold, or an assignment dispatch) must never re-strand an
+            # already-proven merge under a fresh lease forever: that is
+            # exactly the live INFRA-216 blocker, where a settlement
+            # already ``merging`` with an ``externally_merged`` path
+            # re-raised on every resume and never reached ``settled``.
+            # INFRA-218 Sol correction 44eb2806 (a): no projection call
+            # here either — this branch performs no mutation at all,
+            # and ``merge_approved`` now performs the projection, as
+            # separately recoverable work, only after ITS OWN
+            # ``mark_merged``/``mark_settled`` tail (which runs right
+            # after this method returns) has converged the settlement
+            # to ``settled``. Leave the durable projection inputs (the
+            # acceptance gate row, the queue state, the stored review
+            # projection) exactly as they are — no new merge is ever
+            # performed on this path.
             return _outcome(record, reason=record.reason or "merged")
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
@@ -790,7 +1111,36 @@ class ReviewService:
     async def _settle_proven(
         self, record: ReviewRecord, proven: Any, *, reason: str
     ) -> MergeOutcome:
-        """Journal, transition, and project one proven merge; idempotent."""
+        """Journal and transition one proven merge to ``merged``; idempotent.
+
+        INFRA-218 Sol correction 44eb2806 (a): this method used to also
+        AWAIT the post-merge Linear projection here, before either of
+        its callers (``_drive_merge`` and ``reconcile_external_merge``)
+        had run the settlement's own ``mark_merged``/``mark_settled``
+        tail -- so the durable settlement row sat in its ``merging``
+        lease for the full duration of a Linear call. ``_project_fail_
+        soft`` only catches ``Exception``, so ``asyncio.CancelledError``
+        (a ``BaseException``), a killed process, or an indefinitely
+        hung Linear call left a genuinely proven merge (``reviews.state
+        == 'merged'``, real ``merge_sha``) stuck behind a settlement
+        that never reached ``settled``. A targeted cancellation probe
+        reproduced exactly this split.
+
+        The fix is ordering, not exception handling: this method now
+        performs ONLY the durable, already-local writes -- the CI
+        window record, the review's ``merged`` transition with its
+        proven ``merge_sha``, the fast-path callback, and the
+        ``merge.proven`` event -- and returns. It never calls
+        ``self._linear`` (directly or via ``_project_fail_soft``) at
+        all. Both callers now run the settlement's ``mark_merged``/
+        ``mark_settled`` tail against this already-terminal review
+        BEFORE performing the post-merge projection as separate,
+        independently recoverable work -- so no projection is ever
+        awaited while the merge lease is open, and the projection
+        intent journaled by ``_project_after_merge`` (Sol correction
+        deb5ec49) together with ``reconcile_post_merge_projections``
+        still replays it if this process never gets that far.
+        """
 
         self._window.record_merge(proven)
         projection = self._qa.after_merge(record.issue_id)
@@ -820,7 +1170,12 @@ class ReviewService:
                     file=sys.stderr,
                 )
         self._record_merge_proven(record, proven, reason=reason)
-        await self._project_after_merge(record)
+        # INFRA-218 Sol correction 44eb2806 (a): no projection call here
+        # any more — see the docstring above. The caller's settlement
+        # tail (``mark_merged``/``mark_settled``) runs against this
+        # already-``merged`` review immediately after this returns, and
+        # ONLY THEN does the caller perform the post-merge projection as
+        # separately recoverable work.
         return _outcome(record, reason=record.reason or "merged")
 
     def _record_merge_proven(
@@ -1119,15 +1474,21 @@ class ReviewService:
                 state="deferred",
                 reason="the exclusive merge claim is held elsewhere",
             )
-        if record.state == "merged":
+        # INFRA-218 Sol correction 44eb2806 (a): captured before either
+        # branch runs, mirroring ``merge_approved`` — reflects whether
+        # this call is the fresh reconciliation (the review enters
+        # anything other than ``merged``) or a resumed convergence of
+        # an already-``merged`` review, the exact ``reconciling``
+        # distinction ``_project_after_merge`` requires.
+        was_already_merged = record.state == "merged"
+        if was_already_merged:
             # Same replay character as ``_drive_merge``'s already-merged
             # branch (Sol Critical a626cf1f): reaching here with the
             # review already ``merged`` means a prior pass completed
             # ``_settle_proven`` and crashed before this method's own
             # ``mark_merged``/``mark_settled`` tail below, so this is a
             # resumed reconciliation, never the merge that just
-            # happened. Dedup against a live assignment instead.
-            await self._project_after_merge(record, reconciling=True)
+            # happened. No projection call here — see below.
             outcome = _outcome(record, reason=record.reason or "merged")
         else:
             outcome = await self._settle_proven(
@@ -1139,6 +1500,14 @@ class ReviewService:
             review_id, token=token, merge_sha=proven.merge_sha
         )
         self._settlements.mark_settled(review_id, token=token)
+        # INFRA-218 Sol correction 44eb2806 (a): the settlement is now
+        # TERMINAL before the post-merge Linear projection is ever
+        # attempted — see ``merge_approved`` for the full rationale.
+        # Dedup against a live assignment on a replay via
+        # ``reconciling``, exactly as before.
+        await self._project_fail_soft(
+            self._get(review_id), reconciling=was_already_merged
+        )
         return outcome
 
     # -- QA ---------------------------------------------------------------
@@ -1193,6 +1562,37 @@ class ReviewService:
             (issue_id, *_LIVE_STATES),
         ).fetchone()
         return None if row is None else _row_to_record(row)
+
+    def is_descendant_candidate(
+        self, project_key: str, *, newer_sha: str, older_sha: str
+    ) -> bool:
+        """True iff ``newer_sha`` is a proven descendant of ``older_sha``.
+
+        INFRA-218 (S2 plumbing): candidate supersession needs the exact
+        ancestry predicate the merge machinery already owns and proves
+        with — ``AncestryVerifier.is_ancestor`` over the project's own
+        checkout, the same port and repository path
+        :class:`~hermes_orchestrator.merge.IntegrationMerge` uses when
+        it proves a candidate reachable from its merge commit. That
+        port is private to the merge state machine, so this narrow
+        read-only accessor exposes exactly the one question wake
+        supersession must answer, and nothing else: no merge, no
+        mutation, no new git surface.
+
+        Fail closed: an unknown project, an identical pair (a commit is
+        never its own supersessor), or any git error answers ``False``,
+        so an unprovable relationship can never retire a wake.
+        """
+
+        project = self._projects.get(project_key)
+        if project is None or newer_sha == older_sha:
+            return False
+        try:
+            return self._merge.is_ancestor_commit(
+                project_key, ancestor=older_sha, descendant=newer_sha
+            )
+        except GitError:
+            return False
 
     def issue_for_candidate(self, project_key: str, reviewed_sha: str) -> str | None:
         """The issue whose review bound this exact candidate SHA, if any."""
@@ -1341,6 +1741,38 @@ class ReviewService:
             effect_id=effect_id,
         )
 
+    async def _project_fail_soft(
+        self, record: ReviewRecord, *, reconciling: bool
+    ) -> None:
+        """Run :meth:`_project_after_merge`, but never let it block settlement.
+
+        INFRA-218 (S3), generalizing S1(a): a durably-proven merge or
+        settlement must reach its terminal durable state regardless of
+        any downstream Linear/queue/assignment projection failure — a
+        missing stored projection, a Linear API error, an
+        acceptance-dispatch failure. Every caller of
+        ``_project_after_merge`` reaches it only after its own durable
+        write has already committed (the review row's ``merged``
+        transition and ``merge.proven`` event for the fresh caller in
+        ``_settle_proven``; nothing new at all for the replay callers
+        in ``_drive_merge`` and ``reconcile_external_merge``, which
+        perform no mutation), so a projection failure here is reported
+        and left for the next recovery boundary — ``reconcile_acceptance``,
+        riding the same ``resume_settlements`` pass — to repair,
+        exactly as that pass already fails soft per gate.
+        """
+
+        try:
+            await self._project_after_merge(record, reconciling=reconciling)
+        except Exception as error:
+            print(
+                "post-merge projection for "
+                f"{record.review_id!r} failed and will retry at the "
+                f"next recovery boundary: {type(error).__name__}: "
+                f"{error}",
+                file=sys.stderr,
+            )
+
     async def _project_after_merge(
         self, record: ReviewRecord, *, reconciling: bool = False
     ) -> None:
@@ -1373,11 +1805,90 @@ class ReviewService:
             actor="codex_merger",
             reason=f"merged {record.merge_sha}",
         )
-        await self._linear.project(
-            record.issue_id,
-            projection,
-            effect_id=f"linear:{record.issue_id}:after-merge:{record.review_id}",
+        effect_id = f"linear:{record.issue_id}:after-merge:{record.review_id}"
+        # INFRA-218 Sol correction deb5ec49: journal the exact target
+        # BEFORE the first live Linear read (the identical target-only
+        # primitive activation already uses — see
+        # ``ExternalEffectStore.begin_in`` in
+        # ``cells._activate_issue_transaction``), so an outage on that
+        # very first ``validate_issue`` read still leaves a durable
+        # pending row for ``reconcile_post_merge_projections`` to
+        # replay. ``begin`` adopts an already-pending or already-
+        # completed row untouched, so a replay of this method (a
+        # resumed settlement whose review was already ``merged`` on a
+        # prior pass) never double-journals.
+        self._effects.begin(
+            effect_id,
+            target=record.issue_id,
+            request=projection_request(record.issue_id, projection),
         )
+        # INFRA-218 Sol correction d65491fe (defect 2): route through the
+        # legal-walk applier below rather than a bare ``self._linear.project``
+        # call, so even a fresh merge whose issue drifted status between the
+        # review being opened and the merge landing converges instead of
+        # raising.
+        await self._apply_after_merge_target(record.issue_id, projection, effect_id)
+
+    async def _apply_after_merge_target(
+        self, issue_id: str, target: LinearProjection, effect_id: str
+    ) -> None:
+        """Apply an after-merge Linear target, walking illegal hops.
+
+        INFRA-218 Sol correction d65491fe (defect 2): a stored Done/QA
+        target can be unreachable in a single hop from the issue's CURRENT
+        Linear status -- a review whose stored target is "Done" replayed
+        while the issue is still "In Development" is not a legal direct
+        pair in ``linear._ALLOWED_STATUS_TRANSITIONS``, and
+        ``LinearClient.project`` raises rather than mutating. That raise
+        names the live current status in its message; :data:`_legal_status_path`
+        walks the legal intermediate states from that status to
+        ``target.status`` (e.g. In Development -> Review -> Done), applying
+        one hop at a time. Each hop is projected under its own deterministic
+        effect id (the base id suffixed with the hop's status), so a replay
+        of any hop is idempotent and a partial walk (crash mid-walk) resumes
+        exactly where it stopped -- the final hop reuses the ORIGINAL
+        ``effect_id`` and the exact ``target``, so the durable pending row
+        this effect id names completes normally, exactly as a direct
+        single-hop projection would have. When no legal walk exists at all,
+        the intent is left pending (not raised) for the next recovery
+        boundary -- the caller's own fail-soft wrapper never sees an
+        exception for this case.
+        """
+
+        try:
+            await self._linear.project(issue_id, target, effect_id=effect_id)
+            self._complete_post_merge_effect(effect_id)
+            return
+        except ValueError as error:
+            match = _TRANSITION_NOT_ALLOWED.match(str(error))
+            if match is None or target.status is None:
+                raise
+            current_status = match.group("current")
+
+        path = _legal_status_path(current_status, target.status)
+        if path is None:
+            print(
+                "post-merge projection for "
+                f"{effect_id!r} has no legal Linear status walk from "
+                f"{current_status!r} to {target.status!r}; left pending "
+                "for the next recovery boundary",
+                file=sys.stderr,
+            )
+            return
+
+        for hop_status in path[:-1]:
+            hop_effect_id = f"{effect_id}:via:{hop_status.replace(' ', '-')}"
+            await self._linear.project(
+                issue_id,
+                LinearProjection(
+                    status=hop_status, assignee_alias=target.assignee_alias
+                ),
+                effect_id=hop_effect_id,
+            )
+            self._complete_post_merge_effect(hop_effect_id)
+
+        await self._linear.project(issue_id, target, effect_id=effect_id)
+        self._complete_post_merge_effect(effect_id)
 
     async def _hold_for_acceptance(
         self, record: ReviewRecord, *, reconciling: bool = False
