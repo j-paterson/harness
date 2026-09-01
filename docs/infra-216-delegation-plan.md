@@ -102,3 +102,58 @@ The packet-provenance ledger could not be reserved for this
 assignment (operator pane down; explicit manual bootstrap with no
 intake packet). Delegation is recorded here and in the candidate
 message to Sol.
+
+## v2 amendment: Sol rework (2026-09-01)
+
+Sol's verdict on candidate `e2196ba`: **W1 kept; W2 rejected.**
+`hermes chat --continue <session> -q <literal> -Q` starts a separate
+one-shot Hermes process against the same durable session — it runs a
+turn out-of-band and does NOT resume the persistent `/goal` loop in
+the visible cmux chat process, which is the behavior the issue
+requires. Directed rework, delegated as two packets; no live restart
+drill, no PR, no new protocol or provenance machinery.
+
+Lead-owned removal (mechanical, done before delegation): W2's
+`chat_resume.py`, `tests/test_chat_resume.py`, migration
+`0054_chat_resume_wakes.sql`, the `runtime.py` wiring, and the
+54-pins are reverted to base; the schema stays at 53.
+
+| Packet | Boundary | Repo / files | Tier | Wave |
+|---|---|---|---|---|
+| R1 | Interactive goal auto-resume: an interactive `hermes chat --continue <session>` attach whose persisted goal state (`goal:<session_id>`) is ACTIVE (not paused/waiting/completed) resumes the goal loop automatically in that same visible process — exactly once per attach, through the existing `GoalManager`/goal-loop continuation machinery, never a second process. Focused regressions only. | `/Users/josystem/.hermes/hermes-agent` (installed live agent tree, local branch `infra-216-goal-autoresume`; NOT pushed to the public NousResearch origin) — goal/chat-startup modules only | Sonnet | 1 |
+| R2 | Merger-turn intake reconciliation: an `admitted` or `delivered` `wake_deliveries` row whose review is already merged AND whose merge settlement is settled is durably reconciled complete BEFORE `outstanding_wake` selection, so a stale completed wake can never mask the genuinely outstanding one. Focused regressions only. | `src/hermes_orchestrator/merger_turns.py`, `tests/test_merger_turns.py` | Sonnet | 1 |
+
+Gate: focused suites per packet; ONE full-suite run at the final
+integrated head; push `feature/infra-216`; emit the rework-ready
+manifest to Sol. The hermes-agent change is recorded here by local
+branch and commit SHA for Sol's review; it is deliberately not pushed
+to the public upstream.
+
+### Rework integration record (2026-09-01)
+
+Both packet agents were operator-timeboxed at five minutes and
+stopped; their diffs were preserved and integrated by the lead.
+
+- **R1 landed**: hermes-agent local branch `infra-216-goal-autoresume`
+  at `b53b06eee5d8e24e4ffd950f709aa4713d8ada95` (base `95668f5e`,
+  main; the live install was returned to clean `main`). The attach
+  hook `HermesCLI._maybe_autoresume_goal_on_attach` runs once from
+  `run()`'s `if self._resumed:` block and enqueues
+  `GoalManager.maybe_autoresume_on_attach()`'s continuation prompt via
+  the same `_pending_input` queue `/goal resume` uses; no kick when
+  the goal is absent/paused/done/cleared/wait-parked, none in `-q`
+  mode. Focused suites green (47 passed: `tests/hermes_cli/
+  test_goals.py`, `tests/cli/test_cli_goal_autoresume.py`; pytest was
+  bootstrapped into the install's venv via ensurepip — the only venv
+  mutation).
+- **R2 landed**: `MergerTurnService.outstanding_wake` now sweeps
+  candidate rows through `_reconcile_settled_wake` — fail-closed
+  predicate joining the wake's exact identity (`project_key`,
+  `event_id`, `candidate_sha`) against `reviews.state = 'merged'` AND
+  `merge_settlements.state = 'settled'`; a proven-complete row is
+  transitioned to the normal `'completed'` vocabulary with one
+  journaled `wake_delivery.reconciled_complete` event, and selection
+  continues in the same pass. The agent was stopped before writing
+  tests; the two focused regressions (stale-wake reconciliation +
+  same-pass selection + idempotency; fail-closed partial/missing
+  rows) are lead-authored as integration work, not a new packet.
