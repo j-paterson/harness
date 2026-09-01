@@ -93,6 +93,20 @@ def _argv(session_id: str = SESSION, config_path: str = CONFIG_PATH) -> list[str
     ]
 
 
+def _resume_argv(
+    session_id: str = SESSION, config_path: str = CONFIG_PATH
+) -> list[str]:
+    """The SAME launch composition as :func:`_argv`, named with the
+    other Hermes-owned session selector: the shape a RESUMED seat
+    launches (``claude --resume <uuid>``) rather than a genuinely new
+    one (``claude --session-id <uuid>``)."""
+
+    argv = _argv(session_id, config_path)
+    assert argv[1] == "--session-id"
+    argv[1] = "--resume"
+    return argv
+
+
 def _expected_dist_tree_sha256(root: Path) -> str:
     """Independent re-implementation of the packet's dist-tree digest
     contract, so the test does not simply echo the module under test."""
@@ -174,6 +188,7 @@ def _capture(
     entry_path: Path,
     prompt_pattern: str | None = PROMPT_PATTERN,
     cell_id: str = CELL,
+    launch_argv_template: list[str] | None = None,
 ):
     return anchors.capture(
         cell_id=cell_id,
@@ -181,7 +196,9 @@ def _capture(
         entry_path=entry_path,
         package_root=package_root,
         channel_entry=CHANNEL_ENTRY,
-        launch_argv_template=_argv(),
+        launch_argv_template=(
+            _argv() if launch_argv_template is None else launch_argv_template
+        ),
         workspace_uuid=WORKSPACE,
         surface_uuid=SURFACE,
         session_id=SESSION,
@@ -1325,6 +1342,14 @@ def test_adopt_refuses_a_re_measured_content_drift_with_zero_mutation(
         pytest.param(
             _argv(SESSION_2, CONFIG_PATH_3), id="config-path-is-another-sessions"
         ),
+        pytest.param(
+            _drift_argv(lambda a: [*a[:1], "--verbose", *a[2:]]),
+            id="unrelated-flag-in-the-session-selector-slot",
+        ),
+        pytest.param(
+            _drift_argv(lambda a: [*a[:3], "--resume", *a[4:]]),
+            id="session-selector-substituted-for-an-unrelated-flag",
+        ),
         pytest.param([], id="empty-argv"),
     ],
 )
@@ -1348,6 +1373,135 @@ def test_adopt_refuses_launch_argument_drift_with_zero_mutation(
             package_root=package_root,
             entry_path=entry_path,
             launch_argv_template=drifted_argv,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(HARNESS_CELL) is None
+    assert anchors.active_for_cell(CELL) == proven
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
+# --------------------------------------------------------------------
+# The bounded session-selector slot (INFRA-198 blocker 1, observed live
+# 2026-09-01): the proven anchor was captured from a RESUMED seat
+# (``claude --resume <uuid>``) while the adopting harness seat was a
+# genuinely NEW one (``claude --session-id <uuid>``). Both argv were
+# otherwise token-for-token identical, so adoption refused on a single
+# flag that names the very same seat composition.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("template_argv", "adopting_argv"),
+    [
+        pytest.param(
+            _resume_argv(),
+            _argv(SESSION_2, CONFIG_PATH_2),
+            id="proven-resume-adopting-session-id",
+        ),
+        pytest.param(
+            _argv(),
+            _resume_argv(SESSION_2, CONFIG_PATH_2),
+            id="proven-session-id-adopting-resume",
+        ),
+    ],
+)
+def test_adopt_accepts_either_session_selector_before_the_uuid_slot(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    template_argv: list[str],
+    adopting_argv: list[str],
+) -> None:
+    """``--resume`` and ``--session-id`` are the two Hermes-owned ways
+    to name one seat's session over an otherwise identical launch
+    composition, so either may stand for the other at the slot that
+    immediately precedes the session UUID — in both directions. The
+    adopted anchor still persists the PROVEN template verbatim, so the
+    selector the adopting seat happened to use never becomes the new
+    baseline."""
+
+    package_root, entry_path = package
+    proven = _capture(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        launch_argv_template=template_argv,
+    )
+
+    adopted = _adopt(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        launch_argv_template=adopting_argv,
+    )
+
+    assert adopted.cell_id == HARNESS_CELL
+    assert adopted.state == "active"
+    assert adopted.session_id == SESSION_2
+    assert adopted.launch_argv_template == tuple(template_argv)
+    assert adopted.prompt_pattern == proven.prompt_pattern
+    assert anchors.get(proven.anchor_id).state == "active"
+    assert _anchor_event_types(database) == [
+        "channel_trust_anchor.captured",
+        "channel_trust_anchor.adopted",
+    ]
+
+
+# A launch line whose session selector is NOT the token before the
+# session UUID: ``--resume`` here consumes a plain word. Swapping it
+# for ``--session-id`` is exactly the flag substitution the bounded
+# rule must keep refusing.
+_SELECTOR_AWAY_TEMPLATE = [
+    "claude",
+    "--session-id",
+    SESSION,
+    "--resume",
+    "latest",
+    "--mcp-config",
+    CONFIG_PATH,
+    "--dangerously-load-development-channels",
+    CHANNEL_ENTRY,
+]
+_SELECTOR_AWAY_ADOPTING = [
+    "claude",
+    "--session-id",
+    SESSION_2,
+    "--session-id",
+    "latest",
+    "--mcp-config",
+    CONFIG_PATH_2,
+    "--dangerously-load-development-channels",
+    CHANNEL_ENTRY,
+]
+
+
+def test_adopt_refuses_a_session_selector_swap_away_from_the_uuid_slot(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """The selector substitution is legal ONLY where the flag is
+    immediately consuming the session UUID. The same two flags swapped
+    anywhere else in the argv are ordinary drift and still refuse — that
+    pairing requirement is what keeps this from being a general
+    flag-substitution hole."""
+
+    package_root, entry_path = package
+    proven = _capture(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        launch_argv_template=_SELECTOR_AWAY_TEMPLATE,
+    )
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="trusted launch template"):
+        _adopt(
+            anchors,
+            package_root=package_root,
+            entry_path=entry_path,
+            launch_argv_template=_SELECTOR_AWAY_ADOPTING,
         )
 
     assert _anchor_rows(database) == before
@@ -1384,6 +1538,95 @@ def test_adopt_refuses_when_the_target_cell_already_has_an_active_anchor(
         "channel_trust_anchor.captured",
         "channel_trust_anchor.captured",
     ]
+
+
+# --------------------------------------------------------------------
+# ChannelTrustAnchors.proven_source_cell — which cell's anchor may be
+# the adoption source (INFRA-198 blocker 1, observed live 2026-09-01:
+# the harness anchor of an already-retired ``failed`` cell was chosen).
+# --------------------------------------------------------------------
+
+# The adopting cell in these cases: it holds no anchor of its own, so
+# it is only ever the exclusion.
+ADOPTING_CELL = "cell-trust-adopting"
+DEAD_CELL = "cell-trust-dead"
+
+
+def _seed_cell(
+    database: Database,
+    cell_id: str,
+    *,
+    state: str,
+    lane_role: str,
+    project_key: str = "demo",
+    session_id: str = SESSION,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "lane_role, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cell_id,
+                project_key,
+                state,
+                PROFILE,
+                session_id,
+                lane_role,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+
+
+def test_proven_source_cell_skips_an_anchor_whose_cell_is_dead(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """A retired ``failed`` cell's anchor is the residue of a seat
+    Hermes has already torn down; its launch template is whatever that
+    dead seat happened to use, so it is never the trust source for a
+    live one. The dead cell's anchor here is the NEWEST and sits in the
+    same (preferred) lane, so only the holding cell's own state can
+    disqualify it — and with the live cell excluded too, there is no
+    source at all rather than a dead one."""
+
+    package_root, entry_path = package
+    _seed_cell(database, CELL, state="active", lane_role="development")
+    _seed_cell(database, DEAD_CELL, state="failed", lane_role="development")
+    _seed_cell(database, ADOPTING_CELL, state="active", lane_role="harness")
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    _capture(
+        anchors, package_root=package_root, entry_path=entry_path, cell_id=DEAD_CELL
+    )
+
+    assert (
+        anchors.proven_source_cell("demo", exclude_cell_id=ADOPTING_CELL) == CELL
+    )
+    assert anchors.proven_source_cell("demo", exclude_cell_id=CELL) is None
+
+
+def test_proven_source_cell_prefers_a_development_cell_over_a_harness_cell(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+    seeded_harness_cell: None,
+) -> None:
+    """Both lanes alive, both anchors fully proven: the development
+    lane wins, because that is where the operator's one manual trust
+    decision is actually made. The harness anchor here is the newer of
+    the two, so recency alone would have picked it."""
+
+    package_root, entry_path = package
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    _capture(
+        anchors, package_root=package_root, entry_path=entry_path, cell_id=HARNESS_CELL
+    )
+
+    assert anchors.proven_source_cell("demo", exclude_cell_id=ADOPTING_CELL) == CELL
 
 
 def test_gate_still_refuses_anchor_present_for_a_cell_with_no_anchor(

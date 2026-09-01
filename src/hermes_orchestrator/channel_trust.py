@@ -70,6 +70,13 @@ _DEV_CHANNEL_FLAG = "--dangerously-load-development-channels"
 _LEGACY_CHANNELS_FLAG = "--channels"
 _MCP_CONFIG_PATH = re.compile(r"^/[A-Za-z0-9._/-]+\.mcp\.json$")
 
+# The two Hermes-owned ways to name one seat's Claude session on the
+# launch line: ``--resume <uuid>`` for a seat resumed into an existing
+# session, ``--session-id <uuid>`` for a genuinely new one. They are
+# interchangeable ONLY where the flag is immediately followed by the
+# session-UUID slot — see :func:`_argv_matches_template`.
+_SESSION_SELECTOR_FLAGS = frozenset({"--resume", "--session-id"})
+
 # The one prompt-matcher shape the gate ever honors (Sol corrections
 # b4b545f3 packet 4 and f0a5a403 packet 3): the ``re.escape``'d markers
 # of :data:`APPROVED_PROMPT_MARKERS` — exactly those literals, in
@@ -339,17 +346,39 @@ def _channel_entry_appears_once(argv: Sequence[str]) -> bool:
 def _argv_matches_template(
     argv: Sequence[str], template: Sequence[str], *, session_id: str
 ) -> bool:
-    """``argv`` must equal ``template`` token for token, except at a
-    session-UUID slot (any template token that parses as a UUID) —
-    where the live token must itself parse as a UUID equal to
-    ``session_id`` — and a config-path slot (any absolute template
-    token ending ``.mcp.json``) — where the live token must be an
-    absolute, metacharacter-free ``/…/<session_id>.mcp.json`` path for
-    that same session."""
+    """``argv`` must equal ``template`` token for token, except at
+    exactly three bounded slots:
+
+    * a session-UUID slot (any template token that parses as a UUID) —
+      the live token must itself parse as a UUID equal to
+      ``session_id``;
+    * a config-path slot (any absolute template token ending
+      ``.mcp.json``) — the live token must be an absolute,
+      metacharacter-free ``/…/<session_id>.mcp.json`` path for that
+      same session;
+    * a session-selector slot (INFRA-198 blocker 1) — a template token
+      that is exactly ``--resume`` or ``--session-id`` may be answered
+      by the OTHER of that same pair, and ONLY when the immediately
+      following template token is itself a session-UUID slot (that is,
+      ``_is_uuid(template[i + 1])``). ``claude --resume <uuid>`` and
+      ``claude --session-id <uuid>`` are the two Hermes-owned ways to
+      name one seat's session — a resumed seat versus a genuinely new
+      one — over an otherwise identical launch composition. The
+      pairing requirement is what keeps this bounded: the substitution
+      is legal only where the flag is immediately consuming the session
+      UUID, so an arbitrary flag swap anywhere else in the argv still
+      refuses, and the UUID slot itself is still checked against
+      ``session_id`` on the next token.
+
+    Every other difference — token count, order, any other flag,
+    value, or path — refuses.
+    """
 
     if len(argv) != len(template):
         return False
-    for live_token, template_token in zip(argv, template, strict=True):
+    for index, (live_token, template_token) in enumerate(
+        zip(argv, template, strict=True)
+    ):
         if live_token == template_token:
             continue
         if _is_uuid(template_token):
@@ -361,6 +390,13 @@ def _argv_matches_template(
                 return False
             if not live_token.endswith(f"/{session_id}.mcp.json"):
                 return False
+            continue
+        if (
+            template_token in _SESSION_SELECTOR_FLAGS
+            and live_token in _SESSION_SELECTOR_FLAGS
+            and index + 1 < len(template)
+            and _is_uuid(template[index + 1])
+        ):
             continue
         return False
     return True
@@ -657,9 +693,10 @@ class ChannelTrustAnchors:
             raise TrustRefused(
                 "the replacement launch argv does not match the retiring "
                 f"anchor {predecessor.anchor_id!r}'s trusted launch "
-                "template (only the session UUID and the session-scoped "
-                "MCP config path may differ); this is a new trust "
-                "decision, not a rotation carry-forward"
+                "template (only the session UUID, the session-scoped "
+                "MCP config path, and the --resume/--session-id selector "
+                "immediately preceding that UUID may differ); this is a "
+                "new trust decision, not a rotation carry-forward"
             )
 
         if (
@@ -889,9 +926,10 @@ class ChannelTrustAnchors:
             raise TrustRefused(
                 "the adopting launch argv does not match the proven "
                 f"anchor {predecessor.anchor_id!r}'s trusted launch "
-                "template (only the session UUID and the session-scoped "
-                "MCP config path may differ); this is a new trust "
-                "decision, not an adoption of proven trust"
+                "template (only the session UUID, the session-scoped "
+                "MCP config path, and the --resume/--session-id selector "
+                "immediately preceding that UUID may differ); this is a "
+                "new trust decision, not an adoption of proven trust"
             )
 
         stat = entry_path.stat()
@@ -1152,10 +1190,21 @@ class ChannelTrustAnchors:
         nothing on its own, since every content fact is re-measured and
         re-compared there before anything is written.
 
-        The newest qualifying anchor wins, deterministically. Several
-        proven anchors in one project are equally valid proofs of the
-        same program identity, and any that no longer matches the live
-        entry is refused by the re-measurement rather than trusted.
+        The holding CELL must itself still be ``active`` (observed live
+        2026-09-01): a retired or ``failed`` cell's anchor is the
+        residue of a seat Hermes has already torn down, and its launch
+        template is whatever that dead seat happened to use — never the
+        trust source for a live one. Among the cells that qualify, a
+        ``development`` lane cell is preferred over a ``harness`` one:
+        the development lane is where the operator's one manual trust
+        decision is actually made, so its anchor is the closest thing
+        to the original proof.
+
+        Within that preference the newest qualifying anchor wins,
+        deterministically. Several proven anchors in one project are
+        equally valid proofs of the same program identity, and any that
+        no longer matches the live entry is refused by the
+        re-measurement rather than trusted.
         """
 
         row = self._database.execute(
@@ -1163,9 +1212,11 @@ class ChannelTrustAnchors:
             "AS anchors JOIN project_cells AS cells "
             "ON cells.cell_id = anchors.cell_id "
             "WHERE cells.project_key = ? AND anchors.cell_id != ? "
+            "AND cells.state = 'active' "
             "AND anchors.state = 'active' "
             "AND anchors.prompt_pattern IS NOT NULL "
-            "ORDER BY anchors.created_at DESC, anchors.rowid DESC "
+            "ORDER BY CASE WHEN cells.lane_role = 'development' THEN 0 ELSE 1 END, "
+            "anchors.created_at DESC, anchors.rowid DESC "
             "LIMIT 1",
             (project_key, exclude_cell_id),
         ).fetchone()
