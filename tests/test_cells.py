@@ -10,8 +10,10 @@ from uuid import UUID
 import pytest
 
 from hermes_orchestrator.cells import (
+    ProfileCapacityEvidence,
     ProjectCell,
     ProjectCellService,
+    RotationBlocked,
     activate_admitted_issue,
 )
 from hermes_orchestrator.claude import (
@@ -23,7 +25,7 @@ from hermes_orchestrator.cmux_surfaces import SKIP_PERMISSIONS_FLAG
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.handoffs import HandoffService
+from hermes_orchestrator.handoffs import HandoffDocument, HandoffService, HandoffTest
 from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
 from hermes_orchestrator.linear import LinearProjection
@@ -37,6 +39,9 @@ from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import SubagentPacket
 
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
+REPLACEMENT_SESSION = UUID("22222222-2222-4222-8222-222222222222")
+THIRD_SESSION = UUID("33333333-3333-4333-8333-333333333333")
+FOURTH_SESSION = UUID("44444444-4444-4444-8444-444444444444")
 
 
 class RecordingRunner:
@@ -1521,6 +1526,161 @@ class ContextRunner(RecordingRunner):
             )
 
 
+class ReplacementSequenceRunner(RecordingRunner):
+    """Return profile-specific replacement acknowledgement outcomes."""
+
+    def __init__(
+        self,
+        *,
+        capped: set[str],
+        acknowledged: set[str],
+        close_fails: set[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self._capped = capped
+        self._acknowledged = acknowledged
+        self._close_fails = close_fails or set()
+
+    def start_lead(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+        stream = super().start_lead(request)
+        if request.profile_alias not in self._close_fails:
+            return stream
+
+        class CloseFailingStream:
+            def __aiter__(self) -> AsyncIterator[ClaudeEvent]:
+                return self
+
+            async def __anext__(self) -> ClaudeEvent:
+                return await stream.__anext__()
+
+            async def aclose(self) -> None:
+                await stream.aclose()  # type: ignore[attr-defined]
+                raise RuntimeError("replacement stream cleanup failed")
+
+        return CloseFailingStream()
+
+    async def _events(self, request: LeadTurnRequest) -> AsyncIterator[ClaudeEvent]:
+        yield ClaudeEvent(
+            kind="session.started",
+            original_type="system",
+            session_id=request.session_id,
+            parent_tool_use_id=None,
+            timestamp="2026-08-26T12:00:00Z",
+            usage={},
+        )
+        if request.output_schema is None:
+            return
+        if request.profile_alias in self._capped:
+            yield ClaudeEvent(
+                kind="provider.limit",
+                original_type="result",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:01:00Z",
+                usage={},
+                error_code="subscription_limit",
+                limit_kind="fable",
+            )
+            raise RuntimeError("replacement exited 1 after provider.limit")
+        if request.profile_alias in self._acknowledged:
+            yield ClaudeEvent(
+                kind="handoff.acknowledged",
+                original_type="result",
+                session_id=request.session_id,
+                parent_tool_use_id=None,
+                timestamp="2026-08-26T12:02:00Z",
+                usage={},
+                restated_next_action="Continue the same INFRA-198 rotation.",
+            )
+
+
+def rotation_profiles(
+    database: Database,
+    registry: ProfileRegistry,
+    *,
+    now: datetime,
+) -> ProfilePool:
+    evidence = ProfileCapacityEvidence(database)
+    pool = ProfilePool(registry, capacity_evidence=evidence, now=lambda: now)
+    for profile in registry.profiles:
+        pool.record_health(
+            ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=True,
+                reason="eligible",
+                last_checked_at=now,
+            )
+        )
+    with database.transaction() as connection:
+        for alias in ("max-b", "max-c", "max-d"):
+            connection.execute(
+                "INSERT INTO profile_capacity_observations("
+                "profile_alias, model, state, source, observed_at, resets_at, detail"
+                ") VALUES (?, 'fable', ?, 'operator_attestation', ?, ?, ?)",
+                (
+                    alias,
+                    "capped" if alias == "max-b" else "available",
+                    (now - timedelta(hours=1)).isoformat(),
+                    (now - timedelta(minutes=1)).isoformat(),
+                    "reset horizon passed" if alias == "max-b" else "available",
+                ),
+            )
+    return pool
+
+
+def submit_rotation_handoff(handoffs: HandoffService) -> str:
+    return handoffs.submit(
+        HandoffDocument(
+            cell_id="cell-demo",
+            objective="Complete INFRA-198 rotation acceptance",
+            status="ready",
+            decisions=["continue the same handoff across capped profiles"],
+            branch="sol/infra-198-capped-replacement",
+            commits=["pending"],
+            pull_request="pending",
+            modified_files=["src/hermes_orchestrator/cells.py"],
+            tests=[
+                HandoffTest(
+                    command="pytest tests/test_cells.py",
+                    outcome="pending",
+                )
+            ],
+            blockers=[],
+            remaining_steps=["acknowledge and transfer"],
+            commands=["pytest tests/test_cells.py"],
+            environment_notes=["test fixture"],
+            risks=[],
+            next_action="continue the same rotation",
+        )
+    ).handoff_id
+
+
+def replacement_rotation_service(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> tuple[ProjectCellService, HandoffService]:
+    handoffs = HandoffService(database)
+    sessions = iter((REPLACEMENT_SESSION, THIRD_SESSION, FOURTH_SESSION))
+    cells = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=RecordingLinear(),
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: next(sessions),
+        now=lambda: datetime(2026, 8, 26, 12, tzinfo=UTC),
+    )
+    return cells, handoffs
+
+
 def context_cells(
     database: Database,
     queue: QueueService,
@@ -1762,8 +1922,6 @@ async def test_rotation_pending_freezes_new_subwork_until_the_boundary(
 async def test_rotation_thaws_the_retired_session(
     database: Database, queue: QueueService, profiles: ProfilePool
 ) -> None:
-    from hermes_orchestrator.handoffs import HandoffDocument, HandoffTest
-
     clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
     runner = FreezingContextRunner()
     runner.usage_tokens = [85_000]
@@ -1794,6 +1952,183 @@ async def test_rotation_thaws_the_retired_session(
     rotated = await cells.rotate("cell-demo", record.handoff_id)
     assert rotated.session_id != SESSION_ID
     assert runner.thaws == [SESSION_ID]
+
+
+@pytest.mark.asyncio
+async def test_rotation_continues_to_the_next_profile_after_replacement_cap(
+    database: Database,
+    queue: QueueService,
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    profiles = rotation_profiles(database, registry, now=now)
+    runner = ReplacementSequenceRunner(capped={"max-b"}, acknowledged={"max-c"})
+    cells, handoffs = replacement_rotation_service(
+        database, queue, profiles, runner, tmp_path
+    )
+    admit(queue, "ENG-9")
+    assert (await cells.dispatch("ENG-9")).status == "working"
+    handoff_id = submit_rotation_handoff(handoffs)
+
+    rotated = await cells.rotate("cell-demo", handoff_id)
+
+    assert rotated.profile_alias == "max-c"
+    assert [
+        request.profile_alias
+        for request in runner.start_requests
+        if request.output_schema is not None
+    ] == ["max-b", "max-c"]
+    observation = database.execute(
+        "SELECT state, source, resets_at FROM profile_capacity_observations "
+        "WHERE profile_alias = 'max-b' ORDER BY observation_id DESC LIMIT 1"
+    ).fetchone()
+    assert observation is not None
+    assert (observation["state"], observation["source"]) == (
+        "capped",
+        "provider_limit",
+    )
+    assert datetime.fromisoformat(str(observation["resets_at"])) > now
+    assert database.scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'provider.limit' "
+        "AND aggregate_id = 'cell-demo'"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_immediate_rotation_retry_skips_the_durably_capped_profile(
+    database: Database,
+    queue: QueueService,
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    profiles = rotation_profiles(database, registry, now=now)
+    for alias in ("max-c", "max-d"):
+        profiles.record_health(
+            ProfileHealth(
+                profile_alias=alias,
+                eligible=False,
+                reason="temporarily unavailable",
+                last_checked_at=now,
+            )
+        )
+    runner = ReplacementSequenceRunner(capped={"max-b"}, acknowledged={"max-c"})
+    cells, handoffs = replacement_rotation_service(
+        database, queue, profiles, runner, tmp_path
+    )
+    admit(queue, "ENG-9")
+    assert (await cells.dispatch("ENG-9")).status == "working"
+    handoff_id = submit_rotation_handoff(handoffs)
+
+    with pytest.raises(RotationBlocked, match=r"max-b.*capped"):
+        await cells.rotate("cell-demo", handoff_id)
+    restarted_profiles = ProfilePool(
+        registry,
+        capacity_evidence=ProfileCapacityEvidence(database),
+        now=lambda: now,
+    )
+    for alias in ("max-a", "max-b", "max-c", "max-d"):
+        restarted_profiles.record_health(
+            ProfileHealth(
+                profile_alias=alias,
+                eligible=alias != "max-d",
+                reason="available" if alias != "max-d" else "unavailable",
+                last_checked_at=now,
+            )
+        )
+    retry_runner = ReplacementSequenceRunner(capped=set(), acknowledged={"max-c"})
+    retry_cells, _ = replacement_rotation_service(
+        database, queue, restarted_profiles, retry_runner, tmp_path
+    )
+
+    rotated = await retry_cells.rotate("cell-demo", handoff_id)
+
+    assert rotated.profile_alias == "max-c"
+    assert [
+        request.profile_alias
+        for request in retry_runner.start_requests
+        if request.output_schema is not None
+    ] == ["max-c"]
+    assert database.scalar(
+        "SELECT COUNT(*) FROM profile_capacity_observations "
+        "WHERE profile_alias = 'max-b' AND source = 'provider_limit'"
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_rotation_reports_every_cap_when_the_pool_is_exhausted(
+    database: Database,
+    queue: QueueService,
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    profiles = rotation_profiles(database, registry, now=now)
+    runner = ReplacementSequenceRunner(
+        capped={"max-b", "max-c", "max-d"}, acknowledged=set()
+    )
+    cells, handoffs = replacement_rotation_service(
+        database, queue, profiles, runner, tmp_path
+    )
+    admit(queue, "ENG-9")
+    assert (await cells.dispatch("ENG-9")).status == "working"
+    handoff_id = submit_rotation_handoff(handoffs)
+
+    with pytest.raises(RotationBlocked) as blocked:
+        await cells.rotate("cell-demo", handoff_id)
+
+    assert all(alias in str(blocked.value) for alias in ("max-b", "max-c", "max-d"))
+    assert "capped" in str(blocked.value)
+    assert [
+        request.profile_alias
+        for request in runner.start_requests
+        if request.output_schema is not None
+    ] == ["max-b", "max-c", "max-d"]
+    assert database.scalar(
+        "SELECT COUNT(*) FROM profile_capacity_observations "
+        "WHERE source = 'provider_limit'"
+    ) == 3
+    assert handoffs.get(handoff_id).state == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_replacement_cleanup_failure_stops_after_persisting_the_cap(
+    database: Database,
+    queue: QueueService,
+    registry: ProfileRegistry,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    profiles = rotation_profiles(database, registry, now=now)
+    runner = ReplacementSequenceRunner(
+        capped={"max-b"},
+        acknowledged={"max-c"},
+        close_fails={"max-b"},
+    )
+    cells, handoffs = replacement_rotation_service(
+        database, queue, profiles, runner, tmp_path
+    )
+    admit(queue, "ENG-9")
+    assert (await cells.dispatch("ENG-9")).status == "working"
+    handoff_id = submit_rotation_handoff(handoffs)
+
+    with pytest.raises(RuntimeError, match="stream cleanup failed"):
+        await cells.rotate("cell-demo", handoff_id)
+
+    assert [
+        request.profile_alias
+        for request in runner.start_requests
+        if request.output_schema is not None
+    ] == ["max-b"]
+    assert database.scalar(
+        "SELECT COUNT(*) FROM profile_capacity_observations "
+        "WHERE profile_alias = 'max-b' AND source = 'provider_limit'"
+    ) == 1
+    assert handoffs.get(handoff_id).state == "submitted"
+    assert database.scalar(
+        "SELECT profile_alias FROM profile_leases WHERE project_key = 'demo'"
+    ) == "max-a"
 
 
 def event_count(database: Database, event_type: str) -> int:

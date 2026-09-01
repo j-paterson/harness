@@ -1216,74 +1216,115 @@ class ProjectCellService:
                 "no capacity was reserved and no lead was launched"
             )
 
-        reservation = self._profiles.reserve_replacement(
-            current.project_key,
-            current.profile_alias,
-        )
-        if reservation is None:
-            message = "no different healthy profile is available"
-            refusal = getattr(self._profiles, "last_refusal", None)
-            if refusal:
-                message = f"{message}: {refusal}"
-            raise RotationBlocked(message)
-        if persisted_session is not None:
-            # The durable column is TEXT; parse rather than minting a new
-            # session id for an acknowledgement that already named one.
-            replacement_session = UUID(str(persisted_session))
-        else:
-            replacement_session = self._replacement_session_ids()
+        capped_attempts: list[tuple[str, datetime]] = []
+        attempted_profiles: set[str] = set()
+        while True:
+            reservation = self._profiles.reserve_replacement(
+                current.project_key,
+                current.profile_alias,
+            )
+            if reservation is None:
+                message = "no different healthy profile is available"
+                details = [
+                    str(value)
+                    for value in (getattr(self._profiles, "last_refusal", None),)
+                    if value
+                ]
+                details.extend(
+                    f"{alias}: fable-capped until {resets_at.isoformat()}"
+                    for alias, resets_at in capped_attempts
+                )
+                if details:
+                    message = f"{message}: {'; '.join(details)}"
+                raise RotationBlocked(message)
+            if reservation.profile_alias in attempted_profiles:
+                self._profiles.cancel_replacement(current.project_key)
+                raise RotationBlocked(
+                    "replacement selection repeated an already attempted profile: "
+                    f"{reservation.profile_alias}"
+                )
+            attempted_profiles.add(reservation.profile_alias)
+            if persisted_session is not None:
+                # The durable column is TEXT; parse rather than minting a new
+                # session id for an acknowledgement that already named one.
+                replacement_session = UUID(str(persisted_session))
+            else:
+                replacement_session = self._replacement_session_ids()
 
-        request = LeadTurnRequest(
-            session_id=replacement_session,
-            cwd=self._project_paths[current.project_key],
-            prompt=(
-                f"{getattr(handoff, 'markdown', '')}\n\n"
-                "Acknowledge this handoff and restate the exact next action."
-            ),
-            profile_alias=reservation.profile_alias,
-            output_schema={
-                "type": "object",
-                "properties": {
-                    "acknowledged": {"const": True},
-                    "restated_next_action": {"type": "string", "minLength": 1},
+            request = LeadTurnRequest(
+                session_id=replacement_session,
+                cwd=self._project_paths[current.project_key],
+                prompt=(
+                    f"{getattr(handoff, 'markdown', '')}\n\n"
+                    "Acknowledge this handoff and restate the exact next action."
+                ),
+                profile_alias=reservation.profile_alias,
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "acknowledged": {"const": True},
+                        "restated_next_action": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["acknowledged", "restated_next_action"],
+                    "additionalProperties": False,
                 },
-                "required": ["acknowledged", "restated_next_action"],
-                "additionalProperties": False,
-            },
-        )
-        session_started = False
-        acknowledged = already_acknowledged
-        try:
-            stream = self._runner.start_lead(request)
+            )
+            session_started = False
+            acknowledged = False
+            replacement_capped = False
             try:
-                async for event in stream:
-                    if event.kind == "session.started":
-                        session_started = event.session_id == replacement_session
-                    elif (
-                        event.kind == "handoff.acknowledged"
-                        and event.session_id == replacement_session
-                        and event.restated_next_action
-                    ):
-                        # One durable transition persists the acknowledged
-                        # state together with BOTH selected identities.
-                        self._handoffs.acknowledge(
-                            handoff_id,
-                            replacement_session,
-                            event.restated_next_action,
-                            profile_alias=reservation.profile_alias,
-                        )
-                        acknowledged = True
-            finally:
-                await stream.aclose()
-        except BaseException:
-            self._profiles.cancel_replacement(current.project_key)
-            raise
-        if not session_started:
-            self._profiles.cancel_replacement(current.project_key)
-            raise RotationBlocked("replacement session start was not confirmed")
-        if not acknowledged:
-            self._profiles.cancel_replacement(current.project_key)
-            raise RotationBlocked("handoff was not acknowledged by the replacement")
+                stream = self._runner.start_lead(request)
+                try:
+                    async for event in stream:
+                        if event.kind == "session.started":
+                            session_started = event.session_id == replacement_session
+                        elif event.kind == "provider.limit":
+                            resets_at = self._record_replacement_cap(
+                                current,
+                                handoff_id=handoff_id,
+                                replacement_session=replacement_session,
+                                replacement_profile=reservation.profile_alias,
+                                limit_kind=event.limit_kind,
+                            )
+                            capped_attempts.append(
+                                (reservation.profile_alias, resets_at)
+                            )
+                            replacement_capped = True
+                            self._profiles.cancel_replacement(current.project_key)
+                            break
+                        elif (
+                            event.kind == "handoff.acknowledged"
+                            and event.session_id == replacement_session
+                            and event.restated_next_action
+                        ):
+                            # One durable transition persists the acknowledged
+                            # state together with BOTH selected identities.
+                            self._handoffs.acknowledge(
+                                handoff_id,
+                                replacement_session,
+                                event.restated_next_action,
+                                profile_alias=reservation.profile_alias,
+                            )
+                            acknowledged = True
+                            break
+                finally:
+                    await stream.aclose()
+            except BaseException:
+                if not replacement_capped:
+                    self._profiles.cancel_replacement(current.project_key)
+                raise
+            if replacement_capped:
+                persisted_session = None
+                continue
+            if not session_started:
+                self._profiles.cancel_replacement(current.project_key)
+                raise RotationBlocked("replacement session start was not confirmed")
+            if not acknowledged:
+                self._profiles.cancel_replacement(current.project_key)
+                raise RotationBlocked(
+                    "handoff was not acknowledged by the replacement"
+                )
+            break
 
         return await self._finalize_transfer(
             current,
@@ -1992,6 +2033,45 @@ class ProjectCellService:
                 _FABLE_CAP_FALLBACK_DETAIL,
             ),
         )
+
+    def _record_replacement_cap(
+        self,
+        current: ProjectCell,
+        *,
+        handoff_id: str,
+        replacement_session: UUID,
+        replacement_profile: str,
+        limit_kind: str | None,
+    ) -> datetime:
+        """Persist replacement cap evidence before its reservation is released."""
+
+        observed_at = self._aware_now()
+        resets_at = self._cap_cooldown(observed_at, limit_kind)
+        with self._database.transaction() as connection:
+            self._record_fable_cap(
+                connection,
+                replacement_profile,
+                observed_at=observed_at,
+                resets_at=resets_at,
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="provider.limit",
+                    aggregate_type="project_cell",
+                    aggregate_id=current.cell_id,
+                    payload={
+                        "phase": "replacement_acknowledgement",
+                        "handoff_id": handoff_id,
+                        "profile_alias": replacement_profile,
+                        "session_id": str(replacement_session),
+                        "limit_kind": limit_kind,
+                        "resets_at": resets_at.isoformat(),
+                    },
+                ),
+            )
+        self._profiles.set_cooldown(replacement_profile, resets_at)
+        return resets_at
 
     def _aware_now(self) -> datetime:
         value = self._now()
