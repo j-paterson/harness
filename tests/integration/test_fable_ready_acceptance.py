@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,6 +37,7 @@ from hermes_orchestrator.github import MergeResult
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.merge import GitHubIntakeGate, IntegrationMerge
+from hermes_orchestrator.merge_flow import _merged_candidate_proof
 from hermes_orchestrator.merger_turns import (
     CodexThreadReports,
     MergerTurnService,
@@ -156,6 +158,15 @@ class ProductionShapedFlow:
                     CircleCiIntakeGate(self.window, corrections=self.outbox),
                     GitHubIntakeGate(projects=self.projects, github=self.github),
                 )
+            ),
+            # INFRA-217: the REAL production proof, composed exactly as
+            # merge_flow composes it — a deleted (merged) candidate branch
+            # stops resolving, and only a GitHub-proven merged
+            # same-repository pull at the exact reviewed head may excuse
+            # it. Wired here so the flow exercises the production
+            # admission path instead of patching a private attribute.
+            merged_candidate_proof=_merged_candidate_proof(
+                SimpleNamespace(projects=self.projects), self.github
             ),
         )
         self.settlements = MergeSettlements(self.database, self.events, now=lambda: NOW)

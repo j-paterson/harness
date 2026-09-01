@@ -1373,9 +1373,11 @@ async def test_already_merged_pull_reconciles_without_a_second_merge(
             merge_commit_sha=merge_sha,
         )
     }
-    # The production branch-head probe is independent of GitHub's open-PR
-    # list; this fixture normally derives both from one fake collection.
-    flow.admission._branch_head = lambda _project, _branch: SHA_A
+    # A merged pull is gone from GitHub's open list and its branch is
+    # deleted, so the harness's branch-head probe resolves to "" — the
+    # real post-merge condition. Admission is excused ONLY by the
+    # production merged-candidate proof the flow wires (INFRA-217); no
+    # private attribute is patched.
     flow.github.open_pulls = ()
     flow.git.ancestor[(merge_sha, "origin/main")] = True
     flow.git.trees[merge_sha] = "tree-" + SHA_A
