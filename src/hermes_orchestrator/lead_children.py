@@ -17,6 +17,7 @@ the exact lead through the dedicated channel.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 from collections.abc import Callable
@@ -59,6 +60,54 @@ def _bound_cell(
         "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
         (session_id,),
     ).fetchone()
+
+
+def bound_session_at(
+    connection: sqlite3.Connection,
+    cwd: str | None,
+    workspace_uuid: str | None,
+    surface_uuid: str | None,
+) -> str | None:
+    """The stable session id of the managed seat running in ``cwd``.
+
+    INFRA-198: ``/clear`` gives the live Claude session a new LOGICAL id
+    while the process, its channel sidecar, and every durable Hermes row
+    keep the seat's original one. The hook payload then carries an id
+    ``_bound_cell`` cannot resolve, so every lead hook goes inert.
+    Nothing is rebound to the logical id -- durable identity must keep
+    agreeing with the running process and the launch argv the trust
+    anchor persists. Instead each hook ENTRY canonicalizes its session
+    ONCE, from evidence that already exists, persisting nothing:
+
+    cwd -> its ONE project -> that project's ONE active development cell
+    -> that cell's ONE active ``channel_registrations`` row, whose
+    ``session_id`` IS the bound session. The registration is the
+    positive proof the sidecar is connected right now; a lead process
+    lease is NOT that proof (a reboot leaves every lead lease stopped
+    while the seat is live) and serves only as the cwd->project
+    directory. Zero or more than one match at any step returns ``None``
+    and the hook stays inert exactly as today.
+    """
+
+    rows = connection.execute(
+        "SELECT DISTINCT r.session_id FROM channel_registrations r "
+        "JOIN project_cells c ON c.cell_id = r.cell_id "
+        "AND c.state = 'active' AND c.lane_role = 'development' "
+        "AND c.project_key = r.project_key "
+        "AND c.session_id = r.session_id "
+        "WHERE r.state = 'active' AND r.project_key IN ("
+        "SELECT project_key FROM process_leases WHERE cwd = ?)",
+        (str(cwd or os.getcwd()),),
+    ).fetchall()
+    if len(rows) != 1 or not workspace_uuid or not surface_uuid:
+        return None
+    session_id = str(rows[0]["session_id"])
+    anchor = connection.execute(
+        "SELECT 1 FROM channel_trust_anchors WHERE state = 'active' "
+        "AND session_id = ? AND workspace_uuid = ? AND surface_uuid = ?",
+        (session_id, workspace_uuid, surface_uuid),
+    ).fetchone()
+    return session_id if anchor is not None else None
 
 
 class LeadChildTracker:

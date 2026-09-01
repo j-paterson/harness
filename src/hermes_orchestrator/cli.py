@@ -3148,6 +3148,38 @@ def _verify_check(args: argparse.Namespace, settings: Settings) -> int:
     return 0 if valid else 1
 
 
+def _canonical_session(
+    database: Database, session: str, cwd: str | None
+) -> str:
+    """The seat's stable session id for ONE whole hook invocation.
+
+    INFRA-198: ``/clear`` hands the payload a new logical id that names
+    no active cell. Every hook ENTRY resolves the seat once, here, so
+    the entire invocation reads and writes one id -- a method may never
+    read a translated id while writing the logical one. An unresolvable
+    session comes back unchanged and the hook stays inert as today.
+    """
+
+    with suppress(Exception):
+        from hermes_orchestrator.lead_children import (
+            _bound_cell,
+            bound_session_at,
+        )
+
+        with database.transaction() as connection:
+            if _bound_cell(connection, session) is None:
+                return (
+                    bound_session_at(
+                        connection,
+                        cwd,
+                        os.environ.get("CMUX_WORKSPACE_ID"),
+                        os.environ.get("CMUX_SURFACE_ID"),
+                    )
+                    or session
+                )
+    return session
+
+
 def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     """Durably count one child start or completion from a lead hook.
 
@@ -3159,10 +3191,12 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
 
     session = args.session
     child = args.child
+    cwd = None
     if session is None or child is None:
         with suppress(Exception):
             payload = json.loads(sys.stdin.read() or "{}")
             session = session or payload.get("session_id")
+            cwd = payload.get("cwd")
             # Strictly the shared lifecycle identity: SubagentStart
             # and SubagentStop carry the same agent_id. A tool_use_id
             # (a PreToolUse invocation identity) or any other field
@@ -3177,6 +3211,10 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
 
         database = Database.open(_intake_state_dir(args) / "state.db")
         try:
+            # INFRA-198: the same one-shot canonicalization the Stop
+            # entry does -- a child recorded under a /clear-ed logical
+            # id would leave the seat's outstanding set silently empty.
+            session = _canonical_session(database, str(session), cwd)
             tracker = LeadChildTracker(
                 database,
                 control=ControlOperations(
@@ -3353,15 +3391,21 @@ def _intake_poll(args: argparse.Namespace) -> int:
 
     session = args.session
     hook_event = None
+    cwd = None
     if session is None:
         with suppress(Exception):
             payload = json.loads(sys.stdin.read() or "{}")
             session = payload.get("session_id")
             hook_event = payload.get("hook_event_name")
+            cwd = payload.get("cwd")
     if not session:
         return 0
     database = Database.open(_intake_state_dir(args) / "state.db")
     try:
+        # INFRA-198: canonicalize ONCE, before any downstream call --
+        # every use below reads this local and so runs entirely on the
+        # seat's stable id, which /clear does not change.
+        session = _canonical_session(database, str(session), cwd)
         if hook_event == "Stop":
             # INFRA-215 (Sol acce71fc): one UNCONDITIONAL durable Stop
             # record, in the journal that already exists. A lead running
