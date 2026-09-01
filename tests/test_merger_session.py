@@ -14,6 +14,7 @@ terminal-idle hook without a self-cancellation deadlock.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,10 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.merger_session import MergerSession
 from hermes_orchestrator.processes import ProcessRegistry
+from tests.integration.test_fable_ready_acceptance import (
+    SHA_A,
+    ProductionShapedFlow,
+)
 
 _CLOSED = object()
 
@@ -444,3 +449,88 @@ async def test_reconcile_reopens_after_the_connection_ended_on_its_own() -> None
     assert session.is_open
     assert rpc.close_calls == 1
     assert rpc.start_calls == 2
+
+
+@pytest.fixture
+def merge_flow(tmp_path: Path):
+    """The real merge flow (real MergerTurnService over real SQLite)."""
+
+    harness = ProductionShapedFlow(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.close()
+
+
+async def _orphan_merged_submission(harness: ProductionShapedFlow) -> str:
+    """Drive a real approval to merged, then re-open its submitted row.
+
+    INFRA-223's observed shape: the wake is durably 'completed' and the
+    review durably 'merged', but the submission's own terminal write was
+    lost, leaving the row 'submitted'.
+    """
+
+    await harness.merger.ensure_thread("demo")
+    branch = harness.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await harness.emitter.emit(
+        "demo", "ENG-9", verification=(("t", "ok"),)
+    )
+    settled = await harness.turns.submit_review(
+        "demo",
+        issue_id="ENG-9",
+        event_id=emitted.event.event_id,
+        candidate_sha=SHA_A,
+        reviewed_thread_id="thr_legacy",
+        reviewed_generation=1,
+        verdict_json=harness.verdict(SHA_A, branch, 14),
+    )
+    assert settled.kind == "merged"
+    harness.database.execute(
+        "UPDATE submitted_verdicts SET state = 'submitted', result_json = NULL "
+        "WHERE event_id = ?",
+        (emitted.event.event_id,),
+    )
+    return str(emitted.event.event_id)
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciles_an_orphaned_submission_and_holds_nothing(
+    merge_flow: ProductionShapedFlow,
+) -> None:
+    """INFRA-223: a historical submission never holds the Sol thread.
+
+    Before the fix ``has_pending_submission`` reported ANY 'submitted'
+    row as live review work, so this startup reopened — and kept — an App
+    Server over an idle thread ("open in another app"). The startup
+    boundary now repairs the row durably and the session releases.
+    """
+
+    event_id = await _orphan_merged_submission(merge_flow)
+    rpc = FakeRpc()
+    session = MergerSession(
+        _flow(
+            rpc=rpc,
+            merger=FakeMerger(),
+            turns=merge_flow.turns,
+            reviews=merge_flow.reviews,
+        ),
+        ("demo",),
+    )
+
+    await session.startup()
+
+    # The row was repaired durably, not merely filtered out of a query.
+    row = merge_flow.database.execute(
+        "SELECT state, result_json FROM submitted_verdicts WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert str(row["state"]) == "settled"
+    assert json.loads(str(row["result_json"]))["kind"] == "merged"
+    # No review work is active, so the App Server opened for the recovery
+    # pass is released again and no later tick reopens one.
+    assert session.review_active() is False
+    assert session.is_open is False
+    assert rpc.close_calls == 1
+    await session.reconcile("maintenance")
+    assert session.is_open is False
+    assert rpc.start_calls == 1

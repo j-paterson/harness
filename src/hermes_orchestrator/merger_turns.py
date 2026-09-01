@@ -57,6 +57,34 @@ from hermes_orchestrator.verdicts import (
 
 TURN_COMPLETED_METHODS = frozenset({"turn/completed", "thread/turn/completed"})
 
+# INFRA-223: the exact terminal vocabularies the orphaned-submission
+# reconciliation joins against. Neither is invented here.
+#
+# ``wake_deliveries``: the states ``codex_merger._reviewer_is_held``
+# documents as "the terminal ``completed``/``deferred``/``rejected``
+# written when a verdict settles" -- the same three
+# ``release_next_candidate`` names as the terminal wake write, produced by
+# ``CodexMerger.complete_admitted_wake`` (``completed``) and
+# ``CodexMerger.release_delivered_wake`` (``deferred``/``rejected``).
+# Every other state (``pending``, ``claimed``, ``delivered``,
+# ``admitted``) still holds the reviewer, so a submission bound to it is
+# live by definition.
+_TERMINAL_WAKE_STATES = ("completed", "deferred", "rejected")
+
+# ``reviews``: the only two states the codebase already calls terminal
+# for a review's OWN settlement -- ``merged`` (``ReviewService.
+# _settle_proven``: "this already-terminal review", and the proven-merged
+# predicate ``_reconcile_settled_wake`` joins on below) and
+# ``corrections_required`` (``_obsolete_wake_reason``: "this event's own
+# ``reviews`` row is terminal at ``'corrections_required'``"). Everything
+# else -- ``recorded``, ``merging``, ``approved``, ``blocked``,
+# ``reconciliation_required``, ``stale`` -- is still in flight and is
+# deliberately NOT terminal here, so the reconciliation fails closed.
+# ``reviews._LIVE_STATES`` is a different question (which review owns the
+# ISSUE's review slot: ``merged`` is live there while terminal here) and
+# is deliberately not reused.
+_TERMINAL_REVIEW_STATES = ("merged", "corrections_required")
+
 
 class RpcRequester(Protocol):
     async def request(
@@ -584,15 +612,132 @@ class MergerTurnService:
                 )
         return cursor.rowcount == 1
 
-    def has_pending_submission(self, project_key: str) -> bool:
-        """True iff a ``submitted_verdicts`` row for the project is 'submitted'.
+    def reconcile_orphaned_submissions(self, project_key: str) -> tuple[str, ...]:
+        """Settle every ``submitted`` verdict whose own wake AND review ended.
 
-        Read-only SQLite check (INFRA-198 P1): used by ``MergerSession`` to
+        INFRA-223: ``has_pending_submission`` treated ANY row still in
+        state ``'submitted'`` as live review work, with no reconciliation
+        against that submission's own wake or review, so
+        ``MergerSession.review_active`` reported live work for a purely
+        historical submission and reopened -- and held -- a Codex App
+        Server over an idle Sol thread. Observed live: two submissions
+        stayed ``'submitted'`` while their matching ``reviews`` rows were
+        proven merged and their ``wake_deliveries`` rows were
+        ``completed`` (a crash, or a lost signal, between the settlement's
+        durable review/wake writes and ``_record_settled``'s terminal
+        write on the submission itself).
+
+        The repair is durable, not a filter: each ``submitted`` row is
+        joined to its OWN exact ``wake_deliveries`` row and its OWN exact
+        ``reviews`` row -- by this submission's ``event_id``, and (like
+        ``_reconcile_settled_wake``) by its ``candidate_sha`` against the
+        review's ``reviewed_sha`` -- and is settled only when BOTH are
+        terminal (``_TERMINAL_WAKE_STATES`` / ``_TERMINAL_REVIEW_STATES``,
+        both taken from the existing vocabularies). Both joins are INNER:
+        a submission whose wake or review row is missing proves nothing
+        and is left exactly as it is, as is one whose wake still holds the
+        reviewer (``delivered``/``admitted``/``pending``/``claimed``) or
+        whose review is still in flight.
+
+        The settled result is DERIVED from those durable rows only -- the
+        review's own terminal state as the outcome kind, its ``review_id``
+        and proven ``merge_sha`` -- and is written through the very same
+        ``_record_settled`` terminal path every settlement uses. The
+        reviewer thread is never read, no verdict or approval is ever
+        inferred, and no review, merge, or pull request is re-run: the
+        review and merge this submission describes already reached their
+        terminal durable state, which is the whole precondition.
+
+        Idempotent by construction, so a restart repeats it safely: the
+        scan selects only ``state = 'submitted'`` rows, and
+        ``_record_settled``'s UPDATE is itself a compare-and-set on
+        ``state = 'submitted'`` -- a row settled by this pass, or
+        concurrently by a real settlement, is matched by neither on the
+        next run, and exactly one journal event is written per repaired
+        row. Returns the event ids actually repaired (empty on the second
+        and every later pass).
+        """
+
+        wake_slots = ",".join("?" for _ in _TERMINAL_WAKE_STATES)
+        review_slots = ",".join("?" for _ in _TERMINAL_REVIEW_STATES)
+        rows = self._database.execute(
+            "SELECT s.event_id AS event_id, s.issue_id AS issue_id, "
+            "s.candidate_sha AS candidate_sha, w.state AS wake_state, "
+            "r.review_id AS review_id, r.state AS review_state, "
+            "r.merge_sha AS merge_sha FROM submitted_verdicts AS s "
+            "JOIN wake_deliveries AS w ON w.project_key = s.project_key "
+            "AND w.event_id = s.event_id "
+            "JOIN reviews AS r ON r.project_key = s.project_key "
+            "AND r.event_id = s.event_id AND r.reviewed_sha = s.candidate_sha "
+            "WHERE s.project_key = ? AND s.state = 'submitted' "
+            f"AND w.state IN ({wake_slots}) AND r.state IN ({review_slots}) "
+            "ORDER BY s.created_at ASC, s.rowid ASC",
+            (project_key, *_TERMINAL_WAKE_STATES, *_TERMINAL_REVIEW_STATES),
+        ).fetchall()
+        reconciled: list[str] = []
+        for row in rows:
+            event_id = str(row["event_id"])
+            issue_id = str(row["issue_id"])
+            wake_state = str(row["wake_state"])
+            review_state = str(row["review_state"])
+            merge_sha = row["merge_sha"]
+            outcome = TurnOutcome(
+                project_key=project_key,
+                kind=review_state,
+                event_id=event_id,
+                issue_id=issue_id,
+                reason=(
+                    "the submission's own wake is terminal "
+                    f"('{wake_state}') and its own review is terminal "
+                    f"('{review_state}'); settled from those durable rows "
+                    "alone, with no review or merge re-run and no verdict "
+                    "inferred (INFRA-223)"
+                ),
+                review_id=str(row["review_id"]),
+                merge_sha=None if merge_sha is None else str(merge_sha),
+            )
+            if not self._record_settled(event_id, outcome):
+                continue
+            reconciled.append(event_id)
+            with self._database.transaction() as connection:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="submitted_verdict.reconciled_settled",
+                        aggregate_type="submitted_verdict",
+                        aggregate_id=f"verdict:{project_key}:{event_id}",
+                        correlation_id=event_id,
+                        actor="merger_turns",
+                        payload={
+                            "project_key": project_key,
+                            "issue_id": issue_id,
+                            "candidate_sha": str(row["candidate_sha"]),
+                            "wake_state": wake_state,
+                            "review_state": review_state,
+                            "reason": outcome.reason,
+                        },
+                    ),
+                )
+        return tuple(reconciled)
+
+    def has_pending_submission(self, project_key: str) -> bool:
+        """True iff a LIVE ``submitted_verdicts`` row for the project exists.
+
+        Durable SQLite check (INFRA-198 P1): used by ``MergerSession`` to
         decide whether review work is active without any RPC or model
         call. Distinct from ``_pending_submission``, which is scoped to
         one exact wake's ``event_id``.
+
+        INFRA-223: a historical submission -- one whose own wake and own
+        review are both already terminal -- is REPAIRED first
+        (``reconcile_orphaned_submissions``, which settles it durably)
+        and the answer is then read from the repaired state, rather than
+        being filtered out of this query and left orphaned in the
+        database. In the steady state nothing is repairable and this
+        stays a pair of reads.
         """
 
+        self.reconcile_orphaned_submissions(project_key)
         row = self._database.execute(
             "SELECT 1 FROM submitted_verdicts "
             "WHERE project_key = ? AND state = 'submitted' LIMIT 1",
@@ -658,10 +803,19 @@ class MergerTurnService:
         the wake outstanding — it never pulls the thread's report as a
         verdict source. Never called on a timer — only at startup and
         explicit intake boundaries, so nothing polls.
+
+        INFRA-223: the orphaned-submission repair rides this same
+        existing startup/recovery boundary (``MergerSession.startup``
+        calls it immediately after ``ReviewService.resume_settlements``),
+        so a submission left ``'submitted'`` behind an already-terminal
+        wake and review is settled durably at daemon startup instead of
+        holding an App Server open over an idle Sol thread. No new hook,
+        and the pass is idempotent across restarts.
         """
 
         outcomes: list[TurnOutcome] = []
         for project_key in project_keys or tuple(self._projects):
+            self.reconcile_orphaned_submissions(project_key)
             if self.outstanding_wake(project_key) is None:
                 # INFRA-221: a restart between a settled verdict and the
                 # release of the candidate queued behind it leaves nothing
@@ -1416,11 +1570,21 @@ class MergerTurnService:
             result_json=None,
         )
 
-    def _record_settled(self, event_id: str, outcome: TurnOutcome) -> None:
+    def _record_settled(self, event_id: str, outcome: TurnOutcome) -> bool:
+        """Terminally record one outcome onto its ``submitted`` row.
+
+        Returns ``True`` iff this call is the one that settled the row --
+        the UPDATE is a compare-and-set on ``state = 'submitted'``, so a
+        row already settled (by an earlier call, or concurrently) answers
+        ``False`` and nothing is written twice. INFRA-223 uses that
+        return to journal its reconciliation exactly once; the two
+        non-settling refusals below still write nothing at all.
+        """
+
         if outcome.kind == "stale_submission":
             # The refusal is non-settling: the row stays 'submitted' so
             # only a fresh submission from the new binding can settle it.
-            return
+            return False
         if outcome.kind == "admission_race":
             # INFRA-217, Sol correction 43152bf8: a settlement-time
             # admission rejection of a prevalidated candidate is a race,
@@ -1428,9 +1592,9 @@ class MergerTurnService:
             # (terminally) a row that must stay retryable for the same
             # wake. Leave the submitted_verdicts row exactly as
             # ``_settle_wake`` left it ('submitted', no result_json).
-            return
+            return False
         with self._database.transaction() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE submitted_verdicts SET state = 'settled', "
                 "result_json = ?, updated_at = ? "
                 "WHERE event_id = ? AND state = 'submitted'",
@@ -1440,6 +1604,7 @@ class MergerTurnService:
                     event_id,
                 ),
             )
+        return cursor.rowcount == 1
 
     def _close_bound_failure(
         self, project_key: str, manifest: CandidateManifest
