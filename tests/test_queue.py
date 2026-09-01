@@ -358,6 +358,54 @@ def test_conditional_transition_refuses_a_changed_source_state(
     assert int(database.scalar("SELECT count(*) FROM events")) == events_before
 
 
+# -- restore_readiness_after_requeue (INFRA-198) ------------------------
+
+
+def test_restore_readiness_after_requeue_repairs_a_stuck_queued_row(
+    queue_service: QueueService, database: Database
+) -> None:
+    queue_service.admit(request("ENG-11", "chat-11", dependency_ready=True))
+    queue_service.transition(
+        "ENG-11", IssueState.PAUSED, actor="orchestrator", reason="resource pressure"
+    )
+    # The observed production condition: dependency_ready cleared with no
+    # journaled event, then the row moved back to queued out of band.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE admitted_issues SET dependency_ready = 0 WHERE issue_id = ?",
+            ("ENG-11",),
+        )
+    queue_service.transition(
+        "ENG-11", IssueState.QUEUED, actor="remote-operator", reason="retry"
+    )
+    assert queue_service.get("ENG-11").dependency_ready is False
+
+    repaired = queue_service.restore_readiness_after_requeue(
+        "ENG-11", actor="remote-operator", reason="remote operator confirmation"
+    )
+
+    assert repaired is not None
+    assert repaired.state is IssueState.QUEUED
+    assert repaired.dependency_ready is True
+    assert queue_service.get("ENG-11").dependency_ready is True
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        ("ENG-11",),
+    ) == 1
+
+    # Nothing left to repair: a healthy queued+ready row is left untouched.
+    again = queue_service.restore_readiness_after_requeue(
+        "ENG-11", actor="remote-operator", reason="remote operator confirmation"
+    )
+    assert again is None
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        ("ENG-11",),
+    ) == 1
+
+
 def test_mark_dependency_ready_is_scoped_to_its_project(
     database: Database, clock: MutableClock
 ) -> None:

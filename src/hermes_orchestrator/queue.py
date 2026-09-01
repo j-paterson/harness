@@ -304,6 +304,54 @@ class QueueService:
                 flipped.append(issue_id)
         return tuple(flipped)
 
+    def restore_readiness_after_requeue(
+        self, issue_id: str, *, actor: str, reason: str
+    ) -> QueuedIssue | None:
+        """Repair a queued row left not-ready by an out-of-band clear.
+
+        INFRA-198: ``dependency_ready`` can be cleared on a ``paused`` row
+        outside any journaled event (an operational fixup, not a supported
+        transition). When that row is later moved back to ``queued`` by an
+        explicit operator requeue (see ``_retry_handler``), the clear
+        survives and dispatch refuses it forever — ``mark_dependency_ready``
+        deliberately never touches non-``blocked`` rows, so nothing else
+        can repair it. An explicit operator requeue is the readiness
+        authority once a pause hold is cleared, so this method is scoped
+        tightly: it only ever touches a row that is ALREADY ``queued`` with
+        ``dependency_ready = 0``, and it always journals what it did.
+        Returns ``None`` when there is nothing to repair.
+        """
+
+        if not reason.strip():
+            raise ValueError("reason is required")
+        now = self._aware_now().isoformat()
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM admitted_issues WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(issue_id)
+            current = self._row_to_issue(row)
+            if current.state is not IssueState.QUEUED or current.dependency_ready:
+                return None
+            connection.execute(
+                "UPDATE admitted_issues SET dependency_ready = 1, "
+                "updated_at = ? WHERE issue_id = ?",
+                (now, issue_id),
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="issue.dependency_ready",
+                    aggregate_type="issue",
+                    aggregate_id=issue_id,
+                    actor=actor,
+                    payload={"reason": reason},
+                ),
+            )
+        return self.get(issue_id)
+
     def get(self, issue_id: str) -> QueuedIssue:
         """Read one admitted issue."""
 

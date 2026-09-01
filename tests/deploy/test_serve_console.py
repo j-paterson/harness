@@ -67,6 +67,7 @@ GITHUB_REPOS = {"demo": "j-paterson/hermes-orchestrator"}
 ISSUE_ID = "demo-231"
 BLOCKED_ISSUE_ID = "demo-232"
 CONSOLE_QUEUED_ISSUE_ID = "demo-233"
+STUCK_ISSUE_ID = "demo-234"
 SEEDED_PRIORITY = 3
 CELL_ID = "cell-demo-1"
 CELL_SESSION_ID = "lead-session-demo-1"
@@ -147,6 +148,32 @@ def console(tmp_path_factory: pytest.TempPathFactory):
                 actor="operator",
                 reason="dependency wait",
             )
+            # A third issue reproducing the INFRA-198 stuck-queued bug:
+            # admitted ready, paused by the orchestrator, then its
+            # dependency_ready cleared out-of-band (no journaled event —
+            # the observed production condition) before ever being
+            # requeued.
+            queue.admit(
+                AdmissionRequest(
+                    issue_id=STUCK_ISSUE_ID,
+                    project_key="demo",
+                    linear_priority=2,
+                    admitted_by="operator",
+                    instruction_id="operator-instruction-3",
+                )
+            )
+            queue.transition(
+                STUCK_ISSUE_ID,
+                IssueState.PAUSED,
+                actor="orchestrator",
+                reason="resource pressure",
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    "UPDATE admitted_issues SET dependency_ready = 0 "
+                    "WHERE issue_id = ?",
+                    (STUCK_ISSUE_ID,),
+                )
             now = datetime.now(UTC).isoformat()
             # project_cells is daemon-owned (the console only reads it), so
             # the active lead cell is seeded with an explicit INSERT using
@@ -608,6 +635,61 @@ def test_retry_of_a_queued_issue_is_rejected_with_a_static_reason(
     )
     assert row is not None
     assert row[0] == "queued"
+
+
+def test_confirmed_retry_restores_dependency_readiness_after_a_cleared_pause_hold(
+    console: ConsoleHarness,
+) -> None:
+    # INFRA-198: STUCK_ISSUE_ID was seeded paused with dependency_ready
+    # cleared out-of-band. The same production retry command must both
+    # requeue it AND repair readiness — there is no other supported path.
+    with _client(console) as client:
+        cookie_value = _login(client, console.credential)
+        token = _csrf(console, cookie_value)
+        prepared = _prepare(
+            client, token, intent="retry", target=f"issue:{STUCK_ISSUE_ID}"
+        )
+        assert prepared.status_code == 200
+        pending = prepared.json()
+        assert pending["confirmation_phrase"] == f"RETRY {STUCK_ISSUE_ID.upper()}"
+        confirmed = _confirm(client, token, pending, "serve-console-retry-3")
+    assert confirmed.status_code == 200
+    result = confirmed.json()
+    assert result["code"] == "accepted"
+    assert result["state"] == {"issue_id": STUCK_ISSUE_ID, "state": "queued"}
+    row = _query_one(
+        console.database_path,
+        "SELECT state, dependency_ready FROM admitted_issues WHERE issue_id = ?",
+        (STUCK_ISSUE_ID,),
+    )
+    assert row is not None
+    assert row[0] == "queued"
+    assert row[1] == 1
+    event_row = _query_one(
+        console.database_path,
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        (STUCK_ISSUE_ID,),
+    )
+    assert event_row is not None
+    assert event_row[0] == 1
+
+    # Semantics preserved: now that the row is healthy and queued, a
+    # second retry is still rejected with the same static reason code.
+    with _client(console) as client:
+        cookie_value = _login(client, console.credential)
+        token = _csrf(console, cookie_value)
+        prepared = _prepare(
+            client, token, intent="retry", target=f"issue:{STUCK_ISSUE_ID}"
+        )
+        assert prepared.status_code == 200
+        confirmed = _confirm(
+            client, token, prepared.json(), "serve-console-retry-4"
+        )
+    assert confirmed.status_code == 200
+    result = confirmed.json()
+    assert result["code"] == "rejected"
+    assert result["state"] == {"reason": "retry_not_applicable"}
 
 
 def test_confirmed_checkpoint_persists_a_pending_request(

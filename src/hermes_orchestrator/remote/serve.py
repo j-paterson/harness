@@ -126,10 +126,29 @@ def _retry_handler(queue: QueueService) -> Callable[[BaseModel], dict[str, Any]]
             actor="remote-operator",
             reason="remote operator confirmation",
         )
-        if requeued is None:
+        if requeued is not None:
+            # A pause hold can clear dependency_ready out-of-band (INFRA-198);
+            # this requeue is the operator's readiness authority, so repair
+            # it in the same confirmed action. None here just means nothing
+            # needed repairing.
+            queue.restore_readiness_after_requeue(
+                command.issue_id,
+                actor="remote-operator",
+                reason="remote operator confirmation",
+            )
+            return {"issue_id": requeued.issue_id, "state": requeued.state.value}
+        # Not in a retryable state now — but a PREVIOUS requeue may already
+        # have landed the row as queued-and-not-ready with no supported way
+        # out. Retry is that way out: repair it through this same command.
+        repaired = queue.restore_readiness_after_requeue(
+            command.issue_id,
+            actor="remote-operator",
+            reason="remote operator confirmation",
+        )
+        if repaired is None:
             # Static, value-free reason code; the current state never leaks.
             raise ValueError("retry_not_applicable")
-        return {"issue_id": requeued.issue_id, "state": requeued.state.value}
+        return {"issue_id": repaired.issue_id, "state": repaired.state.value}
 
     return retry
 
