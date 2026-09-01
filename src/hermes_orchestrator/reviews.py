@@ -654,10 +654,40 @@ class ReviewService:
         settlement = self._settlements.get(review_id)
 
         pull = self._github.get_pull_request(record.repository, record.pr_number)
+        effect = (
+            self._merge_journal.get(f"merge:{review_id}")
+            if self._merge_journal is not None
+            else None
+        )
+        effect_binding: tuple[str, str, str] | None = None
+        if (
+            effect is not None
+            and effect.state == "completed"
+            and effect.response is not None
+            and effect.request.get("repository") == record.repository
+            and effect.request.get("number") == record.pr_number
+            and effect.request.get("base") == project.integration_branch
+            and effect.request.get("merge_method") == "squash"
+            and pull.head_repository == record.repository
+            and pull.base_repository == record.repository
+            and pull.head_sha == effect.request.get("sha")
+            and pull.head_ref == effect.request.get("head_ref")
+            and pull.merge_commit_sha == effect.response.get("sha")
+        ):
+            effect_binding = (
+                str(effect.request["sha"]),
+                str(effect.request["head_ref"]),
+                str(effect.response["sha"]),
+            )
+        exact_review_binding = (
+            pull.head_sha == record.reviewed_sha and pull.head_ref == record.branch
+        )
         if (
             pull.merged
-            and pull.head_sha == record.reviewed_sha
-            and pull.head_ref == record.branch
+            and (exact_review_binding or effect_binding is not None)
+            and pull.repository == record.repository
+            and pull.head_repository == record.repository
+            and pull.base_repository == record.repository
             and pull.base_ref == project.integration_branch
             and pull.merge_commit_sha is not None
         ):
@@ -666,13 +696,18 @@ class ReviewService:
             # durable receipts instead of going stale — proofs first,
             # then the external merge-effect receipt, then the ledger,
             # review, and Linear tail, all exactly once.
+            candidate_sha, candidate_branch, merge_sha = effect_binding or (
+                record.reviewed_sha,
+                record.branch,
+                pull.merge_commit_sha,
+            )
             try:
                 proven = self._merge.prove_landed(
                     record.project_key,
-                    candidate_sha=record.reviewed_sha,
-                    candidate_branch=record.branch,
+                    candidate_sha=candidate_sha,
+                    candidate_branch=candidate_branch,
                     pr_number=record.pr_number,
-                    merge_sha=pull.merge_commit_sha,
+                    merge_sha=merge_sha,
                     base_sha=settlement.base_sha,
                 )
             except ReconciliationRequired as error:
@@ -680,14 +715,14 @@ class ReviewService:
                     record, "reconciliation_required", reason=str(error)
                 )
                 return _outcome(record, reason=str(error))
-            if self._merge_journal is not None:
+            if self._merge_journal is not None and effect is None:
                 self._merge_journal.record_external(
                     f"merge:{record.review_id}",
                     request={
                         "repository": record.repository,
                         "number": record.pr_number,
-                        "sha": record.reviewed_sha,
-                        "head_ref": record.branch,
+                        "sha": candidate_sha,
+                        "head_ref": candidate_branch,
                         "base": project.integration_branch,
                         "merge_method": "squash",
                     },
@@ -818,6 +853,10 @@ class ReviewService:
                     payload={
                         "repository": getattr(proven, "repository", None),
                         "pr_number": getattr(proven, "pr_number", None),
+                        "submitted_sha": record.reviewed_sha,
+                        "final_integration_sha": getattr(
+                            proven, "candidate_sha", None
+                        ),
                         "candidate_sha": getattr(proven, "candidate_sha", None),
                         "candidate_branch": getattr(proven, "candidate_branch", None),
                         "base_sha": getattr(proven, "base_sha", None),
@@ -852,6 +891,9 @@ class ReviewService:
         issue_id: str,
         manifest: CandidateManifest,
         pr_number: int,
+        submitted_sha: str | None = None,
+        final_integration_sha: str | None = None,
+        merge_sha: str | None = None,
     ) -> MergeOutcome:
         """Reconstruct receipts for a PR merged before verdict settlement.
 
@@ -876,13 +918,47 @@ class ReviewService:
             raise ValueError("issue is not part of the emitted candidate")
         review_id = f"review:{project_key}:{manifest.event_id}"
 
+        identity_chain = (submitted_sha, final_integration_sha, merge_sha)
+        has_identity_chain = any(value is not None for value in identity_chain)
+        if has_identity_chain and not all(
+            value is not None for value in identity_chain
+        ):
+            raise ValueError(
+                "submitted, final integration, and merge shas must be provided together"
+            )
+        if has_identity_chain and submitted_sha != manifest.candidate_sha:
+            raise ValueError("submitted sha is not the immutable reviewed candidate")
+
         pull = self._github.get_pull_request(project.github_repo, pr_number)
         if not pull.merged:
             raise ValueError("the pull request is not merged; nothing to reconcile")
-        if pull.head_ref != manifest.branch or pull.head_sha != manifest.candidate_sha:
+        if (
+            pull.repository != project.github_repo
+            or pull.head_repository != project.github_repo
+            or pull.base_repository != project.github_repo
+        ):
+            raise ValueError("the pull request repository does not match the project")
+        if has_identity_chain:
+            if pull.head_sha != final_integration_sha:
+                raise ValueError(
+                    "the pull request head is not the final integration sha"
+                )
+            if pull.merge_commit_sha != merge_sha:
+                raise ValueError("the pull request merge sha does not match")
+            proven_candidate = str(final_integration_sha)
+            proven_branch = pull.head_ref
+            proven_merge = str(merge_sha)
+        elif (
+            pull.head_ref != manifest.branch
+            or pull.head_sha != manifest.candidate_sha
+        ):
             raise ValueError(
                 "the merged pull request head is not the reviewed candidate"
             )
+        else:
+            proven_candidate = manifest.candidate_sha
+            proven_branch = manifest.branch
+            proven_merge = str(pull.merge_commit_sha)
         if pull.base_ref != project.integration_branch:
             raise ValueError(
                 "the merged pull request base is not the integration branch"
@@ -893,13 +969,20 @@ class ReviewService:
             )
         proven = self._merge.prove_landed(
             project_key,
-            candidate_sha=manifest.candidate_sha,
-            candidate_branch=manifest.branch,
+            candidate_sha=proven_candidate,
+            candidate_branch=proven_branch,
             pr_number=pr_number,
-            merge_sha=pull.merge_commit_sha,
+            merge_sha=proven_merge,
             base_sha=manifest.base_sha,
         )
-
+        request = {
+            "repository": project.github_repo,
+            "number": pr_number,
+            "sha": proven_candidate,
+            "head_ref": proven_branch,
+            "base": project.integration_branch,
+            "merge_method": "squash",
+        }
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             existing = connection.execute(
@@ -981,6 +1064,16 @@ class ReviewService:
             )
         settlement = self._settlements.get(review_id)
         record = self._get(review_id)
+        if settlement.state != "failed":
+            self._merge_journal.record_external(
+                f"merge:{review_id}",
+                request=request,
+                response={
+                    "merged": True,
+                    "sha": proven.merge_sha,
+                    "external": True,
+                },
+            )
         if settlement.state == "settled":
             return _outcome(record, reason=record.reason or "merged")
         if settlement.state == "failed":
@@ -1016,22 +1109,6 @@ class ReviewService:
                 state="deferred",
                 reason="the exclusive merge claim is held elsewhere",
             )
-        self._merge_journal.record_external(
-            f"merge:{review_id}",
-            request={
-                "repository": project.github_repo,
-                "number": pr_number,
-                "sha": manifest.candidate_sha,
-                "head_ref": manifest.branch,
-                "base": project.integration_branch,
-                "merge_method": "squash",
-            },
-            response={
-                "merged": True,
-                "sha": proven.merge_sha,
-                "external": True,
-            },
-        )
         if record.state == "merged":
             # Same replay character as ``_drive_merge``'s already-merged
             # branch (Sol Critical a626cf1f): reaching here with the

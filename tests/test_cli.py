@@ -132,6 +132,88 @@ def test_hermes_command_accepts_strict_json_queue_intent(
     assert json.loads(result.stdout)["code"] == "queued"
 
 
+@pytest.mark.parametrize("blocked_state", ["paused", "blocked"])
+def test_hermes_command_retries_a_locally_blocked_issue(
+    configured_repo: tuple[Path, Path], blocked_state: str
+) -> None:
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.domain import IssueState
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.queue import QueueService
+
+    added = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert added.exit_code == 0
+    _, state_dir = configured_repo
+    database = Database.open(state_dir / "state.db")
+    try:
+        queue = QueueService(database, EventStore(database), {"demo"})
+        queue.transition(
+            "ENG-9",
+            IssueState(blocked_state),
+            actor="test",
+            reason="exercise local retry",
+        )
+    finally:
+        database.close()
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "retry", "issue_id": "ENG-9"}),
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "accepted"
+    assert payload["state"] == {"issue_id": "ENG-9", "state": "queued"}
+
+
+def test_hermes_command_retry_refuses_a_non_retryable_issue(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    request = json.dumps(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-9",
+        }
+    )
+    assert invoke(
+        [*base_arguments(configured_repo), "hermes-command", "--json", request]
+    ).exit_code == 0
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "retry", "issue_id": "ENG-9"}),
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "rejected"
+    assert payload["state"] == {"reason": "retry_not_applicable"}
+
+
 def test_queue_complete_reconciles_externally_completed_issue(
     configured_repo: tuple[Path, Path],
 ) -> None:

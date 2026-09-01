@@ -105,7 +105,11 @@ from hermes_orchestrator.remote.auth import (
     CredentialStateUnreadable,
     RemoteCredentialService,
 )
-from hermes_orchestrator.remote.serve import build_console_dependencies, run_console
+from hermes_orchestrator.remote.serve import (
+    _retry_handler,
+    build_console_dependencies,
+    run_console,
+)
 from hermes_orchestrator.resources import ResourceSnapshot
 from hermes_orchestrator.runtime import (
     DaemonAlreadyRunning,
@@ -346,6 +350,9 @@ def _parser() -> argparse.ArgumentParser:
     merge_reconcile.add_argument("--issue", required=True)
     merge_reconcile.add_argument("--event", required=True)
     merge_reconcile.add_argument("--pr", type=int, required=True)
+    merge_reconcile.add_argument("--submitted-sha", default=None)
+    merge_reconcile.add_argument("--final-integration-sha", default=None)
+    merge_reconcile.add_argument("--merge-sha", default=None)
     merge_reconcile.add_argument("--json", action="store_true")
 
     gate = commands.add_parser(
@@ -1793,6 +1800,7 @@ def _hermes_handlers(
         return _packet_payload(packet)
 
     return {
+        "retry": _retry_handler(runtime.queue),
         "pending_corrections": pending_corrections,
         "ack_correction": ack_correction,
         "pending_wakes": pending_wakes,
@@ -4482,6 +4490,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         issue_id=args.issue,
                         manifest=snapshot.manifest,
                         pr_number=args.pr,
+                        submitted_sha=args.submitted_sha,
+                        final_integration_sha=args.final_integration_sha,
+                        merge_sha=args.merge_sha,
                     )
                 )
             except Exception as error:

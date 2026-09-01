@@ -185,6 +185,45 @@ class QueueService:
     ) -> QueuedIssue:
         """Record one review-flow lifecycle transition for an admitted issue."""
 
+        result = self._transition(
+            issue_id,
+            state,
+            actor=actor,
+            reason=reason,
+            from_states=None,
+        )
+        assert result is not None
+        return result
+
+    def transition_if(
+        self,
+        issue_id: str,
+        state: IssueState,
+        *,
+        from_states: set[IssueState] | frozenset[IssueState],
+        actor: str,
+        reason: str,
+    ) -> QueuedIssue | None:
+        """Transition only from an allowed source state, atomically."""
+
+        return self._transition(
+            issue_id,
+            state,
+            actor=actor,
+            reason=reason,
+            from_states=frozenset(from_states),
+        )
+
+    def _transition(
+        self,
+        issue_id: str,
+        state: IssueState,
+        *,
+        actor: str,
+        reason: str,
+        from_states: frozenset[IssueState] | None,
+    ) -> QueuedIssue | None:
+
         if not reason.strip():
             raise ValueError("transition reason is required")
         now = self._aware_now().isoformat()
@@ -196,6 +235,8 @@ class QueueService:
             if row is None:
                 raise KeyError(issue_id)
             current = self._row_to_issue(row)
+            if from_states is not None and current.state not in from_states:
+                return None
             if current.state is state:
                 return current
             connection.execute(

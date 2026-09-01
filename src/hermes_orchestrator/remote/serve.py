@@ -119,16 +119,16 @@ def _single_active_cell(
 
 def _retry_handler(queue: QueueService) -> Callable[[BaseModel], dict[str, Any]]:
     def retry(command: Any) -> dict[str, Any]:
-        issue = queue.get(command.issue_id)
-        if issue.state not in _RETRYABLE_STATES:
-            # Static, value-free reason code; the current state never leaks.
-            raise ValueError("retry_not_applicable")
-        requeued = queue.transition(
+        requeued = queue.transition_if(
             command.issue_id,
             IssueState.QUEUED,
+            from_states=_RETRYABLE_STATES,
             actor="remote-operator",
             reason="remote operator confirmation",
         )
+        if requeued is None:
+            # Static, value-free reason code; the current state never leaks.
+            raise ValueError("retry_not_applicable")
         return {"issue_id": requeued.issue_id, "state": requeued.state.value}
 
     return retry
