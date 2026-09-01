@@ -1416,6 +1416,75 @@ class TestPostMergeProjectionRecovery:
         effect_id = f"linear:ENG-9:after-merge:{record.review_id}"
         return record, effect_id, real_project
 
+    async def test_a_lost_intent_is_reconstructed_from_the_merged_review(
+        self, acceptance: Any
+    ) -> None:
+        """INFRA-218 Sol correction d65491fe (defect 1).
+
+        The previous correction moved the projection AFTER the terminal
+        mark_settled write so nothing is awaited under the merge lease.
+        That opened a crash window: a death between the terminal write
+        and the effect journal leaves a settled settlement whose review
+        is merged and NO after-merge effect at all, so the pending scan
+        finds nothing and the projection is lost forever. Recovery now
+        reconstructs the exact intent from the merged review itself.
+        """
+
+        _record, effect_id, real_project = await self._merge_with_linear_outage(
+            acceptance
+        )
+        acceptance.linear.project = real_project
+        # Simulate the crash window precisely: the settlement is terminal
+        # and the review merged, but the after-merge effect never existed.
+        acceptance.database.execute(
+            "DELETE FROM external_effects WHERE effect_id = ?", (effect_id,)
+        )
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        ) == 0
+        merges_before = len(acceptance.github.merge_calls)
+
+        await acceptance.service.resume_settlements("demo")
+
+        # Exactly one effect, applied once, and no additional merge.
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        ) == 1
+        assert len(acceptance.github.merge_calls) == merges_before
+
+        # A repeated recovery is a stable no-op.
+        await acceptance.service.resume_settlements("demo")
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        ) == 1
+        assert len(acceptance.github.merge_calls) == merges_before
+
+    async def test_reconstruction_never_duplicates_a_real_intent(
+        self, acceptance: Any
+    ) -> None:
+        """The reconstructed effect id is identical to the fresh path's,
+        so a real pending intent is never duplicated by reconstruction."""
+
+        _record, effect_id, real_project = await self._merge_with_linear_outage(
+            acceptance
+        )
+        acceptance.linear.project = real_project
+        before = acceptance.database.scalar(
+            "SELECT COUNT(*) FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        )
+        assert before == 1
+
+        await acceptance.service.resume_settlements("demo")
+
+        assert acceptance.database.scalar(
+            "SELECT COUNT(*) FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        ) == 1
+
     async def test_pending_target_only_effect_survives_a_first_read_outage(
         self, acceptance: Any
     ) -> None:

@@ -16,6 +16,7 @@ the lead. CircleCI is never polled here.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -36,6 +37,9 @@ from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import MergeBlocked, MergeEffectJournal
 from hermes_orchestrator.lead_assignments import LeadAssignments
+from hermes_orchestrator.linear import (
+    _ALLOWED_STATUS_TRANSITIONS as _LINEAR_STATUS_TRANSITIONS,
+)
 from hermes_orchestrator.linear import (
     ExternalEffectStore,
     LinearProjection,
@@ -74,6 +78,46 @@ _LIVE_STATES = (
     "blocked",
     "reconciliation_required",
 )
+
+# INFRA-218 Sol correction d65491fe (defect 2): ``LinearClient.project``
+# raises exactly this message (see linear.py's transition-legality check)
+# when the live current status and the requested target status are not a
+# legal single-hop pair. Parsed here so a replay can recover the actual
+# live current status without a second read of its own -- the message is
+# the only channel the ``LinearProjector`` protocol exposes for it.
+_TRANSITION_NOT_ALLOWED = re.compile(
+    r"^Linear status transition (?P<current>.+) -> (?P<target>.+) is not allowed$"
+)
+
+
+def _legal_status_path(current: str, target: str) -> tuple[str, ...] | None:
+    """The shortest legal hop sequence from ``current`` to ``target``.
+
+    Walks ``linear._ALLOWED_STATUS_TRANSITIONS`` breadth-first so a stored
+    target unreachable in a single hop (e.g. "In Development" -> "Done")
+    is instead reached through its legal intermediate states ("In
+    Development" -> "Review" -> "Done"). Returns the hop statuses AFTER
+    ``current``, ending with ``target`` -- empty when they already match.
+    ``None`` when no legal walk exists at all.
+    """
+
+    if current == target:
+        return ()
+    frontier: list[tuple[str, tuple[str, ...]]] = [(current, ())]
+    seen = {current}
+    while frontier:
+        next_frontier: list[tuple[str, tuple[str, ...]]] = []
+        for status, path in frontier:
+            for from_status, to_status in _LINEAR_STATUS_TRANSITIONS:
+                if from_status != status or to_status in seen:
+                    continue
+                hop_path = (*path, to_status)
+                if to_status == target:
+                    return hop_path
+                seen.add(to_status)
+                next_frontier.append((to_status, hop_path))
+        frontier = next_frontier
+    return None
 
 
 class LinearProjector(Protocol):
@@ -660,6 +704,72 @@ class ReviewService:
                 )
         return tuple(repairs)
 
+
+    def _reconstruct_missing_after_merge_intents(
+        self, project_key: str | None
+    ) -> None:
+        """Re-journal an after-merge intent lost to a post-settle crash.
+
+        INFRA-218 Sol correction d65491fe. Selects every settled
+        settlement whose review is proven merged and which has NO
+        after-merge effect row (neither pending nor completed), and
+        re-creates the exact intent the fresh path would have written.
+        Deterministic by construction: the effect id and the target both
+        come from the merged review row, so this is idempotent against
+        any real intent and against itself. A review with no stored
+        projection is skipped — there is nothing to reconstruct and
+        inventing a target would be a guess.
+        """
+
+        rows = self._database.execute(
+            "SELECT r.issue_id AS issue_id, r.review_id AS review_id "
+            "FROM reviews r JOIN merge_settlements s "
+            "  ON s.settlement_id = r.review_id "
+            "WHERE r.state = 'merged' AND r.merge_sha IS NOT NULL "
+            "  AND s.state = 'settled' "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM external_effects e "
+            "    WHERE e.effect_id = 'linear:' || r.issue_id "
+            "      || ':after-merge:' || r.review_id"
+            "  )"
+        ).fetchall()
+        for row in rows:
+            record = self._merged_review(str(row["issue_id"]))
+            if record is None or record.projection is None:
+                continue
+            if project_key is not None and record.project_key != project_key:
+                continue
+            if (
+                self._acceptance is not None
+                and self._acceptance.get(record.issue_id) is not None
+            ):
+                # Acceptance-GATED issues are not ours to reconstruct.
+                # Their post-merge projection is owned end to end by the
+                # gate path (hold, then its own satisfaction convergence)
+                # under DIFFERENT effect identities, so a missing
+                # after-merge row there means the ordinary branch never
+                # ran -- not that an intent was lost. Reconstructing one
+                # would re-apply a Done the gate path already converged,
+                # which is exactly the duplicate this guard prevents.
+                continue
+            effect_id = (
+                f"linear:{record.issue_id}:after-merge:{record.review_id}"
+            )
+            try:
+                self._effects.begin(
+                    effect_id,
+                    target=record.issue_id,
+                    request=projection_request(
+                        record.issue_id, record.projection
+                    ),
+                )
+            except Exception as error:  # pragma: no cover - infra guard
+                print(
+                    "post-merge intent reconstruction failed for "
+                    f"{effect_id!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+
     async def reconcile_post_merge_projections(
         self, project_key: str | None = None
     ) -> tuple[str, ...]:
@@ -718,6 +828,24 @@ class ReviewService:
         the gate had existed at merge time.
         """
 
+        # INFRA-218 Sol correction d65491fe (defect 1): the previous
+        # correction moved the projection AFTER the terminal
+        # ``mark_settled`` write so nothing is ever awaited under the
+        # merge lease — but that opened a narrow window of its own. A
+        # crash between that terminal write and
+        # ``_project_after_merge``'s ``self._effects.begin`` leaves a
+        # SETTLED settlement whose review is merged and NO after-merge
+        # effect row at all, so the pending scan below finds nothing and
+        # the projection is lost permanently. Reverting to projecting
+        # under the lease is not the fix (it restores the stranding
+        # defect), so the missing intent is instead reconstructed here,
+        # deterministically, from the merged review itself: the same
+        # ``linear:<issue>:after-merge:<review>`` effect id and the same
+        # stored ``record.projection`` target the fresh path would have
+        # journaled. Because the id is identical, a reconstruction can
+        # never double-apply against a real one, and a later pass finds
+        # the row already present.
+        self._reconstruct_missing_after_merge_intents(project_key)
         rows = self._database.execute(
             "SELECT effect_id, request_json FROM external_effects "
             "WHERE adapter = 'linear' AND operation = 'project' "
@@ -1694,11 +1822,72 @@ class ReviewService:
             target=record.issue_id,
             request=projection_request(record.issue_id, projection),
         )
-        await self._linear.project(
-            record.issue_id,
-            projection,
-            effect_id=effect_id,
-        )
+        # INFRA-218 Sol correction d65491fe (defect 2): route through the
+        # legal-walk applier below rather than a bare ``self._linear.project``
+        # call, so even a fresh merge whose issue drifted status between the
+        # review being opened and the merge landing converges instead of
+        # raising.
+        await self._apply_after_merge_target(record.issue_id, projection, effect_id)
+
+    async def _apply_after_merge_target(
+        self, issue_id: str, target: LinearProjection, effect_id: str
+    ) -> None:
+        """Apply an after-merge Linear target, walking illegal hops.
+
+        INFRA-218 Sol correction d65491fe (defect 2): a stored Done/QA
+        target can be unreachable in a single hop from the issue's CURRENT
+        Linear status -- a review whose stored target is "Done" replayed
+        while the issue is still "In Development" is not a legal direct
+        pair in ``linear._ALLOWED_STATUS_TRANSITIONS``, and
+        ``LinearClient.project`` raises rather than mutating. That raise
+        names the live current status in its message; :data:`_legal_status_path`
+        walks the legal intermediate states from that status to
+        ``target.status`` (e.g. In Development -> Review -> Done), applying
+        one hop at a time. Each hop is projected under its own deterministic
+        effect id (the base id suffixed with the hop's status), so a replay
+        of any hop is idempotent and a partial walk (crash mid-walk) resumes
+        exactly where it stopped -- the final hop reuses the ORIGINAL
+        ``effect_id`` and the exact ``target``, so the durable pending row
+        this effect id names completes normally, exactly as a direct
+        single-hop projection would have. When no legal walk exists at all,
+        the intent is left pending (not raised) for the next recovery
+        boundary -- the caller's own fail-soft wrapper never sees an
+        exception for this case.
+        """
+
+        try:
+            await self._linear.project(issue_id, target, effect_id=effect_id)
+            self._complete_post_merge_effect(effect_id)
+            return
+        except ValueError as error:
+            match = _TRANSITION_NOT_ALLOWED.match(str(error))
+            if match is None or target.status is None:
+                raise
+            current_status = match.group("current")
+
+        path = _legal_status_path(current_status, target.status)
+        if path is None:
+            print(
+                "post-merge projection for "
+                f"{effect_id!r} has no legal Linear status walk from "
+                f"{current_status!r} to {target.status!r}; left pending "
+                "for the next recovery boundary",
+                file=sys.stderr,
+            )
+            return
+
+        for hop_status in path[:-1]:
+            hop_effect_id = f"{effect_id}:via:{hop_status.replace(' ', '-')}"
+            await self._linear.project(
+                issue_id,
+                LinearProjection(
+                    status=hop_status, assignee_alias=target.assignee_alias
+                ),
+                effect_id=hop_effect_id,
+            )
+            self._complete_post_merge_effect(hop_effect_id)
+
+        await self._linear.project(issue_id, target, effect_id=effect_id)
         self._complete_post_merge_effect(effect_id)
 
     async def _hold_for_acceptance(
