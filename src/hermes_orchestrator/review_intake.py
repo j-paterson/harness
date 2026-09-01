@@ -17,6 +17,10 @@ from hermes_orchestrator.manifests import (
 )
 
 BranchHead = Callable[[str, str], str]
+#: ``(project_key, branch, candidate_sha) -> bool``. Proves the exact
+#: reviewed SHA is an already-merged, same-repository pull request
+#: targeting the integration branch (INFRA-217).
+MergedCandidateProof = Callable[[str, str, str], bool]
 BasePolicy = Callable[[str, str], bool]
 
 
@@ -101,6 +105,7 @@ class CandidateAdmission:
         branch_head: BranchHead,
         base_policy: BasePolicy,
         intake_gate: IntakeGate,
+        merged_candidate_proof: MergedCandidateProof | None = None,
     ) -> None:
         if branch_head is None:
             raise ValueError("candidate admission requires a branch head")
@@ -113,6 +118,12 @@ class CandidateAdmission:
         self._branch_head = branch_head
         self._base_policy = base_policy
         self._intake_gate = intake_gate
+        # INFRA-217: GitHub deletes a merged candidate's branch, so
+        # ``branch_head`` stops resolving and admission would reject a
+        # candidate whose merge is already PROVEN. This optional proof
+        # is the only thing that may excuse an unresolvable remote
+        # branch; when absent, behavior is exactly as before.
+        self._merged_candidate_proof = merged_candidate_proof
 
     def admit(
         self,
@@ -153,9 +164,27 @@ class CandidateAdmission:
             )
         head = self._branch_head(project_key, manifest.branch)
         if manifest.candidate_sha != head:
-            raise CandidateRejected(
-                "candidate is not the current branch head"
+            # INFRA-217: an empty head means the remote branch no longer
+            # resolves at all -- the normal state AFTER a merge, since
+            # GitHub deletes the branch. That alone still proves nothing,
+            # so it is excused only when GitHub proves this exact reviewed
+            # SHA is an already-merged, same-repository pull request
+            # targeting the integration branch. Every other case is
+            # unchanged and still fails closed: a branch that RESOLVES to
+            # a different commit is a stale candidate (exact-head
+            # validation for open candidates), and a missing branch with
+            # no merge proof is rejected exactly as before.
+            proven_merged = (
+                head == ""
+                and self._merged_candidate_proof is not None
+                and self._merged_candidate_proof(
+                    project_key, manifest.branch, manifest.candidate_sha
+                )
             )
+            if not proven_merged:
+                raise CandidateRejected(
+                    "candidate is not the current branch head"
+                )
         if not self._base_policy(project_key, manifest.base_sha):
             raise CandidateRejected(
                 "candidate base violates the active review policy"

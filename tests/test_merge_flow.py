@@ -13,6 +13,7 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.merge_flow import (
     _branch_head,
+    _merged_candidate_proof,
     build_merge_flow,
     merger_contract_path,
 )
@@ -216,3 +217,98 @@ def test_branch_head_returns_empty_string_on_resolution_failure(
     head = _branch_head(settings, git)
 
     assert head("demo", "feature/eng-9") == ""
+
+
+@dataclass
+class FakeDiscoveryGitHub:
+    """Records discovery calls and answers with a canned pull."""
+
+    pull: object | None = None
+    error: Exception | None = None
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def discover_pull_request(
+        self, repository: str, *, branch: str, head_sha: str
+    ) -> object | None:
+        self.calls.append((repository, branch, head_sha))
+        if self.error is not None:
+            raise self.error
+        return self.pull
+
+
+def _discovered(**overrides: object) -> object:
+    from hermes_orchestrator.github import DiscoveredPull
+
+    arguments: dict[str, object] = {
+        "number": 14,
+        "state": "closed",
+        "merged": True,
+        "head_sha": "1" * 40,
+        "merge_sha": "2" * 40,
+        "repository": "owner/demo",
+        "head_repository": "owner/demo",
+        "base_ref": "main",
+    }
+    arguments.update(overrides)
+    return DiscoveredPull(**arguments)  # type: ignore[arg-type]
+
+
+def test_merged_candidate_proof_accepts_only_an_exact_merged_same_repo_pull(
+    tmp_path: Path,
+) -> None:
+    """INFRA-217: the only thing that may excuse a deleted branch.
+
+    A merged, same-repository pull at the exact reviewed head targeting
+    the integration branch proves the candidate landed; every other
+    shape answers False so admission keeps failing closed.
+    """
+
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    github = FakeDiscoveryGitHub(pull=_discovered())
+
+    proof = _merged_candidate_proof(settings, github)
+
+    assert proof("demo", "feature/eng-9", "1" * 40) is True
+    assert github.calls == [("owner/demo", "feature/eng-9", "1" * 40)]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"merged": False},
+        {"repository": "someone-else/demo"},
+        {"head_repository": "someone-else/demo"},
+        {"base_ref": "release/next"},
+    ],
+)
+def test_merged_candidate_proof_refuses_every_other_shape(
+    tmp_path: Path, override: dict[str, object]
+) -> None:
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    github = FakeDiscoveryGitHub(pull=_discovered(**override))
+
+    proof = _merged_candidate_proof(settings, github)
+
+    assert proof("demo", "feature/eng-9", "1" * 40) is False
+
+
+def test_merged_candidate_proof_fails_closed_on_no_match_or_github_error(
+    tmp_path: Path,
+) -> None:
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+
+    assert _merged_candidate_proof(settings, FakeDiscoveryGitHub(pull=None))(
+        "demo", "feature/eng-9", "1" * 40
+    ) is False
+    assert _merged_candidate_proof(
+        settings, FakeDiscoveryGitHub(error=RuntimeError("github down"))
+    )("demo", "feature/eng-9", "1" * 40) is False
+    # An unknown project never reaches GitHub at all.
+    unknown = FakeDiscoveryGitHub(pull=_discovered())
+    assert _merged_candidate_proof(settings, unknown)(
+        "nope", "feature/eng-9", "1" * 40
+    ) is False
+    assert unknown.calls == []

@@ -522,3 +522,91 @@ def test_rejects_an_undelivered_event(
 
     with pytest.raises(CandidateRejected, match="one"):
         admission(merger, tmp_path).admit("demo", event, received_generation=1)
+
+
+def test_a_deleted_branch_admits_only_with_a_proven_merged_pull(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """INFRA-217: GitHub deletes a merged candidate's branch.
+
+    ``branch_head`` then resolves to "" and admission used to reject a
+    candidate whose merge was already PROVEN — the production defect Sol
+    found. An unresolvable branch is now excused ONLY by a proof that
+    this exact reviewed SHA is an already-merged same-repository pull
+    request targeting the integration branch.
+    """
+
+    stored_channel(database)
+    event = delivered_event(merger, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+
+    def proof(project_key: str, branch: str, candidate_sha: str) -> bool:
+        calls.append((project_key, branch, candidate_sha))
+        return True
+
+    admitted = CandidateAdmission(
+        channels=merger,
+        manifest_root=tmp_path,
+        branch_head=lambda project_key, branch: "",
+        base_policy=lambda project_key, base_sha: True,
+        intake_gate=PassingGate(),
+        merged_candidate_proof=proof,
+    ).admit("demo", event, received_generation=1)
+
+    assert admitted.manifest.candidate_sha == HEAD
+    # The proof was asked about this exact candidate, not a guess.
+    assert calls == [("demo", admitted.manifest.branch, HEAD)]
+
+
+def test_a_deleted_branch_without_merge_proof_still_fails_closed(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """No proof, or a proof that refuses, keeps today's rejection."""
+
+    stored_channel(database)
+    event = delivered_event(merger, tmp_path)
+
+    with pytest.raises(CandidateRejected, match="current branch head"):
+        admission(merger, tmp_path, head="").admit(
+            "demo", event, received_generation=1
+        )
+
+    with pytest.raises(CandidateRejected, match="current branch head"):
+        CandidateAdmission(
+            channels=merger,
+            manifest_root=tmp_path,
+            branch_head=lambda project_key, branch: "",
+            base_policy=lambda project_key, base_sha: True,
+            intake_gate=PassingGate(),
+            merged_candidate_proof=lambda *args: False,
+        ).admit("demo", event, received_generation=1)
+
+
+def test_a_resolving_branch_at_another_commit_is_never_excused(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """Exact-head validation for OPEN candidates is preserved.
+
+    A branch that resolves to a DIFFERENT commit is a stale candidate,
+    and no merge proof may excuse it — the proof is never even consulted.
+    """
+
+    stored_channel(database)
+    event = delivered_event(merger, tmp_path)
+    consulted: list[object] = []
+
+    def proof(project_key: str, branch: str, candidate_sha: str) -> bool:
+        consulted.append((project_key, branch, candidate_sha))
+        return True
+
+    with pytest.raises(CandidateRejected, match="current branch head"):
+        CandidateAdmission(
+            channels=merger,
+            manifest_root=tmp_path,
+            branch_head=lambda project_key, branch: "f" * 40,
+            base_policy=lambda project_key, base_sha: True,
+            intake_gate=PassingGate(),
+            merged_candidate_proof=proof,
+        ).admit("demo", event, received_generation=1)
+
+    assert consulted == []

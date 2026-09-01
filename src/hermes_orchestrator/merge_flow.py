@@ -195,6 +195,7 @@ def build_merge_flow(
         branch_head=_branch_head(settings, GitVerifier(runner=runner)),
         base_policy=_base_policy(settings, GitVerifier(runner=runner)),
         intake_gate=intake_gate,
+        merged_candidate_proof=_merged_candidate_proof(settings, github),
     )
     qa = QaRouter(database=database, events=events)
     settlements = MergeSettlements(database, events)
@@ -281,6 +282,45 @@ def _branch_head(settings: Settings, git: GitVerifier) -> Callable[[str, str], s
             return ""
 
     return head
+
+
+def _merged_candidate_proof(
+    settings: Settings, github: GitHubClient
+) -> Callable[[str, str, str], bool]:
+    """Prove a reviewed SHA is an already-merged pull request (INFRA-217).
+
+    GitHub deletes a candidate's branch when its pull request merges, so
+    ``origin/<branch>`` stops resolving and admission would reject a
+    candidate whose merge is already proven -- the production defect Sol
+    found. This is the ONLY thing permitted to excuse an unresolvable
+    remote branch, and it excuses nothing else: the discovery must find
+    exactly one pull request at the exact reviewed head whose repository
+    AND head repository are the project repository, whose base is the
+    integration branch, and which is genuinely ``merged``. Discovery is
+    already exact on (branch, head_sha) by construction, so a different
+    commit can never satisfy it. Any ambiguity or GitHub failure answers
+    ``False`` and admission fails closed exactly as before.
+    """
+
+    def proof(project_key: str, branch: str, candidate_sha: str) -> bool:
+        project = settings.projects.get(project_key)
+        if project is None:
+            return False
+        try:
+            discovered = github.discover_pull_request(
+                project.github_repo, branch=branch, head_sha=candidate_sha
+            )
+        except Exception:
+            return False
+        if discovered is None or not discovered.merged:
+            return False
+        return (
+            discovered.repository == project.github_repo
+            and discovered.head_repository == project.github_repo
+            and discovered.base_ref == project.integration_branch
+        )
+
+    return proof
 
 
 def _base_policy(settings: Settings, git: GitVerifier) -> Callable[[str, str], bool]:
