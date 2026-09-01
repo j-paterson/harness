@@ -78,11 +78,6 @@ class FakeRpc:
         "threadSection/list": {"cursor", "limit"},
         "thread/section/move": {"beforeThreadId", "sectionId", "threadId"},
         "turn/interrupt": {"threadId", "turnId"},
-        # INFRA-223: the two EXPERIMENTAL thread-queue methods. The fake
-        # enforces the same handshake gate the real client does — they are
-        # refused outright unless this connection advertised them.
-        "thread/queue/list": {"threadId"},
-        "thread/queue/start": {"threadId", "queueItemId"},
     }
     _REQUIRED_KEYS: ClassVar[dict[str, set[str]]] = {
         "thread/read": {"threadId"},
@@ -92,8 +87,6 @@ class FakeRpc:
         "thread/metadata/update": {"threadId"},
         "thread/section/move": {"sectionId", "threadId"},
         "turn/interrupt": {"threadId", "turnId"},
-        "thread/queue/list": {"threadId"},
-        "thread/queue/start": {"threadId", "queueItemId"},
     }
     _SANDBOX_MODES = frozenset(
         {"read-only", "workspace-write", "danger-full-access"}
@@ -116,54 +109,6 @@ class FakeRpc:
         self._sequences: dict[str, list[dict[str, Any]]] = {}
         self._failures: dict[str, BaseException] = {}
         self.on_request: Any = None
-        # INFRA-223: the exact thread queue this connection would serve.
-        # ``effective_starts`` counts the starts that actually moved a
-        # queued item into execution — whoever caused them — so a test can
-        # assert one candidate was executed exactly once no matter how the
-        # explicit start and Codex's own auto-start raced.
-        self.thread_queue_advertised = False
-        self.queue_items: list[dict[str, Any]] = []
-        self.active_turn_id: str | None = None
-        self.auto_start_on_list = False
-        self.effective_starts = 0
-        self.started_items: list[str] = []
-
-    def enqueue_item(self, item_id: str, text: str) -> None:
-        """Queue one message onto the thread queue, as ``codex queue`` does."""
-
-        self.queue_items.append(
-            {"id": item_id, "status": "queued", "text": text}
-        )
-
-    def _start_item(self, item_id: str) -> None:
-        item = next(
-            (entry for entry in self.queue_items if entry["id"] == item_id),
-            None,
-        )
-        if item is None:
-            raise CodexRequestFailed("thread/queue/start", -32602)
-        if item["status"] != "queued":
-            # Already executing: the real server refuses a second start,
-            # which is exactly what an auto-start race looks like here.
-            raise CodexRequestFailed("thread/queue/start", -32600)
-        item["status"] = "running"
-        self.effective_starts += 1
-        self.started_items.append(item_id)
-
-    def _queue_listing(self) -> dict[str, Any]:
-        payload = {
-            "items": [dict(entry) for entry in self.queue_items],
-            "activeTurnId": self.active_turn_id,
-        }
-        if self.auto_start_on_list and self.queue_items:
-            # Codex auto-started the head right after we observed it
-            # queued — the exact race the connection-close defect showed.
-            self.auto_start_on_list = False
-            self._start_item(str(self.queue_items[0]["id"]))
-        return payload
-
-    def supports_thread_queue(self) -> bool:
-        return self.thread_queue_advertised
 
     def respond(self, method: str, result: dict[str, Any]) -> None:
         self._results[method] = result
@@ -217,20 +162,11 @@ class FakeRpc:
     ) -> dict[str, Any]:
         assert timeout > 0
         self._validate(method, params)
-        if method.startswith("thread/queue/") and not self.thread_queue_advertised:
-            raise CodexUnavailable(
-                f"{method} is experimental and was not advertised"
-            )
         self.requests.append((method, params))
         if self.on_request is not None:
             await self.on_request(method)
         if method in self._failures:
             raise self._failures[method]
-        if method == "thread/queue/list":
-            return self._queue_listing()
-        if method == "thread/queue/start":
-            self._start_item(str((params or {})["queueItemId"]))
-            return {}
         if self._sequences.get(method):
             return self._sequences[method].pop(0)
         if method in self._results:
@@ -1443,258 +1379,3 @@ def test_ponytail_guard_binds_nowhere_but_the_managed_sol_boundary() -> None:
             continue
         source = module.read_text(encoding="utf-8")
         assert "codex_ponytail_guard" not in source, module.name
-
-
-# ---------------------------------------------------------------------------
-# INFRA-223 item 1: exact queue start and recovery
-# ---------------------------------------------------------------------------
-
-
-class LegacyRpc:
-    """An app-server client with no thread-queue handshake surface at all."""
-
-    def __init__(self) -> None:
-        self.methods: list[str] = []
-
-    async def request(
-        self, method: str, params: dict[str, Any] | None, timeout: float
-    ) -> dict[str, Any]:
-        self.methods.append(method)
-        raise AssertionError(
-            "an unadvertised experimental surface must never be called"
-        )
-
-
-def queued_wake(
-    database: Database,
-    *,
-    event_id: str = "evt-1",
-    candidate_sha: str = "1" * 40,
-    state: str = "delivered",
-    queue_state: str | None = "queued",
-    queue_item_id: str | None = None,
-    thread_id: str = "thr_stored",
-    generation: int = 1,
-) -> str:
-    """Insert one wake already queued into the exact thread queue.
-
-    Returns the wake envelope exactly as ``WakeEvent.render`` writes it,
-    which is the text ``codex queue`` puts in the thread queue and the
-    durable ``event=`` identity the head is matched by.
-    """
-
-    stamp = datetime(2026, 8, 27, tzinfo=UTC).isoformat()
-    with database.transaction() as connection:
-        connection.execute(
-            "INSERT INTO wake_deliveries(project_key, event_id, status, "
-            "issue_id, candidate_sha, base_sha, branch, manifest_path, "
-            "manifest_digest, manifest_device, manifest_inode, "
-            "manifest_size, manifest_mtime_ns, manifest_mode, state, "
-            "attempts, created_at, updated_at, thread_id, generation, "
-            "queue_state, queue_item_id) "
-            "VALUES ('demo', ?, 'FABLE_READY', 'ENG-9', ?, ?, "
-            "'feature/eng-9', '/manifests/evt.json', 'sha256:d', "
-            "1, 2, 3, 4, 5, ?, 0, ?, ?, ?, ?, ?, ?)",
-            (
-                event_id,
-                candidate_sha,
-                "2" * 40,
-                state,
-                stamp,
-                stamp,
-                thread_id,
-                generation,
-                queue_state,
-                queue_item_id,
-            ),
-        )
-    return (
-        f"FABLE_READY issue=ENG-9 candidate={candidate_sha} "
-        f"base={'2' * 40} manifest=/manifests/evt.json event={event_id} "
-        f"generation={generation}"
-    )
-
-
-def queue_row(database: Database, event_id: str = "evt-1") -> tuple[Any, ...]:
-    row = database.execute(
-        "SELECT queue_state, queue_item_id FROM wake_deliveries "
-        "WHERE event_id = ?",
-        (event_id,),
-    ).fetchone()
-    return (row["queue_state"], row["queue_item_id"])
-
-
-@pytest.mark.asyncio
-async def test_absent_queue_capability_falls_back_and_records_that_it_did(
-    database: Database,
-) -> None:
-    """The handshake is explicit: a Codex that never advertised the
-    experimental thread-queue surface is never probed, the adapter falls
-    back to today's behaviour instead of failing hard, and the fallback
-    is recorded durably on the channel rather than being silent."""
-
-    stored_thread(database)
-    queued_wake(database)
-    rpc = LegacyRpc()
-    merger = CodexMerger(
-        rpc=rpc,
-        database=database,
-        projects={
-            "demo": ProjectConfig(
-                linear_team="infrastructure",
-                repo_path=Path("/repo/demo"),
-                integration_branch="main",
-                github_repo="j-paterson/demo",
-            )
-        },
-        prompt_file=PROMPT_PATH,
-        now=lambda: datetime(2026, 8, 27, tzinfo=UTC),
-    )
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("capability_absent", False)
-    assert rpc.methods == []
-    channel = merger.read_channel("demo")
-    assert channel is not None
-    assert channel.thread_queue_capability == "absent"
-    # Today's behaviour, unchanged: the wake stays exactly as the queue
-    # CLI left it — durably queued, not started, still recoverable.
-    assert queue_row(database) == ("queued", None)
-
-
-@pytest.mark.asyncio
-async def test_an_advertised_capability_starts_the_exact_idle_head_once(
-    merger: CodexMerger, rpc: FakeRpc, database: Database
-) -> None:
-    stored_thread(database)
-    message = queued_wake(database)
-    rpc.thread_queue_advertised = True
-    rpc.enqueue_item("qi-1", message)
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("started", True)
-    assert outcome.queue_item_id == "qi-1"
-    assert rpc.started_items == ["qi-1"]
-    assert queue_row(database) == ("started", "qi-1")
-    channel = merger.read_channel("demo")
-    assert channel is not None
-    assert channel.thread_queue_capability == "advertised"
-    assert rpc.request_for("thread/queue/start")["params"] == {
-        "threadId": "thr_stored",
-        "queueItemId": "qi-1",
-    }
-
-    # Driving again observes the SAME item already running and issues no
-    # second start: one candidate is never executed twice.
-    again = await merger.drive_queue_head("demo")
-    assert (again.kind, again.started) == ("already_started", True)
-    assert rpc.effective_starts == 1
-    assert rpc.started_items == ["qi-1"]
-
-
-@pytest.mark.asyncio
-async def test_a_queued_candidate_never_interrupts_an_active_turn(
-    merger: CodexMerger, rpc: FakeRpc, database: Database
-) -> None:
-    stored_thread(database)
-    message = queued_wake(database)
-    rpc.thread_queue_advertised = True
-    rpc.enqueue_item("qi-1", message)
-    rpc.active_turn_id = "turn-live"
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("turn_active", False)
-    assert rpc.effective_starts == 0
-    assert "thread/queue/start" not in rpc.methods
-    assert "turn/start" not in rpc.methods
-    # The candidate stays durably queued behind the live turn.
-    assert queue_row(database) == ("queued", None)
-
-
-@pytest.mark.asyncio
-async def test_an_auto_start_racing_an_explicit_start_starts_exactly_once(
-    merger: CodexMerger, rpc: FakeRpc, database: Database
-) -> None:
-    """Observed 2026-09-01: a recovery connection closed right after one
-    turn and Codex auto-started the next queued candidate itself. The
-    explicit start must not make that a second execution."""
-
-    stored_thread(database)
-    message = queued_wake(database)
-    rpc.thread_queue_advertised = True
-    rpc.enqueue_item("qi-1", message)
-    # The head is observed queued, and Codex auto-starts it in the
-    # window between that observation and the explicit start.
-    rpc.auto_start_on_list = True
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("already_started", True)
-    assert rpc.effective_starts == 1
-    assert rpc.started_items == ["qi-1"]
-    assert queue_row(database) == ("started", "qi-1")
-    # The durable transition is itself exactly-once: the row is already
-    # started, so nothing can record a second start over it.
-    assert (
-        merger.record_queue_started("demo", "evt-1", queue_item_id="qi-1")
-        is False
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_head_that_is_not_this_candidate_is_never_started(
-    merger: CodexMerger, rpc: FakeRpc, database: Database
-) -> None:
-    stored_thread(database)
-    queued_wake(database)
-    rpc.thread_queue_advertised = True
-    rpc.enqueue_item("qi-operator", "please look at the dashboard when free")
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("head_unmatched", False)
-    assert rpc.effective_starts == 0
-    assert queue_row(database) == ("queued", None)
-
-
-@pytest.mark.asyncio
-async def test_a_refused_start_leaves_the_head_queued_for_recovery(
-    merger: CodexMerger, rpc: FakeRpc, database: Database
-) -> None:
-    stored_thread(database)
-    message = queued_wake(database)
-    rpc.thread_queue_advertised = True
-    rpc.enqueue_item("qi-1", message)
-    rpc.fail("thread/queue/start", CodexTimeout("thread/queue/start timed out"))
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("start_failed", False)
-    assert rpc.effective_starts == 0
-    # Fail closed: the row goes back to queued (bound to the exact item it
-    # was observed at) so the next boundary re-drives that same head.
-    assert queue_row(database) == ("queued", "qi-1")
-
-
-@pytest.mark.asyncio
-async def test_an_unqueued_or_settled_candidate_is_never_driven(
-    merger: CodexMerger, rpc: FakeRpc, database: Database
-) -> None:
-    stored_thread(database)
-    rpc.thread_queue_advertised = True
-    queued_wake(database, event_id="evt-pending", state="pending", queue_state=None)
-    queued_wake(
-        database,
-        event_id="evt-done",
-        candidate_sha="3" * 40,
-        state="completed",
-        queue_state="settled",
-    )
-
-    outcome = await merger.drive_queue_head("demo")
-
-    assert (outcome.kind, outcome.started) == ("no_queued_candidate", False)
-    assert "thread/queue/list" not in rpc.methods
