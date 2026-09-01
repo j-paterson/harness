@@ -951,6 +951,58 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
     )
 
 
+def _open_idle_linear_router(
+    settings: Settings, *, database: Database, queue: Any
+) -> Any:
+    """Compose the live Linear router the idle dispatcher projects
+    through — Keychain + settings, exactly the way ``_open_merge_flow``
+    composes it for the merge flow (INFRA-199 Finding 1).
+
+    Raises on any composition failure (missing ``config/linear.yaml``,
+    an unreadable Keychain credential, an unregistered project). Sol
+    ec0ed7fe gap 1: the Stop-hook idle path never calls this before its
+    local activation commits — ``_LazyIdleLinearProjector`` defers the
+    composition into the post-commit projection attempt, where
+    ``cells._project_in_development`` swallows a raise here like any
+    other Linear failure. Router composition can therefore never block
+    local work, and never bypasses Linear either: the pending
+    ``external_effects`` row journaled with the activation commit is
+    the durable trace reconciliation resolves.
+    """
+
+    return build_linear_router(
+        settings, database=database, queue=queue, keychain=Keychain()
+    )
+
+
+class _LazyIdleLinearProjector:
+    """Compose the Keychain/config-backed Linear router only at
+    projection time — strictly AFTER the local activation transaction
+    committed (Sol ec0ed7fe gap 1).
+
+    Satisfies ``cells.LinearProjector`` without touching the Keychain,
+    ``config/linear.yaml``, or the network at construction time, so an
+    eligible local activation commits without ever constructing the
+    live Linear client. The first (and only) composition happens inside
+    ``cells._project_in_development``'s suppressed projection attempt.
+    """
+
+    def __init__(
+        self, settings: Settings, *, database: Database, queue: Any
+    ) -> None:
+        self._settings = settings
+        self._database = database
+        self._queue = queue
+
+    async def project(
+        self, issue_id: str, target: Any, effect_id: str
+    ) -> Any:
+        router = _open_idle_linear_router(
+            self._settings, database=self._database, queue=self._queue
+        )
+        return await router.project(issue_id, target, effect_id)
+
+
 ROTATION_REGISTRATION_WAIT_SECONDS = 60.0
 """How long ``rotate-lead`` waits for the replacement session's active
 hermes-control channel registration before reporting the rotation
@@ -2351,6 +2403,150 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     return 0
 
 
+def _idle_admission_priority(
+    executor: Any, *, now: datetime, freshness_minutes: int
+) -> int | None:
+    """The highest issue priority the freshest resource sample
+    authorizes right now, or ``None`` when nothing may be admitted.
+
+    Delegates to :func:`hermes_orchestrator.cells.admission_priority_ceiling`
+    — the ONE shared freshness/priority ceiling the daemon dispatch
+    path's armed transaction-local guard also runs (Sol ec0ed7fe gap
+    3), so the idle and daemon paths can never diverge on what capacity
+    evidence admits. A missing, malformed, implausibly future-dated, or
+    stale sample (INFRA-199 Finding 2) all fail closed exactly like an
+    explicit red/unknown pressure reading does — refuse admission,
+    never guess.
+    """
+
+    from hermes_orchestrator.cells import admission_priority_ceiling
+
+    return admission_priority_ceiling(
+        executor, now=now, freshness_minutes=freshness_minutes
+    )
+
+
+def _dispatch_idle_lead(
+    database: Database, session_id: str, args: argparse.Namespace
+) -> None:
+    """At the calling lead's own genuine idle boundary, hand its live
+    cell one ready, non-conflicting, capacity-permitted assignment
+    (INFRA-199). Only the session's OWN active ``project_cells`` row
+    is ever resolved (mirrors ``LeadIntakePoll.next_offer``'s query).
+
+    The activation itself is never reimplemented here: it runs through
+    ``cells.activate_admitted_issue``, the ONE shared durable service
+    that also backs ``ProjectCellService``'s explicit dispatch path.
+    INFRA-199 v2: that service commits the LOCAL activation transaction
+    first — it never consults Linear — and only once that commit
+    succeeds does it attempt the idempotent ``In Development``
+    projection; a Linear failure there is swallowed rather than
+    undoing or retrying the already-durable local activation (see
+    ``cells._project_in_development``). Candidate eligibility
+    additionally requires a resource sample fresh enough to trust
+    (INFRA-199 Finding 2); that freshness is checked once for candidate
+    selection and rechecked inside the same atomic transaction that
+    activates the candidate — which also re-proves every other mutable
+    predicate (occupancy, exact source state, dependency readiness,
+    operator decisions, cell/lease identity) at commit time.
+    """
+
+    from hermes_orchestrator.cells import activate_admitted_issue
+    from hermes_orchestrator.lead_assignments import LeadAssignments
+    from hermes_orchestrator.queue import QueueService
+
+    cell = database.execute(
+        "SELECT cell_id, project_key, profile_alias FROM project_cells "
+        "WHERE session_id = ? AND state = 'active' "
+        "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if cell is None:
+        return
+    settings = load_settings(args.repo_root, args.state_dir)
+    project_key = str(cell["project_key"])
+    events = EventStore(database)
+    queue = QueueService(database, events, registered_projects=())
+    freshness_minutes = settings.policy.resource_sample_freshness_minutes
+    max_priority = _idle_admission_priority(
+        database, now=datetime.now(UTC), freshness_minutes=freshness_minutes
+    )
+    if max_priority is None:
+        return
+    # Project occupancy (INFRA-199 v2 / INFRA-211): a project already
+    # mid-flight on another issue — in_development OR review — never gets
+    # a second one started here.
+    already_working = database.execute(
+        "SELECT 1 FROM admitted_issues WHERE project_key = ? "
+        "AND state IN (?, ?) LIMIT 1",
+        (
+            project_key,
+            IssueState.IN_DEVELOPMENT.value,
+            IssueState.REVIEW.value,
+        ),
+    ).fetchone()
+    if already_working is not None:
+        return
+    decisions = OperatorDecisions(database)
+    ranked = queue.list_ranked(datetime.now(UTC))
+    candidate = None
+    for issue in ranked:
+        if issue.project_key != project_key or not issue.dependency_ready:
+            continue
+        if issue.linear_priority > max_priority:
+            continue
+        if decisions.pending_for_issue(issue.issue_id):
+            continue
+        candidate = issue
+        break
+    if candidate is None:
+        return
+
+    # Sol ec0ed7fe gap 1: the live Keychain/config-backed Linear router
+    # is NOT composed here any more. An eligible local activation must
+    # commit without ever constructing the live Linear client, so the
+    # lazy projector composes it only inside the post-commit projection
+    # attempt, where a composition failure (no config/linear.yaml, an
+    # unreadable Keychain credential, an unregistered project) is
+    # swallowed by ``cells._project_in_development`` exactly like any
+    # other Linear failure — it can never block or undo the local work,
+    # and the stable pending ``external_effects`` row journaled with the
+    # activation commit remains as the durable trace for reconciliation.
+    linear = _LazyIdleLinearProjector(settings, database=database, queue=queue)
+    assignments = LeadAssignments(database, events=events)
+
+    def _still_eligible(connection: sqlite3.Connection) -> bool:
+        current_max = _idle_admission_priority(
+            connection, now=datetime.now(UTC), freshness_minutes=freshness_minutes
+        )
+        row = connection.execute(
+            "SELECT priority FROM admitted_issues WHERE issue_id = ?",
+            (candidate.issue_id,),
+        ).fetchone()
+        return (
+            row is not None
+            and current_max is not None
+            and int(row["priority"]) <= current_max
+        )
+
+    activated, assignment = asyncio.run(
+        activate_admitted_issue(
+            database=database,
+            events=events,
+            linear=linear,
+            assignments=assignments,
+            cell_id=str(cell["cell_id"]),
+            project_key=project_key,
+            profile_alias=str(cell["profile_alias"]),
+            session_id=session_id,
+            issue_id=candidate.issue_id,
+            guard=_still_eligible,
+        )
+    )
+    if activated and assignment is not None:
+        assignments.notify_committed(assignment)
+
+
 def _intake_poll(args: argparse.Namespace) -> int:
     """Lease the calling lead's next pending envelope, if any.
 
@@ -2380,19 +2576,30 @@ def _intake_poll(args: argparse.Namespace) -> int:
         if hook_event == "Stop":
             # A Stop with live background children records the durable
             # continuation the last child completion will reactivate;
-            # a Stop with none supersedes any stale promise.
+            # a Stop with none supersedes any stale promise and is
+            # this session's genuine idle boundary. An exception here
+            # leaves ``continuation`` truthy, so a hook error never
+            # risks treating an uncertain state as idle.
+            continuation: object = "unknown"
             with suppress(Exception):
                 from hermes_orchestrator.events import EventStore
                 from hermes_orchestrator.lead_children import (
                     LeadChildTracker,
                 )
 
-                LeadChildTracker(
+                continuation = LeadChildTracker(
                     database,
                     control=ControlOperations(
                         database, events=EventStore(database)
                     ),
                 ).record_turn_stop(str(session))
+            if continuation is None:
+                # INFRA-199: at the genuine idle boundary, offer the
+                # existing admitted queue one normal durable
+                # assignment before anything else, so a freshly
+                # published packet rides this same poll response.
+                with suppress(Exception):
+                    _dispatch_idle_lead(database, str(session), args)
         # INFRA-201: settle this session's maintenance receipts
         # silently before offering anything — no output either way,
         # for any hook event, so a wake never reaches the primary view
@@ -3656,6 +3863,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     checkout_root=_code_checkout_root(),
                     binary_path=Path(sys.argv[0]).resolve(),
                     pid=os.getpid(),
+                )
+            if runtime.cells is not None:
+                # Sol ec0ed7fe gap 3: the daemon's dispatch path runs
+                # the IDENTICAL transaction-local freshness/priority
+                # guard the idle dispatcher supplies
+                # (cells.admission_priority_ceiling on the activation
+                # transaction's own connection), armed with the same
+                # policy freshness bound the idle path reads, so
+                # capacity evidence that went stale — or was superseded
+                # by a red sample — between scheduler planning and the
+                # activation commit fails closed.
+                runtime.cells.require_dispatch_capacity_guard(
+                    settings.policy.resource_sample_freshness_minutes
                 )
             supervisor = asyncio.run(
                 _run_daemon(

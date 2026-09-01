@@ -22,7 +22,11 @@ from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
 from hermes_orchestrator.lead_wakes import TerminalWakeInput
-from hermes_orchestrator.linear import LinearProjection
+from hermes_orchestrator.linear import (
+    ExternalEffectStore,
+    LinearProjection,
+    projection_request,
+)
 from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
 from hermes_orchestrator.queue import QueueService
@@ -120,9 +124,18 @@ class LeadSeatEnsurer(Protocol):
 
 
 class LinearProjector(Protocol):
-    """Approved Linear projection boundary used by project cells."""
+    """Approved Linear projection boundary used by project cells.
 
-    async def validate(self, project_key: str, issue_id: str) -> object: ...
+    INFRA-199 v2: Linear never authorizes activation, so this contract
+    is projection-only. There is deliberately no ``validate`` method
+    here any more — the removed pre-commit team/routing check that
+    used to gate whether a candidate could even start is gone (see
+    ``ProjectCellService._dispatch_locked`` and
+    :func:`activate_admitted_issue`); team/routing correctness is
+    proven, post-commit, by ``project``'s own internal
+    ``validate_issue`` call (``LinearClient.project`` in ``linear.py``)
+    the one time Linear is ever consulted in this path.
+    """
 
     async def project(
         self,
@@ -190,6 +203,354 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+# The only source states an activation may CAS out of: the exact
+# runnable states ranked dispatch selects from. Anything else — done,
+# paused, review, qa, in_development — refuses at commit time.
+_RUNNABLE_ISSUE_STATES = (
+    IssueState.QUEUED.value,
+    IssueState.BLOCKED.value,
+)
+
+# Project occupancy (INFRA-199 v2 / INFRA-211): a project is "busy" —
+# refusing a DIFFERENT issue's activation — while it has an issue in
+# EITHER of these states. ``in_development`` is the obvious case; the
+# INFRA-211 failure reproduction showed a second issue starting while
+# the first had already moved to ``review`` (the lead had handed off,
+# but the project is not yet free — the reviewer/settlement flow still
+# owns it), so review occupies the project exactly like in_development
+# does.
+_OCCUPYING_ISSUE_STATES = (
+    IssueState.IN_DEVELOPMENT.value,
+    IssueState.REVIEW.value,
+)
+
+
+def admission_priority_ceiling(
+    executor: object, *, now: datetime, freshness_minutes: int
+) -> int | None:
+    """The highest issue priority the freshest resource sample
+    authorizes right now, or ``None`` when nothing may be admitted.
+
+    THE one shared freshness/priority guard body (Sol ec0ed7fe gap 3):
+    the Stop-hook idle dispatcher (``cli._idle_admission_priority``)
+    and the daemon dispatch path
+    (:meth:`ProjectCellService._activate_issue`'s transaction-local
+    guard) both run exactly this function — first on a plain database
+    snapshot for candidate selection where applicable, then again on
+    the activation transaction's own connection — so the two paths can
+    never diverge on what capacity evidence admits.
+
+    A missing, malformed, implausibly future-dated, or stale sample
+    (INFRA-199 Finding 2) all fail closed here exactly like an explicit
+    red/unknown pressure reading does — refuse admission, never guess.
+    """
+
+    from hermes_orchestrator.admission import YELLOW_ADMITS_PRIORITY_AT_MOST
+    from hermes_orchestrator.resources import read_fresh_sample
+
+    reading = read_fresh_sample(
+        executor,  # type: ignore[arg-type]
+        now=now,
+        max_age=timedelta(minutes=freshness_minutes),
+    )
+    if reading is None:
+        return None
+    return {"green": 4, "yellow": YELLOW_ADMITS_PRIORITY_AT_MOST}.get(
+        reading.pressure
+    )
+
+
+def _in_development_effect_id(issue_id: str) -> str:
+    """The one stable Linear ``In Development`` projection effect id.
+
+    Hermes' durable local lifecycle is authoritative (INFRA-199 v2):
+    local activation commits before this projection is ever attempted,
+    and nothing here ever compensates or re-projects under a bumped
+    epoch, so — unlike the removed intent machinery's per-compensation
+    suffix — a single, permanently stable id is correct: at most one
+    legitimate ``In Development`` projection exists per issue's
+    activation, and ``ExternalEffectStore``/``LinearClient`` (see
+    ``linear.py``) make any replay of it idempotent for free.
+    """
+
+    return f"linear:{issue_id}:in-development:v2"
+
+
+async def _project_in_development(linear: LinearProjector, issue_id: str) -> None:
+    """Best-effort, idempotent ``In Development`` projection attempted
+    ONLY after the local activation transaction already committed
+    (INFRA-199 v2: local-first activation).
+
+    Linear is an eventually consistent workflow projection, never an
+    authority over Hermes' durable local lifecycle. Any failure here —
+    composing the live client itself (the idle path composes its
+    Keychain/config-backed router lazily, inside this very call), a
+    network error, an unreachable or deleted issue, a disallowed
+    status transition — is swallowed: it must never roll back, retry-
+    loop, or duplicate the local work that already committed.
+
+    The durable trace is not lost, though: the activation transaction
+    that this projection follows already journaled the stable
+    TARGET-ONLY ``pending`` row in ``external_effects``
+    (``ExternalEffectStore.begin_in`` inside
+    :func:`_activate_issue_transaction`, no live client required), and
+    the real ``LinearClient.project`` (``linear.py``) ADOPTS that
+    exact row — same effect id, byte-identical request — before its
+    first network operation, so ANY failure class here (router
+    composition, the initial issue read, validation, the update)
+    leaves exactly that one row behind — never nothing. Startup/periodic
+    reconciliation (``ReconcileService._stage_linear`` /
+    ``_project_pending_linear_effect`` in ``reconcile.py``) already
+    reads every ``pending`` Linear effect and surfaces it as a durable
+    finding; that existing, read-only mechanism — not a retry loop
+    here — is what an operator or a later reconciliation pass resolves
+    it through. A later legitimate replay of this same stable effect
+    id (the issue's project cell resuming after a restart, say) is
+    naturally idempotent through that same store, so it converges the
+    pending row forward on its own without any bespoke convergence
+    protocol.
+    """
+
+    with suppress(Exception):
+        await linear.project(
+            issue_id,
+            LinearProjection(status="In Development", assignee_alias="operator"),
+            effect_id=_in_development_effect_id(issue_id),
+        )
+
+
+def _activate_issue_transaction(
+    *,
+    database: Database,
+    events: EventStore,
+    cell_id: str,
+    project_key: str,
+    profile_alias: str,
+    issue_id: str,
+    session_id: str,
+    assignments: LeadAssignments | None,
+    now: Callable[[], datetime],
+    guard: Callable[[sqlite3.Connection], bool] | None = None,
+) -> tuple[bool, LeadAssignment | None]:
+    """The one durable, LOCAL-ONLY activation transaction every dispatch
+    path shares: the full commit-time eligibility recheck, the
+    ``project_cells`` active-lease guard, the ``admitted_issues`` CAS
+    into ``in_development``, the journaled ``issue.started`` event, and
+    (when ``assignments`` is supplied) the durable assignment packet —
+    all in one exclusive write transaction (``Database.transaction``
+    opens ``BEGIN IMMEDIATE``), so a queue transition can never again
+    outrun its assignment and no predicate can change between its
+    recheck and the commit.
+
+    INFRA-199 v2: this transaction never consults Linear. Hermes'
+    durable local lifecycle is authoritative; Linear is an eventually
+    consistent workflow projection attempted only AFTER this commits
+    (see :func:`_project_in_development`, called by both callers below
+    once this returns ``True``).
+
+    Both :meth:`ProjectCellService._activate_issue` (explicit dispatch)
+    and :func:`activate_admitted_issue` (the Stop-hook idle dispatcher,
+    ``cli.py``'s ``_dispatch_idle_lead``) call this exact function;
+    neither reimplements the state machine.
+
+    Commit-time eligibility (INFRA-199 Finding 2) — every mutable
+    predicate observed before dispatch selected this candidate is
+    re-proven inside this transaction, and any failure aborts with
+    ZERO writes:
+
+    - ``guard``, when supplied, runs first on the same connection for
+      any FRESH activation (resource-sample freshness plus the
+      priority ceiling — the idle path and the armed daemon path both
+      supply the identical :func:`admission_priority_ceiling` check);
+      a replay of an already-``in_development`` issue is exempt: it
+      resumes work this same guard already authorized, it never
+      admits new work;
+    - the issue's source state must be one of the exact runnable
+      states (queued/blocked) and the CAS is ``WHERE state = ?`` with
+      that observed value — never merely ``!= done``;
+    - ``dependency_ready`` must still hold;
+    - no OTHER issue of the project may occupy it — ``in_development``
+      OR ``review`` (INFRA-211: a lead that already handed off to
+      review still owns the project until settlement clears it);
+    - no pending operator decision may exist for the issue;
+    - the cell must still be live and its profile lease active
+      (the ``project_cells`` CAS with the ``profile_leases`` guard).
+
+    An issue that is ALREADY ``in_development`` is the replay/resume
+    case: the cell lease is confirmed and the assignment packet is
+    (idempotently) ensured, but no second ``issue.started`` is ever
+    journaled and no queue transition happens — full replay
+    idempotence across effect, transition, event, and assignment.
+    """
+
+    stamp = now().isoformat()
+    assignment: LeadAssignment | None = None
+    with database.transaction() as connection:
+        issue_row = connection.execute(
+            "SELECT state, instruction_id, project_key, dependency_ready "
+            "FROM admitted_issues WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+        if issue_row is None:
+            raise KeyError(issue_id)
+        prior_state = str(issue_row["state"])
+        replaying = prior_state == IssueState.IN_DEVELOPMENT.value
+        if not replaying:
+            if guard is not None and not guard(connection):
+                return False, None
+            if prior_state not in _RUNNABLE_ISSUE_STATES:
+                return False, None
+            if not int(issue_row["dependency_ready"]):
+                return False, None
+            busy = connection.execute(
+                "SELECT 1 FROM admitted_issues WHERE project_key = ? "
+                "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+                (
+                    str(issue_row["project_key"]),
+                    *_OCCUPYING_ISSUE_STATES,
+                    issue_id,
+                ),
+            ).fetchone()
+            if busy is not None:
+                return False, None
+            pending_decision = connection.execute(
+                "SELECT 1 FROM operator_decisions WHERE issue_id = ? "
+                "AND status = 'pending' LIMIT 1",
+                (issue_id,),
+            ).fetchone()
+            if pending_decision is not None:
+                return False, None
+        activated = connection.execute(
+            "UPDATE project_cells SET state = 'active', updated_at = ? "
+            "WHERE cell_id = ? AND state IN ('starting', 'active') "
+            "AND EXISTS ("
+            "SELECT 1 FROM profile_leases "
+            "WHERE project_key = ? AND profile_alias = ? AND state = 'active'"
+            ")",
+            (stamp, cell_id, project_key, profile_alias),
+        )
+        if activated.rowcount == 0:
+            return False, None
+        if not replaying:
+            updated = connection.execute(
+                "UPDATE admitted_issues SET state = ?, updated_at = ? "
+                "WHERE issue_id = ? AND state = ?",
+                (
+                    IssueState.IN_DEVELOPMENT.value,
+                    stamp,
+                    issue_id,
+                    prior_state,
+                ),
+            )
+            if updated.rowcount == 0:
+                return False, None
+            events.append(
+                connection,
+                EventInput(
+                    event_type="issue.started",
+                    aggregate_type="issue",
+                    aggregate_id=issue_id,
+                    payload={"cell_id": cell_id},
+                ),
+            )
+        if assignments is not None:
+            assignment = assignments.publish_in(
+                connection,
+                project_key=project_key,
+                issue_id=issue_id,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias=profile_alias,
+                instruction_id=str(issue_row["instruction_id"]),
+                queue_transition=(
+                    f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
+                ),
+            )
+        # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
+        # projection record becomes durable in this very commit, BEFORE
+        # any fallible Linear operation can run — no live client is
+        # required to write it. ``LinearClient.project`` later ADOPTS
+        # this exact row (same effect id, byte-identical
+        # ``projection_request`` payload) instead of double-beginning,
+        # so every post-commit failure class — router composition, the
+        # initial issue read, team/mapping/transition validation, the
+        # update itself — leaves exactly ONE pending row for
+        # reconciliation (``reconcile._project_pending_linear_effect``).
+        # On a replay the row already exists (pending or completed) and
+        # is adopted untouched, keeping the journal at exactly one row.
+        ExternalEffectStore.begin_in(
+            connection,
+            _in_development_effect_id(issue_id),
+            target=issue_id,
+            request=projection_request(
+                issue_id,
+                LinearProjection(
+                    status="In Development", assignee_alias="operator"
+                ),
+            ),
+        )
+    return True, assignment
+
+
+async def activate_admitted_issue(
+    *,
+    database: Database,
+    events: EventStore,
+    linear: LinearProjector,
+    assignments: LeadAssignments | None,
+    cell_id: str,
+    project_key: str,
+    profile_alias: str,
+    session_id: str,
+    issue_id: str,
+    now: Callable[[], datetime] = _utc_now,
+    guard: Callable[[sqlite3.Connection], bool] | None = None,
+) -> tuple[bool, LeadAssignment | None]:
+    """Dispatch one already-admitted issue onto a live cell durably.
+
+    INFRA-199 v2 (local-first activation): the Stop-hook idle
+    dispatcher (``cli.py``'s ``_dispatch_idle_lead``) calls this
+    instead of reimplementing any part of dispatch's activation
+    sequence. It delegates to the very same
+    :func:`_activate_issue_transaction` that backs
+    :meth:`ProjectCellService._activate_issue`, so the idle path can
+    never diverge from the activation state machine.
+
+    Ordering: the shared LOCAL activation transaction commits FIRST —
+    it never consults Linear at all (see
+    :func:`_activate_issue_transaction`) — and only once it reports
+    success is the idempotent ``In Development`` projection attempted
+    through :func:`_project_in_development`. Linear never authorizes
+    activation: a deleted/unreachable issue, a disallowed transition,
+    or any other Linear failure cannot block or undo the local work
+    that already committed, and is swallowed rather than retried here
+    (see :func:`_project_in_development` for where that failure's
+    durable trace lives and how it gets resolved).
+
+    A commit-time refusal (occupancy, exact-state CAS, dependency
+    flip, pending decision, stale guard, lease identity) leaves ZERO
+    local writes and Linear is never even attempted — there is nothing
+    to project for a candidate that did not activate.
+    """
+
+    activated, assignment = _activate_issue_transaction(
+        database=database,
+        events=events,
+        cell_id=cell_id,
+        project_key=project_key,
+        profile_alias=profile_alias,
+        issue_id=issue_id,
+        session_id=session_id,
+        assignments=assignments,
+        now=now,
+        guard=guard,
+    )
+    if not activated:
+        return False, None
+    await _project_in_development(linear, issue_id)
+    return True, assignment
+
+
 class ProjectCellService:
     """Start or resume exactly one profile-pinned Claude lead per project."""
 
@@ -219,6 +580,7 @@ class ProjectCellService:
         decisions: OperatorDecisions | None = None,
         assignments: LeadAssignments | None = None,
         packets: SubagentPackets | None = None,
+        dispatch_freshness_minutes: int | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -243,8 +605,26 @@ class ProjectCellService:
         self._decisions = decisions
         self._assignments = assignments
         self._packets = packets
+        self._dispatch_freshness_minutes = dispatch_freshness_minutes
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
         self._restore_profile_leases()
+
+    def require_dispatch_capacity_guard(self, freshness_minutes: int) -> None:
+        """Arm the daemon dispatch path's transaction-local capacity guard.
+
+        Sol ec0ed7fe gap 3: the live daemon (``cli``'s ``daemon``
+        command) arms this with the same
+        ``policy.resource_sample_freshness_minutes`` bound the idle
+        dispatcher reads, so every FRESH activation through
+        :meth:`dispatch` re-proves — inside the activation transaction,
+        on its own connection — that the newest resource sample is
+        fresh enough and its pressure admits the issue's priority
+        (:func:`admission_priority_ceiling`, the identical check the
+        idle path runs). Unarmed (unit composition, one-shot rotation)
+        the dispatch path keeps its historical behavior.
+        """
+
+        self._dispatch_freshness_minutes = int(freshness_minutes)
 
     def active_projects(self) -> frozenset[str]:
         """Return projects that already own a live logical lead cell."""
@@ -261,21 +641,50 @@ class ProjectCellService:
         """Start or resume the issue's project lead after explicit admission."""
 
         issue = self._queue.get(issue_id)
-        if self._decisions is not None:
-            pending = self._decisions.pending_for_issue(issue_id)
-            if pending:
-                return DispatchResult(
-                    status="awaiting_operator_decision", issue_id=issue_id
-                )
         lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
         async with lock:
+            if self._decisions is not None:
+                pending = self._decisions.pending_for_issue(issue_id)
+                if pending:
+                    return DispatchResult(
+                        status="awaiting_operator_decision", issue_id=issue_id
+                    )
             return await self._dispatch_locked(issue_id)
 
     async def _dispatch_locked(self, issue_id: str) -> DispatchResult:
         """Dispatch one issue while holding its project-wide in-process lock."""
 
         issue = self._queue.get(issue_id)
-        await self._linear.validate(issue.project_key, issue_id)
+        # Project occupancy (INFRA-199 v2 / INFRA-211): a DIFFERENT queued
+        # issue never starts while this project already has one mid-flight
+        # in EITHER in_development or review. Dispatching that same
+        # in_development issue itself (resume after restart, reconciliation,
+        # handoff) is untouched — only a distinct issue_id is refused here,
+        # and the refusal is a plain read with zero writes. This is a coarse
+        # pre-check only, purely to avoid launching a Claude lead process for
+        # a candidate that cannot activate; the shared activation
+        # transaction (`_activate_issue_transaction`) re-proves the same
+        # occupancy predicate, transactionally, at commit time.
+        busy = self._database.execute(
+            "SELECT 1 FROM admitted_issues WHERE project_key = ? "
+            "AND state IN (?, ?) AND issue_id != ? LIMIT 1",
+            (issue.project_key, *_OCCUPYING_ISSUE_STATES, issue_id),
+        ).fetchone()
+        if busy is not None:
+            return DispatchResult(status="project_busy", issue_id=issue_id)
+        # INFRA-199 v2: Linear is never consulted before the local commit.
+        # Hermes' durable local lifecycle is authoritative; a pre-commit
+        # `linear.validate` here used to gate whether this candidate could
+        # even start a Claude lead, which meant a deleted/unreachable/
+        # misrouted Linear issue could block a locally-eligible, fully
+        # runnable issue from ever activating. That is exactly the
+        # authority Linear must not hold. Team/project routing is instead
+        # proven, post-commit, by the one Linear call this path still makes
+        # — `_project_and_activate`'s idempotent projection, whose
+        # `LinearClient.project` internally re-validates the team/issue
+        # before mutating anything — so a routing problem surfaces as a
+        # durable pending `external_effects` row for reconciliation, never
+        # as a block on local activation.
         cell = self._find_active_cell(issue.project_key)
         created = False
         if cell is None:
@@ -351,15 +760,9 @@ class ProjectCellService:
             if self._classic_seats:
                 # The pane itself runs the classic interactive lead; the
                 # daemon never launches a -p/stream-JSON shadow of it.
-                await self._linear.project(
-                    issue_id,
-                    LinearProjection(
-                        status="In Development",
-                        assignee_alias="operator",
-                    ),
-                    effect_id=f"linear:{issue_id}:in-development:v2",
+                activated, assignment = await self._project_and_activate(
+                    cell, issue_id
                 )
-                activated, assignment = self._activate_issue(cell, issue_id)
                 if activated:
                     if assignment is not None and self._assignments is not None:
                         # The packet is already durable; this only routes
@@ -410,15 +813,9 @@ class ProjectCellService:
                             raise RuntimeError(
                                 "Claude session id did not match its project cell"
                             )
-                        await self._linear.project(
-                            issue_id,
-                            LinearProjection(
-                                status="In Development",
-                                assignee_alias="operator",
-                            ),
-                            effect_id=f"linear:{issue_id}:in-development:v2",
+                        activated, _ = await self._project_and_activate(
+                            cell, issue_id
                         )
-                        activated, _ = self._activate_issue(cell, issue_id)
                         if activated:
                             session_confirmed = True
                             if self._active_time is not None:
@@ -1251,72 +1648,95 @@ class ProjectCellService:
             raise
         return cell, True
 
-    def _activate_issue(
+    async def _project_and_activate(
         self, cell: ProjectCell, issue_id: str
+    ) -> tuple[bool, LeadAssignment | None]:
+        """Local commit first, then the Linear projection (INFRA-199 v2).
+
+        The daemon-side twin of :func:`activate_admitted_issue`'s
+        local-first ordering: :meth:`_activate_issue` — the shared
+        activation transaction — commits first and never consults
+        Linear; only once it reports success is the idempotent ``In
+        Development`` projection attempted, through
+        :func:`_project_in_development`, which swallows any Linear
+        failure rather than rolling back or retrying the already-
+        durable local activation (see its docstring for where that
+        failure's durable trace lives).
+        """
+
+        activated, assignment = self._activate_issue(cell, issue_id)
+        if not activated:
+            return False, None
+        await _project_in_development(self._linear, issue_id)
+        return True, assignment
+
+    def _activate_issue(
+        self,
+        cell: ProjectCell,
+        issue_id: str,
     ) -> tuple[bool, LeadAssignment | None]:
         """Activate the cell and issue; on the classic path, commit the
         durable assignment packet in the very same transaction, so a
-        queue transition can never again outrun its assignment."""
+        queue transition can never again outrun its assignment.
 
-        now = self._aware_now().isoformat()
-        assignment: LeadAssignment | None = None
-        with self._database.transaction() as connection:
-            issue_row = connection.execute(
-                "SELECT state, instruction_id FROM admitted_issues "
-                "WHERE issue_id = ?",
+        Delegates to the shared :func:`_activate_issue_transaction` — the
+        same activation state machine the idle dispatcher's
+        :func:`activate_admitted_issue` runs. Never consults Linear.
+
+        When the dispatch capacity guard is armed
+        (:meth:`require_dispatch_capacity_guard` — the live daemon), the
+        transaction runs the IDENTICAL transaction-local guard the idle
+        path supplies: :func:`admission_priority_ceiling` on the
+        activation transaction's own connection, so a sample that went
+        stale — or was superseded by a red one — between scheduler
+        planning and this commit fails the activation closed instead of
+        authorizing it (Sol ec0ed7fe gap 3).
+        """
+
+        return _activate_issue_transaction(
+            database=self._database,
+            events=self._events,
+            cell_id=cell.cell_id,
+            project_key=cell.project_key,
+            profile_alias=cell.profile_alias,
+            issue_id=issue_id,
+            session_id=str(cell.session_id),
+            assignments=(
+                self._assignments if self._classic_seats else None
+            ),
+            now=self._aware_now,
+            guard=self._capacity_guard(issue_id),
+        )
+
+    def _capacity_guard(
+        self, issue_id: str
+    ) -> Callable[[sqlite3.Connection], bool] | None:
+        """The armed daemon path's transaction-local freshness/priority
+        guard — the same predicate ``cli._dispatch_idle_lead`` builds
+        for the idle path, over the same shared
+        :func:`admission_priority_ceiling`. ``None`` while unarmed."""
+
+        if self._dispatch_freshness_minutes is None:
+            return None
+        freshness_minutes = self._dispatch_freshness_minutes
+
+        def guard(connection: sqlite3.Connection) -> bool:
+            ceiling = admission_priority_ceiling(
+                connection,
+                now=self._aware_now(),
+                freshness_minutes=freshness_minutes,
+            )
+            row = connection.execute(
+                "SELECT priority FROM admitted_issues WHERE issue_id = ?",
                 (issue_id,),
             ).fetchone()
-            if issue_row is None:
-                raise KeyError(issue_id)
-            prior_state = str(issue_row["state"])
-            if prior_state == IssueState.DONE.value:
-                return False, None
-            activated = connection.execute(
-                "UPDATE project_cells SET state = 'active', updated_at = ? "
-                "WHERE cell_id = ? AND state IN ('starting', 'active') "
-                "AND EXISTS ("
-                "SELECT 1 FROM profile_leases "
-                "WHERE project_key = ? AND profile_alias = ? AND state = 'active'"
-                ")",
-                (now, cell.cell_id, cell.project_key, cell.profile_alias),
+            return (
+                row is not None
+                and ceiling is not None
+                and int(row["priority"]) <= ceiling
             )
-            if activated.rowcount == 0:
-                return False, None
-            updated = connection.execute(
-                "UPDATE admitted_issues SET state = ?, updated_at = ? "
-                "WHERE issue_id = ? AND state != ?",
-                (
-                    IssueState.IN_DEVELOPMENT.value,
-                    now,
-                    issue_id,
-                    IssueState.DONE.value,
-                ),
-            )
-            if updated.rowcount == 0:
-                return False, None
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="issue.started",
-                    aggregate_type="issue",
-                    aggregate_id=issue_id,
-                    payload={"cell_id": cell.cell_id},
-                ),
-            )
-            if self._assignments is not None and self._classic_seats:
-                assignment = self._assignments.publish_in(
-                    connection,
-                    project_key=cell.project_key,
-                    issue_id=issue_id,
-                    cell_id=cell.cell_id,
-                    session_id=str(cell.session_id),
-                    profile_alias=cell.profile_alias,
-                    instruction_id=str(issue_row["instruction_id"]),
-                    queue_transition=(
-                        f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
-                    ),
-                )
-        return True, assignment
+
+        return guard
 
     def _worker_key(self, cell: ProjectCell) -> str:
         return f"{cell.cell_id}:{cell.session_id}"

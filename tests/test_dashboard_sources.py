@@ -14,7 +14,9 @@ from hermes_orchestrator.dashboard_sources import (
     CodexStatusProvider,
     ControlAttentionProvider,
     DashboardSources,
+    IdleFact,
     ProfileUsage,
+    ResourceFact,
     ResourceProvider,
     TaskProvider,
     TransitionProvider,
@@ -243,12 +245,22 @@ def _insert_issue(
     priority: int,
     state: str,
     updated_at: str,
+    dependency_ready: int = 1,
 ) -> None:
     connection.execute(
         "INSERT INTO admitted_issues("
-        "issue_id, project_key, priority, state, admitted_at, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?)",
-        (issue_id, project_key, priority, state, updated_at, updated_at),
+        "issue_id, project_key, priority, state, admitted_at, updated_at, "
+        "dependency_ready"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            issue_id,
+            project_key,
+            priority,
+            state,
+            updated_at,
+            updated_at,
+            dependency_ready,
+        ),
     )
 
 
@@ -537,6 +549,117 @@ def test_tasks_observed_at_is_the_latest_updated_at_or_none(
         )
 
     assert TaskProvider(database).observed_at() == "2026-08-30T12:00:00+00:00"
+    database.close()
+
+
+def test_idle_notes_shows_no_queued_work_for_an_idle_live_project(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_cell(
+            connection,
+            cell_id="cell-a",
+            project_key="proj-a",
+            state="active",
+            profile_alias="max-a",
+            session_id="s-1",
+        )
+
+    notes = TaskProvider(database).idle_notes(None)
+
+    assert notes == (IdleFact(project_key="proj-a", hold="no queued work"),)
+    database.close()
+
+
+def test_idle_notes_omits_a_project_already_working(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_cell(
+            connection,
+            cell_id="cell-a",
+            project_key="proj-a",
+            state="active",
+            profile_alias="max-a",
+            session_id="s-1",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-1",
+            project_key="proj-a",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+
+    assert TaskProvider(database).idle_notes(None) == ()
+    database.close()
+
+
+@pytest.mark.parametrize(
+    "priority, dependency_ready, decision_pending, resource, expected_hold",
+    [
+        (1, 0, False, None, "dependency-blocked"),
+        (1, 1, True, None, "operator decision pending"),
+        (
+            2,
+            1,
+            False,
+            ResourceFact(
+                sampled_at="2026-08-30T12:00:00+00:00",
+                pressure="yellow",
+                available_memory_bytes=1,
+                total_memory_bytes=2,
+                swap_used_bytes=0,
+                load_one=0.1,
+                logical_cpus=1,
+                managed_rss_bytes=1,
+                min_disk_free_bytes=None,
+            ),
+            "capacity limited",
+        ),
+    ],
+    ids=["dependency-blocked", "operator-decision", "capacity-limited"],
+)
+def test_idle_notes_reports_the_top_lanes_concrete_hold(
+    tmp_path: Path,
+    priority: int,
+    dependency_ready: int,
+    decision_pending: bool,
+    resource: ResourceFact | None,
+    expected_hold: str,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_cell(
+            connection,
+            cell_id="cell-a",
+            project_key="proj-a",
+            state="active",
+            profile_alias="max-a",
+            session_id="s-1",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-1",
+            project_key="proj-a",
+            priority=priority,
+            state="queued",
+            updated_at="2026-08-30T10:00:00+00:00",
+            dependency_ready=dependency_ready,
+        )
+        if decision_pending:
+            connection.execute(
+                "INSERT INTO operator_decisions("
+                "decision_id, issue_id, project_key, cell_id, session_id, "
+                "actor, choice, status, recorded_at"
+                ") VALUES ('dec-1', 'INFRA-1', 'proj-a', 'cell-a', 's-1', "
+                "'operator', 'hold', 'pending', '2026-08-30T10:00:00+00:00')"
+            )
+
+    [note] = TaskProvider(database).idle_notes(resource)
+
+    assert note == IdleFact(project_key="proj-a", hold=expected_hold)
     database.close()
 
 

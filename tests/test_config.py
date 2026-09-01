@@ -1,8 +1,9 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from hermes_orchestrator.config import load_settings
+from hermes_orchestrator.config import PolicyConfig, load_settings
 
 
 def test_loads_registered_project(tmp_path: Path) -> None:
@@ -456,3 +457,58 @@ def test_the_stable_primary_checkout_is_accepted(tmp_path: Path) -> None:
     settings = load_settings(tmp_path, tmp_path / "state")
 
     assert settings.projects["demo"].repo_path == primary
+
+
+# --- resource_sample_freshness_minutes (INFRA-199 Finding 2) ---------------
+
+
+def test_resource_sample_freshness_minutes_default(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {tmp_path}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\n", encoding="utf-8"
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    # Tight enough that a stalled sampler cannot keep authorizing new
+    # work, loose enough to absorb a couple of missed ~30s ticks — a
+    # small multiple of the sampling cadence, far short of the 24h
+    # retention window.
+    assert settings.policy.resource_sample_freshness_minutes == 5
+
+
+def test_resource_sample_freshness_minutes_is_configurable(tmp_path: Path) -> None:
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config/projects.yaml").write_text(
+        "projects:\n"
+        "  demo:\n"
+        "    linear_team: ENG\n"
+        f"    repo_path: {tmp_path}\n"
+        "    integration_branch: main\n"
+        "    github_repo: owner/demo\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "config/policies.yaml").write_text(
+        "mode: observe\nresource_sample_freshness_minutes: 2\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(tmp_path, tmp_path / "state")
+
+    assert settings.policy.resource_sample_freshness_minutes == 2
+
+
+def test_resource_sample_freshness_minutes_rejects_out_of_range_values() -> None:
+    with pytest.raises(ValidationError):
+        PolicyConfig.model_validate({"resource_sample_freshness_minutes": 0})
+    with pytest.raises(ValidationError):
+        PolicyConfig.model_validate({"resource_sample_freshness_minutes": 61})

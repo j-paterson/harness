@@ -15,6 +15,7 @@ from hermes_orchestrator.linear import (
     LinearGraphQLTransport,
     LinearProjection,
     ProjectLinearRouter,
+    projection_request,
 )
 
 
@@ -168,10 +169,119 @@ async def test_projection_refuses_terminal_status_regression(
     assert transport.operations == ["Issue"]
 
 
+def _pending_linear_rows(database: Database) -> list[dict[str, Any]]:
+    """Read pending Linear effects EXACTLY the way reconciliation does
+    (``reconcile._stage_linear`` /
+    ``_project_pending_linear_effect``): same SELECT, same
+    ``request_json`` fields."""
+
+    rows = database.execute(
+        "SELECT effect_id, target, request_json FROM external_effects "
+        "WHERE adapter = 'linear' AND state = 'pending'"
+    ).fetchall()
+    return [
+        {
+            "effect_id": str(row["effect_id"]),
+            "target": str(row["target"]),
+            "request": json.loads(row["request_json"]),
+        }
+        for row in rows
+    ]
+
+
 @pytest.mark.asyncio
-async def test_pending_projection_does_not_overwrite_newer_linear_change(
+async def test_replay_adopts_the_pending_row_and_completes_it_exactly_once(
     database: Database,
 ) -> None:
+    """Sol ec0ed7fe gap 2 (flipped revision-guard test): the journal
+    row is the stable TARGET-ONLY record, so a replay after a lost
+    response ADOPTS that same pending row, re-reads current state, and
+    completes the effect exactly once — never a second mutation for a
+    target that already holds, never a second row, never a refusal of
+    its own journal entry."""
+
+    class LostResponseTransport(RecordingLinearTransport):
+        fail_after_update = True
+
+        async def execute(
+            self,
+            operation: str,
+            query: str,
+            variables: dict[str, Any],
+        ) -> dict[str, Any]:
+            result = await super().execute(operation, query, variables)
+            if operation == "IssueUpdate" and self.fail_after_update:
+                self.fail_after_update = False
+                raise TimeoutError("Linear response was lost")
+            return result
+
+    transport = LostResponseTransport()
+    effects = ExternalEffectStore(database)
+    client = LinearClient(
+        transport=transport,
+        effects=effects,
+        status_ids={
+            "Todo": "state-todo",
+            "In Development": "state-development",
+            "Review": "state-review",
+            "QA": "state-qa",
+            "Done": "state-done",
+        },
+        assignee_ids={"operator": "user-operator", "ryan": "user-ryan"},
+        expected_team_id="team-engineering",
+    )
+    target = LinearProjection(
+        status="In Development",
+        assignee_alias="operator",
+    )
+    with database.transaction() as connection:
+        ExternalEffectStore.begin_in(
+            connection,
+            "effect-race",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
+
+    # The mutation applied on Linear's side but the response was lost:
+    # exactly one pending row survives the crash boundary.
+    with pytest.raises(TimeoutError, match="response was lost"):
+        await client.project("ENG-9", target, effect_id="effect-race")
+    assert transport.state_id == "state-development"
+    assert [row["effect_id"] for row in _pending_linear_rows(database)] == [
+        "effect-race"
+    ]
+
+    result = await client.project("ENG-9", target, effect_id="effect-race")
+
+    # The replay adopted the same row, saw the target already holding,
+    # and completed without a second IssueUpdate.
+    assert result.changed_fields == ()
+    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
+    assert effects.get("effect-race").state == "completed"
+    assert _pending_linear_rows(database) == []
+    assert (
+        int(
+            database.scalar(
+                "SELECT count(*) FROM external_effects "
+                "WHERE effect_id = 'effect-race'"
+            )
+        )
+        == 1
+    )
+
+    # Every further retry is answered from the completed journal entry.
+    transport.operations.clear()
+    replayed = await client.project("ENG-9", target, effect_id="effect-race")
+    assert replayed == result
+    assert transport.operations == []
+
+
+@pytest.mark.asyncio
+async def test_non_prejournaled_projection_preserves_revision_conflict_guard(
+    database: Database,
+) -> None:
+    """A lost response must not let a retry overwrite a newer Linear edit."""
+
     class LostResponseTransport(RecordingLinearTransport):
         fail_after_update = True
 
@@ -207,7 +317,7 @@ async def test_pending_projection_does_not_overwrite_newer_linear_change(
     )
 
     with pytest.raises(TimeoutError, match="response was lost"):
-        await client.project("ENG-9", target, effect_id="effect-race")
+        await client.project("ENG-9", target, effect_id="effect-review-flow")
     transport.issue(
         status="Review",
         state_id="state-review",
@@ -216,10 +326,10 @@ async def test_pending_projection_does_not_overwrite_newer_linear_change(
     )
 
     with pytest.raises(RuntimeError, match="changed after projection began"):
-        await client.project("ENG-9", target, effect_id="effect-race")
+        await client.project("ENG-9", target, effect_id="effect-review-flow")
 
-    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
     assert transport.state_id == "state-review"
+    assert transport.operations.count("IssueUpdate") == 1
 
 
 @pytest.mark.asyncio
@@ -263,6 +373,196 @@ async def test_completed_effect_retry_does_not_touch_linear(
 
 def test_allowed_projection_has_no_comment_or_label_fields() -> None:
     assert set(LinearProjection.model_fields) == {"status", "assignee_alias"}
+
+
+@pytest.mark.asyncio
+async def test_initial_read_failure_still_leaves_the_pending_row(
+    database: Database,
+) -> None:
+    """The activation journal survives an outage on the first read."""
+
+    class UnreachableTransport:
+        async def execute(
+            self, operation: str, query: str, variables: dict[str, Any]
+        ) -> dict[str, Any]:
+            raise TimeoutError("Linear is unreachable")
+
+    effects = ExternalEffectStore(database)
+    client = LinearClient(
+        transport=UnreachableTransport(),
+        effects=effects,
+        status_ids={"Todo": "state-todo", "In Development": "state-development"},
+        assignee_ids={"operator": "user-operator", "ryan": "user-ryan"},
+        expected_team_id="team-engineering",
+    )
+    target = LinearProjection(status="In Development", assignee_alias="operator")
+    with database.transaction() as connection:
+        ExternalEffectStore.begin_in(
+            connection,
+            "effect-read-outage",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
+
+    with pytest.raises(TimeoutError, match="unreachable"):
+        await client.project("ENG-9", target, effect_id="effect-read-outage")
+
+    [row] = _pending_linear_rows(database)
+    assert row["effect_id"] == "effect-read-outage"
+    assert row["target"] == "ENG-9"
+    # The exact fields reconcile._project_pending_linear_effect binds.
+    assert row["request"] == {
+        "issue_id": "ENG-9",
+        "target": {"status": "In Development", "assignee_alias": "operator"},
+    }
+
+
+@pytest.mark.parametrize(
+    "client_overrides, issue_overrides, match",
+    [
+        pytest.param(
+            {"expected_team_id": "team-other"},
+            {},
+            "configured Linear team",
+            id="team-mismatch",
+        ),
+        pytest.param(
+            {
+                "status_ids": {
+                    "Todo": "state-todo",
+                    "Review": "state-review",
+                }
+            },
+            {},
+            r"In Development.*not configured",
+            id="missing-status-mapping",
+        ),
+        pytest.param(
+            {"assignee_ids": {"ryan": "user-ryan"}},
+            {},
+            r"operator.*not configured",
+            id="missing-assignee-mapping",
+        ),
+        pytest.param(
+            {},
+            {
+                "status": "Done",
+                "state_id": "state-done",
+                "assignee_id": "user-operator",
+                "revision": "done-r1",
+            },
+            r"status transition.*not allowed",
+            id="disallowed-transition",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validation_failures_preserve_one_pending_row(
+    database: Database,
+    transport: RecordingLinearTransport,
+    client_overrides: dict[str, Any],
+    issue_overrides: dict[str, Any],
+    match: str,
+) -> None:
+    """Validation failures preserve the activation's pending row."""
+
+    if issue_overrides:
+        transport.issue(**issue_overrides)
+    arguments: dict[str, Any] = {
+        "transport": transport,
+        "effects": ExternalEffectStore(database),
+        "status_ids": {
+            "Todo": "state-todo",
+            "In Development": "state-development",
+            "Review": "state-review",
+            "QA": "state-qa",
+            "Done": "state-done",
+        },
+        "assignee_ids": {"operator": "user-operator", "ryan": "user-ryan"},
+        "expected_team_id": "team-engineering",
+    }
+    arguments.update(client_overrides)
+    client = LinearClient(**arguments)
+    target = LinearProjection(status="In Development", assignee_alias="operator")
+    with database.transaction() as connection:
+        ExternalEffectStore.begin_in(
+            connection,
+            "effect-validation",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
+
+    with pytest.raises(ValueError, match=match):
+        await client.project("ENG-9", target, effect_id="effect-validation")
+
+    assert "IssueUpdate" not in transport.operations
+    [row] = _pending_linear_rows(database)
+    assert row["effect_id"] == "effect-validation"
+
+    # A retry adopts the same row, fails the same validation, and the
+    # journal still holds exactly one record.
+    with pytest.raises(ValueError, match=match):
+        await client.project("ENG-9", target, effect_id="effect-validation")
+    assert [r["effect_id"] for r in _pending_linear_rows(database)] == [
+        "effect-validation"
+    ]
+    assert (
+        int(
+            database.scalar(
+                "SELECT count(*) FROM external_effects "
+                "WHERE effect_id = 'effect-validation'"
+            )
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_adopts_a_row_begun_without_the_live_client(
+    linear_client: LinearClient,
+    database: Database,
+    transport: RecordingLinearTransport,
+) -> None:
+    """Sol ec0ed7fe gap 2: ``ExternalEffectStore.begin_in`` writes the
+    pending row on a plain local transaction — no live client — exactly
+    the way the activation transaction journals it, and ``project``
+    then ADOPTS that row (same effect id, byte-identical request)
+    instead of double-beginning or refusing; the same single row is
+    completed."""
+
+    target = LinearProjection(status="In Development", assignee_alias="operator")
+    with database.transaction() as connection:
+        begun = ExternalEffectStore.begin_in(
+            connection,
+            "effect-prebegun",
+            target="ENG-9",
+            request=projection_request("ENG-9", target),
+        )
+    assert begun.state == "pending"
+
+    result = await linear_client.project(
+        "ENG-9", target, effect_id="effect-prebegun"
+    )
+
+    assert result.changed_fields == ("status",)
+    assert ExternalEffectStore(database).get("effect-prebegun").state == "completed"
+    assert (
+        int(
+            database.scalar(
+                "SELECT count(*) FROM external_effects "
+                "WHERE effect_id = 'effect-prebegun'"
+            )
+        )
+        == 1
+    )
+    # A different request for the same effect id is still refused, by
+    # the journal itself.
+    with pytest.raises(ValueError, match="already used for another request"):
+        await linear_client.project(
+            "ENG-9",
+            LinearProjection(status="Review", assignee_alias="ryan"),
+            effect_id="effect-prebegun",
+        )
 
 
 @pytest.mark.asyncio
