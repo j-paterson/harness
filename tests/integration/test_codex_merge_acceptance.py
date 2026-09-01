@@ -370,13 +370,12 @@ class Acceptance:
         )
         admitted = self.admission.admit("demo", event, received_generation=1)
         binding = VerdictBinding(
-            repository=REPOSITORY, branch=branch, pr_number=number, reviewed_sha=sha
+            repository=REPOSITORY, branch=branch, reviewed_sha=sha
         )
         document: dict[str, Any] = {
             "verdict": "corrections_required" if defect else "approved",
             "repository": REPOSITORY,
             "branch": branch,
-            "pr_number": number,
             "reviewed_sha": sha,
             "packets": [],
         }
@@ -386,15 +385,16 @@ class Acceptance:
                     "severity": "Critical",
                     "repository": REPOSITORY,
                     "branch": branch,
-                    "pr_number": number,
-                    "reviewed_sha": sha,
+                            "reviewed_sha": sha,
                     "evidence": "merge proof accepts an unrelated tree",
                     "acceptance_criterion": "proof binds the reviewed tree",
                     "required_correction": "compare trees before proving",
                     "required_tests": ["test_unrelated_tree_is_rejected"],
                 }
             ]
-        verdict = parse_verdict(json.dumps(document), expected=binding)
+        verdict = parse_verdict(
+            json.dumps(document), expected=binding
+        ).with_pr_number(number)
         try:
             return await self.service.complete_review(admitted, issue_id, verdict)
         finally:
@@ -563,13 +563,12 @@ async def test_stale_head_after_approval_never_merges(
                 "verdict": "approved",
                 "repository": REPOSITORY,
                 "branch": branch,
-                "pr_number": number,
-                "reviewed_sha": GOOD,
+                    "reviewed_sha": GOOD,
                 "packets": [],
             }
         ),
-        expected=VerdictBinding(REPOSITORY, branch, number, GOOD),
-    )
+        expected=VerdictBinding(REPOSITORY, branch, GOOD),
+    ).with_pr_number(number)
     review = await acceptance.service.record_verdict(admitted, "ENG-9", verdict)
     # The lead pushes again before the merge runs.
     acceptance.github.full_pulls[number] = open_pull(
@@ -605,13 +604,12 @@ async def test_proof_failure_requires_reconciliation_not_done(
                 "verdict": "approved",
                 "repository": REPOSITORY,
                 "branch": branch,
-                "pr_number": number,
-                "reviewed_sha": GOOD,
+                    "reviewed_sha": GOOD,
                 "packets": [],
             }
         ),
-        expected=VerdictBinding(REPOSITORY, branch, number, GOOD),
-    )
+        expected=VerdictBinding(REPOSITORY, branch, GOOD),
+    ).with_pr_number(number)
     outcome = await acceptance.service.complete_review(admitted, "ENG-9", verdict)
     assert outcome.state == "reconciliation_required"
     assert acceptance.linear.targets == [("ENG-9", "Review", "operator")]

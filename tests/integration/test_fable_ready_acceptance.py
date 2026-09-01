@@ -283,11 +283,13 @@ class ProductionShapedFlow:
     def verdict(
         self, sha: str, branch: str, pr_number: int, *, defect: bool = False
     ) -> str:
+        # INFRA-217: the reviewer document carries no pr_number — the
+        # argument survives only for the callers' staging bookkeeping.
+        del pr_number
         document: dict[str, Any] = {
             "verdict": "corrections_required" if defect else "approved",
             "repository": REPOSITORY,
             "branch": branch,
-            "pr_number": pr_number,
             "reviewed_sha": sha,
             "packets": [],
         }
@@ -297,7 +299,6 @@ class ProductionShapedFlow:
                     "severity": "Important",
                     "repository": REPOSITORY,
                     "branch": branch,
-                    "pr_number": pr_number,
                     "reviewed_sha": sha,
                     "evidence": "no regression test for the stale replay",
                     "acceptance_criterion": "replay is covered",
@@ -700,19 +701,32 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
         list_calls_before = len(flow.github.list_calls)
 
         def move_head_after_admission(count: int) -> None:
-            # The intake gate's list is the first call of this turn; the
-            # final live check is the second — the head moves in between.
-            if count == list_calls_before + 2:
+            # INFRA-217: the intake gate's list is this turn's only list
+            # call; the head moves right after admission, so settlement's
+            # exact-head discovery (which follows admission) no longer
+            # finds a pull request at the reviewed head.
+            if count == list_calls_before + 1:
                 flow.github.open_pulls = (
                     open_summary(number=14, head_sha=SHA_B, head_ref=branch_a),
                 )
+                flow.github.full_pulls = {
+                    14: open_pull(number=14, head_sha=SHA_B, head_ref=branch_a)
+                }
 
         flow.github.on_list = move_head_after_admission
         outcome = await flow.submit(
             "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
         )
         assert outcome.kind == "rejected"
-        assert "not the head of the sole open pull request" in outcome.reason
+        # INFRA-217: whichever exact-head check sees the moved head first
+        # — the intake gate's or settlement's discovery — the turn
+        # rejects and the bound failure stays stored.
+        assert (
+            "the open pull request head is not the candidate SHA"
+            in outcome.reason
+            or "approval requires a pull request at the exact reviewed head"
+            in outcome.reason
+        )
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
         assert flow.window.stored_failure("demo") is not None
         assert flow.github.merge_calls[-1]["expected_head_sha"] == SHA_A
@@ -818,15 +832,14 @@ async def test_replaced_channel_keeps_the_approved_settlement_non_settling(
                 "verdict": "approved",
                 "repository": REPOSITORY,
                 "branch": branch,
-                "pr_number": 14,
                 "reviewed_sha": SHA_A,
                 "packets": [],
             }
         ),
         expected=VerdictBinding(
-            repository=REPOSITORY, branch=branch, pr_number=14, reviewed_sha=SHA_A
+            repository=REPOSITORY, branch=branch, reviewed_sha=SHA_A
         ),
-    )
+    ).with_pr_number(14)
     record = await flow.reviews.record_verdict(admitted, "ENG-9", verdict)
     assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
     assert flow.settlements.get(record.review_id).state == "recorded"
@@ -898,15 +911,14 @@ async def test_an_expired_in_flight_merge_reconciles_after_channel_replacement(
                 "verdict": "approved",
                 "repository": REPOSITORY,
                 "branch": branch,
-                "pr_number": 14,
                 "reviewed_sha": SHA_A,
                 "packets": [],
             }
         ),
         expected=VerdictBinding(
-            repository=REPOSITORY, branch=branch, pr_number=14, reviewed_sha=SHA_A
+            repository=REPOSITORY, branch=branch, reviewed_sha=SHA_A
         ),
-    )
+    ).with_pr_number(14)
     record = await flow.reviews.record_verdict(admitted, "ENG-9", verdict)
     assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
     # The previous owner claimed the settlement and GitHub completed the
@@ -995,7 +1007,6 @@ async def test_a_direct_sol_merge_reconciles_at_the_next_intake_boundary(
     binding = VerdictBinding(
         repository=REPOSITORY,
         branch=branch_c,
-        pr_number=16,
         reviewed_sha=SHA_C,
     )
     verdict = parse_verdict(
@@ -1004,13 +1015,12 @@ async def test_a_direct_sol_merge_reconciles_at_the_next_intake_boundary(
                 "verdict": "approved",
                 "repository": REPOSITORY,
                 "branch": branch_c,
-                "pr_number": 16,
                 "reviewed_sha": SHA_C,
                 "packets": [],
             }
         ),
         expected=binding,
-    )
+    ).with_pr_number(16)
     record = await flow.reviews.record_verdict(admitted, "ENG-3", verdict)
     assert flow.merger.complete_admitted_wake("demo", emitted.event.event_id)
     assert flow.settlements.get(record.review_id).state == "recorded"

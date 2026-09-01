@@ -11,6 +11,7 @@ import pytest
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import (
+    DiscoveredPull,
     GitHubError,
     MergeAmbiguous,
     MergeBlocked,
@@ -103,6 +104,12 @@ class FakeGitHub:
     full_pulls: dict[int, PullRequest] = field(default_factory=dict)
     merge_calls: list[dict[str, Any]] = field(default_factory=list)
     list_calls: list[tuple[str, str]] = field(default_factory=list)
+    discover_calls: list[tuple[str, str, str]] = field(default_factory=list)
+    # INFRA-217: when set, discovery returns/raises this instead of
+    # deriving from open_pulls/full_pulls — lets a test model "no pull
+    # request exists" while the harness's branch-head fake (which reads
+    # open_pulls) still sees the staged branch head.
+    discover_override: Any = None
     on_list: Any = None
     get_calls: list[tuple[str, int]] = field(default_factory=list)
 
@@ -147,6 +154,50 @@ class FakeGitHub:
         if pull is None:
             raise GitHubError("GitHub pull-request read returned status 404")
         return pull
+
+    def discover_pull_request(
+        self, repository: str, *, branch: str, head_sha: str
+    ) -> DiscoveredPull | None:
+        # INFRA-217: exact-head discovery over the fake's own state —
+        # full pulls first (they carry merged/merge_sha truth), open
+        # summaries as fallback; ambiguity fails closed like the real
+        # client.
+        self.discover_calls.append((repository, branch, head_sha))
+        if self.discover_override is not None:
+            result = self.discover_override(repository, branch, head_sha)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        matches: dict[int, DiscoveredPull] = {}
+        for number, pull in self.full_pulls.items():
+            if pull.head_ref == branch and pull.head_sha == head_sha:
+                matches[number] = DiscoveredPull(
+                    number=number,
+                    state=pull.state,
+                    merged=pull.merged,
+                    head_sha=pull.head_sha,
+                    merge_sha=pull.merge_commit_sha if pull.merged else None,
+                )
+        for summary in self.open_pulls:
+            if summary.head_ref == branch and summary.head_sha == head_sha:
+                matches.setdefault(
+                    summary.number,
+                    DiscoveredPull(
+                        number=summary.number,
+                        state="open",
+                        merged=False,
+                        head_sha=summary.head_sha,
+                        merge_sha=None,
+                    ),
+                )
+        if len(matches) > 1:
+            raise MergeAmbiguous(
+                "multiple pull requests share the exact head identity"
+            )
+        if matches:
+            (result,) = matches.values()
+            return result
+        return None
 
 
 @dataclass

@@ -1,4 +1,10 @@
-"""Verify strict structured review verdict and correction packet parsing."""
+"""Verify strict structured review verdict and correction packet parsing.
+
+INFRA-217: the reviewer document carries no ``pr_number`` anywhere —
+PR identity is discovered from GitHub by the submission path and
+stamped onto the parsed verdict via :meth:`ReviewVerdict.with_pr_number`.
+A document still carrying the retired field fails the strict key check.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +33,6 @@ def packet(**overrides: Any) -> dict[str, Any]:
         "severity": "Important",
         "repository": "j-paterson/demo",
         "branch": "feature/eng-9",
-        "pr_number": 7,
         "reviewed_sha": SHA,
         "evidence": "delivery claims success on a replaced thread",
         "acceptance_criterion": "stale CAS must fail closed",
@@ -43,7 +48,6 @@ def verdict(**overrides: Any) -> dict[str, Any]:
         "verdict": "corrections_required",
         "repository": "j-paterson/demo",
         "branch": "feature/eng-9",
-        "pr_number": 7,
         "reviewed_sha": SHA,
         "packets": [packet()],
     }
@@ -55,7 +59,6 @@ def binding(**overrides: Any) -> VerdictBinding:
     fields: dict[str, Any] = {
         "repository": "j-paterson/demo",
         "branch": "feature/eng-9",
-        "pr_number": 7,
         "reviewed_sha": SHA,
     }
     fields.update(overrides)
@@ -72,7 +75,7 @@ def test_parses_a_corrections_required_verdict() -> None:
             severity="Important",
             repository="j-paterson/demo",
             branch="feature/eng-9",
-            pr_number=7,
+            pr_number=0,
             reviewed_sha=SHA,
             evidence="delivery claims success on a replaced thread",
             acceptance_criterion="stale CAS must fail closed",
@@ -121,12 +124,33 @@ def test_rejects_malformed_documents() -> None:
         parse_verdict(json.dumps(missing), expected=binding())
 
 
+def test_documents_carrying_the_retired_pr_number_are_rejected() -> None:
+    # INFRA-217: pr_number is no longer reviewer-supplied; the strict
+    # key check rejects it in the envelope and in every packet.
+    with pytest.raises(VerdictError, match="pr_number"):
+        parse_verdict(json.dumps(verdict(pr_number=7)), expected=binding())
+    document = verdict(packets=[packet(pr_number=7)])
+    with pytest.raises(VerdictError, match="pr_number"):
+        parse_verdict(json.dumps(document), expected=binding())
+
+
+def test_with_pr_number_stamps_envelope_and_packets() -> None:
+    parsed = parse_verdict(json.dumps(verdict()), expected=binding())
+    assert parsed.pr_number == 0
+    assert parsed.packets[0].pr_number == 0
+
+    stamped = parsed.with_pr_number(14)
+    assert stamped.pr_number == 14
+    assert all(entry.pr_number == 14 for entry in stamped.packets)
+    # Everything else is untouched, and the original is not mutated.
+    assert stamped.reviewed_sha == parsed.reviewed_sha
+    assert parsed.pr_number == 0
+
+
 @pytest.mark.parametrize(
     "override",
     [
         {"severity": "Minor"},
-        {"pr_number": "seven"},
-        {"pr_number": 0},
         {"reviewed_sha": "abc"},
         {"evidence": ""},
         {"required_tests": []},
@@ -144,7 +168,6 @@ def test_rejects_stale_or_foreign_verdicts() -> None:
     for override, expectation in (
         ({"repository": "j-paterson/other"}, "repository"),
         ({"branch": "feature/other"}, "branch"),
-        ({"pr_number": 9}, "pr_number"),
         ({"reviewed_sha": "b" * 40}, "reviewed_sha"),
     ):
         document = verdict(**override)
@@ -156,7 +179,6 @@ def test_rejects_packets_that_disagree_with_the_envelope() -> None:
     for override in (
         {"repository": "j-paterson/other"},
         {"branch": "feature/other"},
-        {"pr_number": 9},
         {"reviewed_sha": "b" * 40},
     ):
         document = verdict(packets=[packet(**override)])
@@ -168,7 +190,7 @@ def test_verdict_carries_the_admitted_candidate_binding() -> None:
     parsed = parse_verdict(json.dumps(verdict()), expected=binding())
     assert parsed.repository == "j-paterson/demo"
     assert parsed.branch == "feature/eng-9"
-    assert parsed.pr_number == 7
+    assert parsed.pr_number == 0
     assert parsed.reviewed_sha == SHA
 
 
@@ -203,53 +225,6 @@ def test_forbidden_pause_and_advisory_reports_fail_closed() -> None:
         )
 
 
-def test_zero_pr_number_parses_for_corrections_required_against_a_zero_binding() -> (
-    None
-):
-    # INFRA-202: Sol may submit corrections_required with no pull request
-    # open yet; pr_number 0 is well-formed in both the envelope and every
-    # packet when it matches the admitted binding's pr_number.
-    document = verdict(pr_number=0, packets=[packet(pr_number=0)])
-    parsed = parse_verdict(json.dumps(document), expected=binding(pr_number=0))
-
-    assert parsed.pr_number == 0
-    assert parsed.packets[0].pr_number == 0
-
-
-def test_approved_with_zero_pr_number_is_refused() -> None:
-    document = verdict(verdict="approved", pr_number=0, packets=[])
-    with pytest.raises(VerdictError, match="approval requires the sole open"):
-        parse_verdict(json.dumps(document), expected=binding(pr_number=0))
-
-
-@pytest.mark.parametrize(
-    "document_pr_number,expected_pr_number",
-    [(0, 14), (14, 0)],
-)
-def test_zero_and_nonzero_pr_number_never_match_each_other(
-    document_pr_number: int, expected_pr_number: int
-) -> None:
-    document = verdict(
-        pr_number=document_pr_number,
-        packets=[packet(pr_number=document_pr_number)],
-    )
-    with pytest.raises(VerdictError, match="does not match"):
-        parse_verdict(
-            json.dumps(document), expected=binding(pr_number=expected_pr_number)
-        )
-
-
-@pytest.mark.parametrize("bad", [-1, True, False, 7.0])
-def test_negative_bool_and_float_pr_number_are_still_invalid(bad: object) -> None:
-    document = verdict(pr_number=bad)
-    with pytest.raises(VerdictError, match="pr_number"):
-        parse_verdict(json.dumps(document), expected=binding(pr_number=7))
-
-    packet_document = verdict(packets=[packet(pr_number=bad)])
-    with pytest.raises(VerdictError):
-        parse_verdict(json.dumps(packet_document), expected=binding())
-
-
 def test_schema_files_mirror_the_typed_contract() -> None:
     verdict_schema = json.loads(
         (SCHEMAS / "review-verdict.json").read_text(encoding="utf-8")
@@ -267,15 +242,16 @@ def test_schema_files_mirror_the_typed_contract() -> None:
         "verdict",
         "repository",
         "branch",
-        "pr_number",
         "reviewed_sha",
         "packets",
     }
+    assert "pr_number" not in verdict_schema["properties"]
     assert packet_schema["properties"]["severity"]["enum"] == [
         "Critical",
         "Important",
     ]
     assert packet_schema["additionalProperties"] is False
+    assert "pr_number" not in packet_schema["properties"]
     assert set(packet_schema["required"]) == set(
         packet_schema["properties"]
     )

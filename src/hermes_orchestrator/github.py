@@ -155,6 +155,21 @@ class PullRequestSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscoveredPull:
+    """The exactly-one pull request found for one exact head identity.
+
+    INFRA-217 G1: GitHub, not the reviewer, is the authority for PR and
+    merge identity. ``merge_sha`` is populated iff ``merged`` is true.
+    """
+
+    number: int
+    state: str
+    merged: bool
+    head_sha: str
+    merge_sha: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class MergeResult:
     """The confirmed outcome of one deterministic merge mutation."""
 
@@ -536,6 +551,90 @@ class GitHubClient:
                     "stale GitHub response: listed pull does not match the filter"
                 )
         return summaries
+
+    def discover_pull_request(
+        self, repository: str, *, branch: str, head_sha: str
+    ) -> DiscoveredPull | None:
+        """Find the exactly-one pull request at one exact head identity.
+
+        INFRA-217 G1: `pr_number` is retired as reviewer-supplied authority;
+        the exact pull request is discovered from GitHub by repository, head
+        branch, and reviewed head SHA instead, including a PR that is
+        already merged. Both open and closed pull requests are searched in
+        one call via GitHub's `head=owner:branch` filter with `state=all`;
+        the endpoint has no SHA filter, so the exact, case-sensitive SHA
+        match is enforced here. GitHub's list schema (pull-request-simple)
+        carries no `merged`/`merge_commit_sha` fields — see
+        :class:`PullRequestSummary` — so a closed match is re-read in full
+        through :meth:`get_pull_request` to fill those in; an open match can
+        never be merged, so no extra read is needed there. More than one
+        exact `(branch, head_sha)` match is unresolvable ownership and fails
+        closed with :class:`MergeAmbiguous`, the same fail-closed idiom this
+        module already uses for ambiguous merge ownership.
+        """
+
+        _require_repository(repository)
+        _require_ref(branch, "head branch")
+        _require_sha(head_sha)
+        owner = repository.split("/", 1)[0]
+        response = self._transport.request(
+            "GET",
+            f"/repos/{repository}/pulls",
+            query={"state": "all", "head": f"{owner}:{branch}", "per_page": "100"},
+        )
+        if response.status != 200:
+            raise GitHubError(
+                f"GitHub pull-request list returned status {response.status}"
+            )
+        if not isinstance(response.payload, list):
+            raise GitHubError("GitHub pull-request list is not an array")
+        summaries = tuple(
+            _parse_pull_summary(repository, entry) for entry in response.payload
+        )
+        for summary in summaries:
+            if summary.head_ref != branch:
+                raise GitHubError(
+                    "stale GitHub response: listed pull does not match the "
+                    "head filter"
+                )
+        matches = tuple(
+            summary for summary in summaries if summary.head_sha == head_sha
+        )
+        if len(matches) > 1:
+            raise MergeAmbiguous(
+                f"more than one pull request has head {branch}@{head_sha} in "
+                f"{repository}; ownership cannot be resolved automatically"
+            )
+        if not matches:
+            return None
+        summary = matches[0]
+        if summary.state == "open":
+            # An open pull request can never be merged; the summary alone
+            # is a sufficient, cheaper read than the full-PR fetch below.
+            return DiscoveredPull(
+                number=summary.number,
+                state="open",
+                merged=False,
+                head_sha=summary.head_sha,
+                merge_sha=None,
+            )
+        pull = self.get_pull_request(repository, summary.number)
+        if pull.head_sha != head_sha:
+            raise GitHubError(
+                "stale GitHub response: pull request head changed between "
+                "discovery reads"
+            )
+        if pull.merged and pull.merge_commit_sha is None:
+            raise GitHubError(
+                "merged pull request is missing a merge commit identity"
+            )
+        return DiscoveredPull(
+            number=pull.number,
+            state=pull.state,
+            merged=pull.merged,
+            head_sha=pull.head_sha,
+            merge_sha=pull.merge_commit_sha if pull.merged else None,
+        )
 
     def merge(
         self,
