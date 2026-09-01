@@ -407,3 +407,198 @@ async def test_non_trivial_candidate_admits_with_no_packet_or_verifier_wiring(
     # Pure advisory pass-through: exactly what was supplied, nothing
     # appended by admission.
     assert manifest.verification == (("pytest", "advisory only"),)
+
+
+@dataclass
+class FakeLease:
+    """One ``worktree_leases`` row, shaped like ``WorktreeLease``."""
+
+    lease_id: str
+    project_key: str
+    issue_id: str
+    path: str
+    branch: str
+    checkpoint_sha: str | None = None
+
+
+@dataclass
+class FakeLeases:
+    """``WorktreeLeases.active``-shaped read port for INFRA-219 L5."""
+
+    rows: tuple[FakeLease, ...] = ()
+
+    def active(self, project_key: str | None = None) -> tuple[FakeLease, ...]:
+        if project_key is None:
+            return self.rows
+        return tuple(row for row in self.rows if row.project_key == project_key)
+
+
+def _lane_emitter(
+    tmp_path: Path, git: FakeGitRunner, lane_path: Path
+) -> tuple[CandidateEmitter, FakeDeliverer]:
+    """An emitter whose project anchor is NOT the lane's own worktree."""
+
+    deliverer = FakeDeliverer()
+    root = tmp_path / "manifests"
+    root.mkdir(exist_ok=True)
+    git.common_dirs[lane_path] = str(tmp_path / ".git")
+    git.common_dirs[tmp_path] = str(tmp_path / ".git")
+    git.responses[("rev-parse", "--path-format=absolute", "--show-toplevel")] = (
+        str(lane_path) + "\n"
+    )
+    emitter = CandidateEmitter(
+        projects={
+            "demo": ProjectConfig(
+                linear_team="infrastructure",
+                repo_path=tmp_path,
+                integration_branch="main",
+                github_repo="j-paterson/demo",
+            )
+        },
+        git=git,
+        manifest_root=root,
+        delivery=deliverer,
+        now=lambda: NOW,
+    )
+    return emitter, deliverer
+
+
+def test_resolve_lane_refuses_an_unbound_or_ambiguous_issue(
+    tmp_path: Path,
+) -> None:
+    # INFRA-219 L5: an unresolvable lane is the hazard this closes, so
+    # it fails closed before anything is written — never a guess.
+    from hermes_orchestrator.emission import resolve_lane
+
+    empty = FakeLeases()
+    with pytest.raises(EmissionBlocked, match="no live worktree lease"):
+        resolve_lane(empty, "demo", "ENG-9")
+
+    duplicated = FakeLeases(
+        rows=(
+            FakeLease("l1", "demo", "ENG-9", str(tmp_path / "a"), "feature/eng-9"),
+            FakeLease("l2", "demo", "ENG-9", str(tmp_path / "b"), "feature/eng-9"),
+        )
+    )
+    with pytest.raises(EmissionBlocked, match="live worktree leases"):
+        resolve_lane(duplicated, "demo", "ENG-9")
+
+
+@pytest.mark.asyncio
+async def test_publication_freezes_the_requested_issue_lane_not_the_current_checkout(
+    tmp_path: Path,
+) -> None:
+    # THE reproduced defect (INFRA-219 L5): candidate-ready for one issue
+    # froze whichever checkout the lead occupied — live, an INFRA-218
+    # manifest was bound to feature/infra-217's head. A resolved lane now
+    # wins outright and the lane's own worktree is what gets frozen.
+    from hermes_orchestrator.emission import resolve_lane
+
+    lane_path = tmp_path / "lane-eng-9"
+    lane_path.mkdir()
+    git = clean_git()
+    emitter, _deliverer = _lane_emitter(tmp_path, git, lane_path)
+    leases = FakeLeases(
+        rows=(
+            FakeLease("l1", "demo", "ENG-9", str(lane_path), "feature/eng-9"),
+        )
+    )
+
+    lane = resolve_lane(leases, "demo", "ENG-9")
+    result = await emitter.emit(
+        "demo",
+        "ENG-9",
+        verification=(("uv run pytest -q", "ok"),),
+        resolved_lane=lane,
+    )
+
+    assert result.event.issue_id == "ENG-9"
+    # Every FREEZE read — working-tree state, HEAD, base, changed files —
+    # ran in the lane's own worktree. The project anchor is still read
+    # once, but only for the git-common-dir foreign-checkout check.
+    freeze_cwds = {
+        cwd
+        for args, cwd in zip(git.calls, git.cwds, strict=True)
+        if args[1:]
+        in (
+            ("status", "--porcelain"),
+            ("rev-parse", "HEAD"),
+            ("merge-base", "HEAD", "origin/main"),
+        )
+    }
+    assert freeze_cwds == {lane_path}
+
+
+@pytest.mark.asyncio
+async def test_publication_refuses_a_lane_identity_that_is_not_the_request(
+    tmp_path: Path,
+) -> None:
+    # A lane resolved for a DIFFERENT issue can never publish this
+    # candidate, and nothing durable is written.
+    lane_path = tmp_path / "lane-other"
+    lane_path.mkdir()
+    git = clean_git()
+    emitter, deliverer = _lane_emitter(tmp_path, git, lane_path)
+    from hermes_orchestrator.emission import ResolvedLane
+
+    foreign = ResolvedLane(
+        lease_id="l9",
+        project_key="demo",
+        issue_id="ENG-11",
+        path=lane_path,
+        branch="feature/eng-11",
+        expected_head=None,
+    )
+
+    with pytest.raises(EmissionBlocked, match="resolved lane identity"):
+        await emitter.emit(
+            "demo",
+            "ENG-9",
+            verification=(("t", "ok"),),
+            resolved_lane=foreign,
+        )
+
+    assert deliverer.events == []
+
+
+@pytest.mark.asyncio
+async def test_publication_refuses_a_lease_branch_or_head_that_disagrees(
+    tmp_path: Path,
+) -> None:
+    # The lease row is a durable claim, not proof: a branch or HEAD that
+    # disagrees with what was actually frozen fails closed.
+    lane_path = tmp_path / "lane-eng-9"
+    lane_path.mkdir()
+    git = clean_git()
+    emitter, deliverer = _lane_emitter(tmp_path, git, lane_path)
+    from hermes_orchestrator.emission import ResolvedLane
+
+    wrong_branch = ResolvedLane(
+        lease_id="l1",
+        project_key="demo",
+        issue_id="ENG-9",
+        path=lane_path,
+        branch="feature/somewhere-else",
+        expected_head=None,
+    )
+    with pytest.raises(EmissionBlocked, match="disagrees with the frozen branch"):
+        await emitter.emit(
+            "demo", "ENG-9", verification=(("t", "ok"),),
+            resolved_lane=wrong_branch,
+        )
+
+    wrong_head = ResolvedLane(
+        lease_id="l1",
+        project_key="demo",
+        issue_id="ENG-9",
+        path=lane_path,
+        branch="feature/eng-9",
+        expected_head="f" * 40,
+    )
+    with pytest.raises(EmissionBlocked, match="expected head"):
+        await emitter.emit(
+            "demo", "ENG-9", verification=(("t", "ok"),),
+            resolved_lane=wrong_head,
+        )
+
+    assert deliverer.events == []

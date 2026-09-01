@@ -58,6 +58,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
+from hermes_orchestrator.emission import EmissionBlocked, ResolvedLane, resolve_lane
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.handoffs import (
@@ -138,6 +139,7 @@ from hermes_orchestrator.stalls import (
 )
 from hermes_orchestrator.subagent_packets import SubagentPackets
 from hermes_orchestrator.supervisor import Supervisor
+from hermes_orchestrator.worktrees import WorktreeLeases
 
 
 def _watch_interval(raw: str) -> int:
@@ -1386,7 +1388,9 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
     return 0 if result.status not in ("waiting_for_profile", "start_failed") else 1
 
 
-async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
+async def _candidate_ready(
+    flow: MergeFlow, args: Any, resolved_lane: ResolvedLane
+) -> dict[str, Any]:
     verification: list[tuple[str, str]] = []
     for entry in args.verified:
         command, separator, result = entry.partition("=")
@@ -1402,9 +1406,11 @@ async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
             verification=tuple(verification),
             blockers=tuple(args.blocker),
             status=args.status,
-            # The lead runs candidate-ready from its own checkout; the
-            # emitter validates it belongs to the project repository.
-            lead_checkout=Path.cwd(),
+            # INFRA-219 L5: publication is targeted to the requested
+            # issue's OWN live worktree lease -- resolved below, before
+            # the flow is even opened -- never whatever checkout the
+            # lead currently occupies.
+            resolved_lane=resolved_lane,
         )
         thread_status: str | None = None
         if emitted.delivery.thread_id is not None:
@@ -4485,9 +4491,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            # INFRA-219 L5: resolve the requested issue's own live
+            # worktree lease BEFORE the merge flow is even opened, so an
+            # unbound issue never reaches manifest write or wake
+            # publication -- fails closed exactly like the invalid-input
+            # checks above.
+            leases = WorktreeLeases(
+                runtime.database, events=EventStore(runtime.database)
+            )
+            try:
+                resolved_lane = resolve_lane(leases, args.project, args.issue_id)
+            except EmissionBlocked as error:
+                print(str(error), file=sys.stderr)
+                return 1
             try:
                 flow = _open_merge_flow(settings, runtime)
-                payload = asyncio.run(_candidate_ready(flow, args))
+                payload = asyncio.run(_candidate_ready(flow, args, resolved_lane))
             except (ValueError, RuntimeError) as error:
                 print(str(error), file=sys.stderr)
                 return 1

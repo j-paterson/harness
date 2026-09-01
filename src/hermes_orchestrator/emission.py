@@ -122,6 +122,100 @@ class EmissionBlocked(RuntimeError):
     """The local clone is not at a valid immutable freeze boundary."""
 
 
+class LeaseRow(Protocol):
+    """The exact ``worktree_leases`` (migration 0018) columns L5 reads."""
+
+    lease_id: str
+    project_key: str
+    issue_id: str
+    path: str
+    branch: str
+    checkpoint_sha: str | None
+
+
+class LeaseReaderPort(Protocol):
+    """Read access to live worktree leases, matching ``WorktreeLeases``."""
+
+    def active(self, project_key: str | None = None) -> tuple[LeaseRow, ...]: ...
+
+
+class DurableWakePort(Protocol):
+    """Read access to the durable wake registry (``wake_deliveries``).
+
+    A manifest file surviving on disk is never sufficient evidence of a
+    real publication by itself -- INFRA-219 L5 requires a matching
+    durable wake row for the exact event before a stale file left over
+    from a wrong-SHA publication can ever be adopted as a reused
+    manifest.
+    """
+
+    def exists(self, project_key: str, event_id: str) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedLane:
+    """The one publishable lane for an issue: its live worktree lease.
+
+    INFRA-219 L5: publication is explicitly targeted to ONE admitted
+    issue lane and must derive branch, HEAD, and changed files from
+    that lane's bound worktree -- never from whichever checkout the
+    coordinating lead happens to occupy. This is the frozen, proven
+    binding :meth:`CandidateEmitter.emit` freezes against.
+    """
+
+    lease_id: str
+    project_key: str
+    issue_id: str
+    path: Path
+    branch: str
+    expected_head: str | None
+
+
+def resolve_lane(
+    leases: LeaseReaderPort, project_key: str, issue_id: str
+) -> ResolvedLane:
+    """Resolve the ONE live worktree lease bound to ``issue_id``.
+
+    INFRA-219 L5 anchor: ``worktree_leases`` (migration 0018) already
+    binds (project_key, issue_id, repo_path, path, branch) per lease,
+    with a unique live-path index; a live lease is any row whose
+    ``state`` is not ``'reclaimed'``, exactly what
+    :meth:`WorktreeLeases.active` already returns. This is the read
+    boundary that lets ``candidate-ready`` freeze the requested issue's
+    OWN worktree instead of whatever checkout the lead currently
+    occupies -- the reproduced defect (INFRA-218 manifest frozen at
+    ``feature/infra-217``'s head). Fails closed, before any manifest
+    write or wake, when no live lease binds the issue or when more
+    than one does: an unresolvable lane is exactly the hazard this
+    closes, never a case to guess through.
+    """
+
+    live = tuple(
+        lease for lease in leases.active(project_key) if lease.issue_id == issue_id
+    )
+    if not live:
+        raise EmissionBlocked(
+            f"no live worktree lease binds issue {issue_id!r} in project "
+            f"{project_key!r} -- candidate publication refuses to freeze "
+            "an unbound checkout"
+        )
+    if len(live) > 1:
+        raise EmissionBlocked(
+            f"issue {issue_id!r} in project {project_key!r} has "
+            f"{len(live)} live worktree leases -- publication cannot "
+            "resolve one unambiguous lane"
+        )
+    lease = live[0]
+    return ResolvedLane(
+        lease_id=lease.lease_id,
+        project_key=lease.project_key,
+        issue_id=lease.issue_id,
+        path=Path(lease.path),
+        branch=lease.branch,
+        expected_head=lease.checkpoint_sha,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class EmissionResult:
     """One emitted candidate: its wake, manifest path, and delivery."""
@@ -148,6 +242,7 @@ class CandidateEmitter:
         intake_gate: IntakeGatePort | None = None,
         lead: CorrectionSinkPort | None = None,
         issue_for_failure: Callable[[str, str], str | None] | None = None,
+        durable_wake: DurableWakePort | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -157,6 +252,13 @@ class CandidateEmitter:
         self._intake_gate = intake_gate
         self._lead = lead
         self._issue_for_failure = issue_for_failure
+        # INFRA-219 L5: when wired, a manifest file surviving on disk is
+        # never adopted for reuse without a matching durable wake row for
+        # the exact event -- a stale file from a wrong-SHA publication
+        # (the reproduced defect) can never be reused. Optional so a
+        # caller that has not wired the durable wake registry keeps
+        # today's behavior rather than being forced to change at once.
+        self._durable_wake = durable_wake
 
     async def emit(
         self,
@@ -167,6 +269,7 @@ class CandidateEmitter:
         blockers: tuple[str, ...] = (),
         status: str = "FABLE_READY",
         lead_checkout: Path | None = None,
+        resolved_lane: ResolvedLane | None = None,
     ) -> EmissionResult:
         project = self._projects.get(project_key)
         if project is None:
@@ -175,6 +278,24 @@ class CandidateEmitter:
             raise EmissionBlocked(f"unknown wake status {status!r}")
         if not verification:
             raise EmissionBlocked("a candidate requires recorded verification")
+        # INFRA-219 L5: a resolved lane -- the requested issue's OWN live
+        # worktree lease -- is the targeted publication boundary and
+        # replaces "whatever checkout the lead currently occupies" as the
+        # default source of branch/HEAD/changed files. This is exactly
+        # the reproduced defect: `candidate-ready INFRA-218` froze
+        # `lead_checkout` (the lead's own, unrelated, checkout) instead
+        # of INFRA-218's bound worktree. When a resolved lane is
+        # supplied it wins outright -- `lead_checkout` is never
+        # consulted -- so a lead sitting in the wrong lane's checkout can
+        # never again leak into the frozen candidate.
+        if resolved_lane is not None and (
+            resolved_lane.project_key != project_key
+            or resolved_lane.issue_id != issue_id
+        ):
+            raise EmissionBlocked(
+                "resolved lane identity does not match the requested "
+                f"candidate ({project_key!r}, {issue_id!r})"
+            )
         # The durable project path stays anchored to the stable primary
         # checkout, so the candidate branch usually lives in the lead's
         # own linked worktree. The freeze boundary is that checkout —
@@ -182,12 +303,10 @@ class CandidateEmitter:
         # exact project repository; a foreign checkout is refused before
         # any freeze check runs.
         repo = project.repo_path
-        if (
-            lead_checkout is not None
-            and Path(lead_checkout).resolve() != repo.resolve()
-        ):
+        checkout = resolved_lane.path if resolved_lane is not None else lead_checkout
+        if checkout is not None and Path(checkout).resolve() != repo.resolve():
             claimed = self._run(
-                Path(lead_checkout),
+                Path(checkout),
                 "rev-parse",
                 "--path-format=absolute",
                 "--git-common-dir",
@@ -203,7 +322,22 @@ class CandidateEmitter:
                     "the candidate checkout does not belong to the "
                     "project repository"
                 )
-            repo = Path(lead_checkout)
+            repo = Path(checkout)
+        if resolved_lane is not None:
+            # The lease row's path is a durable claim, not yet proven --
+            # confirm the worktree git itself reports is the exact
+            # checkout the lease names before freezing anything from it.
+            toplevel = self._run(
+                repo,
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+            ).strip()
+            if Path(toplevel).resolve() != resolved_lane.path.resolve():
+                raise EmissionBlocked(
+                    "the resolved worktree lease path disagrees with the "
+                    "checkout actually frozen"
+                )
         facts = run_freeze_gate(
             lambda *args: self._run(repo, *args),
             project,
@@ -211,6 +345,20 @@ class CandidateEmitter:
         )
         head, branch = facts.head, facts.branch
         base, changed = facts.base, facts.changed_files
+        if resolved_lane is not None:
+            if branch != resolved_lane.branch:
+                raise EmissionBlocked(
+                    f"resolved lease branch {resolved_lane.branch!r} "
+                    f"disagrees with the frozen branch {branch!r}"
+                )
+            if (
+                resolved_lane.expected_head is not None
+                and head != resolved_lane.expected_head
+            ):
+                raise EmissionBlocked(
+                    "frozen HEAD disagrees with the resolved lease's "
+                    "expected head"
+                )
         # A fresh event per freeze boundary: a deferred candidate must be
         # re-woken as a new event, and the durable wake registry deduplicates
         # by candidate identity, so re-emission is always safe.
@@ -249,6 +397,19 @@ class CandidateEmitter:
                 raise EmissionBlocked(
                     "an immutable manifest already exists for this event with "
                     "a different candidate identity"
+                ) from error
+            # INFRA-219 L5: a manifest file on disk is never eligible for
+            # reuse without a matching durable wake row for this exact
+            # event -- a stale file surviving from a wrong-SHA
+            # publication (the reproduced defect's leftover artifact)
+            # must never be silently adopted.
+            if self._durable_wake is not None and not self._durable_wake.exists(
+                project_key, event_id
+            ):
+                raise EmissionBlocked(
+                    "a manifest file exists for this event with no "
+                    "matching durable wake -- a stale manifest is never "
+                    "eligible for reuse"
                 ) from error
             manifest = existing
             reused = True
