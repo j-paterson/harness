@@ -61,6 +61,31 @@ def reactivations(database: Database) -> int:
     return int(value)  # type: ignore[arg-type]
 
 
+def durable_snapshot(database: Database) -> dict[str, list[tuple[object, ...]]]:
+    """Every row of every table, so 'nothing durable changed' is
+    provable — not just the child row."""
+
+    tables = [
+        str(row[0])
+        for row in database.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    ]
+    return {
+        table: sorted(
+            (
+                tuple(row)
+                for row in database.execute(
+                    f"SELECT * FROM {table}"
+                ).fetchall()
+            ),
+            key=repr,
+        )
+        for table in tables
+    }
+
+
 def test_a_duplicated_completion_never_reactivates_early(
     database: Database, tracker: LeadChildTracker
 ) -> None:
@@ -193,6 +218,108 @@ def test_a_stale_promise_is_superseded_once_children_settle(
         (continuation.continuation_id,),
     )
     assert str(state) == "superseded"
+
+
+def lose_the_binding(database: Database, *, rebind: bool) -> None:
+    """Take the active cell away from SESSION the two ways it really
+    happens: the cell is deactivated, or it is rebound to a new
+    session (a rotation)."""
+
+    with database.transaction() as connection:
+        if rebind:
+            connection.execute(
+                "UPDATE project_cells SET session_id = ?, updated_at = ? "
+                "WHERE cell_id = 'cell-demo'",
+                (FOREIGN_SESSION, NOW.isoformat()),
+            )
+        else:
+            connection.execute(
+                "UPDATE project_cells SET state = 'retired', "
+                "updated_at = ? WHERE cell_id = 'cell-demo'",
+                (NOW.isoformat(),),
+            )
+
+
+@pytest.mark.parametrize("rebind", [False, True])
+def test_a_completion_after_the_binding_is_lost_changes_nothing(
+    database: Database, tracker: LeadChildTracker, rebind: bool
+) -> None:
+    """Sol correction 7a810aad: the child row and the waiting
+    continuation are created WHILE the session is bound, so both
+    outlive the binding and both still match their compare-and-swaps.
+    Once the cell is deactivated (or rebound to another session), the
+    profile-wide SubagentStop must settle nothing: no child row, no
+    continuation row and no control operation may change."""
+
+    seed_active_cell(database)
+    assert tracker.child_started(SESSION, "child-a") is True
+    assert tracker.record_turn_stop(SESSION) is not None
+    lose_the_binding(database, rebind=rebind)
+    before = durable_snapshot(database)
+
+    assert tracker.child_completed(SESSION, "child-a") is None
+
+    assert durable_snapshot(database) == before
+    assert reactivations(database) == 0
+    assert (
+        str(
+            database.scalar(
+                "SELECT state FROM lead_children WHERE session_id = ?",
+                (SESSION,),
+            )
+        )
+        == "started"
+    )
+    assert (
+        str(
+            database.scalar(
+                "SELECT state FROM lead_continuations WHERE session_id = ?",
+                (SESSION,),
+            )
+        )
+        == "waiting"
+    )
+
+
+def test_a_still_bound_completion_settles_and_wakes_exactly_once(
+    database: Database, tracker: LeadChildTracker
+) -> None:
+    """The binding check must cost the managed lead nothing: with the
+    original session still actively bound, the same completion settles
+    the child, reactivates the continuation and wakes it with exactly
+    one children.completed — and a replay adds none."""
+
+    seed_active_cell(database)
+    assert tracker.child_started(SESSION, "child-a") is True
+    continuation = tracker.record_turn_stop(SESSION)
+    assert continuation is not None
+
+    reactivation = tracker.child_completed(SESSION, "child-a")
+
+    assert reactivation is not None
+    assert reactivation.session_id == SESSION
+    assert reactivation.result["completed_children"] == 1
+    assert tracker.child_completed(SESSION, "child-a") is None
+    assert reactivations(database) == 1
+    assert (
+        str(
+            database.scalar(
+                "SELECT state FROM lead_children WHERE session_id = ?",
+                (SESSION,),
+            )
+        )
+        == "completed"
+    )
+    assert (
+        str(
+            database.scalar(
+                "SELECT state FROM lead_continuations "
+                "WHERE continuation_id = ?",
+                (continuation.continuation_id,),
+            )
+        )
+        == "reactivated"
+    )
 
 
 def run_child_event(

@@ -124,6 +124,20 @@ class LeadChildTracker:
         continuation's compare-and-swap commit in one transaction, so a
         crash can never separate them, and the continuation-id dedup
         key makes any retry a durable no-op.
+
+        INFRA-204 (Sol correction 7a810aad): so does a completion from
+        a session bound to NO active managed cell. The compare-and-swap
+        alone only covers a session that was NEVER bound (no child row
+        matches it); a child row created *while* the session was bound
+        outlives the binding, so a later profile-wide SubagentStop
+        would still match it, settle the continuation and enqueue
+        ``children.completed`` for a lead nothing manages any more. The
+        binding is therefore re-read first, inside this same
+        transaction, using the one predicate :meth:`child_started`,
+        :meth:`record_turn_stop`, ``LeadIntakePoll.next_offer`` and the
+        idle dispatch already share; an unbound session changes no
+        child row, no continuation row and no control operation, and
+        returns the same "no effect" ``None`` the CAS-miss path does.
         """
 
         if not child_id.strip():
@@ -131,6 +145,8 @@ class LeadChildTracker:
         stamp = self._now().isoformat()
         operation: ControlOperation | None = None
         with self._database.transaction() as connection:
+            if _bound_cell(connection, session_id) is None:
+                return None
             settled = connection.execute(
                 "UPDATE lead_children SET state = 'completed', "
                 "completed_at = ? "

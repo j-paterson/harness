@@ -3478,6 +3478,62 @@ def test_a_hook_from_an_unbound_session_is_silent_and_inert(
     assert durable_snapshot(state_dir) == before
 
 
+def test_a_child_stop_after_the_binding_is_lost_is_inert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sol correction 7a810aad: the unbound case above starts with no
+    child row, so it only proves a session that was NEVER bound is
+    inert. Here the child row and the waiting continuation are created
+    WHILE the session is bound and outlive the binding, so both still
+    match their compare-and-swaps. Once the cell is deactivated, the
+    profile-wide SubagentStop must still change not one durable row."""
+
+    from hermes_orchestrator.db import Database
+    from tests.test_lead_intake import SESSION, seed_active_cell
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    database = Database.open(state_dir / "state.db")
+    try:
+        seed_active_cell(database)
+    finally:
+        database.close()
+    base = ["--state-dir", str(state_dir)]
+    identity: dict[str, object] = {
+        "session_id": SESSION,
+        "agent_id": "agent-1",
+    }
+    assert (
+        hook_invoke(monkeypatch, [*base, "child-start"], identity).exit_code
+        == 0
+    )
+    assert (
+        hook_invoke(
+            monkeypatch,
+            [*base, "intake-poll"],
+            {"session_id": SESSION, "hook_event_name": "Stop"},
+        ).exit_code
+        == 0
+    )
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE project_cells SET state = 'retired' "
+                "WHERE cell_id = 'cell-demo'"
+            )
+    finally:
+        database.close()
+    before = durable_snapshot(state_dir)
+
+    result = hook_invoke(monkeypatch, [*base, "child-stop"], identity)
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert durable_snapshot(state_dir) == before
+
+
 def test_a_bound_session_still_continues_exactly_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
