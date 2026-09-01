@@ -1327,9 +1327,25 @@ def _open_rotation_collaborators(
     # acceptance testing only and never selects or implements product
     # issues (see ``prompts/claude-harness.md``).
     prompt_name = "claude-harness.md" if lane_role == HARNESS_LANE else "claude-lead.md"
+    # INFRA-214 (observed live 2026-09-01): resolving this from
+    # ``settings.repo_root`` pointed at the stale primary checkout,
+    # which does not carry the merged ``claude-harness.md`` — Claude
+    # exited 1 on a prompt file that was not there. Assets resolve from
+    # the ACTIVATED runtime, version-matched to the running code, and a
+    # missing asset fails closed HERE, before any process is launched.
+    from hermes_orchestrator.runtime import resolve_prompt_file
+
+    prompt_file = resolve_prompt_file(
+        prompt_name, repo_root=settings.repo_root, state_dir=settings.state_dir
+    )
+    if not prompt_file.is_file():
+        raise FileNotFoundError(
+            f"the {lane_role} lead prompt is missing at {prompt_file}; "
+            "refusing to launch a lead with an unresolvable prompt asset"
+        )
     runner = ClaudeRunner(
         registry,
-        prompt_file=settings.repo_root / "prompts" / prompt_name,
+        prompt_file=prompt_file,
         base_env=environment,
         processes=runtime.processes,
         freeze_dir=settings.state_dir / "freezes",
@@ -1352,6 +1368,26 @@ def _open_rotation_collaborators(
         checkpoints=runtime.checkpoints,
         context=ContextMonitor(database, events, policy=settings.policy),
         surfaces=seater,
+        # INFRA-214 (observed live 2026-09-01): this one-shot composition
+        # omitted classic-seat mode, so ``_activate_seat`` passed
+        # ``classic_command=None`` -- Hermes created an EMPTY cmux
+        # workspace and separately launched a hidden ``claude -p``
+        # shadow process instead of the visible channel-enabled classic
+        # session. The daemon's own composition (runtime.py) has always
+        # set this; ``start-lane``/``rotate-lead`` must agree with it, so
+        # the same predicate is used here rather than a second rule.
+        classic_seats=(
+            settings.cmux is not None
+            and settings.cmux.classic_leads
+            and seater is not None
+        ),
+        # INFRA-214: with classic seats enabled,
+        # ``_activate_issue_transaction`` publishes the lead's durable
+        # assignment through ``self._assignments`` -- omitting it would
+        # let the visible harness seat launch correctly and then sit
+        # IDLE with no assignment or channel wake, which is the same
+        # silent-idle class of failure this issue exists to remove.
+        assignments=LeadAssignments(database, events=events),
     )
     return cells, seater
 

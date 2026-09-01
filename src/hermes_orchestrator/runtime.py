@@ -265,6 +265,41 @@ def cmux_password_source(
     return read
 
 
+def resolve_prompt_file(
+    name: str, *, repo_root: Path, state_dir: Path
+) -> Path:
+    """Resolve a prompt asset from the ACTIVATED runtime, not a checkout.
+
+    INFRA-214 (observed live 2026-09-01): ``start-lane --lane harness``
+    launched Claude with ``--append-system-prompt-file <repo_root>/
+    prompts/claude-harness.md`` and the process exited 1, because
+    ``repo_root`` is the stable PRIMARY checkout, which carries only
+    the prompts that existed when it was last updated — the merged
+    ``claude-harness.md`` lives solely in the activated runtime
+    artifact. Prompt and config assets must therefore resolve the same
+    way :func:`resolve_sidecar_entry` already resolves the sidecar:
+    through the ``runtimes/ACTIVE`` pointer, so the asset is always
+    version-matched to the code being run. The ``repo_root`` fallback
+    exists only for the documented pre-activation state, when no ACTIVE
+    runtime is recorded; it is never an arbitrarily stale source
+    checkout standing in for an activated one.
+
+    Existence is deliberately NOT checked here — the caller fails
+    closed before launching any process, so a missing asset can never
+    reach Claude as a bad argument (the exact observed failure).
+    """
+
+    fallback = repo_root / "prompts" / name
+    pointer = state_dir / "runtimes" / "ACTIVE"
+    try:
+        recorded = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback
+    if not recorded:
+        return fallback
+    return Path(recorded) / "prompts" / name
+
+
 def resolve_sidecar_entry(*, repo_root: Path, state_dir: Path) -> Path:
     """Resolve the hermes-control sidecar's launch entry point.
 

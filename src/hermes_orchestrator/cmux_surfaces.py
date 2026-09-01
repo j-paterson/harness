@@ -1398,6 +1398,7 @@ async def _activate_lead_seat(
     cell_id: str,
     session_id: str,
     profile_alias: str,
+    lane_role: str = "development",
     replacing: str | None = None,
     replace_reason: str | None = None,
     command: str | None = None,
@@ -1422,11 +1423,17 @@ async def _activate_lead_seat(
     """
 
     title = f"{project_key} lead"
+    # INFRA-214 (observed live 2026-09-01): the lane never reached the
+    # activation intent, so BOTH failed harness seats persisted as
+    # ``lane_role=development`` and their residue could not be told
+    # apart from the development lane's own binding. ``record_intent``
+    # has always accepted the lane; the seat simply never passed it.
     intent = bindings.record_intent(
         project_key=project_key,
         cell_id=cell_id,
         session_id=session_id,
         profile_alias=profile_alias,
+        lane_role=lane_role,
     )
     # The marker resolves cmux 0.64.22's short mutation acknowledgement
     # (``OK workspace:<n>``) to exactly one workspace through the
@@ -1846,6 +1853,47 @@ class CmuxLeadSeater:
         self._control = control
         self._channel_trust = channel_trust
 
+    async def retire_failed_seat(
+        self, *, cell_id: str, session_id: str, reason: str
+    ) -> bool:
+        """Remove a failed start's seat residue, in the safe order.
+
+        INFRA-214 (observed live 2026-09-01): the two failed harness
+        starts left TWO dead visible cmux workspaces plus active binding
+        residue, so an immediate retry could not start clean. Marking
+        only the durable row closed would HIDE that residue rather than
+        remove it — the workspace would still be on screen and the
+        session's channel config still on disk.
+
+        Order matters and mirrors the established idiom in
+        ``_close_unconfirmed_channel_trust``: close the exact workspace
+        FIRST; mark the binding closed only after a confirmed close;
+        when the close cannot be confirmed, hold the binding RESIDUAL as
+        ownership evidence so a later reconciliation reclaims the exact
+        surface rather than leaking it. Channel configuration is cleaned
+        last, once the surface it belongs to is gone.
+
+        Returns True when the workspace close was confirmed. Never
+        raises: the caller is already on a launch-failure cleanup path.
+        """
+
+        binding = self._bindings.active_lead(cell_id)
+        closed = False
+        if binding is not None:
+            try:
+                await self._port.close_workspace(binding.workspace_uuid)
+            except CmuxError:
+                self._bindings.mark_residual(
+                    binding.binding_id, reason=f"{reason}_close_uncertain"
+                )
+            else:
+                closed = True
+                self._bindings.mark_closed(binding.binding_id, reason=reason)
+        if self._channel_launch is not None:
+            with suppress(Exception):
+                self._channel_launch.cleanup(session_id)
+        return closed
+
     async def ensure(
         self,
         *,
@@ -1855,6 +1903,7 @@ class CmuxLeadSeater:
         profile_alias: str,
         issue_id: str | None = None,
         classic_command: str | None = None,
+        lane_role: str = "development",
     ) -> CmuxBinding | None:
         # The pane runs exactly the sanitized native TUI command for
         # this exact session; anything else is refused before any
@@ -1962,6 +2011,7 @@ class CmuxLeadSeater:
             cell_id=cell_id,
             session_id=session_id,
             profile_alias=profile_alias,
+            lane_role=lane_role,
             command=classic_command,
         )
         if classic_command is not None:

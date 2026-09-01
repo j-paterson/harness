@@ -3571,6 +3571,8 @@ async def test_confirmed_session_gets_exactly_one_lead_seat(
             "profile_alias": "max-a",
             "issue_id": "ENG-9",
             "classic_command": None,
+            # INFRA-214: the seat now carries its true lane.
+            "lane_role": "development",
         }
     ]
 

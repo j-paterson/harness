@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
@@ -1073,7 +1074,9 @@ class ProjectCellService:
             )
             if not seated:
                 if created:
-                    self._fail_unconfirmed_start(cell, issue_id=issue_id)
+                    await self._fail_unconfirmed_start(
+                        cell, issue_id=issue_id
+                    )
                 return DispatchResult(
                     status="seat_failed",
                     issue_id=issue_id,
@@ -1106,7 +1109,9 @@ class ProjectCellService:
                 if issue_completed:
                     self._record_issue_already_completed(cell, issue_id)
                 elif created:
-                    self._fail_unconfirmed_start(cell, issue_id=issue_id)
+                    await self._fail_unconfirmed_start(
+                        cell, issue_id=issue_id
+                    )
                 return DispatchResult(
                     status=(
                         "already_completed"
@@ -1172,13 +1177,13 @@ class ProjectCellService:
                     self._active_time.idle(self._worker_key(cell), self._aware_now())
         except BaseException:
             if created and not session_confirmed:
-                self._fail_unconfirmed_start(
+                await self._fail_unconfirmed_start(
                     cell, issue_id=issue_id, already_completed=issue_completed
                 )
             raise
 
         if created and not session_confirmed and not handoff_required:
-            self._fail_unconfirmed_start(
+            await self._fail_unconfirmed_start(
                 cell,
                 issue_id=issue_id,
                 capped=start_capped,
@@ -1351,6 +1356,9 @@ class ProjectCellService:
                 profile_alias=cell.profile_alias,
                 issue_id=issue_id,
                 classic_command=classic_command,
+                # INFRA-214: the seat persists its TRUE lane, so harness
+                # residue is never recorded as the development lane's.
+                lane_role=cell.lane_role,
             )
         except Exception as error:
             self._journal_seat_failure(
@@ -1916,7 +1924,7 @@ class ProjectCellService:
                 ),
             )
 
-    def _fail_unconfirmed_start(
+    async def _fail_unconfirmed_start(
         self,
         cell: ProjectCell,
         *,
@@ -2000,7 +2008,43 @@ class ProjectCellService:
         self._profiles.release(
             cell.project_key, "lead_start_failed", lane_role=cell.lane_role
         )
+        # INFRA-214 (observed live 2026-09-01): the cell and its profile
+        # lease were released, but the cmux BINDING was not — the two
+        # failed harness starts left two dead visible workspaces and
+        # active binding residue behind, so an immediate retry could not
+        # start clean. Retire the exact binding for this cell so the
+        # seat, its workspace and its channel configuration are durably
+        # released alongside the lease.
+        await self._retire_failed_seat(cell)
         return True
+
+    async def _retire_failed_seat(self, cell: ProjectCell) -> None:
+        """Durably retire the failed start's seat binding, if any.
+
+        Best-effort and never raising: the launch has already failed and
+        the caller is on its cleanup path, so a retirement problem is
+        reported rather than allowed to mask the original failure. The
+        binding lookup is exact-cell, so a sibling lane's live seat is
+        never touched (INFRA-214).
+        """
+
+        if self._surfaces is None:
+            return
+        retire = getattr(self._surfaces, "retire_failed_seat", None)
+        if retire is None:
+            return
+        try:
+            await retire(
+                cell_id=cell.cell_id,
+                session_id=str(cell.session_id),
+                reason="lead_start_failed",
+            )
+        except Exception as error:  # pragma: no cover - cleanup guard
+            print(
+                f"failed-seat retirement for {cell.cell_id!r} did not "
+                f"complete: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
 
     def _get_cell(self, cell_id: str) -> ProjectCell:
         row = self._database.execute(

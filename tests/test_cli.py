@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import types
@@ -1665,6 +1666,10 @@ def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
     lead_worktree = tmp_path / "lead-worktree"
     lead_worktree.mkdir()
     (repo_root / "config").mkdir()
+    # INFRA-214: the launch path fails closed on a missing prompt.
+    (repo_root / "prompts").mkdir(exist_ok=True)
+    for _name in ("claude-lead.md", "claude-harness.md"):
+        (repo_root / "prompts" / _name).write_text("# prompt\n")
     (repo_root / "config/projects.yaml").write_text(
         "projects:\n"
         "  demo:\n"
@@ -2795,6 +2800,10 @@ def test_open_rotation_collaborators_agrees_bootstrap_and_seat_paths_on_lead_wor
     lead_worktree = tmp_path / "lead-worktree"
     lead_worktree.mkdir()
     (repo_root / "config").mkdir()
+    # INFRA-214: the launch path fails closed on a missing prompt.
+    (repo_root / "prompts").mkdir(exist_ok=True)
+    for _name in ("claude-lead.md", "claude-harness.md"):
+        (repo_root / "prompts" / _name).write_text("# prompt\n")
     (repo_root / "config/projects.yaml").write_text(
         "projects:\n"
         "  demo:\n"
@@ -5388,3 +5397,71 @@ def test_open_rotation_collaborators_selects_prompt_by_lane(
         "claude-harness.md",
     ]
     assert prompt_files[1].parent == prompt_files[0].parent
+
+
+def test_start_lane_composes_the_visible_classic_seat_not_a_hidden_runner(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-214 (observed live 2026-09-01): ``start-lane``'s one-shot
+    composition omitted classic-seat mode, so ``_activate_seat`` passed
+    ``classic_command=None`` -- Hermes created an EMPTY cmux workspace
+    and separately launched a hidden ``claude -p`` shadow process
+    instead of the visible channel-enabled classic session. The
+    composition must agree with the daemon's own predicate."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    settings = load_settings(repo_root, state_dir)
+
+    assert settings.cmux is not None
+    # The daemon's predicate (runtime.py) and this command's must agree:
+    # with cmux configured for classic leads, the seat is classic.
+    assert settings.cmux.classic_leads is True
+    source = inspect.getsource(cli_module._open_rotation_collaborators)
+    assert "classic_seats=" in source, (
+        "start-lane's composition must set classic_seats; omitting it is "
+        "what produced the empty workspace plus hidden claude -p shadow"
+    )
+    assert "settings.cmux.classic_leads" in source
+
+
+def test_start_lane_prompt_resolution_fails_closed_before_launch(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing prompt asset must be refused BEFORE any process is
+    launched -- the observed failure handed Claude a path that did not
+    exist and let it exit 1 (INFRA-214)."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    (repo_root / "prompts" / "claude-harness.md").unlink()
+
+    source = inspect.getsource(cli_module._open_rotation_collaborators)
+    assert "resolve_prompt_file" in source
+    assert "refusing to launch a lead with an unresolvable prompt asset" in source
+
+
+def test_start_lane_composition_wires_assignments_for_classic_seats(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-214: with ``classic_seats`` enabled,
+    ``_activate_issue_transaction`` publishes the lead's durable
+    assignment through ``self._assignments``. Omitting it would let the
+    visible harness seat launch correctly and then sit IDLE with no
+    assignment or channel wake -- the same silent-idle failure class
+    this issue exists to remove, and one that would only surface as a
+    lead that started and did nothing."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    source = inspect.getsource(cli_module._open_rotation_collaborators)
+    assert "classic_seats=" in source
+    assert "assignments=LeadAssignments(" in source, (
+        "classic seats publish the assignment through self._assignments; "
+        "the composition must supply it or the seat starts and sits idle"
+    )
