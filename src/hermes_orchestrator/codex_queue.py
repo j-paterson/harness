@@ -216,6 +216,11 @@ class CodexQueueDelivery:
                 generation=None,
                 reason="event_conflict",
             )
+        if (
+            registration.state in ("delivered", "admitted")
+            and registration.thread_id is not None
+        ):
+            await self._start_queued_head(registration.thread_id, event.event_id)
         if registration.state in ("delivered", "admitted", "completed"):
             return QueueDeliveryResult(
                 delivered=True,

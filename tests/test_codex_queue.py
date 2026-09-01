@@ -1583,6 +1583,31 @@ async def test_a_queued_head_carrying_this_event_is_started_then_released(
 
 
 @pytest.mark.asyncio
+async def test_an_existing_delivered_wake_retries_only_the_bounded_start(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+    )
+    assert (await delivery.deliver("demo", event)).delivered
+
+    rpc = FakeQueueRpc(
+        {"items": [{"id": "qi-1", "text": event.render(1)}]}
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, rpc)
+    await delivery.deliver("demo", event)
+    assert len(factory.calls) == 1
+    assert rpc.methods() == ["thread/queue/list", "thread/queue/start"]
+
+
+@pytest.mark.asyncio
 async def test_a_head_that_is_not_this_candidates_is_never_started(
     merger: CodexMerger,
     factory: FakeQueueProcessFactory,
