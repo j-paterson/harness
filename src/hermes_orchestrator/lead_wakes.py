@@ -29,7 +29,16 @@ from hermes_orchestrator.events import EventInput, EventStore
 WAKE_SCHEMA_VERSION = 1
 
 WAKE_KINDS = frozenset(
-    {"completed", "provider_capped", "blocked", "handoff_required"}
+    {
+        "completed",
+        "provider_capped",
+        "blocked",
+        "handoff_required",
+        # INFRA-215: the four above are TERMINAL-boundary signals, each
+        # committed because a turn ended; none can tell an idle seat the
+        # queue still holds safe admitted work.
+        "work_ready",
+    }
 )
 
 
@@ -228,6 +237,161 @@ class LeadTerminalWakes:
         if row is None:
             raise KeyError(wake_id)
         return _row_to_wake(row)
+
+    def _seat_is_idle(self, session_id: str) -> bool:
+        """True only when a Stop is NEWER than the last turn start.
+
+        INFRA-215 (Sol acce71fc): an acknowledged assignment with no
+        started child and no waiting continuation is NOT proof of
+        idleness -- a lead executing its own foreground turn has exactly
+        that durable shape, because ``lead_children`` and
+        ``lead_continuations`` track only background work around Stop.
+        Treating it as idle delivered ``work_ready`` into a busy turn.
+
+        Idleness is therefore a COMPARISON over the existing journal,
+        not a second definition: the session's latest unconditional
+        ``lead_turn.stopped`` record must be strictly newer than its
+        latest managed turn-STARTING input -- an assignment
+        acknowledgement or a channel event that reached a lead. A seat
+        that has started a turn since its last Stop is busy; a seat that
+        has never stopped is not yet proven idle.
+
+        Sol 6c08a91e: the channel side is ordered by the durable
+        PUBLICATION/ACKNOWLEDGEMENT transition, not by ``created_at``,
+        and spans ``published`` AND ``acked``. Acknowledgement is what
+        hands the packet to a foreground turn, so an ``acked`` event is
+        the strongest evidence of a start -- yet it used to leave the
+        query the instant it was consumed, and an event created before
+        the last Stop but published or acked after it used to order
+        before that Stop. Both let a stale Stop look newest while a
+        just-consumed wake drove a live turn. The per-row timestamp
+        falls back ``acked_at`` -> ``published_at`` -> ``updated_at``:
+        an ack may transition straight from ``pending`` (leaving
+        ``published_at`` NULL), and ``updated_at`` is NOT NULL, so a row
+        in either state can never contribute a NULL start and silently
+        drop out of the comparison.
+
+        Sol 3c73856e: the ordering above is necessary but not
+        sufficient. A ``published`` assignment is work already handed to
+        this lead and NOT yet consumed, and until it is acknowledged it
+        contributes no start timestamp at all -- neither does its
+        channel event while that event is still ``pending``. An older
+        Stop was therefore free to look newest and win, committing a
+        second ``work_ready`` onto a seat that already holds unconsumed
+        work. Any such assignment fails the seat closed, reusing that
+        durable state rather than inferring delivery from an
+        unpublished event.
+
+        Sol 62424477: that guard is an EXISTENCE test over the session,
+        never a look at its newest row. ``lead_assignments_live`` is
+        unique by ``(issue_id, session_id)``, so one session legitimately
+        holds several live assignments at once; ordering by recency let
+        a newer acknowledged one hide an older still-published packet.
+        ``state = 'published'`` already excludes ``superseded``, which
+        stays irrelevant here.
+        """
+
+        unconsumed = self._database.scalar(
+            "SELECT 1 FROM lead_assignments "
+            "WHERE session_id = ? AND state = 'published' LIMIT 1",
+            (session_id,),
+        )
+        if unconsumed is not None:
+            return False
+        stopped = self._database.scalar(
+            "SELECT MAX(occurred_at) FROM events "
+            "WHERE aggregate_type = 'lead_session' AND aggregate_id = ? "
+            "AND event_type = 'lead_turn.stopped'",
+            (session_id,),
+        )
+        if not stopped:
+            return False
+        started = self._database.scalar(
+            "SELECT MAX(started) FROM ("
+            "SELECT MAX(acknowledged_at) AS started FROM lead_assignments "
+            "WHERE session_id = ? AND state = 'acknowledged' "
+            "UNION ALL "
+            "SELECT MAX(COALESCE(acked_at, published_at, updated_at)) "
+            "AS started FROM channel_events "
+            "WHERE session_id = ? AND state IN ('published', 'acked'))",
+            (session_id, session_id),
+        )
+        return started is None or str(stopped) > str(started)
+
+    def commit_work_ready(
+        self, project_key: str, *, freshness_minutes: int
+    ) -> TerminalWake | None:
+        """Wake an IDLE development seat that has safe admitted work.
+
+        Silent (``None``) unless every durable predicate holds: an
+        ACTIVE development cell (never the harness lane) whose seat is
+        genuinely idle by :meth:`_seat_is_idle`; a resource sample
+        fresh enough to authorize the issue's priority
+        (:func:`cells.admission_priority_ceiling`, the ONE shared
+        budget the daemon dispatch path and the Stop-hook idle
+        dispatcher already run, and which fails closed on a missing,
+        stale, or red sample); an admitted issue genuinely runnable
+        (``queued`` AND ``dependency_ready``) that is NOT already bound
+        to a live ``worktree_leases`` row — a bound lane is work
+        already in progress, not work to dispatch again; and the
+        canonical :func:`cells.development_lane_saturated` bound.
+
+        The turn key is the runnable SET, never a clock, so an
+        unchanged condition re-commits nothing however often this
+        runs; a changed set is a new condition and wakes once more.
+        """
+
+        from hermes_orchestrator.cells import (
+            admission_priority_ceiling,
+            development_lane_saturated,
+        )
+
+        cell = self._database.execute(
+            "SELECT cell_id, session_id, profile_alias FROM project_cells "
+            "WHERE project_key = ? AND lane_role = 'development' "
+            "AND state = 'active' "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (project_key,),
+        ).fetchone()
+        if cell is None or not self._seat_is_idle(str(cell["session_id"])):
+            return None
+        ceiling = admission_priority_ceiling(
+            self._database,
+            now=self._now(),
+            freshness_minutes=freshness_minutes,
+        )
+        if ceiling is None:
+            return None
+        runnable = [
+            str(row["issue_id"])
+            for row in self._database.execute(
+                "SELECT issue_id FROM admitted_issues WHERE project_key = ? "
+                "AND state = 'queued' AND dependency_ready = 1 "
+                "AND priority <= ? AND issue_id NOT IN ("
+                "SELECT issue_id FROM worktree_leases "
+                "WHERE project_key = ? AND state != 'reclaimed') "
+                "ORDER BY issue_id",
+                (project_key, ceiling, project_key),
+            ).fetchall()
+        ]
+        if not runnable:
+            return None
+        if development_lane_saturated(
+            self._database, project_key=project_key, issue_id=runnable[0]
+        ):
+            return None
+        return self.commit(
+            TerminalWakeInput(
+                project_key=project_key,
+                issue_id=runnable[0],
+                cell_id=str(cell["cell_id"]),
+                session_id=UUID(str(cell["session_id"])),
+                profile_alias=str(cell["profile_alias"]),
+                turn_key="work-ready:" + ",".join(runnable),
+                kind="work_ready",
+                reason=f"{len(runnable)} admitted issue(s) runnable now",
+            )
+        )
 
     def _signal(self, wake: TerminalWake) -> None:
         for listener in self._listeners:

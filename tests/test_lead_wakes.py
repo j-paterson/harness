@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -436,3 +436,357 @@ def test_command_transport_requires_a_command() -> None:
         CommandWakeTransport(())
     with pytest.raises(ValueError):
         CommandWakeTransport(("hermes-notify",), timeout_seconds=0)
+
+
+WAKE_NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+
+
+STOPPED_AT = (WAKE_NOW + timedelta(minutes=1)).isoformat()
+
+
+def seed_work_ready(database: Database, **overrides: object) -> None:
+    """An ACTIVE development seat, IDLE by its own durable proof (its
+    latest assignment acknowledged, no child or continuation
+    outstanding), one queued admitted issue, and a fresh green resource
+    sample: every predicate of ``commit_work_ready`` satisfied."""
+
+    now = WAKE_NOW.isoformat()
+    seed: dict[str, object] = {
+        "lane_role": "development",
+        "cell_state": "active",
+        "assignment_state": "acknowledged",
+        "issue_id": "INFRA-211",
+        "priority": 1,
+        "dependency_ready": 1,
+        "pressure": "green",
+        # A Stop strictly newer than the acknowledgement above is the
+        # only positive proof the turn ended; None models a foreground
+        # turn still running.
+        "stopped_at": STOPPED_AT,
+    }
+    seed.update(overrides)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells(cell_id, project_key, lane_role, state, "
+            "profile_alias, session_id, created_at, updated_at) VALUES "
+            "('cell-demo', 'demo', ?, ?, 'max-a', ?, ?, ?)",
+            (seed["lane_role"], seed["cell_state"], str(SESSION_ID), now, now),
+        )
+        connection.execute(
+            "INSERT INTO admitted_issues(issue_id, project_key, priority, state, "
+            "instruction_id, dependency_ready, overlap_risk, admitted_at, "
+            "updated_at) VALUES (?, 'demo', ?, 'queued', 'chat-1', ?, 0, ?, ?)",
+            (seed["issue_id"], seed["priority"], seed["dependency_ready"], now, now),
+        )
+        connection.execute(
+            "INSERT INTO lead_assignments(assignment_id, schema_version, "
+            "project_key, issue_id, cell_id, session_id, profile_alias, "
+            "instruction_id, queue_transition, state, created_at, updated_at, "
+            "acknowledged_at) VALUES ('assign-prior', 1, 'demo', 'INFRA-210', "
+            "'cell-demo', ?, 'max-a', 'chat-0', 'queued->in_development', ?, "
+            "?, ?, ?)",
+            (
+                str(SESSION_ID),
+                seed["assignment_state"],
+                now,
+                now,
+                # A published packet is handed over but NOT yet consumed,
+                # so it carries no acknowledgement stamp.
+                now if seed["assignment_state"] == "acknowledged" else None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO resource_samples(sample_id, sampled_at, pressure, "
+            "available_memory_bytes, total_memory_bytes, swap_used_bytes, "
+            "load_one, logical_cpus, disk_json, managed_rss_bytes) "
+            "VALUES ('sample-1', ?, ?, 1, 2, 0, 0.1, 8, '{}', 0)",
+            (now, seed["pressure"]),
+        )
+        if seed["stopped_at"] is not None:
+            connection.execute(
+                "INSERT INTO events(event_id, event_type, aggregate_type, "
+                "aggregate_id, occurred_at, actor, payload_json) VALUES "
+                "('evt-stop', 'lead_turn.stopped', 'lead_session', ?, ?, "
+                "'lead', '{}')",
+                (str(SESSION_ID), seed["stopped_at"]),
+            )
+
+
+
+
+def test_an_idle_seat_with_runnable_work_wakes_exactly_once(
+    database: Database,
+) -> None:
+    """Every other kind fires because a turn ENDED, so an idle seat was
+    never told safe work remained. The turn key is the runnable SET, so
+    re-evaluating an unchanged condition commits nothing."""
+
+    seed_work_ready(database)
+    wakes = build_wakes(database)
+
+    first = wakes.commit_work_ready("demo", freshness_minutes=5)
+    again = wakes.commit_work_ready("demo", freshness_minutes=5)
+
+    assert first is not None
+    assert first.kind == "work_ready"
+    assert again is not None
+    assert again.wake_id == first.wake_id
+    assert wake_events(database, "lead_wake.committed") == ["wake-1"]
+
+
+def _start_a_child(database: Database) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_children(session_id, child_id, state, started_at) "
+            "VALUES (?, 'child-1', 'started', ?)",
+            (str(SESSION_ID), WAKE_NOW.isoformat()),
+        )
+
+
+def _promise_a_continuation(database: Database) -> None:
+    now = WAKE_NOW.isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_continuations(continuation_id, session_id, "
+            "project_key, cell_id, condition, state, created_at, updated_at) "
+            "VALUES ('cont-1', ?, 'demo', 'cell-demo', '1 outstanding', "
+            "'waiting', ?, ?)",
+            (str(SESSION_ID), now, now),
+        )
+
+
+def test_an_active_foreground_turn_is_never_treated_as_idle(
+    database: Database,
+) -> None:
+    """Sol acce71fc: a lead running its OWN turn has an acknowledged
+    assignment and zero child/continuation rows -- the same durable
+    shape as an idle seat, because those tables track only background
+    work around Stop. Without a Stop newer than that turn's start,
+    nothing may be committed."""
+
+    seed_work_ready(database, stopped_at=None)
+    wakes = build_wakes(database)
+
+    assert wakes.commit_work_ready("demo", freshness_minutes=5) is None
+    assert wake_events(database, "lead_wake.committed") == []
+
+
+def test_the_same_turn_wakes_once_after_it_reaches_stop(
+    database: Database,
+) -> None:
+    """The other half: once that identical seat records the existing
+    unconditional Stop, the otherwise-unchanged runnable work commits
+    and delivers exactly one wake."""
+
+    seed_work_ready(database)
+    wakes = build_wakes(database)
+
+    wake = wakes.commit_work_ready("demo", freshness_minutes=5)
+
+    assert wake is not None
+    assert wake.kind == "work_ready"
+    assert wake_events(database, "lead_wake.committed") == [wake.wake_id]
+
+
+# Sol 6c08a91e: a channel event created BEFORE the Stop in
+# ``seed_work_ready``, so only its durable publication/acknowledgement
+# transition can order it after that Stop.
+CHANNEL_CONSUMED_AT = (WAKE_NOW + timedelta(minutes=2)).isoformat()
+STOPPED_AGAIN_AT = (WAKE_NOW + timedelta(minutes=3)).isoformat()
+
+
+def _seed_channel_event(
+    database: Database,
+    *,
+    state: str,
+    published_at: str | None = None,
+    acked_at: str | None = None,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO channel_events(event_id, kind, packet_id, cell_id, "
+            "session_id, state, attempts, created_at, updated_at, "
+            "published_at, acked_at) VALUES ('chan-1', "
+            "'HERMES_CORRECTION_READY', 'packet-1', 'cell-demo', ?, ?, 1, "
+            "?, ?, ?, ?)",
+            (
+                str(SESSION_ID),
+                state,
+                WAKE_NOW.isoformat(),
+                acked_at or published_at or WAKE_NOW.isoformat(),
+                published_at,
+                acked_at,
+            ),
+        )
+
+
+def _record_a_newer_stop(database: Database) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO events(event_id, event_type, aggregate_type, "
+            "aggregate_id, occurred_at, actor, payload_json) VALUES "
+            "('evt-stop-2', 'lead_turn.stopped', 'lead_session', ?, ?, "
+            "'lead', '{}')",
+            (str(SESSION_ID), STOPPED_AGAIN_AT),
+        )
+
+
+def test_a_channel_event_published_after_stop_keeps_the_seat_busy(
+    database: Database,
+) -> None:
+    """Sol 6c08a91e: ``created_at`` is when the row was written, not
+    when the input reached a lead. An event created before the last
+    Stop but PUBLISHED after it starts a turn that Stop cannot have
+    ended, so ordering by creation let a stale Stop look newest while a
+    live turn ran."""
+
+    seed_work_ready(database)
+    _seed_channel_event(
+        database, state="published", published_at=CHANNEL_CONSUMED_AT
+    )
+    wakes = build_wakes(database)
+
+    assert wakes.commit_work_ready("demo", freshness_minutes=5) is None
+    assert wake_events(database, "lead_wake.committed") == []
+
+
+def test_an_acknowledged_channel_event_keeps_the_seat_busy(
+    database: Database,
+) -> None:
+    """Acknowledgement is what hands the packet to a foreground turn,
+    yet it used to drop the event out of a ``state = 'published'``
+    query at exactly that moment -- erasing the newest turn start on
+    the strongest evidence one had occurred. It stays authoritative
+    until a Stop newer than the acknowledgement arrives."""
+
+    seed_work_ready(database)
+    _seed_channel_event(database, state="acked", acked_at=CHANNEL_CONSUMED_AT)
+    wakes = build_wakes(database)
+
+    assert wakes.commit_work_ready("demo", freshness_minutes=5) is None
+    assert wake_events(database, "lead_wake.committed") == []
+
+
+def test_a_stop_newer_than_the_acknowledgement_wakes_once(
+    database: Database,
+) -> None:
+    """The other half: the otherwise-identical seat, once it records a
+    Stop newer than that acknowledgement, is genuinely idle and commits
+    exactly one ``work_ready`` wake."""
+
+    seed_work_ready(database)
+    _seed_channel_event(database, state="acked", acked_at=CHANNEL_CONSUMED_AT)
+    _record_a_newer_stop(database)
+    wakes = build_wakes(database)
+
+    wake = wakes.commit_work_ready("demo", freshness_minutes=5)
+
+    assert wake is not None
+    assert wake.kind == "work_ready"
+    assert wake_events(database, "lead_wake.committed") == [wake.wake_id]
+
+
+def test_an_unacknowledged_published_assignment_blocks_the_wake(
+    database: Database,
+) -> None:
+    """Sol 3c73856e: a ``published`` assignment is work already handed
+    to this lead and not yet consumed. Until it is acknowledged it
+    contributes no start timestamp, and neither does its channel event
+    while that event is still ``pending`` -- so an OLDER Stop won the
+    ordering and a second ``work_ready`` landed on a seat that already
+    held unconsumed work."""
+
+    seed_work_ready(database, assignment_state="published")
+    _seed_channel_event(database, state="pending")
+    wakes = build_wakes(database)
+
+    assert wakes.commit_work_ready("demo", freshness_minutes=5) is None
+    assert wake_events(database, "lead_wake.committed") == []
+
+
+def test_an_acknowledged_assignment_and_newer_stop_wakes_once(
+    database: Database,
+) -> None:
+    """The other half: once that same assignment is acknowledged and
+    the foreground turn it started reaches a Stop newer than the
+    consumption, the otherwise-identical runnable work commits and
+    delivers exactly one wake."""
+
+    seed_work_ready(database, assignment_state="acknowledged")
+    _seed_channel_event(database, state="acked", acked_at=CHANNEL_CONSUMED_AT)
+    _record_a_newer_stop(database)
+    wakes = build_wakes(database)
+
+    wake = wakes.commit_work_ready("demo", freshness_minutes=5)
+
+    assert wake is not None
+    assert wake.kind == "work_ready"
+    assert wake_events(database, "lead_wake.committed") == [wake.wake_id]
+
+
+# Older than the assignment `seed_work_ready` writes, so recency
+# ordering puts this one second and a LIMIT 1 guard never sees it.
+ASSIGNED_EARLIER_AT = (WAKE_NOW - timedelta(minutes=1)).isoformat()
+
+
+def _seed_an_older_assignment(
+    database: Database, *, state: str, acknowledged_at: str | None = None
+) -> None:
+    """A second LIVE assignment on the same session, for a different
+    issue. ``lead_assignments_live`` is unique by ``(issue_id,
+    session_id)``, so this is an ordinary multi-lane seat, not a
+    conflict with the row ``seed_work_ready`` already wrote."""
+
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_assignments(assignment_id, schema_version, "
+            "project_key, issue_id, cell_id, session_id, profile_alias, "
+            "instruction_id, queue_transition, state, created_at, "
+            "updated_at, acknowledged_at) VALUES ('assign-older', 1, "
+            "'demo', 'INFRA-209', 'cell-demo', ?, 'max-a', 'chat-x', "
+            "'queued->in_development', ?, ?, ?, ?)",
+            (
+                str(SESSION_ID),
+                state,
+                ASSIGNED_EARLIER_AT,
+                acknowledged_at or ASSIGNED_EARLIER_AT,
+                acknowledged_at,
+            ),
+        )
+
+
+def test_an_older_published_assignment_is_not_hidden_by_a_newer_ack(
+    database: Database,
+) -> None:
+    """Sol 62424477: one session holds several live assignments at once,
+    so asking only for its NEWEST row let a newer acknowledged
+    assignment hide an older still-unconsumed published packet, and the
+    seat looked idle while holding work it had never taken up."""
+
+    seed_work_ready(database, assignment_state="acknowledged")
+    _seed_an_older_assignment(database, state="published")
+    wakes = build_wakes(database)
+
+    assert wakes.commit_work_ready("demo", freshness_minutes=5) is None
+    assert wake_events(database, "lead_wake.committed") == []
+
+
+def test_every_live_assignment_acknowledged_then_a_newer_stop_wakes_once(
+    database: Database,
+) -> None:
+    """The other half: with no published assignment left anywhere on the
+    session and a Stop newer than EVERY consumption timestamp, the
+    otherwise-identical runnable work commits exactly one wake."""
+
+    seed_work_ready(database, assignment_state="acknowledged")
+    _seed_an_older_assignment(
+        database, state="acknowledged", acknowledged_at=CHANNEL_CONSUMED_AT
+    )
+    _record_a_newer_stop(database)
+    wakes = build_wakes(database)
+
+    wake = wakes.commit_work_ready("demo", freshness_minutes=5)
+
+    assert wake is not None
+    assert wake.kind == "work_ready"
+    assert wake_events(database, "lead_wake.committed") == [wake.wake_id]

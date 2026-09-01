@@ -91,6 +91,7 @@ from hermes_orchestrator.lead_intake import LeadIntakeRouter
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.lead_wakes import (
     CommandWakeTransport,
+    LeadTerminalWakes,
     LeadWakeDelivery,
     LeadWakeReconciler,
 )
@@ -922,6 +923,8 @@ async def _run_daemon(
     checkpoint_dispatcher: CheckpointDispatcher | None = None,
     wake_delivery: LeadWakeDelivery | None = None,
     wake_reconciler: LeadWakeReconciler | None = None,
+    wakes: LeadTerminalWakes | None = None,
+    resource_freshness_minutes: int = 5,
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
     cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
@@ -986,6 +989,19 @@ async def _run_daemon(
             # self-host activation intent or successor dependency
             # flip from durable rows. Contains its own failures.
             await post_merge.tick()
+        if wakes is not None:
+            # INFRA-215: every other wake kind fires because a turn
+            # ENDED, so an idle seat was never told safe admitted work
+            # still remained. This is the live boundary that
+            # re-evaluates that condition; the runnable-set turn key
+            # makes an unchanged condition re-commit nothing, so the
+            # per-tick cadence costs one read and no wake.
+            for project_key in projects:
+                with suppress(Exception):
+                    wakes.commit_work_ready(
+                        project_key,
+                        freshness_minutes=resource_freshness_minutes,
+                    )
 
     supervisor = Supervisor(
         service,
@@ -1005,6 +1021,7 @@ async def _run_daemon(
                 and orchestrator_workspace is None
                 and merge_flow is None
                 and post_merge is None
+                and wakes is None
             )
             else _maintenance
         ),
@@ -3346,6 +3363,35 @@ def _intake_poll(args: argparse.Namespace) -> int:
     database = Database.open(_intake_state_dir(args) / "state.db")
     try:
         if hook_event == "Stop":
+            # INFRA-215 (Sol acce71fc): one UNCONDITIONAL durable Stop
+            # record, in the journal that already exists. A lead running
+            # its own foreground turn has an acknowledged assignment and
+            # zero child rows -- the same durable shape as an idle seat
+            # -- so idleness cannot be inferred from those tables. This
+            # event is the only positive proof the session reached Stop,
+            # and `_seat_is_idle` requires it to be NEWER than the
+            # latest turn-starting input.
+            with suppress(Exception):
+                from hermes_orchestrator.events import EventInput, EventStore
+                from hermes_orchestrator.lead_children import _bound_cell
+
+                events = EventStore(database)
+                with database.transaction() as connection:
+                    # INFRA-204: unconditional with respect to CHILDREN,
+                    # never with respect to binding -- an unbound Claude
+                    # session must stay completely inert, so it shares
+                    # the one binding predicate every hook path uses.
+                    if _bound_cell(connection, str(session)) is not None:
+                        events.append(
+                            connection,
+                            EventInput(
+                                event_type="lead_turn.stopped",
+                                aggregate_type="lead_session",
+                                aggregate_id=str(session),
+                                actor="lead",
+                                payload={},
+                            ),
+                        )
             # A Stop with live background children records the durable
             # continuation the last child completion will reactivate;
             # a Stop with none supersedes any stale promise and is
@@ -5099,6 +5145,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             events=EventStore(runtime.database),
                             wakes=runtime.lead_wakes,
                         )
+                    ),
+                    wakes=runtime.lead_wakes,
+                    resource_freshness_minutes=(
+                        settings.policy.resource_sample_freshness_minutes
                     ),
                     cmux_reconciler=runtime.cmux_reconciler,
                     cmux_dead_lead_sweep=runtime.cmux_dead_lead_sweep,

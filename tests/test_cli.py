@@ -380,6 +380,61 @@ async def test_daemon_starts_when_cmux_fails_after_ping(
         database.close()
 
 
+@pytest.mark.asyncio
+async def test_daemon_maintenance_wakes_an_idle_seat_with_runnable_work(
+    tmp_path: Path,
+) -> None:
+    """INFRA-215: the wake has a LIVE caller. Nothing else in the daemon
+    evaluates the underutilization condition, so without this boundary
+    an idle seat with safe admitted work never learns of it. The
+    runnable-set turn key keeps the per-tick cadence idempotent."""
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_wakes import (
+        LeadTerminalWakes,
+        LeadWakeDelivery,
+        TerminalWake,
+    )
+    from tests.test_lead_wakes import WAKE_NOW, seed_work_ready
+
+    database = Database.open(tmp_path / "state.db")
+    try:
+        seed_work_ready(database)
+        wakes = LeadTerminalWakes(
+            database=database, events=EventStore(database), now=lambda: WAKE_NOW
+        )
+        delivered: list[str] = []
+
+        async def transport(wake: TerminalWake) -> bool:
+            delivered.append(wake.kind)
+            return True
+
+        delivery = LeadWakeDelivery(wakes, transport=transport)
+        # Two ticks: the first commits the wake, the second delivers the
+        # row the previous tick's drain could not yet see and re-runs the
+        # unchanged condition, which must commit nothing more.
+        for _ in range(2):
+            await _run_daemon(
+                FakeService(),
+                once=True,
+                interval=60,
+                projects=("demo",),
+                wakes=wakes,
+                wake_delivery=delivery,
+            )
+
+        rows = database.execute(
+            "SELECT kind, state FROM lead_terminal_wakes"
+        ).fetchall()
+        assert [(r["kind"], r["state"]) for r in rows] == [
+            ("work_ready", "delivered")
+        ]
+        assert delivered == ["work_ready"]
+    finally:
+        database.close()
+
+
 def test_merge_flow_commands_are_registered() -> None:
     from hermes_orchestrator.cli import _parser
 
