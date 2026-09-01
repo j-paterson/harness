@@ -226,6 +226,47 @@ class LeadAssignments:
             acknowledged_at=None,
         )
 
+    def acknowledge_in(
+        self,
+        connection: sqlite3.Connection,
+        assignment_id: str,
+        *,
+        session_id: str,
+    ) -> bool:
+        """Consume one packet INSIDE the caller's open transaction.
+
+        The same compare-and-swap :meth:`acknowledge` runs, but on a
+        connection whose transaction the caller owns, so the consume
+        commits — or rolls back — atomically with whatever else that
+        transaction is doing. INFRA-220 (Sol correction 25689ebd packet
+        2) needs exactly this: the canonical activation transaction
+        consumes the exact confirmation it is gated on after all of its
+        own eligibility predicates have passed and before it commits,
+        so a supersession that lands in that window can never leave an
+        activated issue whose confirmation was never consumed.
+        """
+
+        stamp = self._now().isoformat()
+        cursor = connection.execute(
+            "UPDATE lead_assignments SET state = 'acknowledged', "
+            "acknowledged_at = ?, updated_at = ? "
+            "WHERE assignment_id = ? AND session_id = ? "
+            "AND state = 'published'",
+            (stamp, stamp, assignment_id, session_id),
+        )
+        if cursor.rowcount != 1:
+            return False
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="assignment.acknowledged",
+                aggregate_type="lead_assignment",
+                aggregate_id=assignment_id,
+                payload={"session_id": session_id},
+            ),
+        )
+        return True
+
     def acknowledge(self, assignment_id: str, *, session_id: str) -> bool:
         """Record the bound session's exact acknowledgement, once.
 
@@ -233,29 +274,16 @@ class LeadAssignments:
         exact bound session, and the ``published`` state; anything
         else — a foreign session, a superseded packet, a duplicate
         acknowledgement — changes nothing and returns False.
+
+        Standalone wrapper around :meth:`acknowledge_in`: the CAS body
+        exists once, and this opens the transaction for callers that
+        have none of their own.
         """
 
-        stamp = self._now().isoformat()
         with self._database.transaction() as connection:
-            cursor = connection.execute(
-                "UPDATE lead_assignments SET state = 'acknowledged', "
-                "acknowledged_at = ?, updated_at = ? "
-                "WHERE assignment_id = ? AND session_id = ? "
-                "AND state = 'published'",
-                (stamp, stamp, assignment_id, session_id),
+            return self.acknowledge_in(
+                connection, assignment_id, session_id=session_id
             )
-            if cursor.rowcount != 1:
-                return False
-            self._events.append(
-                connection,
-                EventInput(
-                    event_type="assignment.acknowledged",
-                    aggregate_type="lead_assignment",
-                    aggregate_id=assignment_id,
-                    payload={"session_id": session_id},
-                ),
-            )
-        return True
 
     def get(self, assignment_id: str) -> LeadAssignment:
         row = self._database.execute(

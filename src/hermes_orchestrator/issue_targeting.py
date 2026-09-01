@@ -25,10 +25,11 @@ This revision:
   ``admitted_issues`` or journal any projection: publication alone is
   not the transition (that was the base-revision bug), and premature
   advancement before the exact-session ACK would be a new one.
-* :func:`acknowledge_target` is the ACK-gated transition, ordered so
-  the confirmation is CONSUMED ONLY AFTER activation has committed
-  (Sol correction 9944530c packet 1 — see that function's docstring
-  for why this is recoverable rather than atomic).
+* :func:`acknowledge_target` is the ACK-gated transition, in which the
+  confirmation is CONSUMED INSIDE the canonical activation transaction
+  — after every eligibility predicate, before the commit — so the
+  consume and the transition are one commit (Sol correction 25689ebd
+  packet 2; see that function's docstring).
 
 Sol correction 9944530c (this revision) landed three fixes:
 
@@ -37,7 +38,11 @@ Sol correction 9944530c (this revision) landed three fixes:
    canonical activation in a second one: an activation failure — or
    eligibility that changed in between — left a permanently consumed
    confirmation that duplicate-ACK refusal could never retry. The
-   consume now runs LAST; see :func:`acknowledge_target`.
+   consume now runs LAST; see :func:`acknowledge_target`. Sol
+   correction 25689ebd packet 2 then closed the remaining gap — it
+   ran last, but in a SECOND transaction after activation had already
+   committed — by moving it inside the activation transaction as a
+   post-eligibility callback (``cells`` ``on_eligible``).
 2. **Occupancy.** The publish-time occupancy check was a duplicated
    "any other active issue refuses" rule, contradicting the merged
    canonical development model (up to
@@ -280,28 +285,19 @@ async def acknowledge_target(
     session_id: str,
 ) -> TargetAckResult:
     """Consume the exact-session ACK for one published targeting packet
-    and advance the target — exactly once, and never consuming the
-    confirmation before the activation it gates has committed.
+    and advance the target — ATOMICALLY: the confirmation and the
+    canonical activation commit together or neither commits.
 
-    Sol correction 9944530c packet 1. The previous revision ran the
-    ``LeadAssignments.acknowledge`` compare-and-swap in its OWN
-    committed transaction and only then called activation in a second
-    one. Anything that made activation fail in between — a flipped
-    dependency, a saturated lane, a pending operator decision, a lost
-    cell lease, a crash — left the packet permanently ``acknowledged``
-    with the issue still queued, and every retry then died on the
-    duplicate-ACK refusal: an unrecoverable half-transition.
-
-    RECOVERABLE, not atomic, and deliberately so. The canonical
-    activation transaction (``cells._activate_issue_transaction``, via
-    :func:`cells.activate_admitted_issue`) owns its own ``BEGIN
-    IMMEDIATE`` on the single shared connection; SQLite has no nesting
-    here, so the only ways to make the two writes one commit would be
-    to re-implement the activation state machine inside this module —
-    exactly the divergence this module must never introduce — or to
-    let the confirmation be consumed by a hook that runs BEFORE the
-    activation predicates and therefore commits even when they refuse,
-    which is the very bug. Instead the ORDER carries the guarantee:
+    Sol correction 25689ebd packet 2. The previous revision consumed
+    the confirmation AFTER the activation transaction had already
+    committed, arguing that SQLite's lack of nested transactions made
+    atomicity impossible without either re-implementing the activation
+    state machine here or consuming inside the PRE-eligibility
+    ``guard`` (which commits even when eligibility later refuses — the
+    original bug). Both alternatives are still refused; the way
+    through is a POST-ELIGIBILITY callback that runs INSIDE the
+    canonical activation's own ``BEGIN IMMEDIATE``, on that
+    transaction's own connection:
 
     1. Re-read the packet and refuse anything that is not the exact,
        still-``published``, exactly-session-bound confirmation. Zero
@@ -312,25 +308,45 @@ async def acknowledge_target(
        with ``assignments=None`` (it advances ``admitted_issues``,
        journals ``issue.started``, and begins the existing idempotent
        In Development projection effect without publishing a second
-       packet for this same offer) and with a ``guard`` that re-proves
-       the confirmation's exactness TRANSACTIONALLY, on the activation
-       transaction's own connection, alongside every dependency /
-       lane-capacity / operator-decision / cell-lease predicate. A
-       refusal there leaves ZERO writes — including the packet, still
-       ``published`` and still pending for its session, hence
-       retryable.
-    3. Only once activation has COMMITTED is the confirmation consumed,
-       through the EXISTING ``LeadAssignments.acknowledge`` CAS.
+       packet for this same offer), with a ``guard`` that re-proves the
+       confirmation's exactness transactionally BEFORE any write, and
+       with ``on_eligible`` — the post-eligibility hook — that consumes
+       the exact confirmation through the in-transaction primitive
+       ``LeadAssignments.acknowledge_in``.
+    3. That hook runs LAST inside the activation transaction: after
+       every eligibility predicate (dependency readiness, the canonical
+       development-lane bound, operator decisions, the cell's current
+       identity and its active lease, the ``admitted_issues`` CAS) has
+       passed, and before the commit. If its CAS fails — a supersession
+       that landed in exactly the window the previous ordering left
+       open — it returns False and the WHOLE transaction rolls back:
+       the issue never transitions, ``issue.started`` is never
+       journaled, no projection effect is opened, and the packet is
+       left exactly as it was.
 
-    Exactly-once across the crash window between (2) and (3): the
-    packet is still ``published`` and the issue is already
-    ``in_development``, so a retry re-enters activation, which takes
-    its replay branch — the cell lease is re-confirmed but
-    ``admitted_issues`` is NOT re-CASed, no second ``issue.started`` is
-    journaled, and the existing projection effect row is adopted, not
-    re-begun — and the ACK CAS then lands. One transition, one event,
-    one effect, one consumed confirmation, however many times this is
-    retried. Concurrent duplicates race on that single CAS: the loser
+    Sol correction 25689ebd packet 1 is the other half of step (3):
+    "the cell's current identity" is now literally that. The canonical
+    activation's ``project_cells`` CAS re-proves the cell's CURRENT
+    ``project_key``, ``lane_role``, ``profile_alias`` and ``session_id``
+    against the ones the packet named, so a cell that rotated to a new
+    session or profile — or moved lanes — between publication and the
+    ACK can no longer be activated on behalf of the stale identity that
+    named it. Validating this module's own assignment row is not the
+    same thing as proving the cell still IS what the packet named.
+
+    So there is no longer any gap: the exact confirmation is consumed
+    in the same commit that transitions the issue. A refusal anywhere —
+    the guard, any eligibility predicate, or the ACK CAS — leaves ZERO
+    writes, including the packet, still ``published`` and still pending
+    for its session, hence retryable.
+
+    Exactly-once across a crash: a crash before the commit leaves
+    nothing durable and the retry does the whole thing once; a crash
+    after it leaves the packet ``acknowledged``, so the retry stops at
+    step (1) and never re-enters activation. One transition, one
+    ``issue.started``, one projection effect, one consumed
+    confirmation, however many times this is retried. Concurrent
+    duplicates race on that single in-transaction CAS: the loser
     reports ``activated=False`` and has added no effect of its own.
     """
 
@@ -369,6 +385,22 @@ async def acknowledge_target(
         ).fetchone()
         return row is not None
 
+    def consume_confirmation(connection: sqlite3.Connection) -> bool:
+        """The post-eligibility hook: consume THIS exact confirmation
+        inside the activation transaction, after every eligibility
+        predicate has passed and before the commit.
+
+        Its CAS is the EXISTING one (``LeadAssignments.acknowledge_in``
+        — the same compare-and-swap ``acknowledge`` runs, on the
+        caller's connection instead of its own), so a supersession that
+        landed in this window makes it fail here, and the activation
+        that it gates rolls back with it.
+        """
+
+        return assignments.acknowledge_in(
+            connection, assignment_id, session_id=str(session_id)
+        )
+
     activated, _ = await activate_admitted_issue(
         database=database,
         events=events,
@@ -380,21 +412,12 @@ async def acknowledge_target(
         session_id=str(session_id),
         issue_id=assignment.issue_id,
         guard=confirmation_is_exact,
+        on_eligible=consume_confirmation,
     )
-    if not activated:
-        # The packet was NOT consumed: it is still published and still
-        # pending for its session, so this exact target stays retryable.
-        return TargetAckResult(
-            assignment_id=assignment_id,
-            issue_id=assignment.issue_id,
-            activated=False,
-        )
-
-    consumed = assignments.acknowledge(
-        assignment_id, session_id=str(session_id)
-    )
+    # ``activated`` is now one answer for both writes: the transition
+    # and the consume shared a single commit.
     return TargetAckResult(
         assignment_id=assignment_id,
         issue_id=assignment.issue_id,
-        activated=consumed,
+        activated=activated,
     )

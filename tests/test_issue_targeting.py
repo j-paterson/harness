@@ -1,8 +1,9 @@
 """Tests for the INFRA-220 ``target_issue`` / ``acknowledge_target``
-transition (Sol corrections 7ecf4a57 and 9944530c)."""
+transition (Sol corrections 7ecf4a57, 9944530c and 25689ebd)."""
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -127,6 +128,40 @@ def _seed_cell(
             )
 
 
+def _rotate_cell(
+    database: Database,
+    *,
+    cell_id: str = CELL_ID,
+    session_id: str | None = None,
+    profile_alias: str | None = None,
+    lane_role: str | None = None,
+    project_key: str | None = None,
+) -> None:
+    """Rotate the named cell's durable identity in place.
+
+    Models the cell moving on after a packet named it: a new Claude
+    session, a different profile, another lane, another project. The
+    packet's own row is left exactly as published.
+    """
+
+    columns: list[str] = []
+    values: list[object] = []
+    for column, value in (
+        ("session_id", session_id),
+        ("profile_alias", profile_alias),
+        ("lane_role", lane_role),
+        ("project_key", project_key),
+    ):
+        if value is not None:
+            columns.append(f"{column} = ?")
+            values.append(value)
+    with database.transaction() as connection:
+        connection.execute(
+            f"UPDATE project_cells SET {', '.join(columns)} WHERE cell_id = ?",
+            (*values, cell_id),
+        )
+
+
 def _set_lease_state(
     database: Database, *, profile_alias: str = "max-c", state: str
 ) -> None:
@@ -180,6 +215,23 @@ def _admitted_snapshot(database: Database) -> list[tuple[object, ...]]:
 
 def _assignment_count(database: Database) -> int:
     row = database.execute("SELECT COUNT(*) AS n FROM lead_assignments").fetchone()
+    return int(row["n"])
+
+
+def _effect_count(database: Database, issue_id: str) -> int:
+    """Durable ``In Development`` projection effect rows for the issue."""
+
+    row = database.execute(
+        "SELECT COUNT(*) AS n FROM external_effects WHERE target = ?",
+        (issue_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def _consumed_count(database: Database) -> int:
+    row = database.execute(
+        "SELECT COUNT(*) AS n FROM lead_assignments WHERE state = 'acknowledged'"
+    ).fetchone()
     return int(row["n"])
 
 
@@ -725,3 +777,380 @@ def test_harness_cell_is_never_an_eligible_target(
         )
 
     assert _assignment_count(database) == 0
+
+
+# ---------------------------------------------------------------------------
+# Sol correction 25689ebd packet 1 -- the activation transaction re-proves
+# the CELL's own current identity, not merely the assignment row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rotated_cell_identity_refuses_activation_and_stays_retryable(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 1: the cell rotates to another session on another profile
+    between publication and the ACK. The stale session can neither
+    activate nor consume its packet -- and the packet stays retryable.
+
+    The profile lease the packet named is deliberately left ACTIVE, so
+    the pre-existing lease predicate cannot catch this: only re-proving
+    the cell's CURRENT ``session_id``/``profile_alias`` can."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    linear = _RecordingLinear()
+    _rotate_cell(
+        database, session_id=OTHER_SESSION_ID, profile_alias="max-rotated"
+    )
+    before = _admitted_snapshot(database)
+
+    stale = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert stale.activated is False
+    assert _admitted_snapshot(database) == before
+    assert _issue_state(database, "INFRA-9") == "queued"
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    assert _effect_count(database, "INFRA-9") == 0
+    assert linear.projected == []
+    # Nor was the confirmation consumed: it is still published, still
+    # pending for its session, and no ACK was ever journaled.
+    assert _assignment_row(database, assignment_id) == ("published", None)
+    assert _event_count(database, "assignment.acknowledged", assignment_id) == 0
+    pending = assignments.pending_for_session(SESSION_ID)
+    assert [row.assignment_id for row in pending] == [assignment_id]
+
+    # The cell's NEW session cannot consume the stale session's packet
+    # either -- the packet is bound to the session that was named.
+    rotated = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=OTHER_SESSION_ID,
+    )
+
+    assert rotated.activated is False
+    assert _assignment_row(database, assignment_id) == ("published", None)
+    assert _issue_state(database, "INFRA-9") == "queued"
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+
+
+@pytest.mark.asyncio
+async def test_cell_rotated_out_of_the_development_lane_refuses_activation(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 1: the development lane is part of the cell's identity.
+    A cell moved to the harness lane after publication is no longer the
+    cell the packet named, and its packet activates nothing."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    linear = _RecordingLinear()
+    _rotate_cell(database, lane_role=HARNESS_LANE)
+    before = _admitted_snapshot(database)
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is False
+    assert _admitted_snapshot(database) == before
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    assert _effect_count(database, "INFRA-9") == 0
+    assert linear.projected == []
+    assert _assignment_row(database, assignment_id) == ("published", None)
+
+
+@pytest.mark.asyncio
+async def test_cell_rotated_to_another_project_refuses_activation(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Packet 1: so is the project. A cell that now belongs to a
+    different project is not the cell the packet named."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+    linear = _RecordingLinear()
+    _rotate_cell(database, project_key="other")
+    before = _admitted_snapshot(database)
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is False
+    assert _admitted_snapshot(database) == before
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    assert _assignment_row(database, assignment_id) == ("published", None)
+
+
+# ---------------------------------------------------------------------------
+# Sol correction 25689ebd packet 2 -- the confirmation is consumed INSIDE
+# the canonical activation transaction: both commit, or neither does.
+# ---------------------------------------------------------------------------
+
+
+class _Crash(RuntimeError):
+    """A process death at the exact ACK/activation boundary."""
+
+
+class _SupersedingAssignments(LeadAssignments):
+    """Models a supersession landing in the window between activation's
+    eligibility checks and the ACK compare-and-swap.
+
+    It supersedes the packet immediately before whichever consume
+    primitive the production code uses, so the CAS that follows finds
+    no ``published`` row and fails."""
+
+    def __init__(self, database: Database, *, events: EventStore) -> None:
+        super().__init__(database, events=events, now=lambda: NOW)
+        self.db = database
+
+    @staticmethod
+    def _supersede(connection: object, assignment_id: str) -> None:
+        connection.execute(  # type: ignore[attr-defined]
+            "UPDATE lead_assignments SET state = 'superseded' "
+            "WHERE assignment_id = ?",
+            (assignment_id,),
+        )
+
+    def acknowledge_in(
+        self, connection: object, assignment_id: str, *, session_id: str
+    ) -> bool:
+        self._supersede(connection, assignment_id)
+        return super().acknowledge_in(
+            connection, assignment_id, session_id=session_id
+        )
+
+    def acknowledge(self, assignment_id: str, *, session_id: str) -> bool:
+        # The same race for any ordering that consumes in a SECOND
+        # transaction after activation has already committed.
+        with self.db.transaction() as connection:
+            self._supersede(connection, assignment_id)
+        return super().acknowledge(assignment_id, session_id=session_id)
+
+
+class _ObservingAssignments(LeadAssignments):
+    """Records, at the moment the confirmation is consumed, both what
+    the consuming connection can see and what a SEPARATE connection --
+    i.e. the committed database -- can see.
+
+    That pair is the atomicity proof. If the consume runs inside the
+    activation transaction, the consuming connection already sees the
+    staged transition while the outside observer still sees ``queued``,
+    because nothing has committed yet. If the consume runs in a second
+    transaction after activation committed, the outside observer sees
+    ``in_development`` -- the very window a supersession can exploit."""
+
+    def __init__(self, database: Database, *, events: EventStore) -> None:
+        super().__init__(database, events=events, now=lambda: NOW)
+        self.db = database
+        self.observed: list[tuple[str, str]] = []
+
+    def _outside_view(self, issue_id: str) -> str:
+        """The committed issue state, read on its own connection."""
+
+        observer = sqlite3.connect(self.db.path, timeout=1.0)
+        try:
+            row = observer.execute(
+                "SELECT state FROM admitted_issues WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+        finally:
+            observer.close()
+        return str(row[0])
+
+    def acknowledge_in(
+        self, connection: object, assignment_id: str, *, session_id: str
+    ) -> bool:
+        row = connection.execute(  # type: ignore[attr-defined]
+            "SELECT packet.issue_id AS issue_id, issues.state AS state "
+            "FROM lead_assignments packet "
+            "JOIN admitted_issues issues ON issues.issue_id = packet.issue_id "
+            "WHERE packet.assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
+        self.observed.append(
+            (str(row["state"]), self._outside_view(str(row["issue_id"])))
+        )
+        return super().acknowledge_in(
+            connection, assignment_id, session_id=session_id
+        )
+
+
+class _CrashingAssignments(LeadAssignments):
+    """Dies at the ACK boundary while ``armed``, having consumed."""
+
+    def __init__(self, database: Database, *, events: EventStore) -> None:
+        super().__init__(database, events=events, now=lambda: NOW)
+        self.armed = True
+
+    def acknowledge_in(
+        self, connection: object, assignment_id: str, *, session_id: str
+    ) -> bool:
+        consumed = super().acknowledge_in(
+            connection, assignment_id, session_id=session_id
+        )
+        if self.armed:
+            raise _Crash("process died at the ACK boundary")
+        return consumed
+
+    def acknowledge(self, assignment_id: str, *, session_id: str) -> bool:
+        consumed = super().acknowledge(assignment_id, session_id=session_id)
+        if self.armed:
+            raise _Crash("process died at the ACK boundary")
+        return consumed
+
+
+@pytest.mark.asyncio
+async def test_supersession_racing_the_ack_commits_neither_half(
+    database: Database, events: EventStore
+) -> None:
+    """Packet 2: a supersession that lands after every eligibility check
+    but before the ACK CAS must leave NEITHER half durable -- not an
+    activated issue whose confirmation was never consumed."""
+
+    racing = _SupersedingAssignments(database, events=events)
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, racing, events)
+    linear = _RecordingLinear()
+    before = _admitted_snapshot(database)
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=racing,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is False
+    # Neither the activation...
+    assert _admitted_snapshot(database) == before
+    assert _issue_state(database, "INFRA-9") == "queued"
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    assert _effect_count(database, "INFRA-9") == 0
+    assert linear.projected == []
+    # ...nor the consume -- and the racing supersession rolled back with
+    # them, so the exact packet is still published and still retryable.
+    assert _assignment_row(database, assignment_id) == ("published", None)
+    assert _consumed_count(database) == 0
+    assert _event_count(database, "assignment.acknowledged", assignment_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_confirmation_is_consumed_inside_the_activation_transaction(
+    database: Database, events: EventStore
+) -> None:
+    """Packet 2, the positive half of the same guarantee: when the ACK
+    CAS runs, the issue transition is already staged on that very
+    connection and NOT yet visible to any other connection -- consume
+    and activation are one commit, not two."""
+
+    observing = _ObservingAssignments(database, events=events)
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, observing, events)
+    linear = _RecordingLinear()
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=observing,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is True
+    assert observing.observed == [("in_development", "queued")]
+    assert _issue_state(database, "INFRA-9") == "in_development"
+    assert _assignment_row(database, assignment_id)[0] == "acknowledged"
+    assert _event_count(database, "issue.started", "INFRA-9") == 1
+    assert _event_count(database, "assignment.acknowledged", assignment_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_across_the_crash_boundary_activates_exactly_once(
+    database: Database, events: EventStore
+) -> None:
+    """Packet 2: a crash at the ACK boundary leaves NOTHING durable, and
+    the retry produces exactly one ``issue.started``, one projection
+    effect, and one consumed assignment."""
+
+    crashing = _CrashingAssignments(database, events=events)
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, crashing, events)
+    linear = _RecordingLinear()
+    before = _admitted_snapshot(database)
+
+    with pytest.raises(_Crash):
+        await acknowledge_target(
+            database,
+            events=events,
+            linear=linear,
+            assignments=crashing,
+            assignment_id=assignment_id,
+            session_id=SESSION_ID,
+        )
+
+    # The crash took the whole transaction with it: no half-transition.
+    assert _admitted_snapshot(database) == before
+    assert _issue_state(database, "INFRA-9") == "queued"
+    assert _event_count(database, "issue.started", "INFRA-9") == 0
+    assert _effect_count(database, "INFRA-9") == 0
+    assert _assignment_row(database, assignment_id) == ("published", None)
+    assert _consumed_count(database) == 0
+
+    crashing.armed = False
+    retry = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=crashing,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+    duplicate = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=crashing,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert retry.activated is True
+    assert duplicate.activated is False
+    assert _issue_state(database, "INFRA-9") == "in_development"
+    assert _event_count(database, "issue.started", "INFRA-9") == 1
+    assert _effect_count(database, "INFRA-9") == 1
+    assert _consumed_count(database) == 1
+    assert _assignment_count(database) == 1
+    assert _event_count(database, "assignment.acknowledged", assignment_id) == 1
+    assert linear.projected == ["INFRA-9"]

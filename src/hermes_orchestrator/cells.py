@@ -604,6 +604,17 @@ async def _project_in_development(linear: LinearProjector, issue_id: str) -> Non
         )
 
 
+class _ActivationRefused(Exception):
+    """Internal: unwind the activation transaction with ZERO writes.
+
+    ``Database.transaction`` commits on any normal exit from its body,
+    so a plain ``return`` from a point where writes are already staged
+    would make those writes durable. Raising this instead takes the
+    context manager's ``ROLLBACK`` path; :func:`_activate_issue_transaction`
+    catches it at the boundary and reports an ordinary refusal.
+    """
+
+
 def _activate_issue_transaction(
     *,
     database: Database,
@@ -616,6 +627,7 @@ def _activate_issue_transaction(
     assignments: LeadAssignments | None,
     now: Callable[[], datetime],
     guard: Callable[[sqlite3.Connection], bool] | None = None,
+    on_eligible: Callable[[sqlite3.Connection], bool] | None = None,
     lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[bool, LeadAssignment | None]:
     """The one durable, LOCAL-ONLY activation transaction every dispatch
@@ -667,8 +679,29 @@ def _activate_issue_transaction(
       exactly what keeps two racing dispatches from ever together
       exceeding the bound);
     - no pending operator decision may exist for the issue;
-    - the cell must still be live and its profile lease active
-      (the ``project_cells`` CAS with the ``profile_leases`` guard).
+    - the cell must still BE the cell the caller named, and its profile
+      lease must still be active. INFRA-220 (Sol correction 25689ebd
+      packet 1): the ``project_cells`` CAS re-proves the cell's CURRENT
+      durable identity — ``project_key``, ``lane_role``,
+      ``profile_alias`` and ``session_id`` all have to equal the ones
+      this activation was asked for, on top of the live-state and
+      active-lease predicates. Matching on ``cell_id`` alone let a cell
+      that had ROTATED to a different session or profile (or been moved
+      to another lane) still be activated on behalf of the stale
+      identity that named it: the row was checked for existence, never
+      for still being what the caller meant.
+
+    Post-eligibility hook (INFRA-220, Sol correction 25689ebd packet
+    2): ``on_eligible``, when supplied, runs LAST — after every
+    eligibility predicate above has passed and every activation write
+    is staged, but still INSIDE this transaction, on this very
+    connection — and a ``False`` return rolls the whole transaction
+    back. It is the seam a caller uses to make some other durable
+    write commit atomically WITH the activation (``issue_targeting``
+    consumes the exact ACK packet there) without reimplementing any of
+    this state machine and without the pre-eligibility ``guard``'s
+    fatal property: ``guard`` runs BEFORE the predicates, so a write
+    made there would commit even when eligibility later refuses.
 
     An issue that is ALREADY ``in_development`` is the replay/resume
     case: the cell lease is confirmed and the assignment packet is
@@ -697,8 +730,56 @@ def _activate_issue_transaction(
     """
 
     stamp = now().isoformat()
-    assignment: LeadAssignment | None = None
     harness = lane_role == HARNESS_LANE
+    try:
+        return _activate_issue_body(
+            database=database,
+            events=events,
+            cell_id=cell_id,
+            project_key=project_key,
+            profile_alias=profile_alias,
+            issue_id=issue_id,
+            session_id=session_id,
+            assignments=assignments,
+            stamp=stamp,
+            guard=guard,
+            on_eligible=on_eligible,
+            harness=harness,
+            lane_role=lane_role,
+        )
+    except _ActivationRefused:
+        # The transaction rolled back: neither the activation nor
+        # anything ``on_eligible`` wrote alongside it is durable.
+        return False, None
+
+
+def _activate_issue_body(
+    *,
+    database: Database,
+    events: EventStore,
+    cell_id: str,
+    project_key: str,
+    profile_alias: str,
+    issue_id: str,
+    session_id: str,
+    assignments: LeadAssignments | None,
+    stamp: str,
+    guard: Callable[[sqlite3.Connection], bool] | None,
+    on_eligible: Callable[[sqlite3.Connection], bool] | None,
+    harness: bool,
+    lane_role: str,
+) -> tuple[bool, LeadAssignment | None]:
+    """The transaction body of :func:`_activate_issue_transaction`.
+
+    NEVER call this directly: it can raise :class:`_ActivationRefused`
+    (the rollback path a refusing ``on_eligible`` takes), which only
+    :func:`_activate_issue_transaction` translates back into an
+    ordinary ``(False, None)`` refusal. It exists as its own function
+    solely so that ``with database.transaction()`` can sit inside that
+    translator's ``try`` without re-indenting the state machine.
+    """
+
+    assignment: LeadAssignment | None = None
     with database.transaction() as connection:
         issue_row = connection.execute(
             "SELECT state, instruction_id, project_key, dependency_ready "
@@ -743,14 +824,38 @@ def _activate_issue_transaction(
             ).fetchone()
             if pending_decision is not None:
                 return False, None
+        # INFRA-220 (Sol correction 25689ebd packet 1): the cell must
+        # still BE the cell this activation names. Every identity
+        # column the caller bound itself to -- the project, the lane
+        # role, the profile alias, and the exact current session -- is
+        # a predicate of this one CAS, evaluated on the transaction's
+        # own connection at commit time. The previous form matched
+        # ``cell_id`` and liveness only, so a cell that had rotated to
+        # a new session/profile (or been moved to the harness lane)
+        # between the caller's read and this commit was still activated
+        # under the STALE identity: the row existed and held a lease,
+        # which is not the same thing as it still being what the caller
+        # meant. Nothing has been written yet at this point, so a
+        # refusal here leaves zero durable writes.
         activated = connection.execute(
             "UPDATE project_cells SET state = 'active', updated_at = ? "
-            "WHERE cell_id = ? AND state IN ('starting', 'active') "
+            "WHERE cell_id = ? AND project_key = ? AND lane_role = ? "
+            "AND profile_alias = ? AND session_id = ? "
+            "AND state IN ('starting', 'active') "
             "AND EXISTS ("
             "SELECT 1 FROM profile_leases "
             "WHERE project_key = ? AND profile_alias = ? AND state = 'active'"
             ")",
-            (stamp, cell_id, project_key, profile_alias),
+            (
+                stamp,
+                cell_id,
+                project_key,
+                lane_role,
+                profile_alias,
+                session_id,
+                project_key,
+                profile_alias,
+            ),
         )
         if activated.rowcount == 0:
             return False, None
@@ -816,6 +921,15 @@ def _activate_issue_transaction(
                     ),
                 ),
             )
+        if on_eligible is not None and not on_eligible(connection):
+            # INFRA-220 (Sol correction 25689ebd packet 2): every
+            # eligibility predicate has passed and every activation
+            # write above is staged in THIS transaction. The hook ran
+            # last, on this same connection, and refused -- so the
+            # transaction unwinds and neither the activation nor the
+            # hook's own write survives. There is no window in which
+            # one is durable without the other.
+            raise _ActivationRefused
     return True, assignment
 
 
@@ -832,6 +946,7 @@ async def activate_admitted_issue(
     issue_id: str,
     now: Callable[[], datetime] = _utc_now,
     guard: Callable[[sqlite3.Connection], bool] | None = None,
+    on_eligible: Callable[[sqlite3.Connection], bool] | None = None,
     lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[bool, LeadAssignment | None]:
     """Dispatch one already-admitted issue onto a live cell durably.
@@ -856,9 +971,16 @@ async def activate_admitted_issue(
     durable trace lives and how it gets resolved).
 
     A commit-time refusal (occupancy, exact-state CAS, dependency
-    flip, pending decision, stale guard, lease identity) leaves ZERO
-    local writes and Linear is never even attempted — there is nothing
-    to project for a candidate that did not activate.
+    flip, pending decision, stale guard, cell identity, lease
+    identity, or a refusing ``on_eligible`` hook) leaves ZERO local
+    writes and Linear is never even attempted — there is nothing to
+    project for a candidate that did not activate.
+
+    ``on_eligible`` is the post-eligibility transactional callback
+    documented on :func:`_activate_issue_transaction`: it runs inside
+    the activation transaction once every predicate has passed and
+    every activation write is staged, so a caller's own durable write
+    commits with the activation or not at all.
 
     INFRA-219 L3: ``lane_role`` defaults to ``DEVELOPMENT_LANE`` — the
     Stop-hook idle dispatcher never touches the harness lane — so
@@ -877,6 +999,7 @@ async def activate_admitted_issue(
         assignments=assignments,
         now=now,
         guard=guard,
+        on_eligible=on_eligible,
         lane_role=lane_role,
     )
     if not activated:
