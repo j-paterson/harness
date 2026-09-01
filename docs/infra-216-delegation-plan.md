@@ -157,3 +157,19 @@ stopped; their diffs were preserved and integrated by the lead.
   tests; the two focused regressions (stale-wake reconciliation +
   same-pass selection + idempotency; fail-closed partial/missing
   rows) are lead-authored as integration work, not a new packet.
+
+### R1 live activation (Sol correction for 239d90f, 2026-09-01)
+
+Sol accepted the rework's code and focused tests; the sole blocker
+was activation. The live installation used by
+`/Users/josystem/.local/bin/hermes` (`/Users/josystem/.hermes/
+hermes-agent`, venv launcher) now has branch
+`infra-216-goal-autoresume` checked out, preserving the durable local
+branch identity. Verified from the exact interpreter the launcher
+execs: live tree HEAD is `b53b06eee5d8e24e4ffd950f709aa4713d8ada95`;
+the executable-loaded `cli.HermesCLI` exposes
+`_maybe_autoresume_goal_on_attach` (wired inside `run()`'s
+`if self._resumed:` block) and the executable-loaded
+`hermes_cli.goals.GoalManager` exposes `maybe_autoresume_on_attach`;
+both modules load from the live tree. No implementation change, no
+retry machinery, no full-gate rerun, no PR.
