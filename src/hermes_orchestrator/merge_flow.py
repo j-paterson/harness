@@ -30,7 +30,11 @@ from hermes_orchestrator.config import Settings
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import CandidateEmitter
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.git import GitRunner, GitVerifier, SubprocessGitRunner
+from hermes_orchestrator.git import (
+    GitRunner,
+    GitVerifier,
+    SubprocessGitRunner,
+)
 from hermes_orchestrator.github import (
     GitHubClient,
     HttpxGitHubTransport,
@@ -44,6 +48,7 @@ from hermes_orchestrator.processes import ProcessRegistry
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.review_intake import (
+    BranchHeadUnknown,
     CandidateAdmission,
     CompositeIntakeGate,
 )
@@ -195,6 +200,7 @@ def build_merge_flow(
         branch_head=_branch_head(settings, GitVerifier(runner=runner)),
         base_policy=_base_policy(settings, GitVerifier(runner=runner)),
         intake_gate=intake_gate,
+        merged_candidate_proof=_merged_candidate_proof(settings, github),
     )
     qa = QaRouter(database=database, events=events)
     settlements = MergeSettlements(database, events)
@@ -264,23 +270,90 @@ def build_merge_flow(
 
 
 def _branch_head(settings: Settings, git: GitVerifier) -> Callable[[str, str], str]:
-    """Resolve the remote branch head from git, never from open pull requests.
+    """Resolve the remote branch head via a typed ref query, never a fetch.
 
-    Fetches the branch from ``origin`` and resolves ``origin/<branch>`` to
-    its commit SHA; any fetch or resolution failure returns "" rather than
-    raising, since this feeds an admission comparison, not a proof gate
-    (INFRA-202).
+    INFRA-217, Sol correction 43152bf8: production previously used
+    ``git fetch -- origin <branch>`` and treated ANY fetch failure as
+    authoritative absence, but a genuinely deleted remote branch makes
+    that exact command exit 128 with ``fatal: couldn't find remote ref``
+    -- indistinguishable from a network, auth, or invocation failure at
+    the process boundary, so the required already-merged/deleted-branch
+    case never reached the GitHub proof below. The prior ``head_of``-
+    based fallback made the opposite mistake: every
+    :class:`~hermes_orchestrator.git.GitError` from local resolution was
+    read as authoritative absence, even though
+    :class:`~hermes_orchestrator.git.GitVerifier` raises that identical
+    exception for missing refs, corrupt repositories, invalid output, and
+    other local failures alike.
+
+    :meth:`~hermes_orchestrator.git.GitVerifier.remote_head` replaces
+    both with one typed remote-ref query (``git ls-remote --heads``)
+    whose three outcomes stay distinct end to end:
+
+    - AUTHORITATIVE ABSENCE: the remote was reached and its ref
+      namespace is authoritative, and it reports zero matching refs.
+      This is the normal state AFTER a merge, since GitHub deletes the
+      branch, and is represented by returning ``""`` exactly as before.
+    - EXISTS: the remote reports exactly one matching
+      ``refs/heads/<branch>`` entry. Its SHA is returned.
+    - EVERY OTHER FAILURE: transport, authentication, invocation,
+      malformed-output, or local-repository failures. This is NEVER
+      branch absence, so it raises
+      :class:`~hermes_orchestrator.review_intake.BranchHeadUnknown`
+      instead of returning ``""``, and callers must fail closed on it.
     """
 
     def head(project_key: str, branch: str) -> str:
         project = settings.projects[project_key]
         try:
-            git.fetch(project.repo_path, "origin", branch)
-            return git.head_of(project.repo_path, f"origin/{branch}")
-        except Exception:
-            return ""
+            sha = git.remote_head(project.repo_path, "origin", branch)
+        except Exception as error:
+            raise BranchHeadUnknown(
+                f"remote ref query for {branch!r} failed for "
+                f"{project_key!r}: {error}"
+            ) from error
+        return sha if sha is not None else ""
 
     return head
+
+
+def _merged_candidate_proof(
+    settings: Settings, github: GitHubClient
+) -> Callable[[str, str, str], bool]:
+    """Prove a reviewed SHA is an already-merged pull request (INFRA-217).
+
+    GitHub deletes a candidate's branch when its pull request merges, so
+    ``origin/<branch>`` stops resolving and admission would reject a
+    candidate whose merge is already proven -- the production defect Sol
+    found. This is the ONLY thing permitted to excuse an unresolvable
+    remote branch, and it excuses nothing else: the discovery must find
+    exactly one pull request at the exact reviewed head whose repository
+    AND head repository are the project repository, whose base is the
+    integration branch, and which is genuinely ``merged``. Discovery is
+    already exact on (branch, head_sha) by construction, so a different
+    commit can never satisfy it. Any ambiguity or GitHub failure answers
+    ``False`` and admission fails closed exactly as before.
+    """
+
+    def proof(project_key: str, branch: str, candidate_sha: str) -> bool:
+        project = settings.projects.get(project_key)
+        if project is None:
+            return False
+        try:
+            discovered = github.discover_pull_request(
+                project.github_repo, branch=branch, head_sha=candidate_sha
+            )
+        except Exception:
+            return False
+        if discovered is None or not discovered.merged:
+            return False
+        return (
+            discovered.repository == project.github_repo
+            and discovered.head_repository == project.github_repo
+            and discovered.base_ref == project.integration_branch
+        )
+
+    return proof
 
 
 def _base_policy(settings: Settings, git: GitVerifier) -> Callable[[str, str], bool]:

@@ -75,6 +75,69 @@ def test_fetch_failure_raises_git_error(
         verifier.fetch(REPO, "origin", "main")
 
 
+def test_remote_head_authoritative_no_match_returns_none(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    """INFRA-217, Sol correction 43152bf8: a deleted remote branch is an
+    authoritative empty response from ``git ls-remote``, not a fetch
+    failure -- returns ``None``, never raises.
+    """
+
+    argv = ("git", "ls-remote", "--heads", "origin", "gone-branch")
+    runner.results[argv] = GitResult(0, "", "")
+    assert verifier.remote_head(REPO, "origin", "gone-branch") is None
+
+
+def test_remote_head_existing_ref_returns_sha(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "ls-remote", "--heads", "origin", "feature")
+    runner.results[argv] = GitResult(
+        0, f"{CANDIDATE}\trefs/heads/feature\n", ""
+    )
+    assert verifier.remote_head(REPO, "origin", "feature") == CANDIDATE
+
+
+def test_remote_head_nonzero_exit_raises_not_absence(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    """A transport/auth/invocation failure must never be read as absence
+    (INFRA-217, Sol correction 43152bf8's defect: fetch's 128 exit for a
+    genuinely deleted branch used to collapse both into the same signal).
+    """
+
+    argv = ("git", "ls-remote", "--heads", "origin", "feature")
+    runner.results[argv] = GitResult(128, "", "fatal: could not read from remote")
+    with pytest.raises(GitError, match="git ls-remote failed"):
+        verifier.remote_head(REPO, "origin", "feature")
+
+
+def test_remote_head_malformed_output_raises(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    """A zero exit whose stdout does not parse as exactly one expected
+    line must raise, never be read as absence or as a valid SHA.
+    """
+
+    argv = ("git", "ls-remote", "--heads", "origin", "feature")
+    runner.results[argv] = GitResult(0, "not-a-sha-line\n", "")
+    with pytest.raises(GitError, match="malformed output"):
+        verifier.remote_head(REPO, "origin", "feature")
+
+
+def test_remote_head_multiple_lines_raises(
+    verifier: GitVerifier, runner: FakeRunner
+) -> None:
+    argv = ("git", "ls-remote", "--heads", "origin", "feature")
+    runner.results[argv] = GitResult(
+        0,
+        f"{CANDIDATE}\trefs/heads/feature\n{MERGE_SHA}\trefs/heads/feature-x\n",
+        "",
+    )
+    with pytest.raises(GitError, match="unexpected number of matching refs"):
+        verifier.remote_head(REPO, "origin", "feature")
+
+
 def test_is_ancestor_maps_zero_and_one_exit_codes(
     verifier: GitVerifier, runner: FakeRunner
 ) -> None:

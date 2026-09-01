@@ -13,10 +13,12 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.merge_flow import (
     _branch_head,
+    _merged_candidate_proof,
     build_merge_flow,
     merger_contract_path,
 )
 from hermes_orchestrator.queue import QueueService
+from hermes_orchestrator.review_intake import BranchHeadUnknown
 
 
 def test_contract_prefers_the_configuration_root(tmp_path: Path) -> None:
@@ -156,30 +158,31 @@ def test_build_merge_flow_wires_no_admission_enforcement_seams(
 
 @dataclass
 class FakeBranchHeadGit:
-    """Recording fake standing in for GitVerifier's fetch/head_of surface."""
+    """Recording fake standing in for GitVerifier's typed ``remote_head``.
+
+    INFRA-217, Sol correction 43152bf8: ``_branch_head`` now calls the
+    single typed remote-ref query rather than fetch-plus-local-rev-parse,
+    so this fake exposes exactly that one seam.
+    """
 
     heads: dict[str, str] = field(default_factory=dict)
-    fetch_error: GitError | None = None
-    head_of_error: GitError | None = None
+    error: Exception | None = None
     calls: list[tuple[str, ...]] = field(default_factory=list)
 
-    def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
-        self.calls.append(("fetch", str(repo_path), remote, branch))
-        if self.fetch_error is not None:
-            raise self.fetch_error
-
-    def head_of(self, repo_path: Path, ref: str) -> str:
-        self.calls.append(("head_of", str(repo_path), ref))
-        if self.head_of_error is not None:
-            raise self.head_of_error
-        return self.heads[ref]
+    def remote_head(self, repo_path: Path, remote: str, branch: str) -> str | None:
+        self.calls.append(("remote_head", str(repo_path), remote, branch))
+        if self.error is not None:
+            raise self.error
+        return self.heads.get(f"{remote}/{branch}")
 
 
-def test_branch_head_resolves_the_fetched_origin_branch_sha(
+def test_branch_head_resolves_the_queried_remote_ref_sha(
     tmp_path: Path,
 ) -> None:
-    """INFRA-202: admission's branch head comes from git, never from the
-    open-PR list — no GitHub call is made to resolve it."""
+    """INFRA-202/INFRA-217: admission's branch head comes from a typed
+    remote-ref query, never from the open-PR list and never from a
+    fetch-plus-local-resolve pair — no GitHub call is made to resolve
+    it."""
 
     repo_root, _ = _minimal_repo(tmp_path)
     settings = load_settings(repo_root)
@@ -189,30 +192,149 @@ def test_branch_head_resolves_the_fetched_origin_branch_sha(
 
     assert head("demo", "feature/eng-9") == "1" * 40
     assert git.calls == [
-        ("fetch", str(repo_root), "origin", "feature/eng-9"),
-        ("head_of", str(repo_root), "origin/feature/eng-9"),
+        ("remote_head", str(repo_root), "origin", "feature/eng-9"),
     ]
 
 
-def test_branch_head_returns_empty_string_on_fetch_failure(
+def test_branch_head_raises_unknown_on_every_non_authoritative_failure(
     tmp_path: Path,
 ) -> None:
+    """INFRA-217, Sol correction 43152bf8: any failure out of the typed
+    remote-ref query -- transport, authentication, invocation, malformed
+    output, or a local-repository error -- is NEVER authoritative branch
+    absence. It must raise :class:`BranchHeadUnknown` rather than
+    collapsing to the same "" that a genuinely absent branch returns, so
+    ``review_intake`` cannot mistake a transient failure for proof the
+    branch is gone.
+    """
+
     repo_root, _ = _minimal_repo(tmp_path)
     settings = load_settings(repo_root)
-    git = FakeBranchHeadGit(fetch_error=GitError("git fetch failed"))
+
+    for error in (
+        GitError("git ls-remote failed with exit code 128"),
+        GitError("git ls-remote returned malformed output"),
+        OSError("local git corrupt"),
+    ):
+        git = FakeBranchHeadGit(error=error)
+        head = _branch_head(settings, git)
+        with pytest.raises(BranchHeadUnknown):
+            head("demo", "feature/eng-9")
+
+
+def test_branch_head_returns_empty_string_on_authoritative_no_match(
+    tmp_path: Path,
+) -> None:
+    """AUTHORITATIVE ABSENCE: the typed remote query itself succeeds with
+    zero matching refs -- the remote was reachable and its ref namespace
+    is authoritative. This is the normal post-merge state (GitHub deletes
+    the branch) and is represented by returning "" exactly as before
+    INFRA-217, but now sourced from one typed query instead of a fetch
+    whose 128 exit is indistinguishable from a transport failure.
+    """
+
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    git = FakeBranchHeadGit(heads={})
 
     head = _branch_head(settings, git)
 
     assert head("demo", "feature/eng-9") == ""
+    assert git.calls == [
+        ("remote_head", str(repo_root), "origin", "feature/eng-9"),
+    ]
 
 
-def test_branch_head_returns_empty_string_on_resolution_failure(
+@dataclass
+class FakeDiscoveryGitHub:
+    """Records discovery calls and answers with a canned pull."""
+
+    pull: object | None = None
+    error: Exception | None = None
+    calls: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def discover_pull_request(
+        self, repository: str, *, branch: str, head_sha: str
+    ) -> object | None:
+        self.calls.append((repository, branch, head_sha))
+        if self.error is not None:
+            raise self.error
+        return self.pull
+
+
+def _discovered(**overrides: object) -> object:
+    from hermes_orchestrator.github import DiscoveredPull
+
+    arguments: dict[str, object] = {
+        "number": 14,
+        "state": "closed",
+        "merged": True,
+        "head_sha": "1" * 40,
+        "merge_sha": "2" * 40,
+        "repository": "owner/demo",
+        "head_repository": "owner/demo",
+        "base_ref": "main",
+    }
+    arguments.update(overrides)
+    return DiscoveredPull(**arguments)  # type: ignore[arg-type]
+
+
+def test_merged_candidate_proof_accepts_only_an_exact_merged_same_repo_pull(
+    tmp_path: Path,
+) -> None:
+    """INFRA-217: the only thing that may excuse a deleted branch.
+
+    A merged, same-repository pull at the exact reviewed head targeting
+    the integration branch proves the candidate landed; every other
+    shape answers False so admission keeps failing closed.
+    """
+
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    github = FakeDiscoveryGitHub(pull=_discovered())
+
+    proof = _merged_candidate_proof(settings, github)
+
+    assert proof("demo", "feature/eng-9", "1" * 40) is True
+    assert github.calls == [("owner/demo", "feature/eng-9", "1" * 40)]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"merged": False},
+        {"repository": "someone-else/demo"},
+        {"head_repository": "someone-else/demo"},
+        {"base_ref": "release/next"},
+    ],
+)
+def test_merged_candidate_proof_refuses_every_other_shape(
+    tmp_path: Path, override: dict[str, object]
+) -> None:
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    github = FakeDiscoveryGitHub(pull=_discovered(**override))
+
+    proof = _merged_candidate_proof(settings, github)
+
+    assert proof("demo", "feature/eng-9", "1" * 40) is False
+
+
+def test_merged_candidate_proof_fails_closed_on_no_match_or_github_error(
     tmp_path: Path,
 ) -> None:
     repo_root, _ = _minimal_repo(tmp_path)
     settings = load_settings(repo_root)
-    git = FakeBranchHeadGit(head_of_error=GitError("git rev-parse failed"))
 
-    head = _branch_head(settings, git)
-
-    assert head("demo", "feature/eng-9") == ""
+    assert _merged_candidate_proof(settings, FakeDiscoveryGitHub(pull=None))(
+        "demo", "feature/eng-9", "1" * 40
+    ) is False
+    assert _merged_candidate_proof(
+        settings, FakeDiscoveryGitHub(error=RuntimeError("github down"))
+    )("demo", "feature/eng-9", "1" * 40) is False
+    # An unknown project never reaches GitHub at all.
+    unknown = FakeDiscoveryGitHub(pull=_discovered())
+    assert _merged_candidate_proof(settings, unknown)(
+        "nope", "feature/eng-9", "1" * 40
+    ) is False
+    assert unknown.calls == []

@@ -16,8 +16,36 @@ from hermes_orchestrator.manifests import (
     read_manifest_snapshot,
 )
 
+#: ``(project_key, branch) -> sha``. Three outcomes, represented
+#: distinctly (INFRA-217, Sol correction c02dc0fe): the ref resolves, and
+#: its commit SHA is returned; the ref is AUTHORITATIVELY ABSENT -- a
+#: fetch that itself succeeded, followed by a local resolution failure of
+#: ``origin/<branch>``, meaning the remote was reachable and genuinely
+#: has no such branch -- represented by returning ``""``; or any OTHER
+#: failure (a failed fetch -- network, auth, unreachable remote -- or an
+#: unexpected local resolution error), which raises
+#: :class:`BranchHeadUnknown` rather than returning ``""``, so it can
+#: never be conflated with authoritative absence.
 BranchHead = Callable[[str, str], str]
+#: ``(project_key, branch, candidate_sha) -> bool``. Proves the exact
+#: reviewed SHA is an already-merged, same-repository pull request
+#: targeting the integration branch (INFRA-217).
+MergedCandidateProof = Callable[[str, str, str], bool]
 BasePolicy = Callable[[str, str], bool]
+
+
+class BranchHeadUnknown(RuntimeError):
+    """A ``BranchHead`` port could not determine whether the ref exists.
+
+    Raised for a fetch failure, an authentication failure, or a local Git
+    resolution error that is NOT the specific "fetch succeeded, ref does
+    not resolve" case (INFRA-217, Sol correction c02dc0fe). This is never
+    proof of branch absence: a transient fetch, authentication, or local
+    Git failure must fail closed exactly as an unknown/mismatched head
+    does, even when an exact merged pull request can be discovered
+    independently -- only authoritative absence (a ``BranchHead`` port
+    returning ``""``) is eligible for the merged-candidate-proof excuse.
+    """
 
 
 class AdmissionStore(Protocol):
@@ -101,6 +129,7 @@ class CandidateAdmission:
         branch_head: BranchHead,
         base_policy: BasePolicy,
         intake_gate: IntakeGate,
+        merged_candidate_proof: MergedCandidateProof | None = None,
     ) -> None:
         if branch_head is None:
             raise ValueError("candidate admission requires a branch head")
@@ -113,6 +142,49 @@ class CandidateAdmission:
         self._branch_head = branch_head
         self._base_policy = base_policy
         self._intake_gate = intake_gate
+        # INFRA-217: GitHub deletes a merged candidate's branch, so
+        # ``branch_head`` stops resolving and admission would reject a
+        # candidate whose merge is already PROVEN. This optional proof
+        # is the only thing that may excuse an unresolvable remote
+        # branch; when absent, behavior is exactly as before.
+        self._merged_candidate_proof = merged_candidate_proof
+
+    def validate_only(
+        self,
+        project_key: str,
+        event: WakeEvent,
+        *,
+        received_generation: int,
+    ) -> AdmittedCandidate:
+        """Run every read-only admission check with zero durable writes.
+
+        INFRA-217, Sol correction c02dc0fe: ``submit_review`` (see
+        ``merger_turns.py``) previously persisted a ``submitted_verdicts``
+        row -- and only afterward, at settlement, discovered that the
+        exact-head admission gate rejected the candidate -- letting a
+        stale or mismatched remote branch create a durable submission
+        before rejection, which then poisoned a corrected retry via
+        ``_record_settled``'s terminal write. This method shares the
+        identical manifest, envelope, channel, exact-remote-head (or
+        proven-deleted-branch), base-policy, and intake-gate checks that
+        :meth:`admit` runs, but stops before the durable
+        ``admit_wake`` compare-and-swap -- so a caller can run it BEFORE
+        persisting anything and raise :class:`CandidateRejected` with
+        zero durable writes. The settlement-time call to :meth:`admit`
+        below still re-runs the same checks and performs the actual
+        (idempotent) admission, which is retained to catch races between
+        prevalidation and settlement.
+        """
+
+        _snapshot, manifest, channel = self._run_checks(
+            project_key, event, received_generation=received_generation
+        )
+        return AdmittedCandidate(
+            project_key=project_key,
+            manifest=manifest,
+            thread_id=channel.thread_id,
+            generation=channel.generation,
+        )
 
     def admit(
         self,
@@ -122,6 +194,38 @@ class CandidateAdmission:
         received_generation: int,
     ) -> AdmittedCandidate:
         """Admit the wake's candidate or fail closed with a bounded reason."""
+
+        snapshot, manifest, channel = self._run_checks(
+            project_key, event, received_generation=received_generation
+        )
+        if not self._channels.admit_wake(
+            project_key,
+            event,
+            thread_id=channel.thread_id,
+            generation=channel.generation,
+            manifest=snapshot,
+        ):
+            raise CandidateRejected(
+                "event was not admissible: exactly one review per delivered "
+                "candidate and one admitted candidate per project"
+            )
+        return AdmittedCandidate(
+            project_key=project_key,
+            manifest=manifest,
+            thread_id=channel.thread_id,
+            generation=channel.generation,
+        )
+
+    def _run_checks(
+        self,
+        project_key: str,
+        event: WakeEvent,
+        *,
+        received_generation: int,
+    ) -> tuple[ManifestSnapshot, CandidateManifest, ReviewerChannel]:
+        """The complete read-only admission checks, shared by both entry
+        points above; never performs a durable write.
+        """
 
         try:
             snapshot = read_manifest_snapshot(
@@ -151,30 +255,44 @@ class CandidateAdmission:
             raise CandidateRejected(
                 "wake generation is stale for the current reviewer channel"
             )
-        head = self._branch_head(project_key, manifest.branch)
-        if manifest.candidate_sha != head:
+        try:
+            head = self._branch_head(project_key, manifest.branch)
+        except BranchHeadUnknown as error:
+            # INFRA-217, Sol correction c02dc0fe: a fetch failure, an
+            # authentication failure, or a local resolution error is NEVER
+            # branch absence -- it fails closed exactly as an unknown or
+            # mismatched head does, even when an exact merged pull request
+            # can be discovered. Only an authoritative "" (a successful
+            # fetch, then no such ref) is eligible for the merge-proof
+            # excuse below.
             raise CandidateRejected(
-                "candidate is not the current branch head"
+                f"remote branch head could not be determined: {error}"
+            ) from error
+        if manifest.candidate_sha != head:
+            # INFRA-217: an empty head means the remote branch no longer
+            # resolves at all -- the normal state AFTER a merge, since
+            # GitHub deletes the branch. That alone still proves nothing,
+            # so it is excused only when GitHub proves this exact reviewed
+            # SHA is an already-merged, same-repository pull request
+            # targeting the integration branch. Every other case is
+            # unchanged and still fails closed: a branch that RESOLVES to
+            # a different commit is a stale candidate (exact-head
+            # validation for open candidates), and a missing branch with
+            # no merge proof is rejected exactly as before.
+            proven_merged = (
+                head == ""
+                and self._merged_candidate_proof is not None
+                and self._merged_candidate_proof(
+                    project_key, manifest.branch, manifest.candidate_sha
+                )
             )
+            if not proven_merged:
+                raise CandidateRejected(
+                    "candidate is not the current branch head"
+                )
         if not self._base_policy(project_key, manifest.base_sha):
             raise CandidateRejected(
                 "candidate base violates the active review policy"
             )
         self._intake_gate.validate(project_key, manifest)
-        if not self._channels.admit_wake(
-            project_key,
-            event,
-            thread_id=channel.thread_id,
-            generation=channel.generation,
-            manifest=snapshot,
-        ):
-            raise CandidateRejected(
-                "event was not admissible: exactly one review per delivered "
-                "candidate and one admitted candidate per project"
-            )
-        return AdmittedCandidate(
-            project_key=project_key,
-            manifest=manifest,
-            thread_id=channel.thread_id,
-            generation=channel.generation,
-        )
+        return snapshot, manifest, channel

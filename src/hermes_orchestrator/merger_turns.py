@@ -577,12 +577,36 @@ class MergerTurnService:
                     str(deferred),
                 )
             except CandidateRejected as rejected:
-                self._merger.release_delivered_wake(
-                    project_key, event.event_id, outcome="rejected"
-                )
+                # INFRA-217, Sol correction 43152bf8: ``submit_review``'s
+                # ``validate_only`` prevalidation already proved this
+                # exact wake admissible, with zero durable writes, before
+                # the ``submitted_verdicts`` row below was persisted --
+                # this settlement-time re-run of the identical checks
+                # exists only to catch a race where the admissible
+                # condition (most often the remote branch head) changed
+                # AFTER that prevalidation and BEFORE this admission.
+                # Treating that race as a genuine rejection is wrong: the
+                # wake_deliveries row must NOT be released as 'rejected'
+                # (terminal for this candidate identity -- a corrected
+                # retry would need a brand-new SHA and event under that
+                # vocabulary) and the outcome must NOT be terminally
+                # recorded onto the submitted row (``_record_settled``
+                # would settle it, poisoning a corrected same-wake
+                # retry). Both durable rows are left exactly as they
+                # are -- wake_deliveries stays 'delivered', the
+                # submitted_verdicts row stays 'submitted' -- a
+                # zero-additional-write, genuinely retryable state: the
+                # identical wake is picked up again (recovery's
+                # ``handle_turn``, or ``submit_review``'s identical-
+                # duplicate path resuming settlement) and admission is
+                # simply re-evaluated once the underlying condition is
+                # corrected.
                 return TurnOutcome(
-                    project_key, "rejected", event.event_id, event.issue_id,
-                    str(rejected),
+                    project_key, "admission_race", event.event_id,
+                    event.issue_id,
+                    "settlement-time admission rejected a prevalidated "
+                    f"candidate; left retryable with no terminal write: "
+                    f"{rejected}",
                 )
         else:
             try:
@@ -820,6 +844,48 @@ class MergerTurnService:
             ineligibility = _approval_ineligibility_reason(discovered, project)
             if ineligibility is not None:
                 raise SubmissionRejected(ineligibility)
+        # INFRA-217, Sol correction c02dc0fe: the complete read-only
+        # candidate-admission checks -- exact remote-head (or
+        # proven-deleted-branch) validation, base policy, and the intake
+        # gate -- previously ran for the FIRST time inside
+        # ``_settle_wake``'s call to ``CandidateAdmission.admit``, AFTER
+        # this method had already persisted the submitted_verdicts row
+        # below. A stale or mismatched remote branch could therefore
+        # create a durable submission before the exact-head gate rejected
+        # it, and ``_record_settled`` would then terminally record the
+        # rejection, poisoning a corrected retry. ``validate_only`` runs
+        # the identical checks here -- read-only, zero durable writes --
+        # BEFORE ``_persist_submission``/``_supersede_submission``, so a
+        # rejection here leaves every durable table and wake state
+        # untouched and a corrected retry starts clean. This only applies
+        # while the wake is still ``delivered``: an already-``admitted``
+        # wake ran these same checks durably when it was admitted, and
+        # ``_settle_wake`` does not re-run them for that state either, so
+        # prevalidation stays consistent with the settlement-time gate it
+        # mirrors. The settlement-time call to ``CandidateAdmission.admit``
+        # inside ``_settle_wake`` is UNCHANGED and still re-runs the same
+        # checks immediately before the actual admission, to catch races
+        # between this prevalidation and settlement.
+        if state == "delivered":
+            try:
+                self._admission.validate_only(
+                    project_key, event, received_generation=channel.generation
+                )
+            except (MergeWindowExhausted, PriorMergeFailed):
+                # NOT prevalidation refusals. A full merge window defers
+                # the wake back to pending, and a bound prior failure
+                # routes a correction packet to the lead -- both are
+                # recoverable outcomes the settlement path already
+                # produces ('deferred' / 'blocked_prior_failure'), not
+                # zero-write rejections of the submission. Converting
+                # them here would turn a retryable deferral into a hard
+                # refusal, so they deliberately fall through to
+                # persistence and let ``_settle_wake`` handle them
+                # exactly as before this correction. Both subclass
+                # CandidateRejected, so this handler MUST precede it.
+                pass
+            except CandidateRejected as rejected:
+                raise SubmissionRejected(str(rejected)) from rejected
         if stale_existing:
             assert existing is not None
             submission = self._supersede_submission(
@@ -1044,6 +1110,14 @@ class MergerTurnService:
         if outcome.kind == "stale_submission":
             # The refusal is non-settling: the row stays 'submitted' so
             # only a fresh submission from the new binding can settle it.
+            return
+        if outcome.kind == "admission_race":
+            # INFRA-217, Sol correction 43152bf8: a settlement-time
+            # admission rejection of a prevalidated candidate is a race,
+            # not a terminal verdict -- recording it here would settle
+            # (terminally) a row that must stay retryable for the same
+            # wake. Leave the submitted_verdicts row exactly as
+            # ``_settle_wake`` left it ('submitted', no result_json).
             return
         with self._database.transaction() as connection:
             connection.execute(
