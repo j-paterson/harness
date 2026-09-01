@@ -42,7 +42,8 @@ from hermes_orchestrator.cmux_surfaces import (
 )
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
-from hermes_orchestrator.handoffs import HandoffService
+from hermes_orchestrator.handoffs import HandoffRecord, HandoffService
+from hermes_orchestrator.lead_wakes import LeadTerminalWakes, TerminalWakeInput
 
 # Mirrors cells._ACTIVE_CELL_STATES: the lifecycle states in which a
 # project cell is understood to hold a live, addressable lead — never
@@ -77,6 +78,28 @@ _RENEWAL_INTERVAL_SECONDS = 60.0
 # attempt: the write-ahead claim itself and any takeover of an expired
 # claim. The NEWEST of these is the current owner.
 _OWNERSHIP_EVENT_TYPES = ("lead_rotation.attempt", "lead_rotation.takeover")
+
+# Sol 52d15493 (INFRA-198): a consumed newest handoff no longer ends in
+# a terminal operator instruction. The rotation itself files the fresh
+# durable handoff request through the EXISTING request channel
+# (``cells.request_checkpoint`` -> ``handoff_requests`` row +
+# ``project_cell.handoff_required`` evidence + the deduplicated
+# ``handoff_required`` terminal wake) and journals this cell-scoped
+# awaiting marker. The marker is the durable discriminator between a
+# rotation-requested handoff and every ordinary handoff request: only a
+# submission that CAS-closes an open awaiting marker (with
+# ``_AWAITING_RESUMED_EVENT``) may re-drive the rotation, so ordinary
+# stall/red-pressure handoffs never trigger a rotation by accident.
+_AWAITING_EVENT = "lead_rotation.awaiting_handoff"
+_AWAITING_RESUMED_EVENT = "lead_rotation.awaiting_resumed"
+
+# The only handoff-document content the incumbent is asked to provide
+# when the rotation requests a fresh handoff; every other field is
+# mechanically derived from durable rows and the worktree probe (see
+# ``handoffs.derived_handoff_document``).
+NON_DERIVABLE_HANDOFF_CONTENT = (
+    "decisions, caveats/blockers, risks, and the exact next action"
+)
 
 
 def live_cell_project_key(database: Database, cell_id: str) -> str | None:
@@ -140,6 +163,10 @@ class RotationReport:
     profile: str | None = None
     binding_id: str | None = None
     failure: str | None = None
+    # Set only on the non-terminal ``awaiting_handoff`` report: the
+    # durable ``handoff_requests`` row asking the incumbent for the
+    # fresh handoff this rotation resumes on (Sol 52d15493).
+    request_id: str | None = None
 
 
 class LeadRotation:
@@ -160,6 +187,7 @@ class LeadRotation:
     ) -> None:
         self._database = database
         self._events = EventStore(database)
+        self._wakes = LeadTerminalWakes(database=database, events=self._events)
         self._handoffs = handoffs
         self._cells = cells
         self._bindings = bindings
@@ -259,22 +287,21 @@ class LeadRotation:
             # this handoff means the in-flight rotation may resume
             # through the seat/registration phases below; no open
             # attempt means the handoff was already consumed (or predates
-            # the attempt journal) and can never satisfy a new request —
-            # fail closed and demand a fresh handoff.
+            # the attempt journal) and can never satisfy a new request.
+            # It still never satisfies THIS request — but instead of a
+            # terminal operator instruction, the rotation itself files
+            # the fresh durable handoff request with the incumbent and
+            # journals its awaiting marker, so the one Hermes-owned
+            # rotate invocation resumes automatically on the submission
+            # (Sol 52d15493).
             if not self._attempt_open(handoff_id):
-                return self._blocked(
-                    cell_id,
-                    handoff_id,
-                    phase="precondition",
-                    failure=(
-                        f"handoff {handoff_id!r} already completed a "
-                        "rotation onto the current incumbent "
-                        f"({incumbent_profile!r} / {incumbent_session}); a "
-                        "stale acknowledged handoff cannot satisfy a new "
-                        "rotation request. Submit a fresh handoff naming "
-                        "a new replacement for this cell, then retry "
-                        "rotate-lead"
-                    ),
+                return self._request_fresh_handoff(
+                    cell_id=cell_id,
+                    consumed_handoff_id=handoff_id,
+                    project_key=project_key,
+                    incumbent_session=incumbent_session,
+                    incumbent_profile=incumbent_profile,
+                    worktree=worktree,
                 )
             # Post-transfer recovery holds no claim token: the claim
             # guards only the pre-transfer window, every phase from here
@@ -325,6 +352,237 @@ class LeadRotation:
             profile_alias=profile_alias,
             claim_token=claim_token,
         )
+
+    async def resume_on_submission(
+        self, handoff: HandoffRecord
+    ) -> RotationReport | None:
+        """Continue an awaiting rotation the moment its fresh handoff is
+        durably submitted (Sol 52d15493).
+
+        The event-driven continuation the handoff submission path drives
+        through :meth:`HandoffService.subscribe`'s post-commit signal:
+        when the submitted handoff's cell holds an OPEN awaiting marker
+        (journaled by the consumed-handoff branch of :meth:`rotate`),
+        exactly one caller CAS-closes it and re-drives the SAME durable
+        rotation — the fresh submitted handoff is now the cell's newest,
+        so the ordinary claim/transfer/seat phases run and change both
+        the profile and the session. Returns ``None`` for every ordinary
+        submission (no awaiting rotation, or a raced resumer already
+        claimed it): the continuation machinery never fires outside a
+        rotation-requested handoff.
+        """
+
+        if handoff.state != "submitted":
+            return None
+        if not self._claim_awaiting_resumption(
+            handoff.cell_id, handoff.handoff_id
+        ):
+            return None
+        return await self.rotate(handoff.cell_id)
+
+    def _request_fresh_handoff(
+        self,
+        *,
+        cell_id: str,
+        consumed_handoff_id: str,
+        project_key: str,
+        incumbent_session: str,
+        incumbent_profile: str | None,
+        worktree: WorktreeState,
+    ) -> RotationReport:
+        """File the fresh durable handoff request and report awaiting.
+
+        Reuses the EXISTING request channel end to end — nothing new is
+        invented: ``cells.request_checkpoint`` marks the cell
+        ``handoff_required``, journals the ``project_cell.
+        handoff_required`` evidence, and persists the ``handoff_requests``
+        row; the deduplicated ``handoff_required`` terminal wake (bound
+        to that same evidence identity, exactly as the cells direct path
+        binds it) rides the existing outbox/intake delivery to wake the
+        incumbent. The request reason carries every mechanically derived
+        handoff fact, so the incumbent is asked ONLY for the
+        non-derivable content. Idempotent: a repeat call while the cell
+        already awaits re-reports the same request without duplicating
+        the row, the wake, or the awaiting marker.
+        """
+
+        issue_id, issue_state = self._inflight_issue(project_key)
+        reason = (
+            "lead_rotation:fresh_handoff_required "
+            f"consumed={consumed_handoff_id} cell={cell_id} "
+            f"project={project_key} session={incumbent_session} "
+            f"profile={incumbent_profile} issue={issue_id} "
+            f"issue_state={issue_state} branch={worktree.branch} "
+            f"head={worktree.head}; every mechanical handoff field is "
+            "derived from durable state — provide only "
+            f"{NON_DERIVABLE_HANDOFF_CONTENT} "
+            "(hermes-orchestrator submit-handoff); the rotation resumes "
+            "automatically on the durable submission"
+        )
+        filed = self._cells.request_checkpoint(cell_id, reason)
+        request_id = self._newest_handoff_request_id(cell_id)
+        if request_id is None:
+            # Nothing was filed and nothing is pending (e.g. a paused
+            # cell the request channel refuses): fail closed exactly as
+            # before rather than reporting an awaiting state no durable
+            # row backs.
+            return self._blocked(
+                cell_id,
+                consumed_handoff_id,
+                phase="precondition",
+                failure=(
+                    f"handoff {consumed_handoff_id!r} already completed a "
+                    "rotation onto the current incumbent "
+                    f"({incumbent_profile!r} / {incumbent_session}) and a "
+                    "fresh handoff request could not be filed "
+                    f"(request_checkpoint refused, filed={filed}); submit "
+                    "a fresh handoff for this cell, then retry rotate-lead"
+                ),
+            )
+        self._commit_handoff_request_wake(
+            cell_id=cell_id,
+            project_key=project_key,
+            issue_id=issue_id,
+            incumbent_session=incumbent_session,
+            incumbent_profile=incumbent_profile,
+            reason=reason,
+        )
+        self._journal_awaiting(cell_id, consumed_handoff_id, request_id)
+        return RotationReport(
+            ok=False,
+            phase="awaiting_handoff",
+            cell_id=cell_id,
+            handoff_id=consumed_handoff_id,
+            request_id=request_id,
+        )
+
+    def _inflight_issue(self, project_key: str) -> tuple[str, str]:
+        """The single in-flight issue for the project, from durable rows
+        alone; ``("none", "unknown")`` when zero or several exist."""
+
+        rows = self._database.execute(
+            "SELECT issue_id, state FROM admitted_issues "
+            "WHERE project_key = ? AND state IN ('in_development', 'review') "
+            "ORDER BY issue_id",
+            (project_key,),
+        ).fetchall()
+        if len(rows) == 1:
+            return str(rows[0]["issue_id"]), str(rows[0]["state"])
+        return "none", "unknown"
+
+    def _newest_handoff_request_id(self, cell_id: str) -> str | None:
+        row = self._database.execute(
+            "SELECT request_id FROM handoff_requests WHERE cell_id = ? "
+            "ORDER BY requested_at DESC, rowid DESC LIMIT 1",
+            (cell_id,),
+        ).fetchone()
+        return None if row is None else str(row["request_id"])
+
+    def _commit_handoff_request_wake(
+        self,
+        *,
+        cell_id: str,
+        project_key: str,
+        issue_id: str,
+        incumbent_session: str,
+        incumbent_profile: str | None,
+        reason: str,
+    ) -> None:
+        """Wake the incumbent through the existing terminal-wake outbox.
+
+        The turn key binds to the newest ``project_cell.handoff_required``
+        evidence — the same identity the cells direct path and the wake
+        reconciler derive — so direct commit, repair, and replay all
+        converge on one deduplicated row.
+        """
+
+        evidence = self._database.execute(
+            "SELECT event_id FROM events "
+            "WHERE event_type = 'project_cell.handoff_required' "
+            "AND aggregate_id = ? ORDER BY sequence DESC LIMIT 1",
+            (cell_id,),
+        ).fetchone()
+        if evidence is None:
+            return
+        self._wakes.commit(
+            TerminalWakeInput(
+                project_key=project_key,
+                issue_id=issue_id,
+                cell_id=cell_id,
+                session_id=uuid.UUID(incumbent_session),
+                profile_alias=incumbent_profile or "unknown",
+                turn_key=f"handoff:{evidence['event_id']}",
+                kind="handoff_required",
+                reason=reason,
+            )
+        )
+
+    def _journal_awaiting(
+        self, cell_id: str, consumed_handoff_id: str, request_id: str
+    ) -> None:
+        """Journal the awaiting marker once per open request (serialized
+        check-then-append, the same idiom as the claim)."""
+
+        with self._database.transaction() as connection:
+            if self._open_awaiting_sequence(connection, cell_id) is not None:
+                return
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type=_AWAITING_EVENT,
+                    aggregate_type="project_cell",
+                    aggregate_id=cell_id,
+                    payload={
+                        "consumed_handoff_id": consumed_handoff_id,
+                        "request_id": request_id,
+                    },
+                ),
+            )
+
+    def _claim_awaiting_resumption(
+        self, cell_id: str, fresh_handoff_id: str
+    ) -> bool:
+        """CAS-close the open awaiting marker; exactly one resumer wins.
+
+        Check and append run inside ONE ``BEGIN IMMEDIATE`` transaction
+        (the ``_journal_completed`` idiom), so of any number of
+        concurrent submissions exactly one observes the open marker,
+        appends the resumed event, and re-drives the rotation.
+        """
+
+        with self._database.transaction() as connection:
+            awaiting = self._open_awaiting_sequence(connection, cell_id)
+            if awaiting is None:
+                return False
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type=_AWAITING_RESUMED_EVENT,
+                    aggregate_type="project_cell",
+                    aggregate_id=cell_id,
+                    payload={
+                        "handoff_id": fresh_handoff_id,
+                        "awaiting_sequence": awaiting,
+                    },
+                ),
+            )
+        return True
+
+    def _open_awaiting_sequence(
+        self, connection: sqlite3.Connection, cell_id: str
+    ) -> int | None:
+        """The newest awaiting marker not yet closed by a resumption."""
+
+        row = connection.execute(
+            f"SELECT sequence FROM events "
+            f"WHERE event_type = '{_AWAITING_EVENT}' AND aggregate_id = ? "
+            f"AND sequence > COALESCE((SELECT MAX(sequence) FROM events "
+            f"WHERE event_type = '{_AWAITING_RESUMED_EVENT}' "
+            f"AND aggregate_id = ?), 0) "
+            "ORDER BY sequence DESC LIMIT 1",
+            (cell_id, cell_id),
+        ).fetchone()
+        return None if row is None else int(row["sequence"])
 
     async def _seat(
         self,

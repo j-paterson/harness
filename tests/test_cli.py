@@ -1448,6 +1448,7 @@ class _FakeRotationReport:
     profile: str | None
     binding_id: str | None
     failure: str | None
+    request_id: str | None = None
 
 
 def _install_fake_lead_rotation(
@@ -2191,9 +2192,10 @@ def test_rotate_lead_retry_after_seating_the_recovery_reuses_the_same_binding(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Recovery completes and reports once; re-running rotate-lead after
-    that complete report is a NEW rotation request, and the consumed
-    handoff refuses it fail-closed with no second transfer or seat
-    activation (Sol 3c1651df — the in-flight dedup window before the
+    that complete report is a NEW rotation request: the consumed handoff
+    never satisfies it — no second transfer or seat activation — and the
+    rotation reports awaiting the fresh handoff it just requested
+    (Sol 3c1651df / 52d15493 — the in-flight dedup window before the
     complete report is pinned by the lead-rotation suite instead)."""
 
     import hermes_orchestrator.cli as cli_module
@@ -2267,13 +2269,16 @@ def test_rotate_lead_retry_after_seating_the_recovery_reuses_the_same_binding(
     )
 
     # Sol 3c1651df: the first invocation REPORTED complete, consuming the
-    # handoff. The retry is a new rotation request and must fail closed on
-    # the stale handoff instead of returning a free no-op success.
-    assert second.exit_code == 1
+    # handoff. The retry is a new rotation request: the stale handoff never
+    # satisfies it and nothing re-transfers — and instead of a terminal
+    # refusal the rotation files the fresh durable handoff request and
+    # reports awaiting (Sol 52d15493).
+    assert second.exit_code == 0
     second_payload = json.loads(second.stdout)
     assert second_payload["ok"] is False
-    assert second_payload["phase"] == "precondition"
-    assert "stale acknowledged handoff" in (second_payload["failure"] or "")
+    assert second_payload["phase"] == "awaiting_handoff"
+    assert second_payload["failure"] is None
+    assert second_payload["request_id"] is not None
     # Seat activation still ran exactly once across both invocations.
     assert ensure_calls == [first_payload["replacement_session"]]
 
@@ -4066,3 +4071,237 @@ def test_merge_settle_review_reconciles_a_stranded_satisfied_gate(
         ] == [("ENG-9", "Done", "operator")]
     finally:
         harness.close()
+
+
+# -- awaiting-handoff report and submit-handoff continuation (INFRA-198) ---
+
+
+def test_rotate_lead_reports_awaiting_handoff_non_terminally(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sol 52d15493: the awaiting report is a successful non-terminal
+    outcome — the fresh-handoff request was filed and the rotation
+    resumes on submission — never a refusal exit."""
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-1")
+    report = _FakeRotationReport(
+        phase="awaiting_handoff",
+        cell_id="cell-1",
+        handoff_id="handoff-consumed",
+        replacement_session=None,
+        profile=None,
+        binding_id=None,
+        failure=None,
+        request_id="request-1",
+    )
+    _install_fake_lead_rotation(monkeypatch, report=report)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "awaiting_handoff"
+    assert payload["request_id"] == "request-1"
+    assert payload["failure"] is None
+
+
+def _seed_consumed_handoff_cell_state(state_dir: Path) -> None:
+    """The live-defect durable shape (Sol 52d15493): an active max-b
+    incumbent whose newest handoff is already acknowledged onto that
+    same incumbent with NO open rotation attempt — consumed."""
+
+    from uuid import UUID
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.handoffs import HandoffService
+
+    _seed_rotation_cell_state(state_dir)
+    database = Database.open(state_dir / "state.db")
+    try:
+        HandoffService(database).acknowledge(
+            "handoff-1",
+            UUID("11111111-1111-4111-8111-111111111111"),
+            "stale: replacement is the incumbent",
+            profile_alias="max-b",
+        )
+    finally:
+        database.close()
+
+
+def test_one_rotation_request_resumes_automatically_on_submit_handoff(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The INFRA-198 acceptance shape end to end over the real CLI: ONE
+    Hermes-owned rotate-lead on the consumed newest handoff files the
+    durable fresh-handoff request and wake; the incumbent's ONE
+    submit-handoff (non-derivable content only) submits the derived
+    document and the SAME rotation resumes automatically to completion,
+    changing both profile and session — no second rotate-lead, no
+    manual prompt input anywhere."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_consumed_handoff_cell_state(state_dir)
+    # Current fable-capacity evidence for the replacement candidate the
+    # continuation must select (max-b is the incumbent).
+    _seed_capacity_observation(
+        state_dir,
+        "max-c",
+        "available",
+        observed_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    started = _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+
+    first = invoke(
+        [
+            *base_arguments(configured_repo),
+            "rotate-lead",
+            "--cell",
+            "cell-demo",
+            "--json",
+        ]
+    )
+
+    assert first.exit_code == 0
+    awaiting = json.loads(first.stdout)
+    assert awaiting["phase"] == "awaiting_handoff"
+    assert awaiting["handoff_id"] == "handoff-1"
+    assert awaiting["request_id"] is not None
+    assert started == []  # nothing launched while awaiting
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        request = database.execute(
+            "SELECT reason, state FROM handoff_requests "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert request is not None
+        assert str(request["state"]) == "requested"
+        reason = str(request["reason"])
+        assert "consumed=handoff-1" in reason
+        assert "profile=max-b" in reason
+        assert "session=11111111-1111-4111-8111-111111111111" in reason
+        assert (
+            "provide only decisions, caveats/blockers, risks, "
+            "and the exact next action" in reason
+        )
+        wake = database.execute(
+            "SELECT kind, state FROM lead_terminal_wakes "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert wake is not None
+        assert str(wake["kind"]) == "handoff_required"
+        assert database.scalar(
+            "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+        ) == "handoff_required"
+    finally:
+        database.close()
+
+    second = invoke(
+        [
+            *base_arguments(configured_repo),
+            "submit-handoff",
+            "--cell",
+            "cell-demo",
+            "--decision",
+            "Keep the existing public interface.",
+            "--caveat",
+            "CI flake on the network suite.",
+            "--risk",
+            "None known beyond the flake.",
+            "--next-action",
+            "Run the failing test and correct ENG-9.",
+            "--json",
+        ]
+    )
+
+    assert second.exit_code == 0
+    payload = json.loads(second.stdout)
+    resumed = payload["resumed_rotation"]
+    assert resumed is not None
+    assert resumed["phase"] == "complete"
+    assert resumed["profile"] == "max-c"
+    assert resumed["replacement_session"] != (
+        "11111111-1111-4111-8111-111111111111"
+    )
+    assert started == ["max-c"]  # exactly one replacement launch, post-resume
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        cell = database.execute(
+            "SELECT state, profile_alias, session_id FROM project_cells "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+        assert str(cell["state"]) == "active"
+        assert str(cell["profile_alias"]) == "max-c"
+        assert str(cell["session_id"]) == resumed["replacement_session"]
+        submitted = database.execute(
+            "SELECT handoff_id, state FROM handoffs "
+            "WHERE handoff_id = ?",
+            (payload["handoff_id"],),
+        ).fetchone()
+        assert str(submitted["state"]) == "acknowledged"
+    finally:
+        database.close()
+
+
+def test_submit_handoff_without_an_awaiting_rotation_just_submits(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary submission (no awaiting marker) stores the durable
+    handoff and resumes nothing — the continuation never misfires."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    started = _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "submit-handoff",
+            "--cell",
+            "cell-demo",
+            "--decision",
+            "Keep the existing public interface.",
+            "--next-action",
+            "Run the failing test and correct ENG-9.",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["state"] == "submitted"
+    assert payload["resumed_rotation"] is None
+    assert started == []
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assert database.scalar(
+            "SELECT count(*) FROM handoffs WHERE handoff_id = ?",
+            (payload["handoff_id"],),
+        ) == 1
+        # The incumbent cell is untouched by an ordinary submission.
+        assert database.scalar(
+            "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+        ) == "active"
+    finally:
+        database.close()

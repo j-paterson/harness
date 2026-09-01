@@ -100,6 +100,20 @@ class HandoffService:
         self._request_ids = request_ids or (lambda: str(uuid.uuid4()))
         self._handoff_ids = handoff_ids or (lambda: str(uuid.uuid4()))
         self._now = now
+        self._listeners: list[Callable[[HandoffRecord], None]] = []
+
+    def subscribe(self, listener: Callable[[HandoffRecord], None]) -> None:
+        """Register an in-process signal for newly submitted handoffs.
+
+        The post-commit listener idiom (see ``LeadTerminalWakes``): a
+        listener runs only AFTER the submission transaction committed,
+        and a listener failure never rolls back or unsubmits the durable
+        row. INFRA-198 uses this to drive an awaiting lead rotation's
+        continuation the moment the incumbent's fresh handoff lands
+        (``LeadRotation.resume_on_submission``).
+        """
+
+        self._listeners.append(listener)
 
     def request(self, cell_id: str, reason: str) -> HandoffRequest:
         """Persist a safe-boundary handoff request."""
@@ -155,7 +169,16 @@ class HandoffService:
                     now,
                 ),
             )
-        return self.get(handoff_id)
+        record = self.get(handoff_id)
+        for listener in self._listeners:
+            try:
+                listener(record)
+            except Exception:
+                # The durable row is the truth; a failed in-process
+                # signal never unsubmits it (the awaiting-rotation
+                # continuation recovers by rerunning rotate-lead).
+                continue
+        return record
 
     def acknowledge(
         self,
@@ -272,3 +295,65 @@ class HandoffService:
         if value.tzinfo is None:
             raise ValueError("clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
+
+
+def derived_handoff_document(
+    *,
+    cell_id: str,
+    project_key: str,
+    session_id: str,
+    profile_alias: str,
+    issue_id: str,
+    issue_state: str,
+    branch: str,
+    head: str,
+    decisions: list[str],
+    caveats: list[str],
+    risks: list[str],
+    next_action: str,
+) -> HandoffDocument:
+    """Assemble a complete handoff document from durable facts plus the
+    incumbent's non-derivable content (INFRA-198, Sol 52d15493).
+
+    Every mechanical field — identity, git position, issue state,
+    environment — comes from the caller's durable rows and worktree
+    probe; the incumbent supplies ONLY decisions, caveats (blockers),
+    risks, and the exact next action. Validation stays with
+    :meth:`HandoffService.submit`: an unreadable worktree (empty branch
+    or head) fails the document's own non-empty constraints, so an
+    unverifiable checkpoint can never be dressed up as a handoff.
+    """
+
+    return HandoffDocument.model_construct(
+        cell_id=cell_id,
+        objective=(
+            f"Hand off the {project_key} project lead for cell {cell_id} "
+            f"(issue {issue_id})"
+        ),
+        status=(
+            f"issue {issue_id} is {issue_state}; branch {branch} at "
+            f"{head} is committed and pushed (verified by the rotation "
+            "worktree gate)"
+        ),
+        decisions=decisions,
+        branch=branch,
+        commits=[head],
+        pull_request="not recorded in durable state (derived)",
+        modified_files=[f"(derived) all changes are committed on {branch or '?'}"],
+        tests=[
+            HandoffTest(
+                command="git status --porcelain && git rev-parse HEAD "
+                "(lead worktree probe)",
+                outcome=f"clean; HEAD {head} matches the pushed origin branch",
+            )
+        ],
+        blockers=caveats,
+        remaining_steps=[next_action],
+        commands=["hermes-orchestrator status --json"],
+        environment_notes=[
+            f"incumbent session {session_id} on profile {profile_alias}; "
+            f"project {project_key}"
+        ],
+        risks=risks,
+        next_action=next_action,
+    )

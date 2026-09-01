@@ -26,6 +26,7 @@ from hermes_orchestrator.queue import QueueService
 
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 REPLACEMENT_SESSION = UUID("22222222-2222-4222-8222-222222222222")
+THIRD_SESSION = UUID("33333333-3333-4333-8333-333333333333")
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
 
@@ -643,14 +644,17 @@ async def test_repeated_recovery_produces_one_replacement_and_one_execution(
     ) == str(REPLACEMENT_SESSION)
 
     # Boundary 3: recovery completes seating. A further call is a NEW
-    # rotation request; the consumed handoff refuses it (Sol 3c1651df).
+    # rotation request; the consumed handoff never satisfies it — the
+    # rotation files the fresh-handoff request and reports awaiting
+    # instead of transferring anything (Sol 3c1651df / 52d15493).
     second = await rotation.rotate("cell-demo")
     assert second.ok is True
     assert second.phase == "complete"
     third = await rotation.rotate("cell-demo")
     assert third.ok is False
-    assert third.phase == "precondition"
-    assert "stale acknowledged handoff" in (third.failure or "")
+    assert third.phase == "awaiting_handoff"
+    assert third.failure is None
+    assert third.request_id is not None
 
     # One replacement lead, one effective handoff execution.
     assert runner.start_count == 1  # the initial dispatch only
@@ -726,9 +730,10 @@ async def test_completed_rotation_handoff_never_satisfies_a_new_request(
     runner: RecordingRunner,
 ) -> None:
     """Sol 3c1651df: after a rotation reports ``complete``, its handoff is
-    consumed. A later rotate-lead call is a NEW request and must fail
-    closed instead of returning a free no-op success — the live defect
-    reused exactly such a stale handoff while nothing rotated."""
+    consumed. A later rotate-lead call is a NEW request: nothing may
+    transfer off the stale handoff — and instead of a terminal operator
+    instruction the rotation files the fresh durable handoff request and
+    reports awaiting (Sol 52d15493)."""
 
     await start_cell(cells, queue)
     submit_handoff(handoffs)
@@ -744,12 +749,15 @@ async def test_completed_rotation_handoff_never_satisfies_a_new_request(
     second = await rotation.rotate("cell-demo")
 
     assert second.ok is False
-    assert second.phase == "precondition"
-    assert "stale acknowledged handoff" in (second.failure or "")
-    assert "fresh handoff" in (second.failure or "")
+    assert second.phase == "awaiting_handoff"
+    assert second.failure is None
+    assert second.request_id is not None
     # Nothing moved: no second ack turn, lease, or seat activation.
     assert runner.start_count == start_count_after_first
     assert len(seater.calls) == calls_after_first
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)
 
 
 @pytest.mark.asyncio
@@ -765,7 +773,9 @@ async def test_pre_journal_stale_handoff_fails_closed(
     """The live-defect shape itself: an acknowledged handoff whose
     replacement already equals the durable incumbent, with NO journaled
     attempt (it predates the attempt journal — e.g. handoff c194833f).
-    rotate-lead must refuse, not report ok, and must not transfer."""
+    rotate-lead must not report ok and must not transfer off the stale
+    handoff; it files the fresh-handoff request and reports awaiting
+    (Sol 52d15493)."""
 
     await start_cell(cells, queue)
     handoff_id = submit_handoff(handoffs)
@@ -780,8 +790,9 @@ async def test_pre_journal_stale_handoff_fails_closed(
     report = await rotation.rotate("cell-demo")
 
     assert report.ok is False
-    assert report.phase == "precondition"
-    assert "stale acknowledged handoff" in (report.failure or "")
+    assert report.phase == "awaiting_handoff"
+    assert report.failure is None
+    assert report.request_id is not None
     assert runner.start_count == 1  # only the initial dispatch
     assert seater.calls == []
     assert database.scalar(
@@ -1396,3 +1407,248 @@ async def test_concurrent_post_transfer_recovery_completes_exactly_once(
     binding = bindings.active_lead("cell-demo")
     assert binding is not None
     assert binding.session_id == str(REPLACEMENT_SESSION)
+
+
+# -- fresh-handoff request and event-driven continuation (Sol 52d15493) ----
+
+
+def make_cells_with_replacements(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    handoffs: HandoffService,
+    tmp_path: Path,
+    replacement_ids: Iterator[UUID],
+) -> ProjectCellService:
+    """The fixture cell service, but with a replacement-session SEQUENCE:
+    the continuation's second rotation must mint a session different from
+    the first rotation's replacement (now the incumbent)."""
+
+    from hermes_orchestrator.events import EventStore
+
+    return ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=RecordingLinear(),
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: NOW,
+        handoffs=handoffs,
+        replacement_session_ids=lambda: next(replacement_ids),
+    )
+
+
+async def consume_one_full_rotation(
+    cells: ProjectCellService,
+    queue: QueueService,
+    handoffs: HandoffService,
+    runner: RecordingRunner,
+    rotation: LeadRotation,
+) -> str:
+    """Dispatch, submit, and fully rotate once: the handoff is consumed
+    and the incumbent is now the first rotation's replacement."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    first = await rotation.rotate("cell-demo")
+    assert first.ok is True
+    assert first.phase == "complete"
+    return handoff_id
+
+
+@pytest.mark.asyncio
+async def test_consumed_handoff_files_the_fresh_request_with_derived_fields(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-198 required test 1: a rotate-lead over the consumed newest
+    handoff files the durable fresh-handoff request through the existing
+    channel — the ``handoff_requests`` row and the deduplicated
+    ``handoff_required`` wake carry the mechanically derived facts, the
+    incumbent is asked ONLY for the non-derivable content — and the
+    report is awaiting/requested, never the terminal operator
+    instruction. A repeat call duplicates nothing."""
+
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+    consumed = await consume_one_full_rotation(
+        cells, queue, handoffs, runner, rotation
+    )
+    start_count_after_first = runner.start_count
+    calls_after_first = len(seater.calls)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "awaiting_handoff"
+    assert report.failure is None
+    assert report.handoff_id == consumed
+    assert report.request_id is not None
+
+    # The durable request row, on the EXISTING handoff_requests channel,
+    # carries every mechanically derived fact ...
+    request = database.execute(
+        "SELECT request_id, state, reason FROM handoff_requests "
+        "WHERE cell_id = 'cell-demo'"
+    ).fetchone()
+    assert request is not None
+    assert str(request["request_id"]) == report.request_id
+    assert str(request["state"]) == "requested"
+    reason = str(request["reason"])
+    assert f"consumed={consumed}" in reason
+    assert "cell=cell-demo" in reason
+    assert "project=demo" in reason
+    assert f"session={REPLACEMENT_SESSION}" in reason
+    assert "profile=max-b" in reason
+    assert "issue=ENG-9" in reason
+    assert "branch=feature/infra-197" in reason
+    assert "head=deadbeef" in reason
+    # ... and asks the incumbent ONLY for the non-derivable content.
+    assert (
+        "provide only decisions, caveats/blockers, risks, "
+        "and the exact next action" in reason
+    )
+
+    # The incumbent is woken through the existing terminal-wake outbox,
+    # bound to the handoff_required evidence identity.
+    wake = database.execute(
+        "SELECT kind, session_id, profile_alias, reason, state, turn_key "
+        "FROM lead_terminal_wakes WHERE cell_id = 'cell-demo'"
+    ).fetchall()
+    assert len(wake) == 1
+    assert str(wake[0]["kind"]) == "handoff_required"
+    assert str(wake[0]["session_id"]) == str(REPLACEMENT_SESSION)
+    assert str(wake[0]["profile_alias"]) == "max-b"
+    assert str(wake[0]["reason"]) == reason
+    assert str(wake[0]["turn_key"]).startswith("handoff:")
+    assert database.scalar(
+        "SELECT state FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == "handoff_required"
+
+    # Nothing transferred or launched, and a repeat call is idempotent:
+    # same awaiting report, no duplicate request, wake, or marker.
+    repeat = await rotation.rotate("cell-demo")
+    assert repeat.phase == "awaiting_handoff"
+    assert repeat.request_id == report.request_id
+    assert runner.start_count == start_count_after_first
+    assert len(seater.calls) == calls_after_first
+    assert database.scalar(
+        "SELECT count(*) FROM handoff_requests WHERE cell_id = 'cell-demo'"
+    ) == 1
+    assert database.scalar(
+        "SELECT count(*) FROM lead_terminal_wakes WHERE cell_id = 'cell-demo'"
+    ) == 1
+    assert rotation_event_count(database, "lead_rotation.awaiting_handoff") == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_submission_resumes_the_same_rotation_changing_both(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    handoffs: CountingHandoffs,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    """INFRA-198 required test 2: once the incumbent submits the fresh
+    handoff, the SAME awaiting rotation resumes automatically through the
+    post-commit listener continuation — exactly as the submission path
+    drives it — and the completed rotation changes BOTH the profile and
+    the session; the incumbent is retired."""
+
+    from hermes_orchestrator.handoffs import HandoffRecord
+
+    replacement_ids = iter([REPLACEMENT_SESSION, THIRD_SESSION])
+    cells = make_cells_with_replacements(
+        database, queue, profiles, runner, handoffs, tmp_path, replacement_ids
+    )
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+    await consume_one_full_rotation(cells, queue, handoffs, runner, rotation)
+
+    awaiting = await rotation.rotate("cell-demo")
+    assert awaiting.phase == "awaiting_handoff"
+
+    # The event-driven continuation, wired the way the submission path
+    # wires it: the post-commit signal hands the durable record to
+    # resume_on_submission.
+    submitted: list[HandoffRecord] = []
+    handoffs.subscribe(submitted.append)
+    fresh_id = submit_handoff(handoffs)
+    assert [record.handoff_id for record in submitted] == [fresh_id]
+
+    resumed = await rotation.resume_on_submission(submitted[0])
+
+    assert resumed is not None
+    assert resumed.ok is True
+    assert resumed.phase == "complete"
+    assert resumed.handoff_id == fresh_id
+    # BOTH identities changed relative to the incumbent the awaiting
+    # rotation found (the first rotation's replacement, max-b).
+    assert resumed.replacement_session == str(THIRD_SESSION)
+    assert resumed.replacement_session != str(REPLACEMENT_SESSION)
+    assert resumed.profile is not None
+    assert resumed.profile != "max-b"
+    cell = database.execute(
+        "SELECT state, session_id, profile_alias FROM project_cells "
+        "WHERE cell_id = 'cell-demo'"
+    ).fetchone()
+    assert str(cell["state"]) == "active"
+    assert str(cell["session_id"]) == str(THIRD_SESSION)
+    assert str(cell["profile_alias"]) == resumed.profile
+    binding = bindings.active_lead("cell-demo")
+    assert binding is not None
+    assert binding.session_id == str(THIRD_SESSION)
+    assert runner.retired_sessions == [SESSION_ID, REPLACEMENT_SESSION]
+
+    # Ownership-claim invariants held across both rotations: one open
+    # attempt per handoff, each closed by exactly one completion; the
+    # one awaiting marker was resumed exactly once.
+    assert rotation_event_count(database, "lead_rotation.attempt") == 2
+    assert rotation_event_count(database, "lead_rotation.completed") == 2
+    assert rotation_event_count(database, "lead_rotation.awaiting_handoff") == 1
+    assert rotation_event_count(database, "lead_rotation.awaiting_resumed") == 1
+
+    # A replayed signal for the same record never re-drives anything.
+    assert await rotation.resume_on_submission(submitted[0]) is None
+
+
+@pytest.mark.asyncio
+async def test_ordinary_handoff_submission_never_triggers_the_continuation(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """An ordinary handoff request (stall remedy / red pressure) followed
+    by a submission carries NO awaiting marker: the continuation returns
+    None, journals nothing, and rotates nothing."""
+
+    await start_cell(cells, queue)
+    assert cells.request_checkpoint("cell-demo", "stall:no_material_change")
+    fresh_id = submit_handoff(handoffs)
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    assert await rotation.resume_on_submission(handoffs.get(fresh_id)) is None
+
+    assert rotation_event_count(database, "lead_rotation.attempt") == 0
+    assert rotation_event_count(database, "lead_rotation.awaiting_resumed") == 0
+    assert seater.calls == []
+    assert runner.start_count == 1  # the initial dispatch only
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
