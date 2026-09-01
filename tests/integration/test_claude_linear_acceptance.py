@@ -108,10 +108,17 @@ async def test_explicit_queue_to_one_lead_and_linear_projection(tmp_path: Path) 
 
         assert restarted_profiles.acquire("demo").profile_alias == "max-a"
         resumed_actions = restarted_scheduler.plan(GreenSnapshot())
-        # INFRA-199: a distinct queued issue never starts while another
-        # issue of the project is still in development.
-        busy = await restarted_cells.dispatch(resumed_actions[0].issue_id)
-        assert busy.status == "project_busy"
+        # INFRA-219 (Sol correction 110ed759, packet R6) SUPERSEDES the
+        # original INFRA-199 rule asserted here — "a distinct queued issue
+        # never starts while another issue of the project is still in
+        # development". The authoritative dual-lane contract requires one
+        # development lead to coordinate at least three (up to six)
+        # concurrently admitted issue lanes, so a second distinct issue
+        # now dispatches CONCURRENTLY into the same lead cell rather than
+        # being refused. Occupancy is bounded, not exclusive; the refusal
+        # at the bound is covered in tests/test_cells.py.
+        concurrent = await restarted_cells.dispatch(resumed_actions[0].issue_id)
+        assert concurrent.status == "working"
         queue.complete("ENG-9", reason="merged", evidence="integration test")
         resumed = await restarted_cells.dispatch(resumed_actions[0].issue_id)
 
@@ -119,7 +126,10 @@ async def test_explicit_queue_to_one_lead_and_linear_projection(tmp_path: Path) 
         assert resumed_actions[0].kind == "resume_project_cell"
         assert resumed.status == "working"
         assert restarted_runner.start_count == 0
-        assert restarted_runner.resume_count == 1
+        # Two dispatches now reach the SAME live lead cell (the concurrent
+        # lane above, then this one), so the lead is resumed twice and
+        # started zero times — one lead cell, many issue lanes.
+        assert restarted_runner.resume_count == 2
         assert database.scalar("SELECT count(*) FROM project_cells") == 1
         assert linear.targets[-1] == ("ENG-10", "In Development", "operator")
     finally:
