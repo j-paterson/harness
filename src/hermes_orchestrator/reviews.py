@@ -646,7 +646,33 @@ class ReviewService:
             # acknowledged) assignment instead of opening a fresh
             # dispatch epoch that supersedes one the lead already
             # acknowledged.
-            await self._project_after_merge(record, reconciling=True)
+            #
+            # INFRA-218 (a): the merge itself was already proven on the
+            # pass that first recorded ``merged`` — this branch's own
+            # job is convergence of the settlement row, not projection.
+            # A downstream projection failure (Linear, the acceptance
+            # hold, or an assignment dispatch) must never re-strand an
+            # already-proven merge under a fresh lease forever: that is
+            # exactly the live INFRA-216 blocker, where a settlement
+            # already ``merging`` with an ``externally_merged`` path
+            # re-raised on every resume and never reached ``settled``.
+            # Fail soft here, the same contract ``reconcile_acceptance``
+            # already uses: report and leave the durable projection
+            # inputs (the acceptance gate row, the queue state) for the
+            # next recovery boundary to repair, while this pass still
+            # converges the settlement to ``settled`` under the real,
+            # already-proven ``merge_sha`` — no new merge is ever
+            # performed on this path.
+            try:
+                await self._project_after_merge(record, reconciling=True)
+            except Exception as error:
+                print(
+                    "post-merge projection replay for "
+                    f"{record.review_id!r} failed and will retry at the "
+                    f"next recovery boundary: {type(error).__name__}: "
+                    f"{error}",
+                    file=sys.stderr,
+                )
             return _outcome(record, reason=record.reason or "merged")
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
@@ -1127,7 +1153,21 @@ class ReviewService:
             # ``mark_merged``/``mark_settled`` tail below, so this is a
             # resumed reconciliation, never the merge that just
             # happened. Dedup against a live assignment instead.
-            await self._project_after_merge(record, reconciling=True)
+            #
+            # INFRA-218 (a): same fail-soft contract as ``_drive_merge``
+            # — a downstream projection failure must never block the
+            # settlement tail below from converging this already-proven
+            # merge to ``settled``.
+            try:
+                await self._project_after_merge(record, reconciling=True)
+            except Exception as error:
+                print(
+                    "post-merge projection replay for "
+                    f"{record.review_id!r} failed and will retry at the "
+                    f"next recovery boundary: {type(error).__name__}: "
+                    f"{error}",
+                    file=sys.stderr,
+                )
             outcome = _outcome(record, reason=record.reason or "merged")
         else:
             outcome = await self._settle_proven(

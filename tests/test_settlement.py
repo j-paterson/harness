@@ -980,6 +980,70 @@ class TestExternalReconciliation:
         )
         assert acceptance.database.scalar("SELECT COUNT(*) FROM ci_merge_ledger") == 1
 
+    async def test_a_stranded_merging_settlement_converges_despite_a_projection_failure(
+        self, acceptance: Any
+    ) -> None:
+        # INFRA-218 (a): reproduces the live INFRA-216 blocker exactly —
+        # a settlement stuck ``merging``/``externally_merged`` with a
+        # NULL ``merge_sha`` and an expired lease, whose review record
+        # is ALREADY ``merged`` with a real merge_sha. Root cause: in
+        # ``_drive_merge``'s (and ``reconcile_external_merge``'s)
+        # already-merged replay branch, an unguarded downstream
+        # projection call (``_project_after_merge``) could raise and
+        # propagate out of ``merge_approved``, leaving the settlement
+        # under its claimed lease forever — "merging" for good, because
+        # every resumer hits the identical raise. Here the review's
+        # stored projection is missing, which is exactly what
+        # ``_project_after_merge`` raises on
+        # (``RuntimeError("merged review has no stored projection")``).
+        event, _, _ = acceptance.prepare("ENG-9", GOOD)
+        manifest = self.externally_merge(acceptance, event, GOOD)
+        settled = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=14
+        )
+        assert settled.state == "merged"
+        assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
+        assert acceptance.github.merge_calls == []
+
+        # Simulate the crash shape: the settlement never reached
+        # ``settled`` (NULL merge_sha, stuck ``merging``, expired
+        # lease) even though the review record already proved
+        # ``merged``; the stored projection is also lost, reproducing
+        # the exact raise that stranded INFRA-216.
+        with acceptance.database.transaction() as connection:
+            connection.execute(
+                "UPDATE merge_settlements SET state = 'merging', "
+                "merge_sha = NULL, owner_token = 'stale-owner', "
+                "lease_expires_at = '2000-01-01T00:00:00+00:00' "
+                "WHERE settlement_id = 'review:demo:evt-1'"
+            )
+            connection.execute(
+                "UPDATE reviews SET projection_json = NULL "
+                "WHERE review_id = 'review:demo:evt-1'"
+            )
+        stranded = acceptance.settlements.get("review:demo:evt-1")
+        assert stranded.state == "merging"
+        assert stranded.merge_sha is None
+
+        [outcome] = await acceptance.service.resume_settlements("demo")
+
+        assert outcome.state == "merged"
+        assert acceptance.github.merge_calls == []
+        converged = acceptance.settlements.get("review:demo:evt-1")
+        assert converged.state == "settled"
+        assert converged.merge_sha == merge_sha_for(GOOD)
+        assert converged.path == "externally_merged"
+
+        # A second resume is a stable no-op: nothing left resumable,
+        # zero merge calls, no duplicated receipts.
+        assert await acceptance.service.resume_settlements("demo") == ()
+        assert acceptance.github.merge_calls == []
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 1
+        )
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM ci_merge_ledger") == 1
+
     async def test_reviewer_fix_chain_preserves_submitted_and_final_identities(
         self, acceptance: Any
     ) -> None:
