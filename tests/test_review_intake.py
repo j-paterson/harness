@@ -95,12 +95,14 @@ def manifest() -> CandidateManifest:
     )
 
 
-def delivered_event(
+def registered_event(
     merger: CodexMerger,
     tmp_path: Path,
     event_id: str = "evt-1",
     candidate_sha: str = HEAD,
-) -> WakeEvent:
+) -> tuple[WakeEvent, Any]:
+    """Write the immutable manifest and durably register its wake."""
+
     document = manifest()
     if event_id != "evt-1" or candidate_sha != HEAD:
         document = CandidateManifest(
@@ -119,7 +121,18 @@ def delivered_event(
     path = write_manifest(tmp_path, document, head_sha=candidate_sha)
     snapshot = read_manifest_snapshot(path, root=tmp_path)
     event = wake_event_for(document, path)
-    registration = merger.register_wake("demo", event, manifest=snapshot)
+    return event, merger.register_wake("demo", event, manifest=snapshot)
+
+
+def delivered_event(
+    merger: CodexMerger,
+    tmp_path: Path,
+    event_id: str = "evt-1",
+    candidate_sha: str = HEAD,
+) -> WakeEvent:
+    event, registration = registered_event(
+        merger, tmp_path, event_id, candidate_sha
+    )
     assert registration.state == "pending"
     assert registration.claim_token is not None
     assert registration.thread_id is not None
@@ -404,9 +417,20 @@ def test_concurrent_candidates_cannot_both_be_admitted(
 ) -> None:
     stored_channel(database)
     first = delivered_event(merger, tmp_path)
-    second = delivered_event(
+    # INFRA-221 keeps a second candidate durably QUEUED behind the first,
+    # so two delivered rows can no longer arise through registration.
+    # ``admit_wake``'s single-admitted compare-and-swap is an independent
+    # durable defense that must still hold, so force exactly the
+    # two-delivered shape a database written before that gate can carry.
+    second, registration = registered_event(
         merger, tmp_path, event_id="evt-2", candidate_sha="5" * 40
     )
+    assert registration.state == "queued"
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE wake_deliveries SET state = 'delivered', "
+            "thread_id = 'thr_stored', generation = 1 WHERE event_id = 'evt-2'"
+        )
 
     admitted = admission(merger, tmp_path).admit(
         "demo", first, received_generation=1

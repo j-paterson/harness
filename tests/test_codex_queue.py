@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ import pytest
 
 from hermes_orchestrator.codex_merger import CodexMerger
 from hermes_orchestrator.codex_queue import (
+    CANDIDATE_QUEUED,
     CODEX_QUEUE_BINARY,
     WAKE_STATUSES,
     CodexQueueDelivery,
@@ -128,8 +129,23 @@ def manifest_root(tmp_path: Path) -> Path:
     return root
 
 
+class MovingClock:
+    """A wall clock the test can advance past a delivery claim's lease."""
+
+    def __init__(self) -> None:
+        self._moment = datetime(2026, 8, 28, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self._moment
+
+    def advance(self, seconds: float) -> None:
+        self._moment = self._moment + timedelta(seconds=seconds)
+
+
 def make_merger(
-    database: Database, lease_seconds: float = 300.0
+    database: Database,
+    lease_seconds: float = 300.0,
+    now: Callable[[], datetime] | None = None,
 ) -> CodexMerger:
     prompt = Path(__file__).parent.parent / "prompts" / "codex-merger.md"
     return CodexMerger(
@@ -144,7 +160,7 @@ def make_merger(
             )
         },
         prompt_file=prompt,
-        now=lambda: datetime(2026, 8, 28, tzinfo=UTC),
+        now=now or (lambda: datetime(2026, 8, 28, tzinfo=UTC)),
         wake_claim_lease_seconds=lease_seconds,
     )
 
@@ -1000,6 +1016,16 @@ async def test_success_for_one_event_keeps_fallback_for_another(
     channel = merger.read_channel("demo")
     assert channel is not None
     assert channel.heartbeat_enabled is True
+    # INFRA-221: the fallback is a delivery path too, so while the healthy
+    # event holds the reviewer with an unsettled verdict the blocked wake
+    # is NOT eligible to be woken — its durable pending row simply waits.
+    assert merger.pending_heartbeat_wakes(
+        "demo", manifest_root=manifest_root
+    ) == []
+    assert merger.complete_admitted_wake("demo", "evt-2") is False
+    assert merger.release_delivered_wake(
+        "demo", "evt-2", outcome="rejected"
+    ) is True
     assert merger.pending_heartbeat_wakes(
         "demo", manifest_root=manifest_root
     ) == [blocked]
@@ -1256,3 +1282,215 @@ async def read_pid(pid_file: Path) -> int:
                 return int(text)
         await asyncio.sleep(0.02)
     raise AssertionError("stand-in codex child pid was never written")
+
+
+@pytest.mark.asyncio
+async def test_a_second_candidate_is_queued_until_the_first_settles(
+    delivery: CodexQueueDelivery,
+    factory: FakeQueueProcessFactory,
+    merger: CodexMerger,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    # INFRA-221: exactly ONE candidate is active at the primary Sol
+    # Merger. The second candidate is durably registered but stays
+    # 'pending' -- queued, never rendered into the thread -- until the
+    # first candidate's verdict settles and frees the reviewer.
+    stored_channel(database)
+    first = wake_event(manifest_root)
+    second = wake_event(manifest_root, event_id="evt-2", candidate_sha="5" * 40)
+
+    assert (await delivery.deliver("demo", first)).delivered is True
+    queued = await delivery.deliver("demo", second)
+
+    assert (queued.delivered, queued.reason) == (False, CANDIDATE_QUEUED)
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-2'"
+    ) == "pending"
+    assert database.scalar(
+        "SELECT thread_id FROM wake_deliveries WHERE event_id = 'evt-2'"
+    ) is None
+    # Exactly one invoke: nothing was rendered into the thread for evt-2.
+    assert factory.messages() == [first.render(1)]
+    assert merger.next_releasable_candidate("demo") is None
+
+    # The first verdict settles; only now is the queued candidate
+    # releasable, and the ordinary wake path delivers it exactly once.
+    assert merger.release_delivered_wake(
+        "demo", "evt-1", outcome="rejected"
+    ) is True
+    assert merger.next_releasable_candidate("demo") == second
+    assert (await delivery.deliver("demo", second)).delivered is True
+    assert factory.messages() == [first.render(1), second.render(1)]
+    assert merger.next_releasable_candidate("demo") is None
+
+
+def delivered_event_ids(database: Database) -> list[str]:
+    rows = database.execute(
+        "SELECT event_id FROM wake_deliveries WHERE state = 'delivered' "
+        "ORDER BY event_id"
+    ).fetchall()
+    return [str(row["event_id"]) for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_a_late_success_from_an_expired_claim_cannot_deliver(
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    # Sol correction 370eb20c: treating an expired claim as an abandoned
+    # delivery is what stops a crashed deliverer wedging the queue, but
+    # the abandoned claimant must not keep a usable token. Once another
+    # candidate has been released, a LATE success reported for the
+    # expired claim is refused, and EXACTLY ONE candidate is delivered.
+    clock = MovingClock()
+    stored_channel(database)
+    first = wake_event(manifest_root)
+    second = wake_event(manifest_root, event_id="evt-2", candidate_sha="5" * 40)
+    merger = make_merger(database, lease_seconds=300.0, now=clock)
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+    )
+
+    abandoned = merger.register_wake(
+        "demo", first, manifest=snapshot_for(manifest_root, first)
+    )
+    assert abandoned.claim_token is not None
+    clock.advance(301.0)
+
+    # The lease has lapsed, so the second candidate is released -- and
+    # releasing it invalidates the first claim in the same transaction.
+    assert (await delivery.deliver("demo", second)).delivered is True
+    assert database.scalar(
+        "SELECT claim_token FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) is None
+
+    assert merger.record_wake_delivery_success(
+        "demo",
+        thread_id="thr_stored",
+        generation=1,
+        event_id=first.event_id,
+        claim_token=abandoned.claim_token,
+        candidate_sha=first.candidate_sha,
+    ) is False
+
+    assert delivered_event_ids(database) == ["evt-2"]
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) == "pending"
+    # The refusal rewrote no channel evidence and rendered nothing.
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.last_delivered_event_id == "evt-2"
+    assert factory.messages() == [second.render(1)]
+    # The abandoned candidate is queued, not lost: it is releasable again
+    # as soon as the delivered candidate's verdict settles.
+    assert merger.next_releasable_candidate("demo") is None
+    assert merger.release_delivered_wake(
+        "demo", "evt-2", outcome="rejected"
+    ) is True
+    assert merger.next_releasable_candidate("demo") == first
+
+
+@pytest.mark.asyncio
+async def test_restart_after_expiry_keeps_exactly_one_delivered_candidate(
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+    tmp_path: Path,
+) -> None:
+    # Sol correction 370eb20c: a restart after the lease lapses recovers
+    # the abandoned candidate (the queue never wedges) and still admits
+    # only ONE candidate to the reviewer -- and the pre-restart token is
+    # dead, so its late success cannot deliver a second.
+    clock = MovingClock()
+    stored_channel(database)
+    first = wake_event(manifest_root)
+    second = wake_event(manifest_root, event_id="evt-2", candidate_sha="5" * 40)
+    merger_a = make_merger(database, lease_seconds=300.0, now=clock)
+    abandoned = merger_a.register_wake(
+        "demo", first, manifest=snapshot_for(manifest_root, first)
+    )
+    assert abandoned.claim_token is not None
+    clock.advance(301.0)
+
+    restarted_db = Database.open(tmp_path / "state.db")
+    try:
+        merger_b = make_merger(restarted_db, lease_seconds=300.0, now=clock)
+        redelivery = CodexQueueDelivery(
+            channels=merger_b,
+            manifest_root=manifest_root,
+            process_factory=factory,
+        )
+
+        # Not wedged: the abandoned candidate is releasable after restart.
+        assert merger_b.next_releasable_candidate("demo") == first
+        assert (await redelivery.deliver("demo", first)).delivered is True
+
+        # Still exactly one candidate at the reviewer.
+        queued = await redelivery.deliver("demo", second)
+        assert (queued.delivered, queued.reason) == (False, CANDIDATE_QUEUED)
+
+        # The claim abandoned before the restart can never complete.
+        assert merger_b.record_wake_delivery_success(
+            "demo",
+            thread_id="thr_stored",
+            generation=1,
+            event_id=first.event_id,
+            claim_token=abandoned.claim_token,
+            candidate_sha=first.candidate_sha,
+        ) is False
+
+        assert delivered_event_ids(restarted_db) == ["evt-1"]
+        assert restarted_db.scalar(
+            "SELECT state FROM wake_deliveries WHERE event_id = 'evt-2'"
+        ) == "pending"
+        assert factory.messages() == [first.render(1)]
+    finally:
+        restarted_db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_lapsed_claim_alone_cannot_record_a_delivery_success(
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    # Sol correction 370eb20c, second half: the success path fails closed
+    # on the claim's own expiry, before any other candidate is released.
+    # State and token still match here -- only the lapsed lease refuses.
+    clock = MovingClock()
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    merger = make_merger(database, lease_seconds=300.0, now=clock)
+
+    registration = merger.register_wake(
+        "demo", event, manifest=snapshot_for(manifest_root, event)
+    )
+    assert registration.claim_token is not None
+    clock.advance(301.0)
+
+    assert merger.record_wake_delivery_success(
+        "demo",
+        thread_id="thr_stored",
+        generation=1,
+        event_id=event.event_id,
+        claim_token=registration.claim_token,
+        candidate_sha=event.candidate_sha,
+    ) is False
+
+    assert delivered_event_ids(database) == []
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.last_delivered_event_id is None
+    # Still not wedged: the abandoned candidate is redelivered whole.
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+    )
+    assert (await delivery.deliver("demo", event)).delivered is True
+    assert delivered_event_ids(database) == ["evt-1"]

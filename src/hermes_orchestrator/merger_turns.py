@@ -70,6 +70,18 @@ class ThreadReportSource(Protocol):
     async def latest_report(self, thread_id: str) -> str | None: ...
 
 
+class WakeDeliverer(Protocol):
+    """The existing queue delivery boundary (``codex queue`` only).
+
+    INFRA-221: releasing a queued candidate is not a new transport — it
+    is the very same ``CodexQueueDelivery.deliver`` the emitter uses, so
+    a released candidate is registered, claimed, rendered, and recorded
+    exactly like a freshly emitted one.
+    """
+
+    async def deliver(self, project_key: str, event: WakeEvent) -> object: ...
+
+
 class CorrectionSink(Protocol):
     def deliver(
         self,
@@ -253,9 +265,16 @@ class MergerTurnService:
         window: CiWindow,
         manifest_root: Path,
         now: Callable[[], datetime] | None = None,
+        delivery: WakeDeliverer | None = None,
     ) -> None:
         self._database = database
         self._window = window
+        # INFRA-221: the wake path used to release the next durably
+        # queued candidate once the current verdict settles. Optional so a
+        # caller that has not wired delivery keeps today's behavior: the
+        # gate still holds later candidates queued, they are simply
+        # released at the next boundary that does have it.
+        self._delivery = delivery
         self._projects = dict(projects)
         self._merger = merger
         self._admission = admission
@@ -644,6 +663,13 @@ class MergerTurnService:
         outcomes: list[TurnOutcome] = []
         for project_key in project_keys or tuple(self._projects):
             if self.outstanding_wake(project_key) is None:
+                # INFRA-221: a restart between a settled verdict and the
+                # release of the candidate queued behind it leaves nothing
+                # outstanding and a durably pending wake. Release it here
+                # so the queue can never wedge; when a candidate IS still
+                # current this releases nothing and recovery reopens that
+                # same candidate below, never advancing past it.
+                await self.release_next_candidate(project_key)
                 continue
             try:
                 outcomes.append(await self.handle_turn(project_key))
@@ -658,6 +684,29 @@ class MergerTurnService:
                     )
                 )
         return tuple(outcomes)
+
+    async def release_next_candidate(self, project_key: str) -> object | None:
+        """Wake the next queued candidate, but only once nothing is current.
+
+        INFRA-221: the release half of the one-candidate-at-a-time gate.
+        :meth:`CodexMerger.next_releasable_candidate` answers ``None``
+        while any candidate still holds the reviewer, which is exactly the
+        fail-closed rule the issue requires: a submission that failed or
+        settled ambiguously leaves its ``wake_deliveries`` row
+        ``delivered``/``admitted``, so it stays current and NOTHING is
+        released. Only a durably settled verdict — whose terminal wake
+        write (``completed``/``deferred``/``rejected``) is made in the
+        same settlement path — frees the slot. The release itself goes
+        through the ordinary delivery adapter, whose claim
+        compare-and-swap makes the wake exactly-once.
+        """
+
+        if self._delivery is None:
+            return None
+        event = self._merger.next_releasable_candidate(project_key)
+        if event is None:
+            return None
+        return await self._delivery.deliver(project_key, event)
 
     async def handle_turn(self, project_key: str) -> TurnOutcome:
         """Reconcile the outstanding wake; settle only a submitted verdict."""
@@ -678,6 +727,11 @@ class MergerTurnService:
         await self._reviews.resume_settlements(project_key)
         outstanding = self.outstanding_wake(project_key)
         if outstanding is None:
+            # INFRA-221: nothing holds the reviewer, so a candidate that
+            # was queued behind an earlier verdict (or whose release was
+            # lost to a crash between settlement and delivery) is woken
+            # here, at the same boundary, with no polling turn.
+            await self.release_next_candidate(project_key)
             return TurnOutcome(
                 project_key, "no_outstanding_wake", None, None,
                 "no delivered candidate wake; terminal idle",
@@ -701,6 +755,7 @@ class MergerTurnService:
             project, project_key, channel, event, state, submitted=submitted
         )
         self._record_settled(event.event_id, outcome)
+        await self.release_next_candidate(project_key)
         return outcome
 
     async def _settle_wake(
@@ -1178,6 +1233,11 @@ class MergerTurnService:
             project, project_key, channel, event, state, submitted=submission
         )
         self._record_settled(event_id, outcome)
+        # INFRA-221: the next queued candidate is released ONLY after this
+        # verdict's settlement durably succeeded — outputting the document
+        # is not completion, and a non-settling outcome keeps this
+        # candidate current so nothing is released here.
+        await self.release_next_candidate(project_key)
         return outcome
 
     async def _resolve_duplicate(

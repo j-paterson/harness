@@ -383,6 +383,10 @@ def build_merge_flow(
         lead=outbox,
         window=window,
         manifest_root=manifest_root,
+        # INFRA-221: the same queue delivery adapter the emitter uses, so
+        # the candidate held behind an unsettled verdict is released and
+        # woken through the existing wake path once that verdict settles.
+        delivery=delivery,
     )
     return MergeFlow(
         rpc=rpc,

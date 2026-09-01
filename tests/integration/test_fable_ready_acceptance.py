@@ -210,6 +210,10 @@ class ProductionShapedFlow:
             window=self.window,
             manifest_root=self.manifest_root,
             now=lambda: NOW,
+            # INFRA-221: the production wiring — the same delivery adapter
+            # the emitter uses, so a candidate queued behind an unsettled
+            # verdict is released through the real wake path.
+            delivery=self.delivery,
         )
 
     def ledger_state(self, merge_sha: str) -> str:
