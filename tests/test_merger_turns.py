@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,7 @@ from hermes_orchestrator.merger_turns import (
 )
 from hermes_orchestrator.verdicts import IDLE_TERMINAL_REPORT
 from tests.integration.test_fable_ready_acceptance import (
+    BASE,
     SHA_A,
     SHA_B,
     SHA_C,
@@ -1391,3 +1395,298 @@ async def test_already_merged_pull_reconciles_without_a_second_merge(
     assert outcome.merge_sha == merge_sha
     assert "externally merged; reconciled" in outcome.reason
     assert flow.github.merge_calls == []
+
+def _insert_wake(
+    flow: ProductionShapedFlow,
+    *,
+    event_id: str,
+    issue_id: str,
+    sha: str,
+    state: str,
+    created_at: datetime,
+    status: str = "FABLE_READY",
+) -> None:
+    """Insert one raw ``wake_deliveries`` row for INFRA-218 S2 fixtures.
+
+    Bypasses the real emission/admission machinery -- irrelevant to
+    ``outstanding_wake``'s own supersession scan -- and lets a test place
+    two candidate rows for the SAME issue directly, with an explicit
+    ``created_at`` ordering.
+    """
+
+    branch = f"feature/{issue_id.lower()}"
+    stamp = created_at.isoformat()
+    flow.database.execute(
+        "INSERT INTO wake_deliveries("
+        "project_key, event_id, status, issue_id, candidate_sha, base_sha, "
+        "branch, manifest_path, manifest_digest, manifest_device, "
+        "manifest_inode, manifest_size, manifest_mtime_ns, manifest_mode, "
+        "state, thread_id, generation, claim_token, claim_expires_at, "
+        "attempts, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, "
+        "NULL, NULL, 0, ?, ?)",
+        (
+            "demo",
+            event_id,
+            status,
+            issue_id,
+            sha,
+            BASE,
+            branch,
+            f"{event_id}.json",
+            hashlib.sha256(event_id.encode()).hexdigest(),
+            1,
+            1,
+            1,
+            1,
+            0o644,
+            state,
+            stamp,
+            stamp,
+        ),
+    )
+
+
+def _insert_submitted_verdict(
+    flow: ProductionShapedFlow,
+    *,
+    event_id: str,
+    issue_id: str,
+    sha: str,
+    created_at: datetime,
+) -> None:
+    """Insert a raw LIVE ``submitted_verdicts`` row (state 'submitted')."""
+
+    stamp = created_at.isoformat()
+    flow.database.execute(
+        "INSERT INTO submitted_verdicts(event_id, project_key, issue_id, "
+        "candidate_sha, reviewed_thread_id, reviewed_generation, "
+        "verdict_json, state, created_at, updated_at) VALUES "
+        "(?, 'demo', ?, ?, 'thr_legacy', 1, '{}', 'submitted', ?, ?)",
+        (event_id, issue_id, sha, stamp, stamp),
+    )
+
+
+def _reconciled_events(flow: ProductionShapedFlow) -> list[dict[str, Any]]:
+    rows = flow.database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'wake_delivery.reconciled_complete' "
+        "ORDER BY sequence ASC"
+    ).fetchall()
+    return [json.loads(r["payload_json"]) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_newer_descendant_supersedes_obsolete_unreviewed_wake(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-218 S2 clause 1: a newer proven-descendant candidate for the
+    # SAME issue supersedes an older, unreviewed (never submitted) wake,
+    # so a stale wake can never hold intake -- the newer wake surfaces as
+    # outstanding in the SAME pass, with one supersession event journaled.
+    older = flow.clock
+    newer = flow.clock + timedelta(minutes=5)
+    flow.git.ancestor[(SHA_A, SHA_B)] = True
+    _insert_wake(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A,
+        state="delivered", created_at=older,
+    )
+    _insert_wake(
+        flow, event_id="evt-new", issue_id="ENG-9", sha=SHA_B,
+        state="delivered", created_at=newer,
+    )
+
+    outstanding = flow.turns.outstanding_wake("demo")
+
+    assert outstanding is not None
+    event, state = outstanding
+    assert (event.event_id, state) == ("evt-new", "delivered")
+    retired = flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-old'"
+    ).fetchone()
+    assert retired["state"] == "completed"
+    events = _reconciled_events(flow)
+    assert len(events) == 1
+    assert events[0]["issue_id"] == "ENG-9"
+    assert events[0]["candidate_sha"] == SHA_A
+    assert "superseded" in events[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_different_issues_never_supersede_each_other(
+    flow: ProductionShapedFlow,
+) -> None:
+    # A newer, provably-descendant candidate for a DIFFERENT issue must
+    # never retire another issue's wake.
+    older = flow.clock
+    newer = flow.clock + timedelta(minutes=5)
+    flow.git.ancestor[(SHA_A, SHA_B)] = True
+    _insert_wake(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A,
+        state="delivered", created_at=older,
+    )
+    _insert_wake(
+        flow, event_id="evt-new", issue_id="ENG-11", sha=SHA_B,
+        state="delivered", created_at=newer,
+    )
+
+    outstanding = flow.turns.outstanding_wake("demo")
+
+    assert outstanding is not None
+    event, state = outstanding
+    assert (event.event_id, state) == ("evt-old", "delivered")
+    assert flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-old'"
+    ).fetchone()["state"] == "delivered"
+    assert _reconciled_events(flow) == []
+
+
+@pytest.mark.asyncio
+async def test_older_wake_with_a_live_submitted_verdict_is_never_retired(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Fail closed: a live 'submitted' verdict (awaiting settlement) makes
+    # the older wake NOT obsolete, even though a proven descendant exists
+    # for the same issue -- it must never be retired.
+    older = flow.clock
+    newer = flow.clock + timedelta(minutes=5)
+    flow.git.ancestor[(SHA_A, SHA_B)] = True
+    _insert_wake(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A,
+        state="delivered", created_at=older,
+    )
+    _insert_submitted_verdict(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A, created_at=older,
+    )
+    _insert_wake(
+        flow, event_id="evt-new", issue_id="ENG-9", sha=SHA_B,
+        state="delivered", created_at=newer,
+    )
+
+    outstanding = flow.turns.outstanding_wake("demo")
+
+    assert outstanding is not None
+    event, state = outstanding
+    assert (event.event_id, state) == ("evt-old", "delivered")
+    assert flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-old'"
+    ).fetchone()["state"] == "delivered"
+    assert _reconciled_events(flow) == []
+
+
+@pytest.mark.asyncio
+async def test_non_descendant_newer_candidate_retires_nothing(
+    flow: ProductionShapedFlow,
+) -> None:
+    # No proof of descendance -- unrelated or divergent history -- means
+    # no supersession, even though the older wake is unreviewed.
+    older = flow.clock
+    newer = flow.clock + timedelta(minutes=5)
+    flow.git.ancestor[(SHA_A, SHA_B)] = False
+    _insert_wake(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A,
+        state="delivered", created_at=older,
+    )
+    _insert_wake(
+        flow, event_id="evt-new", issue_id="ENG-9", sha=SHA_B,
+        state="delivered", created_at=newer,
+    )
+
+    outstanding = flow.turns.outstanding_wake("demo")
+
+    assert outstanding is not None
+    event, state = outstanding
+    assert (event.event_id, state) == ("evt-old", "delivered")
+    assert flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-old'"
+    ).fetchone()["state"] == "delivered"
+    assert _reconciled_events(flow) == []
+
+
+@pytest.mark.asyncio
+async def test_supersession_reconciliation_is_idempotent(
+    flow: ProductionShapedFlow,
+) -> None:
+    # A second `outstanding_wake` call retires nothing more and journals
+    # nothing more than the first.
+    older = flow.clock
+    newer = flow.clock + timedelta(minutes=5)
+    flow.git.ancestor[(SHA_A, SHA_B)] = True
+    _insert_wake(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A,
+        state="delivered", created_at=older,
+    )
+    _insert_wake(
+        flow, event_id="evt-new", issue_id="ENG-9", sha=SHA_B,
+        state="delivered", created_at=newer,
+    )
+
+    first = flow.turns.outstanding_wake("demo")
+    events_after_first = _reconciled_events(flow)
+
+    second = flow.turns.outstanding_wake("demo")
+    events_after_second = _reconciled_events(flow)
+
+    assert first is not None and second is not None
+    assert first[0].event_id == second[0].event_id == "evt-new"
+    assert len(events_after_first) == 1
+    assert events_after_second == events_after_first
+
+
+@pytest.mark.asyncio
+async def test_newer_descendant_supersedes_a_correction_completed_wake(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-218 S2, the second obsolete branch (lead-added at
+    # integration: the packet's five required tests exercised only the
+    # 'unreviewed' and live-submitted branches). A wake whose review
+    # returned corrections is equally obsolete once a newer proven
+    # descendant candidate exists for the SAME issue, so it is retired
+    # with the same terminal vocabulary and reason wording.
+    older = flow.clock
+    newer = flow.clock + timedelta(minutes=5)
+    flow.git.ancestor[(SHA_A, SHA_B)] = True
+    _insert_wake(
+        flow, event_id="evt-old", issue_id="ENG-9", sha=SHA_A,
+        state="delivered", created_at=older,
+    )
+    _insert_wake(
+        flow, event_id="evt-new", issue_id="ENG-9", sha=SHA_B,
+        state="delivered", created_at=newer,
+    )
+    stamp = older.isoformat()
+    # A correction-completed wake is one whose verdict was submitted and
+    # settled as corrections_required — so both rows exist, and the
+    # 'unreviewed' branch (no submitted verdict at all) must NOT claim it.
+    flow.database.execute(
+        "INSERT INTO submitted_verdicts("
+        "event_id, project_key, issue_id, candidate_sha, "
+        "reviewed_thread_id, reviewed_generation, verdict_json, state, "
+        "created_at, updated_at) "
+        "VALUES ('evt-old', 'demo', 'ENG-9', ?, 'thr_legacy', 1, '{}', "
+        "'settled', ?, ?)",
+        (SHA_A, stamp, stamp),
+    )
+    flow.database.execute(
+        "INSERT INTO reviews("
+        "review_id, project_key, issue_id, event_id, repository, branch, "
+        "pr_number, reviewed_sha, state, merge_sha, reason, "
+        "projection_json, created_at, updated_at"
+        ") VALUES (?, 'demo', 'ENG-9', 'evt-old', ?, 'feature/eng-9', "
+        "0, ?, 'corrections_required', NULL, NULL, NULL, ?, ?)",
+        ("review:demo:evt-old", "j-paterson/demo", SHA_A, stamp, stamp),
+    )
+
+    outstanding = flow.turns.outstanding_wake("demo")
+
+    assert outstanding is not None
+    event, state = outstanding
+    assert (event.event_id, state) == ("evt-new", "delivered")
+    retired = flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-old'"
+    ).fetchone()
+    assert retired["state"] == "completed"
+    events = _reconciled_events(flow)
+    assert len(events) == 1
+    assert "superseded" in events[0]["reason"]
+    assert "correction-completed" in events[0]["reason"]

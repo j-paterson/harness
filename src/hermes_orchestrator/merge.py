@@ -225,6 +225,25 @@ class IntegrationMerge:
             changed_paths=proof.changed_paths,
         )
 
+    def is_ancestor_commit(
+        self, project_key: str, *, ancestor: str, descendant: str
+    ) -> bool:
+        """True iff ``ancestor`` is reachable from ``descendant``.
+
+        INFRA-218 (S2 plumbing): the one narrow read-only ancestry
+        question wake supersession needs, answered by the SAME
+        ``AncestryVerifier`` port and project checkout this class
+        already proves merges with (see ``prove_landed``'s reachability
+        checks). Read-only: no merge, no mutation, no new git surface.
+        An unknown project fails closed as ``False``; a git failure
+        raises ``GitError`` for the caller to fail closed on.
+        """
+
+        project = self._projects.get(project_key)
+        if project is None:
+            return False
+        return self._git.is_ancestor(project.repo_path, ancestor, descendant)
+
     def prove_landed(
         self,
         project_key: str,

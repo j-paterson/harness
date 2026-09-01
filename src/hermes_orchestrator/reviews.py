@@ -33,6 +33,7 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import MergeBlocked, MergeEffectJournal
 from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.linear import LinearProjection
@@ -1230,6 +1231,37 @@ class ReviewService:
             (issue_id, *_LIVE_STATES),
         ).fetchone()
         return None if row is None else _row_to_record(row)
+
+    def is_descendant_candidate(
+        self, project_key: str, *, newer_sha: str, older_sha: str
+    ) -> bool:
+        """True iff ``newer_sha`` is a proven descendant of ``older_sha``.
+
+        INFRA-218 (S2 plumbing): candidate supersession needs the exact
+        ancestry predicate the merge machinery already owns and proves
+        with — ``AncestryVerifier.is_ancestor`` over the project's own
+        checkout, the same port and repository path
+        :class:`~hermes_orchestrator.merge.IntegrationMerge` uses when
+        it proves a candidate reachable from its merge commit. That
+        port is private to the merge state machine, so this narrow
+        read-only accessor exposes exactly the one question wake
+        supersession must answer, and nothing else: no merge, no
+        mutation, no new git surface.
+
+        Fail closed: an unknown project, an identical pair (a commit is
+        never its own supersessor), or any git error answers ``False``,
+        so an unprovable relationship can never retire a wake.
+        """
+
+        project = self._projects.get(project_key)
+        if project is None or newer_sha == older_sha:
+            return False
+        try:
+            return self._merge.is_ancestor_commit(
+                project_key, ancestor=older_sha, descendant=newer_sha
+            )
+        except GitError:
+            return False
 
     def issue_for_candidate(self, project_key: str, reviewed_sha: str) -> str | None:
         """The issue whose review bound this exact candidate SHA, if any."""
