@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -388,6 +388,64 @@ _OCCUPYING_ISSUE_STATES = (
 # because the count is nonzero. A deliberately plain module constant,
 # not new config surface, exactly as R6 requires.
 MAX_DEVELOPMENT_ISSUE_LANES = 6
+
+
+def issue_lane_branch(issue_id: str) -> str:
+    """The lane branch this project uses for an admitted issue."""
+
+    return f"feature/{issue_id.lower()}"
+
+
+def bind_admitted_issue_worktree(
+    database: Database,
+    leases: object,
+    git: object,
+    *,
+    project_key: str,
+    issue_id: str,
+    repo_path: Path,
+    branch: str | None = None,
+    forbidden: Sequence[Path] = (),
+    integration_branch: str = "main",
+) -> tuple[str, ...]:
+    """Materialize and bind ONE admitted issue's dedicated worktree.
+
+    Module level, not a cell-service method, because the INFRA-214
+    migration runs from ``reconcile`` — a NON-live runtime that builds
+    no ``ProjectCellService`` at all (that needs the profile pool,
+    runner and Linear client, none of which this binding touches).
+    Gating the catch-up on a live cell service made it silently skip and
+    still exit zero, which is the same "looks bound, cannot publish"
+    failure this whole path exists to remove.
+
+    The occupancy proof stays attached to the binding wherever it runs:
+    an issue that does not currently occupy a development lane of this
+    project is REFUSED, so the migration can never invent a lease for a
+    completed, unknown, or unadmitted issue.
+    """
+
+    placeholders = ",".join("?" for _ in _OCCUPYING_ISSUE_STATES)
+    row = database.execute(
+        "SELECT issue_id FROM admitted_issues "
+        f"WHERE project_key = ? AND issue_id = ? AND state IN ({placeholders})",
+        (project_key, issue_id, *_OCCUPYING_ISSUE_STATES),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"{issue_id!r} is not an occupying admitted issue of "
+            f"{project_key!r}; the catch-up targets one exact issue"
+        )
+    bind_issue_worktree(
+        leases,
+        git,
+        project_key=project_key,
+        issue_id=issue_id,
+        repo_path=repo_path,
+        branch=branch or issue_lane_branch(issue_id),
+        forbidden=tuple(forbidden),
+        integration_branch=integration_branch,
+    )
+    return (issue_id,)
 
 
 def admission_priority_ceiling(
@@ -2217,23 +2275,22 @@ class ProjectCellService:
         cell = self._find_active_cell(project_key, DEVELOPMENT_LANE)
         if cell is None:
             return ()
-        placeholders = ",".join("?" for _ in _OCCUPYING_ISSUE_STATES)
-        row = self._database.execute(
-            "SELECT issue_id FROM admitted_issues "
-            f"WHERE project_key = ? AND issue_id = ? AND state IN ({placeholders})",
-            (project_key, issue_id, *_OCCUPYING_ISSUE_STATES),
-        ).fetchone()
-        if row is None:
-            raise ValueError(
-                f"{issue_id!r} is not an occupying admitted issue of "
-                f"{project_key!r}; the catch-up targets one exact issue"
-            )
-        if not self._bind_issue_lane(cell, issue_id, branch=branch):
-            raise RuntimeError(
-                f"issue-lane binding for {issue_id!r} failed; see the "
-                "reported reason above"
-            )
-        return (issue_id,)
+        repo_path = self._issue_repo_paths.get(project_key)
+        if repo_path is None:
+            return ()
+        return bind_admitted_issue_worktree(
+            self._database,
+            self._worktree_leases,
+            self._issue_git,
+            project_key=project_key,
+            issue_id=issue_id,
+            repo_path=repo_path,
+            branch=branch,
+            forbidden=self._forbidden_lane_paths(cell),
+            integration_branch=self._issue_integration_branches.get(
+                project_key, "main"
+            ),
+        )
 
     def _bind_issue_lane(
         self, cell: ProjectCell, issue_id: str, *, branch: str | None = None
@@ -2292,9 +2349,7 @@ class ProjectCellService:
 
     @staticmethod
     def _issue_branch(issue_id: str) -> str:
-        """The lane branch this project uses for an admitted issue."""
-
-        return f"feature/{issue_id.lower()}"
+        return issue_lane_branch(issue_id)
 
     def _forbidden_lane_paths(self, cell: ProjectCell) -> tuple[Path, ...]:
         """Checkouts that may never carry an issue lane's lease."""

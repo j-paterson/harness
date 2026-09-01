@@ -833,9 +833,15 @@ class WorktreeGit:
         check that decides between reusing a validated existing branch
         and creating the lane's branch from the fetched integration
         head.
+
+        Runs the probe DIRECTLY rather than through ``_run``: absence is
+        the expected answer on a first assignment, and ``rev-parse``
+        reports it as exit 1, which ``_run`` cannot distinguish from a
+        real git failure. Routing it through ``_run`` turned every
+        first-ever issue binding into a hard error.
         """
 
-        result = self._run(
+        result = self._runner.run(
             ("git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"),
             repo_path,
         )

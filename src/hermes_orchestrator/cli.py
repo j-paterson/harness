@@ -28,6 +28,7 @@ from hermes_orchestrator.cells import (
     HARNESS_LANE,
     ProfileCapacityEvidence,
     ProjectCellService,
+    bind_admitted_issue_worktree,
     ensure_harness_checkout,
 )
 from hermes_orchestrator.channel_hub import (
@@ -4945,12 +4946,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
             # their candidates stay unpublishable. This idempotent
             # catch-up binds any occupying issue that still has no live
             # lease, and is a no-op for those that do.
-            if runtime.cells is not None and args.bind_issue_lane:
+            if args.bind_issue_lane:
                 # Targeted and observable: one exact issue, and a failure
                 # surfaces rather than being suppressed. A blanket sweep
                 # would try to bind legacy issues whose branches are
                 # checked out elsewhere and bury the real repair in noise.
+                #
+                # Bound to the lease store and git directly, NOT to
+                # runtime.cells: `reconcile` is a non-live runtime and
+                # builds no cell service, so gating on one made this
+                # silently do nothing and still exit zero.
                 project_key, _, issue_id = args.bind_issue_lane.partition(":")
+                project = settings.projects.get(project_key)
                 if not issue_id:
                     _print(
                         {"error": "expected --bind-issue-lane <project>:<issue>"},
@@ -4958,12 +4965,29 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         human="--bind-issue-lane takes <project>:<issue>.",
                     )
                     return 1
+                if (
+                    project is None
+                    or runtime.worktree_leases is None
+                    or runtime.worktree_git is None
+                ):
+                    _print(
+                        {"error": f"no registered project {project_key!r}"},
+                        json_output=args.json,
+                        human=f"Unknown project {project_key!r}.",
+                    )
+                    return 1
                 try:
                     payload["bound_issue_lanes"] = list(
-                        runtime.cells.bind_missing_issue_lanes(
-                            project_key,
+                        bind_admitted_issue_worktree(
+                            database,
+                            runtime.worktree_leases,
+                            runtime.worktree_git,
+                            project_key=project_key,
                             issue_id=issue_id,
+                            repo_path=project.repo_path,
                             branch=args.bind_issue_branch,
+                            forbidden=(Path.cwd(),),
+                            integration_branch=project.integration_branch,
                         )
                     )
                 except Exception as error:
