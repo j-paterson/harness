@@ -53,6 +53,7 @@ from hermes_orchestrator.cmux_surfaces import (
     RegistryProfileDirectory,
     managed_claude_worker_alive,
 )
+from hermes_orchestrator.codex_queue import CANDIDATE_QUEUED
 from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.context import ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
@@ -4990,6 +4991,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     f"{payload['issue_id']}: {payload['delivery_reason']}."
                 ),
             )
+            # INFRA-221: a candidate held behind the reviewer's single
+            # active slot published successfully — it is durably queued
+            # and is woken automatically once the current verdict
+            # settles, so this is not a failure the lead should retry.
+            if payload["delivery_reason"] == CANDIDATE_QUEUED:
+                return 0
             return 0 if payload["delivered"] else 1
 
         if args.command == "reviewer-fix":

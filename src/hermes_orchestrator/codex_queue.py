@@ -27,6 +27,12 @@ from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 
 CODEX_QUEUE_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
 
+#: Delivery reason for a candidate held behind the one-at-a-time reviewer
+#: gate (INFRA-221). Not a failure: the candidate is durably queued in
+#: ``wake_deliveries`` and is released and woken by the same delivery path
+#: once the current candidate's verdict settles.
+CANDIDATE_QUEUED = "candidate_queued"
+
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 
@@ -163,6 +169,19 @@ class CodexQueueDelivery:
                 thread_id=None,
                 generation=None,
                 reason=f"duplicate_{registration.state}",
+            )
+        if registration.state == "queued":
+            # INFRA-221: another candidate holds the reviewer with an
+            # unsettled verdict. The wake is durably registered and
+            # pending -- that row IS the queue -- but nothing is rendered
+            # into the thread, so Sol never receives a second candidate
+            # while the current verdict is outstanding.
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=0,
+                thread_id=None,
+                generation=None,
+                reason=CANDIDATE_QUEUED,
             )
         if registration.state == "pending_elsewhere":
             return QueueDeliveryResult(

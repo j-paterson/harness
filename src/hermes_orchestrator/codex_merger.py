@@ -32,6 +32,7 @@ class _WakeCasMiss(Exception):
 
 MERGER_MODEL = "gpt-5.6-sol"
 
+
 # The narrow writable Codex workspace mode (INFRA-194 operator scope):
 # the bounded ACCEPT_WITH_REVIEWER_FIX path must be able to write and
 # commit inside the project workspace, and nothing beyond it — never
@@ -82,6 +83,40 @@ _SECTION_PAGE_LIMIT = 16
 # matching the BLOCKED_ON_EXTERNAL_INTAKE turn contract: no active goal
 # continuation until a validated explicit wake arrives.
 IDLE_GOAL_STATUS = "blocked"
+
+
+def _reviewer_is_held(
+    connection: sqlite3.Connection,
+    project_key: str,
+    *,
+    except_event_id: str,
+    stamp: str,
+) -> bool:
+    """True iff another candidate currently holds the primary Sol Merger.
+
+    INFRA-221: exactly ONE candidate may be active at the reviewer at a
+    time. A candidate holds the reviewer while it is genuinely occupying
+    the thread with an unsettled verdict: an unexpired in-flight delivery
+    claim (``claimed``), a wake delivered into the thread whose verdict
+    has not settled (``delivered``), or the single admitted candidate
+    (``admitted``). Every other durable state -- ``pending`` (queued, not
+    yet delivered) and the terminal ``completed``/``deferred``/
+    ``rejected`` written when a verdict settles -- leaves the reviewer
+    free. An EXPIRED claim is an abandoned delivery, not a held reviewer,
+    so a crashed deliverer can never wedge the queue past its bounded
+    lease. The row for ``except_event_id`` is never counted: a wake never
+    blocks itself (its own reopen and re-claim must still work).
+    """
+
+    row = connection.execute(
+        "SELECT 1 FROM wake_deliveries WHERE project_key = ? "
+        "AND event_id != ? AND (state IN ('delivered', 'admitted') "
+        "OR (state = 'claimed' AND claim_expires_at IS NOT NULL "
+        "AND claim_expires_at > ?)) LIMIT 1",
+        (project_key, except_event_id, stamp),
+    ).fetchone()
+    return row is not None
+
 
 
 class RpcRequester(Protocol):
@@ -468,6 +503,23 @@ class CodexMerger:
                     (stamp, project_key),
                 )
 
+            def release_or_queue(event_id: str) -> WakeRegistration:
+                """Claim this wake for delivery, or leave it durably queued.
+
+                INFRA-221: the one-candidate-at-a-time gate. While another
+                candidate holds the reviewer with an unsettled verdict, this
+                wake keeps its durable ``pending`` row -- it IS the queue --
+                and no delivery claim is issued, so nothing is rendered into
+                the thread. ``MergerTurnService`` releases it through the
+                same delivery path once the current verdict settles.
+                """
+
+                if channel_state == "ready" and _reviewer_is_held(
+                    connection, project_key, except_event_id=event_id, stamp=stamp
+                ):
+                    return outcome("queued")
+                return outcome("pending", claim(event_id))
+
             def claim(event_id: str) -> str | None:
                 if channel_state != "ready":
                     return None
@@ -531,7 +583,7 @@ class CodexMerger:
                         (stamp, project_key, event.event_id),
                     )
                     arm_heartbeat()
-                    return outcome("pending", claim(event.event_id))
+                    return release_or_queue(event.event_id)
                 if state == "claimed":
                     arm_heartbeat()
                     expires = row["claim_expires_at"]
@@ -544,10 +596,10 @@ class CodexMerger:
                         "AND event_id = ? AND state = 'claimed'",
                         (stamp, project_key, event.event_id),
                     )
-                    return outcome("pending", claim(event.event_id))
+                    return release_or_queue(event.event_id)
                 if state == "pending":
                     arm_heartbeat()
-                    return outcome("pending", claim(event.event_id))
+                    return release_or_queue(event.event_id)
                 return outcome(state)
             try:
                 connection.execute(
@@ -634,10 +686,10 @@ class CodexMerger:
                         ),
                     )
                     arm_heartbeat()
-                    return outcome("pending", claim(event.event_id))
+                    return release_or_queue(event.event_id)
                 return outcome(state)
             arm_heartbeat()
-            return outcome("pending", claim(event.event_id))
+            return release_or_queue(event.event_id)
 
     def record_wake_delivery_success(
         self,
@@ -840,6 +892,46 @@ class CodexMerger:
             )
         return cursor.rowcount == 1
 
+    def next_releasable_candidate(self, project_key: str) -> WakeEvent | None:
+        """The oldest queued candidate, only while the reviewer is free.
+
+        INFRA-221: the read half of the one-candidate-at-a-time gate.
+        ``None`` while any candidate still holds the primary Sol Merger
+        (see :func:`_reviewer_is_held`) -- a candidate whose verdict is
+        not durably settled keeps its slot, so an ambiguous or failed
+        settlement releases nothing and the same candidate stays current.
+        Otherwise the oldest durably ``pending`` wake for the project is
+        returned so the caller can wake it through the ordinary delivery
+        path; delivery's own claim compare-and-swap keeps that release
+        exactly-once.
+        """
+
+        self._project(project_key)
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            if _reviewer_is_held(
+                connection, project_key, except_event_id="", stamp=stamp
+            ):
+                return None
+            row = connection.execute(
+                "SELECT status, issue_id, candidate_sha, base_sha, "
+                "manifest_path, event_id, manifest_digest FROM wake_deliveries "
+                "WHERE project_key = ? AND state = 'pending' "
+                "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                (project_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return WakeEvent(
+            status=str(row["status"]),
+            issue_id=str(row["issue_id"]),
+            candidate_sha=str(row["candidate_sha"]),
+            base_sha=str(row["base_sha"]),
+            manifest_path=str(row["manifest_path"]),
+            event_id=str(row["event_id"]),
+            manifest_digest=str(row["manifest_digest"]),
+        )
+
     def pending_heartbeat_wakes(
         self, project_key: str, *, manifest_root: Path
     ) -> list[WakeEvent]:
@@ -863,6 +955,14 @@ class CodexMerger:
             return []
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            # INFRA-221: the fallback is a delivery path too, so it obeys
+            # the same one-candidate-at-a-time gate -- while a candidate
+            # holds the reviewer with an unsettled verdict, the queued
+            # wakes behind it are not eligible to be woken.
+            if _reviewer_is_held(
+                connection, project_key, except_event_id="", stamp=stamp
+            ):
+                return []
             rows = connection.execute(
                 "SELECT status, issue_id, candidate_sha, base_sha, "
                 "manifest_path, manifest_digest, manifest_device, "

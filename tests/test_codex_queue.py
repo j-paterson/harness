@@ -15,6 +15,7 @@ import pytest
 
 from hermes_orchestrator.codex_merger import CodexMerger
 from hermes_orchestrator.codex_queue import (
+    CANDIDATE_QUEUED,
     CODEX_QUEUE_BINARY,
     WAKE_STATUSES,
     CodexQueueDelivery,
@@ -1000,6 +1001,16 @@ async def test_success_for_one_event_keeps_fallback_for_another(
     channel = merger.read_channel("demo")
     assert channel is not None
     assert channel.heartbeat_enabled is True
+    # INFRA-221: the fallback is a delivery path too, so while the healthy
+    # event holds the reviewer with an unsettled verdict the blocked wake
+    # is NOT eligible to be woken — its durable pending row simply waits.
+    assert merger.pending_heartbeat_wakes(
+        "demo", manifest_root=manifest_root
+    ) == []
+    assert merger.complete_admitted_wake("demo", "evt-2") is False
+    assert merger.release_delivered_wake(
+        "demo", "evt-2", outcome="rejected"
+    ) is True
     assert merger.pending_heartbeat_wakes(
         "demo", manifest_root=manifest_root
     ) == [blocked]
@@ -1256,3 +1267,44 @@ async def read_pid(pid_file: Path) -> int:
                 return int(text)
         await asyncio.sleep(0.02)
     raise AssertionError("stand-in codex child pid was never written")
+
+
+@pytest.mark.asyncio
+async def test_a_second_candidate_is_queued_until_the_first_settles(
+    delivery: CodexQueueDelivery,
+    factory: FakeQueueProcessFactory,
+    merger: CodexMerger,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    # INFRA-221: exactly ONE candidate is active at the primary Sol
+    # Merger. The second candidate is durably registered but stays
+    # 'pending' -- queued, never rendered into the thread -- until the
+    # first candidate's verdict settles and frees the reviewer.
+    stored_channel(database)
+    first = wake_event(manifest_root)
+    second = wake_event(manifest_root, event_id="evt-2", candidate_sha="5" * 40)
+
+    assert (await delivery.deliver("demo", first)).delivered is True
+    queued = await delivery.deliver("demo", second)
+
+    assert (queued.delivered, queued.reason) == (False, CANDIDATE_QUEUED)
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-2'"
+    ) == "pending"
+    assert database.scalar(
+        "SELECT thread_id FROM wake_deliveries WHERE event_id = 'evt-2'"
+    ) is None
+    # Exactly one invoke: nothing was rendered into the thread for evt-2.
+    assert factory.messages() == [first.render(1)]
+    assert merger.next_releasable_candidate("demo") is None
+
+    # The first verdict settles; only now is the queued candidate
+    # releasable, and the ordinary wake path delivers it exactly once.
+    assert merger.release_delivered_wake(
+        "demo", "evt-1", outcome="rejected"
+    ) is True
+    assert merger.next_releasable_candidate("demo") == second
+    assert (await delivery.deliver("demo", second)).delivered is True
+    assert factory.messages() == [first.render(1), second.render(1)]
+    assert merger.next_releasable_candidate("demo") is None

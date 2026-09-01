@@ -1099,13 +1099,17 @@ async def test_stale_settled_wake_is_reconciled_before_selection(
         assert row["state"] == completed == "completed"
 
     # The genuinely outstanding wake behind the stale row surfaces in
-    # the SAME pass.
+    # the SAME pass. The fresh candidate is emitted first, while the
+    # settled row is terminal and the reviewer is free (INFRA-221 would
+    # otherwise hold it durably queued behind the simulated stale row),
+    # and only then is the stale row put back to mask it.
+    flow.stage("ENG-11", SHA_B, pr_number=16)
+    fresh = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+    assert fresh.delivery.delivered is True
     flow.database.execute(
         "UPDATE wake_deliveries SET state = 'delivered' WHERE event_id = ?",
         (emitted.event.event_id,),
     )
-    flow.stage("ENG-11", SHA_B, pr_number=16)
-    fresh = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
     outstanding = flow.turns.outstanding_wake("demo")
     assert outstanding is not None
     event, state = outstanding
@@ -1692,3 +1696,170 @@ async def test_newer_descendant_supersedes_a_correction_completed_wake(
     assert len(events) == 1
     assert "superseded" in events[0]["reason"]
     assert "correction-completed" in events[0]["reason"]
+
+
+# -- INFRA-221: one candidate at the reviewer at a time -------------------
+
+
+def _wake_states(flow: ProductionShapedFlow) -> dict[str, str]:
+    rows = flow.database.execute(
+        "SELECT event_id, state FROM wake_deliveries"
+    ).fetchall()
+    return {str(row["event_id"]): str(row["state"]) for row in rows}
+
+
+async def _first_delivered_second_queued(
+    flow: ProductionShapedFlow,
+) -> tuple[Any, Any, str]:
+    """Deliver ENG-9, then emit ENG-11 behind its unsettled verdict."""
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    first = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    assert first.delivery.delivered is True
+    flow.stage("ENG-11", SHA_B, pr_number=16)
+    second = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+    # Restore the first candidate's GitHub staging: it is still the one
+    # candidate at the reviewer, and it is the one that settles next.
+    flow.stage("ENG-9", SHA_A, pr_number=14)
+    return first, second, branch
+
+
+@pytest.mark.asyncio
+async def test_second_candidate_stays_queued_while_a_verdict_is_unsettled(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-221 required test 1: with a candidate delivered and its
+    # verdict UNSETTLED, emitting a second candidate leaves the second
+    # durably QUEUED and never delivers it into the reviewer thread.
+    first, second, _branch = await _first_delivered_second_queued(flow)
+
+    assert second.delivery.delivered is False
+    assert second.delivery.reason == "candidate_queued"
+    states = _wake_states(flow)
+    assert states[first.event.event_id] == "delivered"
+    assert states[second.event.event_id] == "pending"
+    assert flow.database.execute(
+        "SELECT thread_id, generation FROM wake_deliveries WHERE event_id = ?",
+        (second.event.event_id,),
+    ).fetchone()["thread_id"] is None
+    # Only the first candidate was ever rendered into the thread, and the
+    # first candidate is still the one outstanding wake.
+    assert flow.processes.messages() == [first.event.render(1)]
+    assert flow.turns.outstanding_wake("demo") == (first.event, "delivered")
+
+    # Observation is non-settling and releases nothing.
+    assert (await flow.turns.handle_turn("demo")).kind == "awaiting_submission"
+    assert flow.processes.messages() == [first.event.render(1)]
+    assert _wake_states(flow)[second.event.event_id] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_settled_verdict_releases_and_wakes_the_queued_candidate_once(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-221 required test 2: once the first verdict is durably
+    # SETTLED, the queued candidate is released and woken exactly once,
+    # through the same delivery path, with no polling turn and no
+    # operator message.
+    first, second, branch = await _first_delivered_second_queued(flow)
+    # Nothing was woken for the queued candidate before settlement.
+    assert flow.processes.messages() == [first.event.render(1)]
+
+    settled = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            first.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+
+    assert settled.kind == "merged"
+    states = _wake_states(flow)
+    assert states[first.event.event_id] == "completed"
+    assert states[second.event.event_id] == "delivered"
+    assert flow.processes.messages() == [
+        first.event.render(1),
+        second.event.render(1),
+    ]
+    assert flow.turns.outstanding_wake("demo") == (second.event, "delivered")
+    # Exactly once: no later boundary re-wakes the released candidate.
+    assert (await flow.turns.handle_turn("demo")).kind == "awaiting_submission"
+    assert [o.kind for o in await flow.turns.recover_outstanding()] == [
+        "awaiting_submission"
+    ]
+    assert flow.processes.messages() == [
+        first.event.render(1),
+        second.event.render(1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_settlement_keeps_the_candidate_current_and_releases_none(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-221 required test 3: fail closed. A refused submission and a
+    # persisted submission whose settlement refuses both leave the FIRST
+    # candidate current, and nothing is released.
+    first, second, branch = await _first_delivered_second_queued(flow)
+
+    with pytest.raises(SubmissionRejected):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(first.event.event_id, "ENG-9", SHA_A, "{}"),
+        )
+
+    states = _wake_states(flow)
+    assert states[first.event.event_id] == "delivered"
+    assert states[second.event.event_id] == "pending"
+    assert flow.processes.messages() == [first.event.render(1)]
+
+    # A durably submitted verdict whose settlement refuses (the reviewer
+    # channel was replaced) is ambiguous, not settled: the row stays
+    # 'submitted', the candidate stays current, nothing is released.
+    document = flow.verdict(SHA_A, branch, 14)
+    _persist_submitted_row(flow, first.event.event_id, "ENG-9", SHA_A, document)
+    _replace_channel(flow)
+
+    outcomes = await flow.turns.recover_outstanding()
+
+    assert [outcome.kind for outcome in outcomes] == ["stale_submission"]
+    assert _submitted_rows(flow) == [
+        (first.event.event_id, "submitted", document)
+    ]
+    assert _review_count(flow) == 0
+    states = _wake_states(flow)
+    assert states[first.event.event_id] == "delivered"
+    assert states[second.event.event_id] == "pending"
+    assert flow.processes.messages() == [first.event.render(1)]
+    assert flow.turns.outstanding_wake("demo") == (first.event, "delivered")
+
+
+@pytest.mark.asyncio
+async def test_restart_reopens_the_same_candidate_and_never_skips_it(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-221 required test 4: restart replays the exact candidate that
+    # is current; the queued candidate behind it is never advanced to.
+    first, second, branch = await _first_delivered_second_queued(flow)
+
+    restarted_merger = flow.new_merger(flow.rpc)
+    restarted = flow.new_turns(restarted_merger, flow.rpc)
+    outcomes = await restarted.recover_outstanding()
+
+    assert [outcome.kind for outcome in outcomes] == ["awaiting_submission"]
+    assert outcomes[0].event_id == first.event.event_id
+    assert restarted.outstanding_wake("demo") == (first.event, "delivered")
+    assert _wake_states(flow)[second.event.event_id] == "pending"
+    assert flow.processes.messages() == [first.event.render(1)]
+
+    # The exact completed verdict for the reopened candidate settles, and
+    # only then does the queued candidate advance.
+    settled = await restarted.submit_review(
+        "demo",
+        **_submission(
+            first.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+    assert settled.kind == "merged"
+    assert _wake_states(flow)[second.event.event_id] == "delivered"
+    assert restarted.outstanding_wake("demo") == (second.event, "delivered")
