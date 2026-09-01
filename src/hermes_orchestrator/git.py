@@ -35,6 +35,22 @@ class GitError(RuntimeError):
     """Raised when local Git evidence cannot be produced deterministically."""
 
 
+class AmbiguousHunkError(GitError):
+    """A reviewed hunk's preimage is ambiguous or relocated on the parent.
+
+    Raised only by :meth:`GitVerifier._verify_hunk_positions` for the one
+    narrow class of failure where a reviewed hunk's exact preimage occurs
+    zero, several, or a mismatched number of times relative to its mapped
+    target position on the merge's first parent (INFRA-198: a duplicated
+    block elsewhere in the file makes the positional proof inconclusive).
+    Every other patch-reconstruction failure -- a changed target, a
+    missing preimage, applied fuzz, or an unexplained offset -- still
+    raises the base :class:`GitError` and must always fail closed; only
+    this narrower subclass is ever eligible for the exact-PR-binding
+    fallback in :meth:`hermes_orchestrator.merge.IntegrationMerge._prove`.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class GitResult:
     """One completed git invocation."""
@@ -607,7 +623,7 @@ class GitVerifier:
                 ]
                 mapped = mapped_positions[hunk_number]
                 if len(occurrences) != 1 or occurrences[0] != mapped:
-                    raise GitError(
+                    raise AmbiguousHunkError(
                         "reviewed hunk is ambiguous or relocated on the "
                         f"merge parent: {reviewed_file.path} hunk "
                         f"#{hunk_number} (occurrences={len(occurrences)}, "
