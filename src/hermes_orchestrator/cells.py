@@ -1143,6 +1143,11 @@ class ProjectCellService:
         issue_completed = False
         start_capped = False
         limit_kind: str | None = None
+        # INFRA-205 B: the horizon of a cap persisted the moment the
+        # pre-confirmation limit arrived, so the release path reuses the
+        # recorded horizon instead of computing a second one that could
+        # disagree with the durable observation.
+        start_cap_resets_at: datetime | None = None
         # New work starts: any prior safe-boundary proof is no longer current.
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason=f"dispatch:{issue_id}")
@@ -1259,8 +1264,28 @@ class ProjectCellService:
                                 "subscription_limit",
                                 limit_kind=limit_kind,
                             )
+                            # INFRA-205 C: the capped seat can no longer
+                            # author its own handoff, and rotate-lead
+                            # refuses without one. Hermes forms the
+                            # minimal, unmistakably machine-formed
+                            # document from durable state so the
+                            # EXISTING rotation path is reachable.
+                            self._form_capped_seat_handoff(
+                                cell, issue_id, limit_kind=limit_kind
+                            )
                         else:
                             start_capped = True
+                            # INFRA-205 B: persist the cap BEFORE the
+                            # reservation is released -- and before the
+                            # ``aclose()`` await below, which is exactly
+                            # the window in which a concurrent seating
+                            # could otherwise re-pick the profile that
+                            # just died.
+                            start_cap_resets_at = self._record_start_cap(
+                                cell,
+                                limit_kind=limit_kind,
+                                resets_at=getattr(event, "resets_at", None),
+                            )
                             break
             finally:
                 await stream.aclose()
@@ -1280,6 +1305,7 @@ class ProjectCellService:
                 capped=start_capped,
                 already_completed=issue_completed,
                 limit_kind=limit_kind,
+                capped_resets_at=start_cap_resets_at,
             )
 
         if issue_completed:
@@ -2023,7 +2049,19 @@ class ProjectCellService:
         capped: bool = False,
         already_completed: bool = False,
         limit_kind: str | None = None,
+        capped_resets_at: datetime | None = None,
     ) -> bool:
+        """Fail one unconfirmed start and release its reservation.
+
+        INFRA-205 B: ``capped_resets_at`` is the horizon of a capacity
+        observation this turn ALREADY persisted (at the moment the
+        pre-confirmation limit arrived, before this release). When it is
+        supplied the lease cooldown reuses that exact horizon and no
+        second observation is written; unset, the historical behavior is
+        unchanged — the horizon is computed here and the observation is
+        recorded in this same transaction.
+        """
+
         if self._safety is not None:
             self._safety.invalidate(cell.cell_id, reason="start_failed")
         if self._checkpoints is not None:
@@ -2033,7 +2071,9 @@ class ProjectCellService:
         now_value = self._aware_now()
         now = now_value.isoformat()
         cooldown_until = (
-            self._cap_cooldown(now_value, limit_kind) if capped else None
+            (capped_resets_at or self._cap_cooldown(now_value, limit_kind))
+            if capped
+            else None
         )
         with self._database.transaction() as connection:
             updated = connection.execute(
@@ -2053,7 +2093,7 @@ class ProjectCellService:
                         cell.profile_alias,
                     ),
                 )
-                if limit_kind == "fable":
+                if limit_kind == "fable" and capped_resets_at is None:
                     self._record_fable_cap(
                         connection,
                         cell.profile_alias,
@@ -2717,6 +2757,167 @@ class ProjectCellService:
                 _FABLE_CAP_FALLBACK_DETAIL,
             ),
         )
+
+    def _record_start_cap(
+        self,
+        cell: ProjectCell,
+        *,
+        limit_kind: str | None,
+        resets_at: datetime | None = None,
+    ) -> datetime | None:
+        """Persist a pre-confirmation cap BEFORE its reservation frees.
+
+        INFRA-205 B (observed live): a seat that hit its provider limit
+        before confirming released its reservation leaving NO durable
+        trace, so the very next seating knew nothing and could re-pick
+        the profile that had just died -- which is how ``max-b`` was
+        seated while already capped until 2026-09-08.
+
+        Mirrors :meth:`_record_replacement_cap`, the equivalent writer on
+        the rotation path, and reuses the same
+        :meth:`_record_fable_cap` observation and the same horizon rule,
+        so a cap recorded here is indistinguishable from one recorded
+        there. The stream's own reset horizon wins when it carries one;
+        otherwise the worst-case weekly cycle applies, exactly as
+        :meth:`_cap_cooldown` decides for the lease cooldown, so the
+        observation and the cooldown can never disagree.
+
+        Only a FABLE cap is recorded: session and monthly-spend limits
+        say nothing about weekly Fable capacity, and inventing an
+        observation for them would make an unrelated profile ineligible.
+        """
+
+        if limit_kind != "fable" or not cell.profile_alias:
+            return None
+        observed_at = self._aware_now()
+        horizon = resets_at or self._cap_cooldown(observed_at, limit_kind)
+        if horizon.tzinfo is None:
+            horizon = horizon.replace(tzinfo=UTC)
+        with self._database.transaction() as connection:
+            self._record_fable_cap(
+                connection,
+                cell.profile_alias,
+                observed_at=observed_at,
+                resets_at=horizon,
+            )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="provider.limit",
+                    aggregate_type="project_cell",
+                    aggregate_id=cell.cell_id,
+                    payload={
+                        "phase": "start_unconfirmed",
+                        "profile_alias": cell.profile_alias,
+                        "session_id": str(cell.session_id),
+                        "limit_kind": limit_kind,
+                        "resets_at": horizon.isoformat(),
+                    },
+                ),
+            )
+        self._profiles.set_cooldown(cell.profile_alias, horizon)
+        return horizon
+
+    def _form_capped_seat_handoff(
+        self, cell: ProjectCell, issue_id: str, *, limit_kind: str | None
+    ) -> None:
+        """Compose the minimal handoff a capped seat can no longer write.
+
+        INFRA-205 C (observed live): ``rotate-lead`` refuses without a
+        submitted handoff, and a worker that hits its provider limit
+        dies before authoring one -- so the lane was stuck between a
+        capped incumbent and the one command that would replace it
+        ("no handoff has been submitted for this cell").
+
+        Every field comes from DURABLE state -- the cell, its issue, its
+        lane branch, its pending assignment -- and nothing describes work
+        that may never have happened: this seat may have produced no
+        commits, no tests and no pull request at all. The document says
+        so in its own text, so it can never be mistaken for the lead's
+        own account of its progress.
+
+        Best effort by construction: the cap itself is already durable
+        and the incumbent is already held, so a failure here leaves the
+        existing state untouched and merely leaves the operator to open
+        the handoff, exactly as before this method existed.
+        """
+
+        if self._handoffs is None or not hasattr(self._handoffs, "submit"):
+            return
+        row = self._database.execute(
+            "SELECT assignment_id FROM lead_assignments "
+            "WHERE cell_id = ? AND session_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (cell.cell_id, str(cell.session_id)),
+        ).fetchone()
+        assignment = str(row["assignment_id"]) if row is not None else "none"
+        from hermes_orchestrator.handoffs import HandoffDocument, HandoffTest
+
+        machine_formed = (
+            "machine-formed by Hermes for a provider-capped seat; the "
+            "worker reported its "
+            f"{limit_kind or 'provider'} limit before it could hand off"
+        )
+        unknown = "unknown: the capped seat reported none before it exited"
+        branch = self._issue_branch(issue_id)
+        # Sol correction 41aa9af5: the document is constructed OUTSIDE any
+        # exception guard. It is built entirely from our own durable
+        # facts, so a schema error here is a programming defect and must
+        # surface loudly -- the previous version wrapped construction in
+        # a bare ``except`` and turned a validation failure into a silent
+        # no-op, leaving rotate-lead unreachable while reporting nothing.
+        document = HandoffDocument(
+            cell_id=cell.cell_id,
+            objective=f"Continue {issue_id} on the {cell.lane_role} lane.",
+            status=machine_formed,
+            decisions=[machine_formed],
+            branch=branch,
+            commits=[unknown],
+            pull_request="none",
+            modified_files=[unknown],
+            tests=[
+                HandoffTest(
+                    command="none",
+                    outcome="not run: the seat was capped before working",
+                )
+            ],
+            blockers=[
+                f"profile {cell.profile_alias} is fable-capped; "
+                f"pending assignment {assignment} is unconfirmed"
+            ],
+            remaining_steps=[
+                f"Re-seat {issue_id} on a fable-capable profile and "
+                f"confirm assignment {assignment}."
+            ],
+            commands=[
+                f"hermes-orchestrator rotate-lead --cell {cell.cell_id}"
+            ],
+            environment_notes=[
+                f"lane {cell.lane_role}; branch {branch}; "
+                f"session {cell.session_id}"
+            ],
+            risks=[
+                "this document is machine-formed: it describes no work, "
+                "because the seat was capped before performing any"
+            ],
+            next_action=(
+                f"Rotate {cell.cell_id} onto a fable-capable profile and "
+                f"resume {issue_id}."
+            ),
+        )
+        try:
+            self._handoffs.submit(document)
+        except Exception as error:
+            # Only the durable WRITE is guarded, and never silently: the
+            # cap is already persisted and the incumbent already held, so
+            # a failed submit leaves the operator exactly where they were
+            # -- but it says so rather than reporting a handoff that does
+            # not exist.
+            print(
+                "could not store the capped seat's machine-formed handoff "
+                f"for {cell.cell_id!r}: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
 
     def _record_replacement_cap(
         self,

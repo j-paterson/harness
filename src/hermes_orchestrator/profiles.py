@@ -437,7 +437,12 @@ class ProfilePool:
 
     @property
     def last_refusal(self) -> str | None:
-        """Why the latest replacement reservation refused its candidates."""
+        """Why the latest seating attempt refused its candidates.
+
+        INFRA-205: written by first seating (:meth:`acquire`) as well as
+        by :meth:`reserve_replacement`, since both now apply the same
+        capacity rule and both owe the caller the evidence gap by name.
+        """
 
         return self._last_refusal
 
@@ -450,6 +455,15 @@ class ProfilePool:
         lane never inherits, and never blocks on, the development lane's
         existing affinity for the same project; it competes for a slot
         exactly as a distinct project would.
+
+        INFRA-205: first seating applies the SAME ``_capacity_refusal``
+        that ``reserve_replacement`` already applies, so one rule governs
+        both paths. The live defect: rotation honoured a durable
+        fable cap that first seating ignored, so a profile capped for
+        another week was seated for a brand-new cell on auth health
+        alone. Without a capacity-evidence port the helper returns None
+        for every candidate, so an un-ported pool keeps its exact
+        historical auth-health-only behavior.
         """
 
         key = (project_key, lane_role)
@@ -458,16 +472,23 @@ class ProfilePool:
             return existing
 
         now = self._now()
+        refusals: list[str] = []
         for profile in self._registry.profiles:
             state = self._states[profile.alias]
             cooling_down = (
                 state.cooldown_until is not None and state.cooldown_until > now
             )
             if state.eligible and not cooling_down and state.active_project_count == 0:
+                refusal = self._durable_cap_refusal(profile.alias, now)
+                if refusal is not None:
+                    refusals.append(refusal)
+                    continue
                 lease = ProfileLease(project_key, profile.alias, now, lane_role)
                 self._leases[key] = lease
                 state.active_project_count += 1
                 return lease
+        if refusals:
+            self._last_refusal = "; ".join(refusals)
         return None
 
     def restore(
@@ -561,6 +582,43 @@ class ProfilePool:
         replacement = ProfileLease(project_key, replacement_alias, now, lane_role)
         self._replacement_reservations[key] = replacement
         return replacement
+
+    def _durable_cap_refusal(self, alias: str, now: datetime) -> str | None:
+        """Refuse first seating ONLY on a live durable fable cap.
+
+        INFRA-205: deliberately narrower than
+        :meth:`_capacity_refusal`, which additionally refuses missing
+        and stale evidence. That stricter bar is right when
+        DELIBERATELY choosing a replacement, but wrong for first
+        seating: a profile with no recent observation is
+        eligible-to-probe, not known-bad, and refusing it would make an
+        un-observed pool unseatable rather than merely cap-aware. A
+        passed ``resets_at`` likewise means the budget cycled -- unknown
+        again, so probe it.
+
+        What it does refuse is the exact live defect: a profile whose
+        newest fable observation says ``capped`` and whose horizon has
+        NOT passed (or which carries no horizon at all, clearable only
+        by a newer attestation) is never seated, however healthy its
+        authentication looks.
+        """
+
+        if self._capacity_evidence is None:
+            return None
+        observation = self._capacity_evidence.latest(alias, "fable")
+        if observation is None or observation.state != "capped":
+            return None
+        if observation.resets_at is None:
+            return (
+                f"{alias}: fable-capped with no reset horizon; only a "
+                "newer capacity observation (operator attestation) clears it"
+            )
+        if observation.resets_at > now:
+            return (
+                f"{alias}: fable-capped until "
+                f"{observation.resets_at.isoformat()}"
+            )
+        return None
 
     def _capacity_refusal(self, alias: str, now: datetime) -> str | None:
         """Fail closed unless current fable-capacity evidence admits alias."""

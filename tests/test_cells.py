@@ -6001,3 +6001,193 @@ class _DeadSurfacePort:
 
     async def surface_alive(self, ref: object) -> bool:
         return False
+
+
+def _seed_fable_observation(
+    database: Database,
+    alias: str,
+    *,
+    state: str,
+    observed_at: datetime,
+    resets_at: datetime | None,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at, detail"
+            ") VALUES (?, 'fable', ?, 'provider_limit', ?, ?, 'test')",
+            (
+                alias,
+                state,
+                observed_at.isoformat(),
+                None if resets_at is None else resets_at.isoformat(),
+            ),
+        )
+
+
+def test_first_seating_refuses_a_live_durable_fable_cap(
+    database: Database, registry: ProfileRegistry
+) -> None:
+    """INFRA-205 A (observed live 2026-09-01): Hermes seated max-b for a
+    brand-new harness cell while durable state already recorded max-b as
+    fable-capped until 2026-09-08. Rotation consulted that cap; FIRST
+    SEATING did not, so the capped profile was chosen on authentication
+    health alone and the worker died on its provider limit immediately."""
+
+    now = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    pool = ProfilePool(
+        registry, capacity_evidence=ProfileCapacityEvidence(database), now=lambda: now
+    )
+    for profile in registry.profiles:
+        pool.record_health(
+            ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=True,
+                reason="eligible",
+                last_checked_at=now,
+            )
+        )
+    first = registry.profiles[0].alias
+    _seed_fable_observation(
+        database,
+        first,
+        state="capped",
+        observed_at=now - timedelta(hours=1),
+        resets_at=now + timedelta(days=7),
+    )
+
+    lease = pool.acquire("demo")
+
+    assert lease is not None
+    assert lease.profile_alias != first, "a live durable cap must not be seated"
+
+
+def test_first_seating_probes_a_profile_whose_cap_horizon_passed(
+    database: Database, registry: ProfileRegistry
+) -> None:
+    """A passed reset horizon means the budget cycled: capacity is
+    UNKNOWN and eligible to probe, not known-bad. Refusing it would make
+    first seating stricter than the issue asks and could leave a pool
+    with only stale observations unseatable."""
+
+    now = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    pool = ProfilePool(
+        registry, capacity_evidence=ProfileCapacityEvidence(database), now=lambda: now
+    )
+    first = registry.profiles[0].alias
+    pool.record_health(
+        ProfileHealth(
+            profile_alias=first,
+            eligible=True,
+            reason="eligible",
+            last_checked_at=now,
+        )
+    )
+    _seed_fable_observation(
+        database,
+        first,
+        state="capped",
+        observed_at=now - timedelta(days=9),
+        resets_at=now - timedelta(minutes=1),
+    )
+
+    lease = pool.acquire("demo")
+
+    assert lease is not None
+    assert lease.profile_alias == first
+
+
+def test_capped_seat_handoff_is_schema_valid_and_stored(
+    database: Database, registry: ProfileRegistry
+) -> None:
+    """Sol correction 41aa9af5: the machine-formed handoff was built with
+    the WRONG schema -- HandoffTest(name=/result=) instead of
+    command=/outcome=, and five required HandoffDocument fields missing
+    -- and construction sat inside a bare ``except``. Validation failed
+    silently, nothing was stored, and rotate-lead stayed unreachable
+    while the code reported no problem at all.
+
+    This asserts the document actually LANDS, which is the only thing
+    that makes rotation reachable."""
+
+    from hermes_orchestrator.handoffs import HandoffService
+
+    now = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=QueueService(database, EventStore(database), {"demo"}),
+        profiles=ProfilePool(registry, now=lambda: now),
+        runner=RecordingRunner(),
+        linear=RecordingLinear(),
+        project_paths={"demo": Path("/repos/demo")},
+        handoffs=handoffs,
+        now=lambda: now,
+    )
+    cell = ProjectCell(
+        cell_id="cell-capped",
+        project_key="demo",
+        state="active",
+        profile_alias="max-b",
+        session_id=UUID("f8478b07-f248-4e9e-908f-98233025c0b7"),
+        lane_role="harness",
+    )
+
+    service._form_capped_seat_handoff(cell, "ENG-9", limit_kind="fable")
+
+    row = database.execute(
+        "SELECT document_json FROM handoffs WHERE cell_id = ?",
+        ("cell-capped",),
+    ).fetchone()
+    assert row is not None, "the handoff must be stored, not silently dropped"
+    stored = json.loads(str(row["document_json"]))
+    assert stored["cell_id"] == "cell-capped"
+    assert stored["branch"] == "feature/eng-9"
+    # Unmistakably machine-formed, never readable as the lead's own account.
+    assert "machine-formed" in stored["status"]
+    assert stored["tests"][0]["command"] == "none"
+
+
+def test_pre_confirmation_fable_cap_is_persisted_before_release(
+    database: Database, registry: ProfileRegistry
+) -> None:
+    """INFRA-205 B: a seat that hit its provider limit before confirming
+    released its reservation leaving NO durable trace, so the next
+    seating could re-pick the profile that had just died -- exactly how
+    max-b was seated while already capped."""
+
+    now = datetime(2026, 9, 1, 14, tzinfo=UTC)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=QueueService(database, EventStore(database), {"demo"}),
+        profiles=ProfilePool(registry, now=lambda: now),
+        runner=RecordingRunner(),
+        linear=RecordingLinear(),
+        project_paths={"demo": Path("/repos/demo")},
+        now=lambda: now,
+    )
+    cell = ProjectCell(
+        cell_id="cell-capped",
+        project_key="demo",
+        state="active",
+        profile_alias="max-b",
+        session_id=UUID("f8478b07-f248-4e9e-908f-98233025c0b7"),
+        lane_role="harness",
+    )
+
+    horizon = service._record_start_cap(cell, limit_kind="fable", resets_at=None)
+
+    assert horizon is not None
+    row = database.execute(
+        "SELECT profile_alias, model, state, source FROM "
+        "profile_capacity_observations ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert str(row["profile_alias"]) == "max-b"
+    assert str(row["model"]) == "fable"
+    assert str(row["state"]) == "capped"
+    assert str(row["source"]) == "provider_limit"
+    # A session cap says nothing about weekly Fable capacity.
+    assert service._record_start_cap(cell, limit_kind="session") is None
