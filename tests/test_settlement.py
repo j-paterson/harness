@@ -1359,6 +1359,142 @@ class TestExternalReconciliation:
 
 
 @pytest.mark.asyncio
+class TestPostMergeProjectionRecovery:
+    """INFRA-218 Sol correction deb5ec49.
+
+    Sol's finding: the S1(a)/S3 fail-soft settlement path
+    (``_project_fail_soft``) always converges a durably-proven merge or
+    settlement to its terminal state even when a downstream Linear
+    projection raises -- but a successfully settled ORDINARY (non
+    acceptance-gated) merge is never returned by ``resume_settlements``
+    again once its settlement reaches ``settled``, and
+    ``reconcile_acceptance`` only repairs acceptance-GATED issues. Since
+    ``LinearClient.project`` only journals its own pending
+    ``external_effects`` row AFTER its first live read succeeds
+    (``validate_issue``), an outage on that very first read used to
+    leave nothing durable to retry: Git/GitHub converged, but Linear
+    could stay permanently stale.
+
+    The correction: ``_project_after_merge``'s ordinary branch now
+    journals the exact target-only projection request through
+    ``ReviewService._effects`` (the same ``ExternalEffectStore``
+    primitive activation already relies on) BEFORE calling
+    ``self._linear.project``, and ``reconcile_post_merge_projections``
+    -- riding the identical ``resume_settlements`` recovery boundary as
+    ``reconcile_acceptance`` -- replays whatever is left pending.
+    """
+
+    async def _merge_with_linear_outage(
+        self, acceptance: Any
+    ) -> tuple[Any, str, Any]:
+        """Merge a fresh, non-acceptance-gated ENG-9 review whose first
+        post-merge Linear projection read fails, mirroring
+        ``TestExternalReconciliation.test_a_fresh_merge_settles_despite_a_projection_failure``.
+        Returns the review record, the exact target-only effect id the
+        ordinary post-merge branch journals, and the real (unpatched)
+        ``project`` callable for tests that go on to restore it.
+        """
+
+        event, branch, number = acceptance.prepare("ENG-9", GOOD)
+        admitted = acceptance.admission.admit("demo", event, received_generation=1)
+        record = await acceptance.service.record_verdict(
+            admitted, "ENG-9", verdict_for(branch, number)
+        )
+        real_project = acceptance.linear.project
+
+        async def failing_project(issue_id: str, target: Any, effect_id: str) -> Any:
+            if "after-merge" in effect_id:
+                raise RuntimeError("linear outage")
+            return await real_project(issue_id, target, effect_id)
+
+        acceptance.linear.project = failing_project
+
+        outcome = await acceptance.service.merge_approved(record.review_id)
+
+        assert outcome.state == "merged"
+        assert outcome.merge_sha == merge_sha_for(GOOD)
+        effect_id = f"linear:ENG-9:after-merge:{record.review_id}"
+        return record, effect_id, real_project
+
+    async def test_pending_target_only_effect_survives_a_first_read_outage(
+        self, acceptance: Any
+    ) -> None:
+        record, effect_id, _real_project = await self._merge_with_linear_outage(
+            acceptance
+        )
+
+        review_state = acceptance.database.scalar(
+            "SELECT state FROM reviews WHERE review_id = ?", (record.review_id,)
+        )
+        assert str(review_state) == "merged"
+        settled = acceptance.settlements.get(record.review_id)
+        assert settled.state == "settled"
+
+        rows = acceptance.database.execute(
+            "SELECT state, request_json FROM external_effects WHERE effect_id = ?",
+            (effect_id,),
+        ).fetchall()
+        assert len(rows) == 1
+        assert str(rows[0]["state"]) == "pending"
+        request = json.loads(rows[0]["request_json"])
+        assert request == {
+            "issue_id": "ENG-9",
+            "target": {"status": "Done", "assignee_alias": "operator"},
+        }
+
+    async def test_recovery_boundary_completes_the_pending_projection(
+        self, acceptance: Any
+    ) -> None:
+        _record, effect_id, real_project = await self._merge_with_linear_outage(
+            acceptance
+        )
+        acceptance.linear.project = real_project
+        merge_calls_before = len(acceptance.github.merge_calls)
+
+        outcomes = await acceptance.service.resume_settlements("demo")
+
+        # No settlement is resumable any more (it already settled from
+        # Git/GitHub truth) -- the recovered projection rides the same
+        # boundary but is not one of this tuple's outcomes.
+        assert outcomes == ()
+        assert len(acceptance.github.merge_calls) == merge_calls_before
+        assert acceptance.linear.targets[-1] == ("ENG-9", "Done", "operator")
+        state = acceptance.database.scalar(
+            "SELECT state FROM external_effects WHERE effect_id = ?", (effect_id,)
+        )
+        assert str(state) == "completed"
+
+    async def test_recovery_boundary_replay_is_idempotent(
+        self, acceptance: Any
+    ) -> None:
+        _record, effect_id, real_project = await self._merge_with_linear_outage(
+            acceptance
+        )
+        acceptance.linear.project = real_project
+        first = await acceptance.service.resume_settlements("demo")
+        assert first == ()
+        targets_after_first_recovery = list(acceptance.linear.targets)
+        merge_calls_after_first_recovery = len(acceptance.github.merge_calls)
+
+        replay = await acceptance.service.resume_settlements("demo")
+
+        assert replay == ()
+        assert acceptance.linear.targets == targets_after_first_recovery
+        assert len(acceptance.github.merge_calls) == merge_calls_after_first_recovery
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM reviews") == 1
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM merge_settlements") == 1
+        )
+        assert (
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM external_effects WHERE effect_id = ?",
+                (effect_id,),
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
 class TestExternalReconciliationExactBinding:
     """INFRA-198: Sol correction b30c55f3 (live PR #43) -- reconciliation
     of an advanced-base squash merge whose exact GitHub PR binding
