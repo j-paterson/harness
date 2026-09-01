@@ -22,6 +22,7 @@ from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
+from hermes_orchestrator.git import WorktreeStatus
 from hermes_orchestrator.github import (
     MergeBlocked,
     MergeEffectJournal,
@@ -47,6 +48,11 @@ from hermes_orchestrator.review_intake import (
 from hermes_orchestrator.reviews import ReviewService
 from hermes_orchestrator.settlement import MergeSettlements
 from hermes_orchestrator.verdicts import CorrectionPacket, VerdictBinding, parse_verdict
+from hermes_orchestrator.worktrees import (
+    WorktreeCustodian,
+    WorktreeLeaseInput,
+    WorktreeLeases,
+)
 from tests.test_merge import FakeGit, FakeGitHub, open_pull, open_summary
 from tests.test_review_intake import NullRpc, stored_channel
 
@@ -659,3 +665,178 @@ async def test_rejecting_unmerged_work_fails_closed(acceptance: Acceptance) -> N
         await acceptance.service.reject_from_qa(
             "ENG-9", reason="nothing merged", evidence="none"
         )
+
+
+# -- INFRA-198: post-merge settlement releases the development lane --------
+
+
+class LaneGit:
+    """Clean, pushed worktree: the shape merged work always leaves."""
+
+    def __init__(self, *, contains: bool = True) -> None:
+        self.contains = contains
+        self.head = "c" * 40
+
+    def status_of(self, path: Path) -> WorktreeStatus:
+        return WorktreeStatus(modified=(), untracked=())
+
+    def head_sha(self, path: Path) -> str:
+        return self.head
+
+    def branch(self, path: Path) -> str | None:
+        return "feature/eng-9"
+
+    def head_message(self, path: Path) -> str:
+        return "merged work"
+
+    def ahead(self, path: Path) -> int | None:
+        return 0
+
+    def add_all(self, path: Path) -> None:  # pragma: no cover - clean tree
+        raise AssertionError("a clean worktree is never committed")
+
+    def commit(self, path: Path, message: str) -> str:  # pragma: no cover
+        raise AssertionError("a clean worktree is never committed")
+
+    def push(self, path: Path, remote: str, branch: str) -> None:
+        return None
+
+    def fetch(self, path: Path, remote: str, branch: str) -> None:
+        return None
+
+    def remote_contains(
+        self, path: Path, sha: str, remote: str, branch: str
+    ) -> bool:
+        return self.contains
+
+    def worktree_remove(self, repo_path: Path, path: Path) -> None:
+        return None
+
+    def worktree_prune(self, repo_path: Path) -> None:
+        return None
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
+        return ()
+
+
+class LaneRegistry:
+    def active(self, project_key: str | None = None) -> tuple[Any, ...]:
+        return ()
+
+    def request_stop(self, lease_id: str, checkpoint_id: str) -> Any:
+        raise AssertionError("no process lease is bound in this lane")
+
+
+def lease_lane(acceptance: Acceptance, *, contains: bool = True) -> str:
+    """Give ENG-9 the development-lane lease its merged work occupied."""
+
+    leases = WorktreeLeases(acceptance.database, acceptance.events)
+    acceptance.service.worktrees = leases
+    acceptance.service.custodian = WorktreeCustodian(
+        leases, LaneRegistry(), LaneGit(contains=contains)
+    )
+    return leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="ENG-9",
+            repo_path="/repo/demo",
+            path="/repo/demo-issue-ENG-9",
+            branch="feature/eng-9",
+            remote="origin",
+        )
+    ).lease_id
+
+
+def lane_states(acceptance: Acceptance) -> list[str]:
+    return [
+        str(row["state"])
+        for row in acceptance.database.execute(
+            "SELECT state FROM worktree_leases WHERE issue_id = 'ENG-9'"
+        ).fetchall()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gated_merge_settles_out_of_the_development_lane(
+    acceptance: Acceptance,
+) -> None:
+    """INFRA-198: merged, held work stops consuming the lane."""
+
+    acceptance.seat_cell()
+    acceptance.gates.require(
+        "ENG-9",
+        instruction_id="chat-accept-eng-9",
+        predicates=("operator_signoff",),
+    )
+    lease_lane(acceptance)
+
+    outcome = await acceptance.submit("ENG-9", sha=GOOD)
+
+    assert outcome.state == "merged"
+    assert acceptance.queue.get("ENG-9").state is IssueState.POST_MERGE_ACCEPTANCE
+    # The lane is free: no row survives the runnable query's
+    # "state != 'reclaimed'" clause for this issue.
+    assert lane_states(acceptance) == ["reclaimed"]
+    assert acceptance.gates.pending("ENG-9") is True
+
+
+@pytest.mark.asyncio
+async def test_settlement_replay_settles_the_lane_exactly_once(
+    acceptance: Acceptance,
+) -> None:
+    """Replaying settlement for settled work is a durable no-op."""
+
+    acceptance.seat_cell()
+    acceptance.gates.require(
+        "ENG-9",
+        instruction_id="chat-accept-eng-9",
+        predicates=("operator_signoff",),
+    )
+    lease_lane(acceptance)
+    await acceptance.submit("ENG-9", sha=GOOD)
+    before = lane_states(acceptance)
+
+    repairs = await acceptance.service.reconcile_acceptance("demo")
+
+    assert [repair.action for repair in repairs] == ["held"]
+    assert lane_states(acceptance) == before == ["reclaimed"]
+    rows = acceptance.database.execute(
+        "SELECT * FROM lead_assignments WHERE issue_id = 'ENG-9' "
+        "AND state != 'superseded'"
+    ).fetchall()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_unprovable_lease_is_left_active_not_force_released(
+    acceptance: Acceptance,
+) -> None:
+    """No remote proof: the lease stays put and the merge still holds."""
+
+    acceptance.seat_cell()
+    acceptance.gates.require(
+        "ENG-9",
+        instruction_id="chat-accept-eng-9",
+        predicates=("operator_signoff",),
+    )
+    lease_lane(acceptance, contains=False)
+
+    outcome = await acceptance.submit("ENG-9", sha=GOOD)
+
+    assert outcome.state == "merged"
+    assert lane_states(acceptance) == ["checkpointed"]
+    assert acceptance.queue.get("ENG-9").state is IssueState.POST_MERGE_ACCEPTANCE
+
+
+@pytest.mark.asyncio
+async def test_ordinary_merge_also_settles_the_lane(
+    acceptance: Acceptance,
+) -> None:
+    """Ungated merged work releases the lane on the Done path too."""
+
+    lease_lane(acceptance)
+
+    await acceptance.submit("ENG-9", sha=GOOD)
+
+    assert acceptance.queue.get("ENG-9").state is IssueState.DONE
+    assert lane_states(acceptance) == ["reclaimed"]

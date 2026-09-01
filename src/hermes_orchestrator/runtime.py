@@ -705,6 +705,11 @@ def open_runtime(
                 registry=processes,
             )
             merge_flow.reviews.on_merged = post_merge.on_merged
+            # INFRA-198: attached the same way, so post-merge settlement
+            # releases the development lane through the custodian's own
+            # proof chain instead of holding it through acceptance.
+            merge_flow.reviews.worktrees = worktree_leases
+            merge_flow.reviews.custodian = custodian
             runner = ClaudeRunner(
                 registry,
                 prompt_file=prompt_path,

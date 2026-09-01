@@ -252,6 +252,11 @@ class ReviewService:
         # keeps the pre-gate behavior byte-for-byte.
         self._acceptance = acceptance
         self._assignments = assignments
+        # INFRA-198: lane-settlement collaborators, attached by the live
+        # runtime like ``on_merged``. Merged work must stop occupying the
+        # development lane; ``None`` keeps the pre-settlement behavior.
+        self.worktrees: Any | None = None
+        self.custodian: Any | None = None
         self._now = now or (lambda: datetime.now(UTC))
         # INFRA-198 P2: an optional accelerator over durable rows, wired
         # by the caller (never by this constructor's own defaults) as a
@@ -680,6 +685,10 @@ class ReviewService:
                     IssueState.DONE,
                     IssueState.POST_MERGE_ACCEPTANCE,
                     IssueState.QA,
+                    # INFRA-198: a re-submitted candidate returns a held
+                    # issue to in_development; the merge still stands, so
+                    # the hold (and its lane settlement) must replay.
+                    IssueState.IN_DEVELOPMENT,
                 ):
                     await self._hold_for_acceptance(record, reconciling=True)
                     repairs.append(
@@ -1966,6 +1975,7 @@ class ReviewService:
             actor="codex_merger",
             reason=f"merged {record.merge_sha}",
         )
+        self._settle_development_lane(record)
         effect_id = f"linear:{record.issue_id}:after-merge:{record.review_id}"
         # INFRA-218 Sol correction deb5ec49: journal the exact target
         # BEFORE the first live Linear read (the identical target-only
@@ -2051,6 +2061,41 @@ class ReviewService:
         await self._linear.project(issue_id, target, effect_id=effect_id)
         self._complete_projection_effect(effect_id)
 
+    def _settle_development_lane(self, record: ReviewRecord) -> None:
+        """Release the development lane held by merged, settled work.
+
+        INFRA-198: the implementation is merged, so the lane it occupies
+        starves the next queued issue while acceptance proceeds --
+        acceptance itself needs no worktree. The lease is released only
+        through the EXISTING custodian chain (checkpoint -> remote proof
+        -> reclaim), with every proof requirement intact: a lease whose
+        proof cannot be established is left exactly as found and
+        reported, never force-released. No active lease for the issue is
+        a durable no-op, so replaying settlement settles nothing twice.
+        """
+
+        if self.worktrees is None or self.custodian is None:
+            return
+        for lease in self.worktrees.active(record.project_key):
+            if lease.issue_id != record.issue_id:
+                continue
+            try:
+                checkpoint = self.custodian.checkpoint(
+                    lease.lease_id, record.issue_id
+                )
+                self.custodian.reclaim(
+                    lease.lease_id, self.custodian.verify_remote(checkpoint)
+                )
+            except Exception as error:  # unprovable: leave the lease put
+                print(
+                    "development lane for "
+                    f"{record.issue_id!r} was not settled; lease "
+                    f"{lease.lease_id} left active: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+            return
+
     async def _hold_for_acceptance(
         self, record: ReviewRecord, *, reconciling: bool = False
     ) -> None:
@@ -2083,6 +2128,7 @@ class ReviewService:
             actor="codex_merger",
             reason=f"merged {record.merge_sha}; acceptance pending",
         )
+        self._settle_development_lane(record)
         self._dispatch_acceptance_assignment(
             record, gate, prior_state=prior_state.value, reconciling=reconciling
         )
