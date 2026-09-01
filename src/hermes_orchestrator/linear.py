@@ -44,6 +44,13 @@ _ALLOWED_STATUS_TRANSITIONS = frozenset(
         ("Review", "Done"),
         ("QA", "In Development"),
         ("QA", "Done"),
+        # Post-merge ACCEPTANCE only (INFRA-198, Sol 52d15493): the gate
+        # machinery moves a merged issue done -> post_merge_acceptance
+        # and projects the acceptance hold back to Linear as
+        # Done -> In Development (observed refused live on merged
+        # e8d5757). No other regression out of Done is permitted; every
+        # remaining Done -> * transition still fails closed below.
+        ("Done", "In Development"),
     }
 )
 

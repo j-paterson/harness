@@ -148,10 +148,16 @@ async def test_projection_updates_allowed_status_transition(
 
 
 @pytest.mark.asyncio
-async def test_projection_refuses_terminal_status_regression(
+async def test_done_to_in_development_accepted_for_acceptance_projection(
     linear_client: LinearClient,
     transport: RecordingLinearTransport,
 ) -> None:
+    """INFRA-198 (Sol 52d15493, required test 3): the post-merge
+    acceptance projection — the gate machinery moves a merged issue
+    done -> post_merge_acceptance and projects the hold back to Linear
+    as Done -> In Development — is an allowed transition (it was
+    refused live on merged e8d5757)."""
+
     transport.issue(
         status="Done",
         state_id="state-done",
@@ -159,14 +165,45 @@ async def test_projection_refuses_terminal_status_regression(
         revision="done-r1",
     )
 
-    with pytest.raises(ValueError, match=r"status transition.*not allowed"):
-        await linear_client.project(
-            "ENG-9",
-            LinearProjection(status="In Development", assignee_alias="operator"),
-            effect_id="effect-terminal-guard",
-        )
+    result = await linear_client.project(
+        "ENG-9",
+        LinearProjection(status="In Development", assignee_alias="operator"),
+        effect_id="effect-acceptance-hold",
+    )
 
-    assert transport.operations == ["Issue"]
+    assert result.changed_fields == ("status",)
+    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
+    assert transport.variables[1] == {
+        "id": "linear-eng-9",
+        "input": {"stateId": "state-development"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_projection_refuses_every_other_done_regression(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    """The acceptance carve-out is exactly one transition: every other
+    regression out of Done still fails closed with no update sent."""
+
+    for index, target in enumerate(("Todo", "Review", "QA")):
+        transport.issue(
+            status="Done",
+            state_id="state-done",
+            assignee_id="user-operator",
+            revision=f"done-r{index}",
+        )
+        transport.operations.clear()
+
+        with pytest.raises(ValueError, match=r"status transition.*not allowed"):
+            await linear_client.project(
+                "ENG-9",
+                LinearProjection(status=target, assignee_alias="operator"),
+                effect_id=f"effect-terminal-guard-{index}",
+            )
+
+        assert transport.operations == ["Issue"]
 
 
 def _pending_linear_rows(database: Database) -> list[dict[str, Any]]:
