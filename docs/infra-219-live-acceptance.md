@@ -122,3 +122,44 @@ NOT YET RUN — blocked on the precondition above. This section stays
 empty until a real run fills it with durable rows and captured cmux
 evidence. It must never be filled from a surrogate, a fixture, or a
 dry run.
+
+## Live acceptance failure observed 2026-09-01 (binding)
+
+**The lead was woken manually through cmux after PR #52 merged and
+runtime `8ac98e2757ba` was activated.** That is an acceptance failure,
+not an operational detail: this issue's whole claim is that Hermes
+alone launches, binds, recovers, and drives both lanes with "no manual
+cmux intervention".
+
+Measured at the time: the activation durably recorded its receipts —
+`daemon.restarted`, `channel.reregistered`, `channel.replayed` — bound
+to this exact lead session and sitting in state `published`, i.e. NOT
+delivered to the lead. The lead was idle. Nothing converted those
+published control operations into a wake of the exact bound session,
+and no supported CLI or `hermes-command` surface acknowledges them
+either (they were acknowledged for this activation through
+`ControlOperations.acknowledge` directly).
+
+**Binding requirement added to this issue's acceptance:** a
+merged-runtime or control event (`daemon.restarted`,
+`channel.reregistered`, `channel.replayed`, and any future control
+kind) published against an ACTIVE cell must wake that exact idle
+project lead — the bound session, in its own lane — without cmux
+interaction or operator action, and must be acknowledgeable through a
+supported surface. Publishing a receipt nobody delivers is the same
+class of defect as the projection that was journaled but never
+replayed.
+
+Scope note: this is a delivery gap in an existing mechanism, not new
+architecture. The durable receipts already exist and are already
+bound to the right session; what is missing is the wake and the
+acknowledgement surface. No new transport, protocol, or discovery
+cycle is warranted.
+
+### Proof step added to the procedure below
+
+7. **Control-event wake.** With the development lead idle, activate a
+   merged runtime. Prove the published `daemon.restarted` receipt
+   reaches that exact bound session as a wake with no cmux interaction
+   and no operator action, and that the lead can acknowledge it
+   through a supported command. Repeat for the harness lane.
