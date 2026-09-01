@@ -74,6 +74,11 @@ from hermes_orchestrator.handoffs import (
     derived_handoff_document,
 )
 from hermes_orchestrator.hermes_tools import HermesCommandService
+from hermes_orchestrator.issue_targeting import (
+    IssueTargetingRefused,
+    acknowledge_target,
+    target_issue,
+)
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
@@ -180,6 +185,30 @@ def _parser() -> argparse.ArgumentParser:
 
     queue_list = commands.add_parser("queue-list", help="list the private queue")
     queue_list.add_argument("--json", action="store_true")
+
+    target_issue_cmd = commands.add_parser(
+        "target-issue",
+        help="bind a named existing session to one admitted issue",
+    )
+    target_issue_cmd.add_argument("issue_id")
+    target_issue_cmd.add_argument("--project", required=True)
+    target_issue_cmd.add_argument("--cell", required=True)
+    target_issue_cmd.add_argument("--session", required=True)
+    target_issue_cmd.add_argument("--instruction", required=True)
+    target_issue_cmd.add_argument("--json", action="store_true")
+
+    target_issue_ack_cmd = commands.add_parser(
+        "target-issue-ack",
+        help=(
+            "consume the exact-session ACK for a published target-issue "
+            "packet; only this advances the issue and journals the "
+            "In Development projection (INFRA-220, Sol correction "
+            "7ecf4a57)"
+        ),
+    )
+    target_issue_ack_cmd.add_argument("assignment_id")
+    target_issue_ack_cmd.add_argument("--session", required=True)
+    target_issue_ack_cmd.add_argument("--json", action="store_true")
 
     queue_complete = commands.add_parser(
         "queue-complete",
@@ -4978,6 +5007,70 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 payload,
                 json_output=args.json,
                 human=f"{len(payload)} explicitly admitted issue(s).",
+            )
+            return 0
+
+        if args.command == "target-issue":
+            events = EventStore(database)
+            assignments = LeadAssignments(database, events=events)
+            try:
+                result = target_issue(
+                    database,
+                    events=events,
+                    assignments=assignments,
+                    issue_id=args.issue_id,
+                    project_key=args.project,
+                    cell_id=args.cell,
+                    session_id=args.session,
+                    instruction=args.instruction,
+                    known_projects=settings.projects.keys(),
+                )
+            except IssueTargetingRefused as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            _print(
+                result.assignment.as_dict(),
+                json_output=args.json,
+                human=(
+                    f"Targeted {result.assignment.issue_id} to session "
+                    f"{result.assignment.session_id}"
+                    + (" (already pending)" if result.idempotent else ".")
+                ),
+            )
+            return 0
+
+        if args.command == "target-issue-ack":
+            from hermes_orchestrator.queue import QueueService
+
+            events = EventStore(database)
+            assignments = LeadAssignments(database, events=events)
+            queue = QueueService(database, events, registered_projects=())
+            linear = _LazyIdleLinearProjector(settings, database=database, queue=queue)
+            ack_result = asyncio.run(
+                acknowledge_target(
+                    database,
+                    events=events,
+                    linear=linear,
+                    assignments=assignments,
+                    assignment_id=args.assignment_id,
+                    session_id=args.session,
+                )
+            )
+            if not ack_result.activated:
+                print(
+                    f"assignment {args.assignment_id!r} was not acknowledged "
+                    "or could not be activated",
+                    file=sys.stderr,
+                )
+                return 1
+            _print(
+                {
+                    "assignment_id": ack_result.assignment_id,
+                    "issue_id": ack_result.issue_id,
+                    "activated": ack_result.activated,
+                },
+                json_output=args.json,
+                human=f"Advanced {ack_result.issue_id} to in_development.",
             )
             return 0
 
