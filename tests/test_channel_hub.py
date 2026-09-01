@@ -735,7 +735,12 @@ class TestDirectRouting:
                     repository="owner/demo",
                     branch="feature/x",
                     pr_number=7,
-                    reviewed_sha="abc",
+                    # INFRA-193: the stored packet is validated against the
+                    # authoritative CorrectionPacket schema on every read,
+                    # which requires a real 40-hex reviewed_sha. Every one
+                    # of the 193 packets in live durable state satisfies
+                    # this; "abc" was only ever an unrealistic placeholder.
+                    reviewed_sha="a" * 40,
                     evidence="the defect",
                     acceptance_criterion="it works",
                     required_correction="fix it",

@@ -27,7 +27,11 @@ from typing import Any
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.manifests import CandidateManifest
-from hermes_orchestrator.verdicts import CorrectionPacket
+from hermes_orchestrator.verdicts import (
+    PACKET_KEYS,
+    CorrectionPacket,
+    packet_value_violation,
+)
 
 
 class CorrectionPayloadError(ValueError):
@@ -342,18 +346,12 @@ def packet_to_dict(packet: CorrectionPacket) -> dict[str, Any]:
 
 
 #: The exact durable ``CorrectionPacket`` schema written by
-#: :func:`packet_to_dict`. A stored packet must carry these keys, with
-#: these types, and no others — see :func:`packet_schema_violation`.
-_PACKET_TEXT_FIELDS = (
-    "severity",
-    "repository",
-    "branch",
-    "reviewed_sha",
-    "evidence",
-    "acceptance_criterion",
-    "required_correction",
-)
-_PACKET_FIELDS = frozenset({*_PACKET_TEXT_FIELDS, "pr_number", "required_tests"})
+#: :func:`packet_to_dict`, DERIVED from the authoritative verdict packet
+#: key set rather than restated: a stored packet carries every
+#: reviewer-supplied key plus the stamped ``pr_number``, and no others —
+#: see :func:`packet_schema_violation`.
+_PACKET_FIELDS = frozenset({*PACKET_KEYS, "pr_number"})
+_PACKET_TEXT_FIELDS = tuple(sorted(PACKET_KEYS - {"required_tests"}))
 
 
 def packet_schema_violation(value: Any) -> str | None:
@@ -361,13 +359,22 @@ def packet_schema_violation(value: Any) -> str | None:
 
     ``None`` means ``value`` is exactly the object :func:`packet_to_dict`
     writes: every field present, every field of exactly the right type,
-    and not one key more. Nothing is coerced or normalized here, because
+    every field within the ``CorrectionPacket`` VALUE constraints, and
+    not one key more. Nothing is coerced or normalized here, because
     coercion is a third way to be wrong — neither a parse error nor the
     stored record, but a silent rewrite of it. A ``required_tests``
     string is rejected rather than iterated into single characters, a
     stringified ``pr_number`` is rejected rather than parsed, and an
     unknown stored key is rejected rather than dropped, so a fetched
     packet is the stored packet and never a repair of it.
+
+    The value constraints are not restated here: keys come from
+    :data:`~hermes_orchestrator.verdicts.PACKET_KEYS` and the values go
+    through :func:`~hermes_orchestrator.verdicts.packet_value_violation`,
+    the same function the strict verdict parser uses, so a stored packet
+    the verdict schema would reject cannot be fetched. The type checks
+    below run first only to name the offending type precisely; they
+    reject nothing the shared value check would admit.
     """
 
     if not isinstance(value, dict):
@@ -385,9 +392,18 @@ def packet_schema_violation(value: Any) -> str | None:
                 f"field {field} must be a string, got "
                 f"{type(value[field]).__name__}"
             )
+    # The ONE real difference from a parsed verdict packet: a packet
+    # parsed from a reviewer's document carries pr_number=0 because the
+    # number is not reviewer-supplied (see CorrectionPacket.pr_number),
+    # while a stored packet carries the GitHub number stamped by
+    # with_pr_number. Stored validation therefore admits any non-negative
+    # int here — and only here; every other field follows the
+    # authoritative rules exactly.
     pr_number = value["pr_number"]
     if isinstance(pr_number, bool) or not isinstance(pr_number, int):
         return f"field pr_number must be an integer, got {type(pr_number).__name__}"
+    if pr_number < 0:
+        return f"field pr_number must not be negative, got {pr_number}"
     required_tests = value["required_tests"]
     if not isinstance(required_tests, list | tuple) or isinstance(
         required_tests, str | bytes
@@ -402,7 +418,9 @@ def packet_schema_violation(value: Any) -> str | None:
                 f"field required_tests[{position}] must be a string, got "
                 f"{type(item).__name__}"
             )
-    return None
+    # The authoritative CorrectionPacket value constraints, shared with
+    # the strict verdict parser rather than re-implemented here.
+    return packet_value_violation(value)
 
 
 def packet_from_dict(value: dict[str, Any]) -> CorrectionPacket:

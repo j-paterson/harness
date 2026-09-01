@@ -391,6 +391,60 @@ def test_fetch_fails_closed_on_wrong_stored_scalar_types(
         outbox.fetch(delivered.correction_id)
 
 
+@pytest.mark.parametrize(
+    ("field", "corruption", "expectation"),
+    [
+        ("severity", "Bogus", "unknown severity"),
+        ("reviewed_sha", "x", "invalid reviewed_sha"),
+        ("evidence", "", "invalid evidence"),
+        ("required_tests", [], "invalid required_tests"),
+        ("required_tests", [""], "invalid required_tests"),
+    ],
+)
+def test_fetch_fails_closed_on_stored_packet_value_violations(
+    outbox: LeadCorrectionOutbox,
+    database: Database,
+    field: str,
+    corruption: object,
+    expectation: str,
+) -> None:
+    """A stored packet the strict verdict schema would reject is refused.
+
+    Right keys and right Python types are not the schema: the severity
+    vocabulary, the 40-hex reviewed SHA, the non-empty required text and
+    the non-empty list of non-empty required tests are `CorrectionPacket`
+    VALUE constraints. A durable packet violating one is as malformed as
+    an unparseable row, and the fetch must return no document at all
+    rather than hand the lead a finding no reviewer could have written.
+    """
+
+    delivered = outbox.deliver("ENG-9", (packet(),))
+    corrupted = stored_packet_dicts()
+    corrupted[0][field] = corruption
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE lead_corrections SET packets_json = ? WHERE correction_id = ?",
+            (json.dumps(corrupted), delivered.correction_id),
+        )
+
+    with pytest.raises(CorrectionPayloadError, match=expectation) as refusal:
+        outbox.fetch(delivered.correction_id)
+    assert "no partial record is returned" in str(refusal.value)
+    # get() and pending() fail closed identically, and no confirmation is
+    # possible over the invalid payload: zero partial document anywhere.
+    with pytest.raises(CorrectionPayloadError):
+        outbox.get(delivered.correction_id)
+    with pytest.raises(CorrectionPayloadError):
+        outbox.pending("demo")
+    with pytest.raises(CorrectionPayloadError):
+        outbox.acknowledge(
+            delivered.correction_id,
+            observed_count=1,
+            payload_sha256=payload_digest((packet(),)),
+        )
+    assert_untouched(database, delivered.correction_id)
+
+
 def test_delivery_requires_one_bound_candidate(outbox: LeadCorrectionOutbox) -> None:
     with pytest.raises(ValueError, match="at least one"):
         outbox.deliver("ENG-9", ())
