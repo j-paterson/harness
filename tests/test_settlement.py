@@ -21,7 +21,7 @@ import pytest
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.git import GitError
+from hermes_orchestrator.git import AmbiguousHunkError, GitError
 from hermes_orchestrator.github import MergeResult
 from hermes_orchestrator.manifests import read_manifest_snapshot
 from hermes_orchestrator.settlement import (
@@ -1036,6 +1036,95 @@ class TestExternalReconciliation:
 
         assert acceptance.database.scalar("SELECT COUNT(*) FROM reviews") == 0
         assert acceptance.database.scalar("SELECT COUNT(*) FROM merge_settlements") == 0
+
+
+@pytest.mark.asyncio
+class TestExternalReconciliationExactBinding:
+    """INFRA-198: Sol correction b30c55f3 (live PR #43) -- reconciliation
+    of an advanced-base squash merge whose exact GitHub PR binding
+    (repository, base, PR number, reviewed head SHA == candidate SHA,
+    merged, merge commit reachable from main) is already fully proven
+    must not park in ``reconciliation_required`` merely because the
+    fourth-relation patch reconstruction hits an ambiguous duplicate
+    hunk. That binding is sufficient proof on its own; the hunk
+    reconstruction is corroboration, not a gate."""
+
+    def _wire_ambiguous_patch(
+        self, acceptance: Any, candidate: str, merge_sha: str, *, base: str = BASE
+    ) -> None:
+        """Force the first three relations to fail and the fourth's
+        positional proof to hit exactly the ambiguous-duplicate-hunk
+        class (a stand-in for the live tests/test_db.py duplicate
+        hunk) -- never a genuine tree mismatch."""
+
+        acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        acceptance.git.ancestor[(candidate, merge_sha)] = False
+        acceptance.git.trees[merge_sha] = STABLE_APPLIED_TREE
+        acceptance.git.trees[candidate] = "tree-" + candidate
+        acceptance.git.ancestor[(base, PARENT_SHA)] = True
+        acceptance.git.parents[merge_sha] = PARENT_SHA
+        acceptance.git.paths[(base, candidate)] = ADVANCED_PATHS
+        acceptance.git.paths[(PARENT_SHA, merge_sha)] = ADVANCED_PATHS
+        acceptance.git.apply_to_tree_error = AmbiguousHunkError(
+            "reviewed hunk is ambiguous or relocated on the merge parent: "
+            "tests/test_db.py hunk #1 (occurrences=2, expected line 10)"
+        )
+
+    async def test_ambiguous_duplicate_hunk_settles_on_the_exact_pr_binding(
+        self, acceptance: Any
+    ) -> None:
+        event, branch, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        merge_sha = merge_sha_for(GOOD)
+        self._wire_ambiguous_patch(acceptance, GOOD, merge_sha)
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=GOOD,
+            head_ref=branch,
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+        manifest = _manifest_for(acceptance, event)
+
+        outcome = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        assert outcome.state == "merged"
+        assert outcome.merge_sha == merge_sha
+        review_id = "review:demo:evt-1"
+        payload = _merge_proven_payload(acceptance, review_id)
+        assert payload["relation"] == "exact_binding_ambiguous_patch"
+        assert payload["base_sha"] == BASE
+        assert payload["merge_parent_sha"] == PARENT_SHA
+        settlement = acceptance.settlements.get(review_id)
+        assert settlement.state == "settled"
+        assert settlement.merge_sha == merge_sha
+        review_state = acceptance.database.scalar(
+            "SELECT state FROM reviews WHERE review_id = ?", (review_id,)
+        )
+        assert str(review_state) == "merged"
+
+        replay = await acceptance.service.reconcile_external_merge(
+            project_key="demo", issue_id="ENG-9", manifest=manifest, pr_number=number
+        )
+
+        assert replay.state == "merged"
+        assert acceptance.github.merge_calls == []
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM reviews") == 1
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 1
+        )
+        assert (
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'merge.proven' "
+                "AND aggregate_id = ?",
+                (review_id,),
+            )
+            == 1
+        )
 
 
 @pytest.mark.asyncio
