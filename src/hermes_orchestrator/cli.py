@@ -542,6 +542,16 @@ def _parser() -> argparse.ArgumentParser:
             "recover an already-running cell in this lane"
         ),
     )
+    start_lane.add_argument(
+        "--harness-run",
+        default=None,
+        help=(
+            "explicit harness-run identity; REQUIRED with --lane harness "
+            "(and refused with --lane development) -- mirrors "
+            "ProjectCellService.dispatch's own harness_run contract "
+            "(Sol correction 110ed759 / INFRA-219 L3, R1)"
+        ),
+    )
     start_lane.add_argument("--json", action="store_true")
 
     submit_handoff = commands.add_parser(
@@ -1309,6 +1319,29 @@ def _open_rotation_collaborators(
     return cells, seater
 
 
+#: DispatchResult statuses that mean "a lead is genuinely running (or
+#: just ran a turn) in this lane" -- the only outcomes ``start-lane``
+#: may report as success. This is an explicit ALLOW-list, not a deny
+#: -list, by deliberate Sol correction 110ed759 / INFRA-219 R1 design:
+#: the prior code (``return 0 if result.status not in (...) else 1``)
+#: was a deny-list that treated every *unrecognized* status -- including
+#: the harness-run refusals L3 later added -- as success. An allow-list
+#: cannot repeat that inversion: a new refusal status ``dispatch`` grows
+#: in the future is nonzero by construction, with zero further changes
+#: here. The two members reflect the two ways ``_dispatch_locked`` ends
+#: with a lead actually seated/run: ``"seated"`` (the classic-seats path
+#: activates the visible pane lead) and ``"working"`` (the streaming
+#: path completed a turn with the session durably confirmed). Every
+#: other status -- ``already_completed``, ``handoff_required``,
+#: ``seat_failed``, ``start_reconciliation_required``,
+#: ``start_unconfirmed``, ``project_busy``, ``awaiting_operator_decision``,
+#: ``harness_run_required``, ``harness_run_not_permitted``, and
+#: ``waiting_for_profile``/``start_failed`` (the two the old deny-list
+#: already caught) -- is a refusal or a non-start terminal state, and
+#: exits nonzero here.
+_LANE_DISPATCH_SUCCESS_STATUSES = frozenset({"seated", "working"})
+
+
 def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
     """``start-lane``: launch or recover one project's lead cell in one
     lane through Hermes' existing cell creation/launch path.
@@ -1321,6 +1354,22 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
     cell in the requested lane is adopted and reported (L1's
     ``(project_key, lane_role)`` uniqueness refuses a duplicate row
     before this command would ever attempt one), never a traceback.
+
+    Sol correction 110ed759 / INFRA-219 R1: L3 made ``harness_run`` a
+    MANDATORY ``ProjectCellService.dispatch`` argument for a harness
+    dispatch (``HARNESS_LANE`` without it refuses
+    ``harness_run_required``; a development dispatch that supplies one
+    refuses ``harness_run_not_permitted``), but L2 wrote this command
+    before L3 existed and never passed it -- so every harness start
+    refused, and the old exit line mapped only
+    ``waiting_for_profile``/``start_failed`` to nonzero, so the refusal
+    silently exited 0. This command now (1) carries an explicit
+    ``--harness-run`` argument and mirrors ``dispatch``'s own
+    lane/harness_run validation at the CLI boundary -- fail-closed
+    before ever calling ``dispatch``, so the dispatch-level refusal is
+    never the only guard -- and (2) maps exit codes through the
+    :data:`_LANE_DISPATCH_SUCCESS_STATUSES` ALLOW-list instead of a
+    deny-list, so any refusal status, present or future, exits nonzero.
     """
 
     if settings.cmux is None or runtime.cmux_bindings is None:
@@ -1375,7 +1424,40 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
         )
         return 1
 
-    result = asyncio.run(cells.dispatch(args.issue, lane_role=lane_role))
+    # Sol correction 110ed759 / INFRA-219 R1: mirror ProjectCellService
+    # .dispatch's own lane/harness_run validation HERE, at the CLI
+    # boundary, before ever calling dispatch -- fail-closed with a
+    # clear message and a nonzero exit, rather than letting the
+    # dispatch-level refusal (``harness_run_required`` /
+    # ``harness_run_not_permitted``) be the only guard against a
+    # harness start that never launches anything.
+    if lane_role == HARNESS_LANE and not args.harness_run:
+        _print(
+            {"error": "harness_run_required"},
+            json_output=args.json,
+            human=(
+                "--lane harness requires --harness-run: the harness lane "
+                "requires an explicit harness-run request bound to "
+                "lane_role='harness' (Sol correction 110ed759 / "
+                "INFRA-219 L3)."
+            ),
+        )
+        return 1
+    if lane_role != HARNESS_LANE and args.harness_run:
+        _print(
+            {"error": "harness_run_not_permitted"},
+            json_output=args.json,
+            human=(
+                "--lane development refuses --harness-run: development "
+                "occupancy is proven by explicit issue admission alone "
+                "(Sol correction 110ed759 / INFRA-219 L3)."
+            ),
+        )
+        return 1
+
+    result = asyncio.run(
+        cells.dispatch(args.issue, lane_role=lane_role, harness_run=args.harness_run)
+    )
     payload = dataclasses.asdict(result)
     _print(
         payload,
@@ -1385,7 +1467,7 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
             f"(cell {result.cell_id}, session {result.session_id})."
         ),
     )
-    return 0 if result.status not in ("waiting_for_profile", "start_failed") else 1
+    return 0 if result.status in _LANE_DISPATCH_SUCCESS_STATUSES else 1
 
 
 async def _candidate_ready(

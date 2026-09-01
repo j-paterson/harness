@@ -12,6 +12,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.merge_flow import (
+    DatabaseDurableWakeReader,
     _branch_head,
     _merged_candidate_proof,
     build_merge_flow,
@@ -154,6 +155,77 @@ def test_build_merge_flow_wires_no_admission_enforcement_seams(
 
     for seam in ("_packets", "_verifier", "_session_chain", "_grandfather_binding"):
         assert not hasattr(flow.emitter, seam)
+
+
+def test_build_merge_flow_wires_a_durable_wake_reader_into_the_emitter(
+    tmp_path: Path,
+) -> None:
+    """Sol correction 110ed759 (INFRA-219 R3): packet L5 added the
+    ``durable_wake`` port to ``CandidateEmitter`` so a manifest file
+    surviving on disk is never adopted for reuse without a matching
+    durable wake row for the exact event -- but the port was left
+    optional and ``build_merge_flow`` composed the production emitter
+    without it, so the gate never bound. This proves the emitter built by
+    ``build_merge_flow`` carries a real (non-None) durable-wake reader,
+    and that the reader answers correctly for a known-present and a
+    known-absent event id against the SAME database the flow was built
+    with -- not a fake."""
+
+    repo_root, state_dir = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    database = Database.open(settings.state_dir / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, settings.projects)
+
+    flow = build_merge_flow(
+        settings,
+        database=database,
+        events=events,
+        queue=queue,
+        linear=_NullLinear(),
+        keychain=_FakeKeychain(),
+        base_env={},
+    )
+
+    reader = flow.emitter._durable_wake
+    assert reader is not None
+    assert isinstance(reader, DatabaseDurableWakeReader)
+
+    assert reader.exists("demo", "unknown-event") is False
+
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO wake_deliveries("
+            "project_key, event_id, status, issue_id, candidate_sha, "
+            "base_sha, branch, manifest_path, manifest_digest, "
+            "manifest_device, manifest_inode, manifest_size, "
+            "manifest_mtime_ns, manifest_mode, state, created_at, "
+            "updated_at) VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "demo",
+                "known-event",
+                "FABLE_READY",
+                "ENG-9",
+                "a" * 40,
+                "b" * 40,
+                "feature/eng-9",
+                "/tmp/manifest.json",
+                "digest",
+                1,
+                1,
+                1,
+                1,
+                0o100644,
+                "pending",
+                "2026-08-30T00:00:00+00:00",
+                "2026-08-30T00:00:00+00:00",
+            ),
+        )
+
+    assert reader.exists("demo", "known-event") is True
+    assert reader.exists("demo", "unknown-event") is False
 
 
 @dataclass

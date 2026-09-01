@@ -1520,6 +1520,11 @@ class ProjectCellService:
                 lane_role=current.lane_role,
             )
             return current
+        # No lane scoping needed here either: profile_alias is the
+        # global PRIMARY KEY on profile_leases, so this conflict check
+        # already asks "does ANY lease anywhere hold this profile" --
+        # exactly the global shared-resource limit migration 0055 left
+        # untouched ("one profile serves one lease at a time").
         conflict = self._database.execute(
             "SELECT project_key FROM profile_leases WHERE profile_alias = ?",
             (replacement_profile,),
@@ -1560,15 +1565,34 @@ class ProjectCellService:
         )
         try:
             with self._database.transaction() as connection:
+                # No lane scoping needed here: profile_alias is the
+                # table's own PRIMARY KEY (migration 0055's note),
+                # globally unique across every lane, so it already names
+                # exactly one row -- the rotating cell's own prior lease.
                 connection.execute(
                     "DELETE FROM profile_leases WHERE profile_alias = ?",
                     (current.profile_alias,),
                 )
+                # Sol correction 110ed759 (INFRA-219 R2): migration 0055
+                # (packet L4) gave profile_leases a lane_role column with a
+                # unique index on (project_key, lane_role), but this insert
+                # predates that and always wrote the implicit default
+                # 'development' -- rotating a HARNESS cell silently wrote
+                # its replacement lease into the development lane,
+                # colliding with (or displacing) the real development
+                # lease. The replacement lease must carry the rotating
+                # cell's OWN lane, never an assumed default.
                 connection.execute(
                     "INSERT INTO profile_leases("
-                    "profile_alias, project_key, state, acquired_at"
-                    ") VALUES (?, ?, 'active', ?)",
-                    (rotated.profile_alias, rotated.project_key, now),
+                    "profile_alias, project_key, state, acquired_at, "
+                    "lane_role"
+                    ") VALUES (?, ?, 'active', ?, ?)",
+                    (
+                        rotated.profile_alias,
+                        rotated.project_key,
+                        now,
+                        rotated.lane_role,
+                    ),
                 )
                 connection.execute(
                     "UPDATE project_cells SET state = 'active', "

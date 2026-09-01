@@ -1956,6 +1956,153 @@ async def test_rotation_thaws_the_retired_session(
     assert runner.thaws == [SESSION_ID]
 
 
+def _stub_handoff_document(cell_id: str) -> HandoffDocument:
+    """A minimally valid handoff document for direct ``.rotate()`` tests."""
+
+    return HandoffDocument(
+        cell_id=cell_id,
+        objective="o",
+        status="s",
+        decisions=["d"],
+        branch="b",
+        commits=["c"],
+        pull_request="pr",
+        modified_files=["f"],
+        tests=[HandoffTest(command="t", outcome="ok")],
+        blockers=[],
+        remaining_steps=["r"],
+        commands=["cmd"],
+        environment_notes=["e"],
+        risks=[],
+        next_action="n",
+    )
+
+
+@pytest.mark.asyncio
+async def test_harness_rotation_lane_scopes_replacement_lease_spares_development(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """Sol correction 110ed759 (INFRA-219 R2): ``_finalize_transfer``'s
+    replacement-lease INSERT predates migration 0055's ``lane_role``
+    column and always wrote the implicit 'development' default --
+    rotating a HARNESS cell silently converted its replacement lease
+    into the development lane, colliding with (or displacing) the real
+    development lease. This proves the harness replacement lease is
+    written with ``lane_role='harness'`` and that the development
+    lane's own lease row is byte-identical before and after that
+    rotation."""
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter([SESSION_ID, REPLACEMENT_SESSION])
+    cell_ids = iter(["cell-dev", "cell-harness"])
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cell_ids),
+        handoffs=handoffs,
+        replacement_session_ids=lambda: THIRD_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    dev = await service.dispatch("ENG-9")
+    assert dev.status == "working"
+
+    admit(queue, "ENG-11")
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+    assert harness.status == "working"
+
+    dev_lease_before = database.execute(
+        "SELECT profile_alias, project_key, lane_role, state, acquired_at "
+        "FROM profile_leases WHERE lane_role = 'development'"
+    ).fetchall()
+    assert len(dev_lease_before) == 1
+
+    record = handoffs.submit(_stub_handoff_document("cell-harness"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-harness", record.handoff_id)
+
+    assert rotated.lane_role == "harness"
+    harness_lease = database.execute(
+        "SELECT lane_role FROM profile_leases WHERE profile_alias = ?",
+        (rotated.profile_alias,),
+    ).fetchone()
+    assert harness_lease is not None
+    assert harness_lease["lane_role"] == "harness"
+
+    dev_lease_after = database.execute(
+        "SELECT profile_alias, project_key, lane_role, state, acquired_at "
+        "FROM profile_leases WHERE lane_role = 'development'"
+    ).fetchall()
+    assert [tuple(row) for row in dev_lease_after] == [
+        tuple(row) for row in dev_lease_before
+    ]
+
+
+@pytest.mark.asyncio
+async def test_development_rotation_still_writes_the_development_lane(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """Regression (Sol correction 110ed759, INFRA-219 R2): development-
+    lane rotation -- the only lane that existed before INFRA-219 L4 --
+    must still write its replacement lease with ``lane_role
+    ='development'`` exactly as today, unaffected by threading the
+    rotating cell's OWN lane through the replacement-lease insert."""
+
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    assert (await service.dispatch("ENG-9")).status == "working"
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-demo", record.handoff_id)
+
+    assert rotated.lane_role == "development"
+    lease_lane = database.scalar(
+        "SELECT lane_role FROM profile_leases WHERE profile_alias = ?",
+        (rotated.profile_alias,),
+    )
+    assert lease_lane == "development"
+
+
 @pytest.mark.asyncio
 async def test_rotation_continues_to_the_next_profile_after_replacement_cap(
     database: Database,

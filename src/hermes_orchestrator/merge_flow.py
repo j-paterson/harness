@@ -98,6 +98,38 @@ class KeychainReader(Protocol):
     def read(self, service: str, account: str) -> str: ...
 
 
+class DatabaseDurableWakeReader:
+    """Read-only ``wake_deliveries`` lookup satisfying ``DurableWakePort``.
+
+    Sol correction 110ed759 (INFRA-219 R3): packet L5 added the
+    ``durable_wake`` port to :class:`CandidateEmitter` precisely so a
+    manifest file surviving on disk is never adopted for reuse without a
+    matching durable wake row for the exact event -- but the port was left
+    optional and ``build_merge_flow`` composed the production emitter
+    without wiring it, so the stale-manifest gate never actually bound in
+    production. ``wake_deliveries`` is keyed ``PRIMARY KEY (project_key,
+    event_id)`` (migration 0004), which is exactly the existence question
+    the port asks; nothing already exposed on :class:`CodexMerger` answers
+    it as a plain read (every existing ``wake_deliveries`` query there is
+    folded into a write's compare-and-swap or a delivery-state scan), so
+    this adapter reads the table directly through the same ``Database``
+    handle ``build_merge_flow`` already holds rather than growing a new
+    write-oriented method on the Merger's channel surface for a read.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def exists(self, project_key: str, event_id: str) -> bool:
+        return bool(
+            self._database.scalar(
+                "SELECT EXISTS(SELECT 1 FROM wake_deliveries "
+                "WHERE project_key = ? AND event_id = ?)",
+                (project_key, event_id),
+            )
+        )
+
+
 @dataclass(slots=True)
 class MergeFlow:
     """The composed live merge graph for every configured project."""
@@ -239,6 +271,10 @@ def build_merge_flow(
         # delegation-evidence ledger and no mandatory verifier
         # receipt. Test results are advisory; Sol and CI own
         # verification.
+        # Sol correction 110ed759 (INFRA-219 R3): wire the durable-wake
+        # reader so the stale-manifest gate L5 added actually binds in
+        # production — see DatabaseDurableWakeReader above.
+        durable_wake=DatabaseDurableWakeReader(database),
     )
     turns = MergerTurnService(
         database=database,
