@@ -1889,7 +1889,17 @@ class CmuxLeadSeater:
             else:
                 closed = True
                 self._bindings.mark_closed(binding.binding_id, reason=reason)
-        if self._channel_launch is not None:
+        # Sol correction d85c374d: cleanup is GATED on the surface
+        # actually being gone. An unconfirmed close may have left the
+        # workspace alive, and a live surface stripped of its channel
+        # configuration is worse than the residue itself: it survives
+        # on screen with no way to reach it, and the residual binding
+        # that reconciliation relies on can no longer be resolved.
+        # Holding the configuration keeps the surface reclaimable.
+        #
+        # With NO binding there is no surface to retain, so the orphaned
+        # configuration is safe -- and correct -- to remove.
+        if self._channel_launch is not None and (binding is None or closed):
             with suppress(Exception):
                 self._channel_launch.cleanup(session_id)
         return closed

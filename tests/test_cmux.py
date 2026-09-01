@@ -1438,7 +1438,14 @@ async def test_retire_failed_seat_holds_residual_when_close_is_unconfirmed(
     """An unconfirmed close must NOT be recorded as closed: the binding
     is held as residual ownership evidence so a later reconciliation
     reclaims the exact surface instead of leaking it (INFRA-214, same
-    idiom as the channel-trust close path)."""
+    idiom as the channel-trust close path).
+
+    Sol correction d85c374d: the session's channel configuration must
+    ALSO survive. The workspace may still be alive, and stripping a live
+    surface of its configuration is worse than the residue -- it stays
+    on screen with no way to reach it, and the residual binding
+    reconciliation depends on can no longer be resolved. This assertion
+    was missing, which is exactly why the unsafe cleanup passed."""
 
     class RefusingPort(FakeSeaterPort):
         async def close_workspace(self, workspace_uuid: str) -> None:
@@ -1470,4 +1477,31 @@ async def test_retire_failed_seat_holds_residual_when_close_is_unconfirmed(
         (binding.binding_id,),
     ).fetchone()
     assert state["state"] == "residual"
+    # The surface may still be alive: its configuration and capability
+    # are PRESERVED so the residual binding stays reconcilable.
+    assert channel.cleaned == []
     assert seater_bindings.active_lead("cell-harness") is None
+
+
+@pytest.mark.asyncio
+async def test_retire_failed_seat_cleans_channel_when_no_binding_exists(
+    seater_bindings: CmuxSurfaceBindings,
+) -> None:
+    """Sol correction d85c374d, the other half: with NO binding there is
+    no surface to retain, so the orphaned session configuration is safe
+    -- and correct -- to remove. Gating cleanup on a confirmed close
+    alone would strand it forever."""
+
+    port = FakeSeaterPort()
+    channel = FakeChannelLaunch(config=Path("/tmp/x.mcp.json"))
+    seater = make_seater(seater_bindings, port, channel_launch=channel)
+
+    closed = await seater.retire_failed_seat(
+        cell_id="cell-harness",
+        session_id=LEAD_SESSION,
+        reason="lead_start_failed",
+    )
+
+    assert closed is False
+    assert port.closed == []
+    assert channel.cleaned == [LEAD_SESSION]
