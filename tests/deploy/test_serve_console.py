@@ -67,6 +67,9 @@ GITHUB_REPOS = {"demo": "j-paterson/hermes-orchestrator"}
 ISSUE_ID = "demo-231"
 BLOCKED_ISSUE_ID = "demo-232"
 CONSOLE_QUEUED_ISSUE_ID = "demo-233"
+STUCK_ISSUE_ID = "demo-234"
+GATED_ISSUE_ID = "demo-235"
+REQUEUED_ISSUE_ID = "demo-236"
 SEEDED_PRIORITY = 3
 CELL_ID = "cell-demo-1"
 CELL_SESSION_ID = "lead-session-demo-1"
@@ -146,6 +149,77 @@ def console(tmp_path_factory: pytest.TempPathFactory):
                 IssueState.BLOCKED,
                 actor="operator",
                 reason="dependency wait",
+            )
+            # A third issue reproducing the INFRA-198 stuck-queued bug:
+            # admitted ready, paused by the orchestrator, then its
+            # dependency_ready cleared out-of-band (no journaled event —
+            # the observed production condition) before ever being
+            # requeued.
+            queue.admit(
+                AdmissionRequest(
+                    issue_id=STUCK_ISSUE_ID,
+                    project_key="demo",
+                    linear_priority=2,
+                    admitted_by="operator",
+                    instruction_id="operator-instruction-3",
+                )
+            )
+            queue.transition(
+                STUCK_ISSUE_ID,
+                IssueState.PAUSED,
+                actor="orchestrator",
+                reason="resource pressure",
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    "UPDATE admitted_issues SET dependency_ready = 0 "
+                    "WHERE issue_id = ?",
+                    (STUCK_ISSUE_ID,),
+                )
+            # A fourth issue admitted as a LEGITIMATE dependency gate:
+            # queued with dependency_ready = 0 straight out of admission,
+            # never paused, never requeued. Retry must not touch it.
+            queue.admit(
+                AdmissionRequest(
+                    issue_id=GATED_ISSUE_ID,
+                    project_key="demo",
+                    linear_priority=2,
+                    admitted_by="operator",
+                    instruction_id="operator-instruction-4",
+                    dependency_ready=False,
+                )
+            )
+            # A fifth issue carrying the residue of a PRIOR confirmed
+            # requeue: paused, readiness cleared out-of-band, then moved
+            # back to queued by a journaled operator requeue. It is queued
+            # (so retry falls through to the recovery path) and it has the
+            # durable issue.transitioned provenance that path requires.
+            queue.admit(
+                AdmissionRequest(
+                    issue_id=REQUEUED_ISSUE_ID,
+                    project_key="demo",
+                    linear_priority=2,
+                    admitted_by="operator",
+                    instruction_id="operator-instruction-5",
+                )
+            )
+            queue.transition(
+                REQUEUED_ISSUE_ID,
+                IssueState.PAUSED,
+                actor="orchestrator",
+                reason="resource pressure",
+            )
+            with database.transaction() as connection:
+                connection.execute(
+                    "UPDATE admitted_issues SET dependency_ready = 0 "
+                    "WHERE issue_id = ?",
+                    (REQUEUED_ISSUE_ID,),
+                )
+            queue.transition(
+                REQUEUED_ISSUE_ID,
+                IssueState.QUEUED,
+                actor="remote-operator",
+                reason="remote operator confirmation",
             )
             now = datetime.now(UTC).isoformat()
             # project_cells is daemon-owned (the console only reads it), so
@@ -608,6 +682,138 @@ def test_retry_of_a_queued_issue_is_rejected_with_a_static_reason(
     )
     assert row is not None
     assert row[0] == "queued"
+
+
+def test_confirmed_retry_restores_dependency_readiness_after_a_cleared_pause_hold(
+    console: ConsoleHarness,
+) -> None:
+    # INFRA-198: STUCK_ISSUE_ID was seeded paused with dependency_ready
+    # cleared out-of-band. The same production retry command must both
+    # requeue it AND repair readiness — there is no other supported path.
+    with _client(console) as client:
+        cookie_value = _login(client, console.credential)
+        token = _csrf(console, cookie_value)
+        prepared = _prepare(
+            client, token, intent="retry", target=f"issue:{STUCK_ISSUE_ID}"
+        )
+        assert prepared.status_code == 200
+        pending = prepared.json()
+        assert pending["confirmation_phrase"] == f"RETRY {STUCK_ISSUE_ID.upper()}"
+        confirmed = _confirm(client, token, pending, "serve-console-retry-3")
+    assert confirmed.status_code == 200
+    result = confirmed.json()
+    assert result["code"] == "accepted"
+    assert result["state"] == {"issue_id": STUCK_ISSUE_ID, "state": "queued"}
+    row = _query_one(
+        console.database_path,
+        "SELECT state, dependency_ready FROM admitted_issues WHERE issue_id = ?",
+        (STUCK_ISSUE_ID,),
+    )
+    assert row is not None
+    assert row[0] == "queued"
+    assert row[1] == 1
+    event_row = _query_one(
+        console.database_path,
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        (STUCK_ISSUE_ID,),
+    )
+    assert event_row is not None
+    assert event_row[0] == 1
+
+    # Semantics preserved: now that the row is healthy and queued, a
+    # second retry is still rejected with the same static reason code.
+    with _client(console) as client:
+        cookie_value = _login(client, console.credential)
+        token = _csrf(console, cookie_value)
+        prepared = _prepare(
+            client, token, intent="retry", target=f"issue:{STUCK_ISSUE_ID}"
+        )
+        assert prepared.status_code == 200
+        confirmed = _confirm(
+            client, token, prepared.json(), "serve-console-retry-4"
+        )
+    assert confirmed.status_code == 200
+    result = confirmed.json()
+    assert result["code"] == "rejected"
+    assert result["state"] == {"reason": "retry_not_applicable"}
+
+
+def test_confirmed_retry_leaves_a_newly_admitted_dependency_gate_alone(
+    console: ConsoleHarness,
+) -> None:
+    # INFRA-198 correction: GATED_ISSUE_ID was ADMITTED queued with
+    # dependency_ready = 0 — a legitimate dependency gate, not requeue
+    # residue. Admission permits exactly the state shape the recovery path
+    # repairs, so without durable provenance of a prior requeue the row
+    # must be rejected with the same static reason and left untouched.
+    before = _query_one(
+        console.database_path,
+        "SELECT state, dependency_ready, updated_at FROM admitted_issues "
+        "WHERE issue_id = ?",
+        (GATED_ISSUE_ID,),
+    )
+    assert before is not None
+    assert before[0] == "queued"
+    assert before[1] == 0
+    with _client(console) as client:
+        cookie_value = _login(client, console.credential)
+        token = _csrf(console, cookie_value)
+        prepared = _prepare(
+            client, token, intent="retry", target=f"issue:{GATED_ISSUE_ID}"
+        )
+        assert prepared.status_code == 200
+        confirmed = _confirm(
+            client, token, prepared.json(), "serve-console-retry-gated"
+        )
+    assert confirmed.status_code == 200
+    result = confirmed.json()
+    assert result["code"] == "rejected"
+    assert result["state"] == {"reason": "retry_not_applicable"}
+    # The durable row is unchanged — not merely the returned value.
+    after = _query_one(
+        console.database_path,
+        "SELECT state, dependency_ready, updated_at FROM admitted_issues "
+        "WHERE issue_id = ?",
+        (GATED_ISSUE_ID,),
+    )
+    assert after == before
+    ready_events = _query_one(
+        console.database_path,
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        (GATED_ISSUE_ID,),
+    )
+    assert ready_events == (0,)
+
+
+def test_confirmed_retry_still_repairs_the_residue_of_a_prior_requeue(
+    console: ConsoleHarness,
+) -> None:
+    # The other side of the same gate: REQUEUED_ISSUE_ID is queued and
+    # not-ready too, but a PRIOR confirmed requeue journaled an
+    # issue.transitioned event into queued for it. That durable provenance
+    # is what makes the recovery path applicable, so retry still repairs it.
+    with _client(console) as client:
+        cookie_value = _login(client, console.credential)
+        token = _csrf(console, cookie_value)
+        prepared = _prepare(
+            client, token, intent="retry", target=f"issue:{REQUEUED_ISSUE_ID}"
+        )
+        assert prepared.status_code == 200
+        confirmed = _confirm(
+            client, token, prepared.json(), "serve-console-retry-residue"
+        )
+    assert confirmed.status_code == 200
+    result = confirmed.json()
+    assert result["code"] == "accepted"
+    assert result["state"] == {"issue_id": REQUEUED_ISSUE_ID, "state": "queued"}
+    row = _query_one(
+        console.database_path,
+        "SELECT state, dependency_ready FROM admitted_issues WHERE issue_id = ?",
+        (REQUEUED_ISSUE_ID,),
+    )
+    assert row == ("queued", 1)
 
 
 def test_confirmed_checkpoint_persists_a_pending_request(

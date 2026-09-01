@@ -358,6 +358,116 @@ def test_conditional_transition_refuses_a_changed_source_state(
     assert int(database.scalar("SELECT count(*) FROM events")) == events_before
 
 
+# -- restore_readiness_after_requeue (INFRA-198) ------------------------
+
+
+def test_restore_readiness_after_requeue_repairs_a_stuck_queued_row(
+    queue_service: QueueService, database: Database
+) -> None:
+    queue_service.admit(request("ENG-11", "chat-11", dependency_ready=True))
+    queue_service.transition(
+        "ENG-11", IssueState.PAUSED, actor="orchestrator", reason="resource pressure"
+    )
+    # The observed production condition: dependency_ready cleared with no
+    # journaled event, then the row moved back to queued out of band.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE admitted_issues SET dependency_ready = 0 WHERE issue_id = ?",
+            ("ENG-11",),
+        )
+    queue_service.transition(
+        "ENG-11", IssueState.QUEUED, actor="remote-operator", reason="retry"
+    )
+    assert queue_service.get("ENG-11").dependency_ready is False
+
+    repaired = queue_service.restore_readiness_after_requeue(
+        "ENG-11", actor="remote-operator", reason="remote operator confirmation"
+    )
+
+    assert repaired is not None
+    assert repaired.state is IssueState.QUEUED
+    assert repaired.dependency_ready is True
+    assert queue_service.get("ENG-11").dependency_ready is True
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        ("ENG-11",),
+    ) == 1
+
+    # Nothing left to repair: a healthy queued+ready row is left untouched.
+    again = queue_service.restore_readiness_after_requeue(
+        "ENG-11", actor="remote-operator", reason="remote operator confirmation"
+    )
+    assert again is None
+    assert database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'issue.dependency_ready' "
+        "AND aggregate_id = ?",
+        ("ENG-11",),
+    ) == 1
+
+
+def test_restore_readiness_refuses_a_newly_admitted_dependency_gated_row(
+    queue_service: QueueService, database: Database, clock: MutableClock
+) -> None:
+    # Admission itself permits queued + dependency_ready = 0: that is a
+    # legitimate dependency gate, NOT the residue of a prior requeue. With
+    # no journaled transition into queued there is no requeue provenance,
+    # so the row must be left completely unchanged.
+    queue_service.admit(request("ENG-12", "chat-12", dependency_ready=False))
+    before = database.execute(
+        "SELECT state, dependency_ready, updated_at FROM admitted_issues "
+        "WHERE issue_id = ?",
+        ("ENG-12",),
+    ).fetchone()
+    events_before = int(database.scalar("SELECT count(*) FROM events"))
+    clock.advance(5)
+
+    assert (
+        queue_service.restore_readiness_after_requeue(
+            "ENG-12", actor="remote-operator", reason="remote operator confirmation"
+        )
+        is None
+    )
+
+    after = database.execute(
+        "SELECT state, dependency_ready, updated_at FROM admitted_issues "
+        "WHERE issue_id = ?",
+        ("ENG-12",),
+    ).fetchone()
+    assert tuple(after) == tuple(before)
+    assert queue_service.get("ENG-12").dependency_ready is False
+    assert int(database.scalar("SELECT count(*) FROM events")) == events_before
+
+
+def test_restore_readiness_accepts_provenance_from_a_transition_if_requeue(
+    queue_service: QueueService, database: Database
+) -> None:
+    # The retry handler's FIRST call site: transition_if commits the
+    # issue.transitioned event before restore_readiness_after_requeue opens
+    # its own transaction, so the same provenance predicate is satisfied by
+    # the requeue that just happened.
+    queue_service.admit(request("ENG-13", "chat-13", dependency_ready=False))
+    queue_service.transition(
+        "ENG-13", IssueState.PAUSED, actor="orchestrator", reason="resource pressure"
+    )
+
+    requeued = queue_service.transition_if(
+        "ENG-13",
+        IssueState.QUEUED,
+        from_states={IssueState.PAUSED, IssueState.BLOCKED},
+        actor="remote-operator",
+        reason="remote operator confirmation",
+    )
+    assert requeued is not None
+    repaired = queue_service.restore_readiness_after_requeue(
+        "ENG-13", actor="remote-operator", reason="remote operator confirmation"
+    )
+
+    assert repaired is not None
+    assert repaired.dependency_ready is True
+    assert queue_service.get("ENG-13").dependency_ready is True
+
+
 def test_mark_dependency_ready_is_scoped_to_its_project(
     database: Database, clock: MutableClock
 ) -> None:
