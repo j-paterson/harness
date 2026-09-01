@@ -3692,12 +3692,15 @@ def test_restore_lead_refuses_a_racing_owner_or_rotation(
     entry = trust_package(tmp_path)
     capture_trust_anchor(database, entry)
     original_id, _lost_id = relaunched_seat_shape(database, bindings)
-    [selected] = bindings.restorable_relaunched_leads()
+    [(selected, anchor_id)] = bindings.restorable_relaunched_leads()
     assert selected.binding_id == original_id
     racing = bind_demo_lead(bindings, FRESH)
     with pytest.raises(CmuxBindingConflict):
         bindings.restore_lead(
-            original_id, ref=REBOOTED_WORKSPACE, reason="relaunched"
+            original_id,
+            ref=REBOOTED_WORKSPACE,
+            reason="relaunched",
+            anchor_id=anchor_id,
         )
     bindings.mark_lost(str(racing.binding_id), reason="raced")
     database.execute(
@@ -3706,7 +3709,10 @@ def test_restore_lead_refuses_a_racing_owner_or_rotation(
     )
     with pytest.raises(CmuxBindingConflict):
         bindings.restore_lead(
-            original_id, ref=REBOOTED_WORKSPACE, reason="relaunched"
+            original_id,
+            ref=REBOOTED_WORKSPACE,
+            reason="relaunched",
+            anchor_id=anchor_id,
         )
     assert bindings.get(original_id).state == "stale"
     anchor = ChannelTrustAnchors(
@@ -3714,6 +3720,42 @@ def test_restore_lead_refuses_a_racing_owner_or_rotation(
     ).active_for_cell("cell-demo")
     assert anchor is not None
     assert anchor.workspace_uuid == LEAD.workspace_uuid
+
+
+def test_restore_lead_refuses_when_the_selected_anchor_was_replaced(
+    database: Database, bindings: CmuxSurfaceBindings, tmp_path: Path
+) -> None:
+    """The restore must consume the exact anchor selected with the stale seat."""
+
+    entry = trust_package(tmp_path)
+    anchors = ChannelTrustAnchors(database, events=EventStore(database))
+    selected_anchor = capture_trust_anchor(database, entry)
+    original_id, _lost_id = relaunched_seat_shape(database, bindings)
+    anchors.rebind(
+        cell_id="cell-demo",
+        profile_alias="max-a",
+        entry_path=entry,
+        package_root=entry.parents[2],
+        channel_entry="server:hermes-control",
+        launch_argv_template=CHANNEL_ARGV,
+        workspace_uuid=FRESH.workspace_uuid,
+        surface_uuid=FRESH.surface_uuid,
+        session_id=SESSION,
+    )
+
+    with pytest.raises(CmuxBindingConflict):
+        bindings.restore_lead(
+            original_id,
+            ref=REBOOTED_WORKSPACE,
+            reason="relaunched",
+            anchor_id=selected_anchor.anchor_id,
+        )
+
+    assert bindings.get(original_id).state == "stale"
+    active_anchor = anchors.active_for_cell("cell-demo")
+    assert active_anchor is not None
+    assert active_anchor.anchor_id != selected_anchor.anchor_id
+    assert active_anchor.workspace_uuid == FRESH.workspace_uuid
 
 
 def test_an_anchor_remint_rolls_back_with_its_caller(

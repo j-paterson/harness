@@ -755,13 +755,14 @@ class CmuxSurfaceBindings:
         ).fetchone()
         return None if row is None else _row_to_binding(row)
 
-    def restorable_relaunched_leads(self) -> tuple[CmuxBinding, ...]:
+    def restorable_relaunched_leads(self) -> tuple[tuple[CmuxBinding, str], ...]:
         """Stale lead bindings with no active sibling whose fully-proven
         active anchor still names exactly their session and surface: the
         reboot-relaunched seat a failed recovery retired (INFRA-198)."""
 
         rows = self._database.execute(
-            "SELECT b.* FROM cmux_surface_bindings b "
+            "SELECT b.*, a.anchor_id AS selected_anchor_id "
+            "FROM cmux_surface_bindings b "
             "JOIN channel_trust_anchors a ON a.cell_id = b.cell_id "
             "AND a.state = 'active' AND a.prompt_pattern IS NOT NULL "
             "AND a.session_id = b.session_id "
@@ -779,10 +780,17 @@ class CmuxSurfaceBindings:
             "WHERE role = 'lead' AND state = 'active' "
             "AND cell_id = b.cell_id)"
         ).fetchall()
-        return tuple(_row_to_binding(row) for row in rows)
+        return tuple(
+            (_row_to_binding(row), str(row["selected_anchor_id"])) for row in rows
+        )
 
     def restore_lead(
-        self, binding_id: str, *, ref: CmuxSurfaceRef, reason: str
+        self,
+        binding_id: str,
+        *,
+        ref: CmuxSurfaceRef,
+        reason: str,
+        anchor_id: str,
     ) -> CmuxBinding:
         """Flip one stale lead binding back to active at ``ref`` while
         its cell has no active lead; the caller proved the seat alive.
@@ -822,9 +830,7 @@ class CmuxSurfaceBindings:
         # either way. ``rebind`` is that contract, re-measuring every
         # content fact and refusing a pending prompt pattern.
         anchors = ChannelTrustAnchors(self._database, events=self._events)
-        anchor = anchors.active_for_cell(cell_id)
-        if anchor is None:
-            raise CmuxBindingConflict("a restored seat needs a proven anchor")
+        anchor = anchors.get(anchor_id)
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             # Both ownership facts re-proved under the write lock: a
@@ -837,6 +843,22 @@ class CmuxSurfaceBindings:
                 (*identity, cell_id),
             ).fetchone() is None:
                 raise CmuxBindingConflict("this cell no longer names this seat")
+            selected_anchor = connection.execute(
+                "SELECT 1 FROM channel_trust_anchors WHERE anchor_id = ? "
+                "AND state = 'active' AND cell_id = ? AND session_id = ? "
+                "AND profile_alias = ? AND surface_uuid = ?",
+                (
+                    anchor_id,
+                    cell_id,
+                    current.session_id,
+                    current.profile_alias,
+                    current.surface_uuid,
+                ),
+            ).fetchone()
+            if selected_anchor is None:
+                raise CmuxBindingConflict(
+                    "the selected anchor no longer names this seat"
+                )
             # The anchor re-mint rides THIS transaction, so the anchor
             # and the binding reach the new workspace together or
             # neither does; a refusal here rolls both back.
@@ -1334,7 +1356,7 @@ class CmuxSurfaceReconciler:
         no new capability, no keypress; a seat not provably alive stays
         exactly as it is."""
 
-        for binding in self._bindings.restorable_relaunched_leads():
+        for binding, anchor_id in self._bindings.restorable_relaunched_leads():
             if binding.session_id is None:
                 continue
             try:
@@ -1358,7 +1380,10 @@ class CmuxSurfaceReconciler:
                 continue
             try:
                 restored = self._bindings.restore_lead(
-                    binding.binding_id, ref=ref, reason="relaunched_seat_restored"
+                    binding.binding_id,
+                    ref=ref,
+                    reason="relaunched_seat_restored",
+                    anchor_id=anchor_id,
                 )
             except CmuxBindingConflict:
                 continue
