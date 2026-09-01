@@ -33,7 +33,7 @@ from hermes_orchestrator.codex_rpc import RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
-from hermes_orchestrator.github import GitHubError
+from hermes_orchestrator.github import DiscoveredPull, GitHubError
 from hermes_orchestrator.manifests import (
     CandidateManifest,
     ManifestError,
@@ -181,6 +181,59 @@ def _outcome_from_json(text: str) -> TurnOutcome:
         review_id=value["review_id"],
         merge_sha=value["merge_sha"],
     )
+
+
+def _approval_ineligibility_reason(
+    discovered: DiscoveredPull | None, project: ProjectConfig
+) -> str | None:
+    """``None`` when GitHub proves an approval-eligible pull; else why not.
+
+    Sol correction 6e1bfe60 (INFRA-217, Important): a *discovered* pull is
+    not automatically an *eligible* one. Before this correction, a
+    closed-unmerged exact-head pull was still returned by discovery, and
+    the only rejection test was ``discovered is None`` — so a closed
+    pull's approval was persisted here and rejected only later by the
+    merge driver, consuming the wake and forcing a corrected retry to
+    conflict with the stale submission. This predicate is the single
+    source of truth for approval eligibility, applied identically at both
+    call sites (``submit_review`` before any persistence, and
+    ``_settle_wake`` before any review/settlement/wake-terminal write):
+    eligible means GitHub proved exactly one same-repository pull at the
+    reviewed branch and SHA, whose head repository is also the project
+    repository (no foreign fork slip-through), that targets the
+    project's integration branch (no wrong-base slip-through), and that
+    is either still open or already merged — closed-unmerged is
+    INELIGIBLE. Head branch and head SHA are already exact by
+    construction of ``discover_pull_request``'s query and need no
+    re-check here.
+    """
+
+    if discovered is None:
+        return (
+            "approval requires a pull request at the exact reviewed head; "
+            "none was discovered on GitHub"
+        )
+    if (
+        discovered.repository != project.github_repo
+        or discovered.head_repository != project.github_repo
+    ):
+        return (
+            "approval requires a same-repository pull request; the "
+            "discovered pull's repository or head repository is not the "
+            "project repository"
+        )
+    if discovered.base_ref != project.integration_branch:
+        return (
+            "approval requires a pull request targeting the project's "
+            "integration branch; the discovered pull targets a different "
+            "base"
+        )
+    if discovered.state != "open" and not discovered.merged:
+        return (
+            "approval requires an open or already-merged pull request; "
+            "the discovered pull is closed and unmerged"
+        )
+    return None
 
 
 class MergerTurnService:
@@ -573,20 +626,24 @@ class MergerTurnService:
                 project_key, "verdict_invalid", event.event_id, event.issue_id,
                 str(error),
             )
-        if verdict is not None and (
-            verdict.verdict == "approved" and discovered is None
-        ):
-            # The discovery gate is rejection-capable and therefore runs
-            # BEFORE the rework failure close, exactly where the retired
-            # sole-open-pull-request check rejected — a rework candidate
-            # whose approval cannot bind a live pull request must leave
-            # its bound failure stored.
-            self._merger.complete_admitted_wake(project_key, event.event_id)
-            return TurnOutcome(
-                project_key, "rejected", event.event_id, event.issue_id,
-                "approval requires a pull request at the exact reviewed "
-                "head; none was discovered on GitHub",
-            )
+        if verdict is not None and verdict.verdict == "approved":
+            # Sol correction 6e1bfe60: the same eligibility judgement used
+            # before persistence in submit_review is re-applied here, so
+            # an ineligible pull (closed-unmerged, wrong base, foreign
+            # head repository) cannot slip through this recovery/resume
+            # settlement site either. The rejection-capable gate still
+            # runs BEFORE the rework failure close, exactly where the
+            # retired sole-open-pull-request check rejected — a rework
+            # candidate whose approval cannot bind an eligible pull
+            # request must leave its bound failure stored. The no-pull
+            # rejection reason is unchanged from before this correction.
+            ineligibility = _approval_ineligibility_reason(discovered, project)
+            if ineligibility is not None:
+                self._merger.complete_admitted_wake(project_key, event.event_id)
+                return TurnOutcome(
+                    project_key, "rejected", event.event_id, event.issue_id,
+                    ineligibility,
+                )
         # Every rejection-capable validation — manifest, channel generation,
         # branch head, base, issue, intake gates, admission, and the
         # discovery gate above — has now passed; only here may an
@@ -752,11 +809,17 @@ class MergerTurnService:
             raise SubmissionRejected(
                 f"pull-request discovery failed: {error}"
             ) from error
-        if document.verdict == "approved" and discovered is None:
-            raise SubmissionRejected(
-                "approval requires a pull request at the exact reviewed "
-                "head; none was discovered on GitHub"
-            )
+        if document.verdict == "approved":
+            # Sol correction 6e1bfe60: discovery alone is not eligibility.
+            # This full identity-and-state judgement runs before ANY
+            # persistence (submitted_verdict, review, settlement,
+            # correction, or wake-terminal write) below, so a closed-
+            # unmerged, wrong-base, or foreign-head-repository pull
+            # rejects with zero durable writes and a corrected retry for
+            # the same wake starts clean.
+            ineligibility = _approval_ineligibility_reason(discovered, project)
+            if ineligibility is not None:
+                raise SubmissionRejected(ineligibility)
         if stale_existing:
             assert existing is not None
             submission = self._supersede_submission(

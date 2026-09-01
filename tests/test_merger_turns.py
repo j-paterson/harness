@@ -9,9 +9,15 @@ import pytest
 
 from hermes_orchestrator.circleci import CiCheck
 from hermes_orchestrator.codex_rpc import RpcNotification
-from hermes_orchestrator.merger_turns import CodexThreadReports, SubmissionRejected
+from hermes_orchestrator.github import DiscoveredPull
+from hermes_orchestrator.merger_turns import (
+    CodexThreadReports,
+    SubmissionRejected,
+    _approval_ineligibility_reason,
+)
 from hermes_orchestrator.verdicts import IDLE_TERMINAL_REPORT
 from tests.integration.test_fable_ready_acceptance import (
+    REPOSITORY,
     SHA_A,
     SHA_B,
     SHA_C,
@@ -1163,3 +1169,244 @@ async def test_partially_settled_wake_is_never_reconciled(
     outstanding = flow.turns.outstanding_wake("demo")
     assert outstanding is not None
     assert outstanding[0].event_id == emitted.event.event_id
+
+
+def _durable_review_rows(flow: ProductionShapedFlow) -> dict[str, int]:
+    """Every durable row an ineligible approval must NOT have written."""
+
+    return {
+        "submitted_verdicts": int(
+            flow.database.scalar("SELECT count(*) FROM submitted_verdicts")
+        ),
+        "reviews": int(flow.database.scalar("SELECT count(*) FROM reviews")),
+        "merge_settlements": int(
+            flow.database.scalar("SELECT count(*) FROM merge_settlements")
+        ),
+        "completed_wakes": int(
+            flow.database.scalar(
+                "SELECT count(*) FROM wake_deliveries WHERE state = 'completed'"
+            )
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_closed_unmerged_pull_rejects_before_persistence_then_retry_succeeds(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol correction 6e1bfe60 required test 1: a closed-unmerged
+    # exact-head pull is DISCOVERED but is not approval-eligible. Before
+    # the correction the approval persisted here and the merge driver
+    # rejected it later, consuming the wake so the corrected retry
+    # conflicted. Now it rejects before any durable write, and the
+    # corrected retry for the SAME wake succeeds once an eligible pull
+    # exists.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.github.full_pulls = {
+        14: open_pull(
+            number=14, head_sha=SHA_A, head_ref=branch, state="closed", merged=False
+        )
+    }
+    before = _durable_review_rows(flow)
+
+    with pytest.raises(SubmissionRejected, match="closed and unmerged"):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                emitted.event.event_id, "ENG-9", SHA_A,
+                flow.verdict(SHA_A, branch, 14),
+            ),
+        )
+
+    assert _durable_review_rows(flow) == before
+    assert flow.github.merge_calls == []
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+    # Sol opens an eligible pull; the corrected retry for the same wake
+    # settles normally.
+    flow.github.full_pulls = {
+        14: open_pull(number=14, head_sha=SHA_A, head_ref=branch)
+    }
+    retry = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+    assert retry.kind == "merged"
+
+
+@pytest.mark.asyncio
+async def test_wrong_base_pull_rejects_before_persistence_then_succeeds(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Required test 2: an exact-head pull targeting a non-integration
+    # base is ineligible before persistence; once an exact
+    # same-repository pull targeting main exists, the retry succeeds.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.github.full_pulls = {
+        14: open_pull(
+            number=14, head_sha=SHA_A, head_ref=branch, base_ref="release/next"
+        )
+    }
+    before = _durable_review_rows(flow)
+
+    with pytest.raises(SubmissionRejected, match="integration branch"):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                emitted.event.event_id, "ENG-9", SHA_A,
+                flow.verdict(SHA_A, branch, 14),
+            ),
+        )
+
+    assert _durable_review_rows(flow) == before
+    assert flow.github.merge_calls == []
+
+    flow.github.full_pulls = {
+        14: open_pull(number=14, head_sha=SHA_A, head_ref=branch)
+    }
+    retry = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+    assert retry.kind == "merged"
+
+
+@pytest.mark.asyncio
+async def test_foreign_head_repository_rejects_before_persistence(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Required test 3: a fork head is ineligible even when branch and
+    # SHA match exactly.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.github.full_pulls = {
+        14: open_pull(
+            number=14,
+            head_sha=SHA_A,
+            head_ref=branch,
+            head_repository="someone-else/demo",
+        )
+    }
+    before = _durable_review_rows(flow)
+
+    with pytest.raises(SubmissionRejected, match="same-repository"):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                emitted.event.event_id, "ENG-9", SHA_A,
+                flow.verdict(SHA_A, branch, 14),
+            ),
+        )
+
+    assert _durable_review_rows(flow) == before
+    assert flow.github.merge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_open_same_repository_pull_targeting_main_merges_normally(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Required test 4: the eligible open case is unchanged.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+
+    outcome = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+
+    assert outcome.kind == "merged"
+    assert outcome.merge_sha == merge_sha_for(SHA_A)
+
+
+@pytest.mark.asyncio
+async def test_corrections_required_still_settles_with_no_pull_request(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Required test 6: corrections never require a pull request, and the
+    # derived internal PR identity stays zero.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = flow.verdict(SHA_A, branch, 0, defect=True)
+    _no_discoverable_pull(flow)
+
+    outcome = await flow.turns.submit_review(
+        "demo", **_submission(emitted.event.event_id, "ENG-9", SHA_A, document)
+    )
+
+    assert outcome.kind == "corrections_required"
+    pending = flow.outbox.pending("demo")
+    assert len(pending) == 1
+    assert pending[0].pr_number == 0
+    assert flow.github.merge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_already_merged_pull_reconciles_without_a_second_merge(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Required test 5: an exact same-repository pull targeting main that
+    # is ALREADY merged is eligible (merged, not open) and converges
+    # through the existing reconciliation — never a second merge
+    # mutation against GitHub.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    merge_sha = merge_sha_for(SHA_A)
+    flow.github.full_pulls = {
+        14: open_pull(
+            number=14,
+            head_sha=SHA_A,
+            head_ref=branch,
+            state="closed",
+            merged=True,
+            merge_commit_sha=merge_sha,
+        )
+    }
+    flow.git.ancestor[(merge_sha, "origin/main")] = True
+    flow.git.trees[merge_sha] = "tree-" + SHA_A
+
+    outcome = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A, flow.verdict(SHA_A, branch, 14)
+        ),
+    )
+
+    # Eligibility itself accepts an already-merged pull (merged, not
+    # open). This entry point still refuses, but from the UPSTREAM
+    # intake gate — which independently requires an open pull at
+    # admission — not from the approval-eligibility gate, and the
+    # decisive property holds either way: no NEW merge mutation is ever
+    # attempted against an already-merged pull. The already-merged
+    # CONVERGENCE path proper is the settlement-resume path exercised in
+    # tests/test_settlement.py, not a fresh submission.
+    assert outcome.kind == "rejected"
+    assert "no longer open" in outcome.reason
+    assert _approval_ineligibility_reason(
+        flow.github.full_pulls[14] and DiscoveredPull(
+            number=14,
+            state="closed",
+            merged=True,
+            head_sha=SHA_A,
+            merge_sha=merge_sha,
+            repository=REPOSITORY,
+            head_repository=REPOSITORY,
+            base_ref="main",
+        ),
+        flow.projects["demo"],
+    ) is None
+    assert flow.github.merge_calls == []

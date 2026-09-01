@@ -160,6 +160,16 @@ class DiscoveredPull:
 
     INFRA-217 G1: GitHub, not the reviewer, is the authority for PR and
     merge identity. ``merge_sha`` is populated iff ``merged`` is true.
+
+    Sol correction 6e1bfe60 (INFRA-217, Important): discovery alone is not
+    approval eligibility. ``repository``, ``head_repository``, and
+    ``base_ref`` are carried here so a caller can judge same-repository,
+    same-head-repository (no foreign fork), and correct-integration-base
+    eligibility without a second GitHub read; head branch and head SHA are
+    already exact by construction of the discovery query and need no
+    field here. They are populated from the same full pull-request read
+    already performed for a closed match, and from the list summary
+    (which carries them too) for an open match.
     """
 
     number: int
@@ -167,6 +177,9 @@ class DiscoveredPull:
     merged: bool
     head_sha: str
     merge_sha: str | None
+    repository: str
+    head_repository: str
+    base_ref: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +584,13 @@ class GitHubClient:
         exact `(branch, head_sha)` match is unresolvable ownership and fails
         closed with :class:`MergeAmbiguous`, the same fail-closed idiom this
         module already uses for ambiguous merge ownership.
+
+        Sol correction 6e1bfe60: a closed-list match is revalidated against
+        the fresh full read's own head SHA and head ref, not the head SHA
+        alone — the same stale-response fail-closed idiom already used
+        here. The returned identity's ``repository``, ``head_repository``,
+        and ``base_ref`` also come from that full read for a closed match,
+        never from the list summary.
         """
 
         _require_repository(repository)
@@ -617,9 +637,16 @@ class GitHubClient:
                 merged=False,
                 head_sha=summary.head_sha,
                 merge_sha=None,
+                repository=summary.repository,
+                head_repository=summary.head_repository,
+                base_ref=summary.base_ref,
             )
         pull = self.get_pull_request(repository, summary.number)
-        if pull.head_sha != head_sha:
+        # Sol correction 6e1bfe60: revalidate the full identity from this
+        # fresh read, not head SHA alone — a listed match whose full read
+        # disagrees on either head field is exactly as untrustworthy as
+        # the head-SHA-only staleness this already guarded against.
+        if pull.head_sha != head_sha or pull.head_ref != branch:
             raise GitHubError(
                 "stale GitHub response: pull request head changed between "
                 "discovery reads"
@@ -634,6 +661,9 @@ class GitHubClient:
             merged=pull.merged,
             head_sha=pull.head_sha,
             merge_sha=pull.merge_commit_sha if pull.merged else None,
+            repository=pull.repository,
+            head_repository=pull.head_repository,
+            base_ref=pull.base_ref,
         )
 
     def merge(

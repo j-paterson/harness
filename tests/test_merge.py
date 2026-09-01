@@ -177,6 +177,12 @@ class FakeGitHub:
                     merged=pull.merged,
                     head_sha=pull.head_sha,
                     merge_sha=pull.merge_commit_sha if pull.merged else None,
+                    # Sol correction 6e1bfe60 (INFRA-217): discovery
+                    # carries the identity fields approval eligibility
+                    # is judged on, so the fake must too.
+                    repository=pull.repository,
+                    head_repository=pull.head_repository,
+                    base_ref=pull.base_ref,
                 )
         for summary in self.open_pulls:
             if summary.head_ref == branch and summary.head_sha == head_sha:
@@ -188,6 +194,9 @@ class FakeGitHub:
                         merged=False,
                         head_sha=summary.head_sha,
                         merge_sha=None,
+                        repository=summary.repository,
+                        head_repository=summary.head_repository,
+                        base_ref=summary.base_ref,
                     ),
                 )
         if len(matches) > 1:

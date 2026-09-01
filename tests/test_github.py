@@ -295,7 +295,14 @@ def test_discover_pull_request_returns_open_match(
         REPOSITORY, branch="feature/eng-9", head_sha=HEAD
     )
     assert discovered == DiscoveredPull(
-        number=14, state="open", merged=False, head_sha=HEAD, merge_sha=None
+        number=14,
+        state="open",
+        merged=False,
+        head_sha=HEAD,
+        merge_sha=None,
+        repository=REPOSITORY,
+        head_repository=REPOSITORY,
+        base_ref="main",
     )
     assert transport.calls == [
         (
@@ -331,7 +338,14 @@ def test_discover_pull_request_returns_merged_match_with_merge_sha(
         REPOSITORY, branch="feature/eng-9", head_sha=HEAD
     )
     assert discovered == DiscoveredPull(
-        number=14, state="closed", merged=True, head_sha=HEAD, merge_sha=MERGE_SHA
+        number=14,
+        state="closed",
+        merged=True,
+        head_sha=HEAD,
+        merge_sha=MERGE_SHA,
+        repository=REPOSITORY,
+        head_repository=REPOSITORY,
+        base_ref="main",
     )
 
 
@@ -350,7 +364,14 @@ def test_discover_pull_request_returns_closed_unmerged_match(
         REPOSITORY, branch="feature/eng-9", head_sha=HEAD
     )
     assert discovered == DiscoveredPull(
-        number=14, state="closed", merged=False, head_sha=HEAD, merge_sha=None
+        number=14,
+        state="closed",
+        merged=False,
+        head_sha=HEAD,
+        merge_sha=None,
+        repository=REPOSITORY,
+        head_repository=REPOSITORY,
+        base_ref="main",
     )
 
 
