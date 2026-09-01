@@ -684,7 +684,7 @@ class TestStaleChannelSettlementFence:
                 manifest=snapshot.manifest,
                 pr_number=14,
             )
-        assert acceptance.settlements.get("review:demo:evt-1").state == "merging"
+        assert acceptance.settlements.get("review:demo:evt-1").state == "recorded"
         replace_reviewer_channel(acceptance)
         with acceptance.database.transaction() as connection:
             connection.execute(
@@ -981,10 +981,151 @@ class TestExternalReconciliation:
         )
         assert acceptance.database.scalar("SELECT COUNT(*) FROM ci_merge_ledger") == 1
 
+    async def test_reviewer_fix_chain_preserves_submitted_and_final_identities(
+        self, acceptance: Any
+    ) -> None:
+        event, _, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        manifest = _manifest_for(acceptance, event)
+        final_sha = THIRD
+        merge_sha = merge_sha_for(final_sha)
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=final_sha,
+            head_ref="sol/eng-9-integration",
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+        acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        acceptance.git.ancestor[(final_sha, merge_sha)] = False
+        acceptance.git.trees[merge_sha] = "tree-final"
+        acceptance.git.trees[final_sha] = "tree-final"
+
+        outcome = await acceptance.service.reconcile_external_merge(
+            project_key="demo",
+            issue_id="ENG-9",
+            manifest=manifest,
+            pr_number=number,
+            submitted_sha=GOOD,
+            final_integration_sha=final_sha,
+            merge_sha=merge_sha,
+        )
+
+        assert outcome.state == "merged"
+        assert outcome.merge_sha == merge_sha
+        review = acceptance.database.execute(
+            "SELECT reviewed_sha, merge_sha FROM reviews WHERE review_id = ?",
+            (outcome.review_id,),
+        ).fetchone()
+        assert tuple(review) == (GOOD, merge_sha)
+        effect = acceptance.guarded_github.journal.get(f"merge:{outcome.review_id}")
+        assert effect is not None
+        assert effect.request["sha"] == final_sha
+        assert effect.request["head_ref"] == "sol/eng-9-integration"
+        payload = _merge_proven_payload(acceptance, outcome.review_id)
+        assert payload["submitted_sha"] == GOOD
+        assert payload["final_integration_sha"] == final_sha
+        assert payload["merge_sha"] == merge_sha
+
+    async def test_reviewer_fix_chain_resumes_after_a_claimed_crash(
+        self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        event, _, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        manifest = _manifest_for(acceptance, event)
+        final_sha = THIRD
+        merge_sha = merge_sha_for(final_sha)
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=final_sha,
+            head_ref="sol/eng-9-integration",
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=merge_sha,
+        )
+        acceptance.git.ancestor[(merge_sha, "origin/main")] = True
+        acceptance.git.ancestor[(final_sha, merge_sha)] = False
+        acceptance.git.trees[merge_sha] = "tree-final"
+        acceptance.git.trees[final_sha] = "tree-final"
+        original = acceptance.service._settle_proven
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("simulated crash after external effect")
+
+        monkeypatch.setattr(acceptance.service, "_settle_proven", crash)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await acceptance.service.reconcile_external_merge(
+                project_key="demo",
+                issue_id="ENG-9",
+                manifest=manifest,
+                pr_number=number,
+                submitted_sha=GOOD,
+                final_integration_sha=final_sha,
+                merge_sha=merge_sha,
+            )
+        monkeypatch.setattr(acceptance.service, "_settle_proven", original)
+        expire_settlement_lease(acceptance)
+
+        [outcome] = await acceptance.service.resume_settlements("demo")
+
+        assert outcome.state == "merged"
+        assert outcome.merge_sha == merge_sha
+        assert acceptance.settlements.get(outcome.review_id).state == "settled"
+
+    @pytest.mark.parametrize(
+        ("submitted_sha", "final_sha", "merge_sha", "fragment"),
+        [
+            (THIRD, THIRD, merge_sha_for(THIRD), "submitted sha"),
+            (GOOD, "d" * 40, merge_sha_for(THIRD), "final integration sha"),
+            (GOOD, THIRD, "e" * 40, "merge sha"),
+            (GOOD, None, None, "provided together"),
+        ],
+    )
+    async def test_reviewer_fix_chain_mismatch_writes_zero_receipts(
+        self,
+        acceptance: Any,
+        submitted_sha: str,
+        final_sha: str | None,
+        merge_sha: str | None,
+        fragment: str,
+    ) -> None:
+        event, _, number = acceptance.prepare("ENG-9", GOOD, pr_number=14)
+        manifest = _manifest_for(acceptance, event)
+        actual_merge = merge_sha_for(THIRD)
+        acceptance.github.full_pulls[number] = open_pull(
+            number=number,
+            head_sha=THIRD,
+            head_ref="sol/eng-9-integration",
+            state="closed",
+            merged=True,
+            mergeable=None,
+            merge_commit_sha=actual_merge,
+        )
+
+        with pytest.raises(ValueError, match=fragment):
+            await acceptance.service.reconcile_external_merge(
+                project_key="demo",
+                issue_id="ENG-9",
+                manifest=manifest,
+                pr_number=number,
+                submitted_sha=submitted_sha,
+                final_integration_sha=final_sha,
+                merge_sha=merge_sha,
+            )
+
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM reviews") == 0
+        assert acceptance.database.scalar("SELECT COUNT(*) FROM merge_settlements") == 0
+        assert (
+            acceptance.database.scalar("SELECT COUNT(*) FROM github_merge_effects")
+            == 0
+        )
+
     @pytest.mark.parametrize(
         ("mutation", "error_type", "fragment"),
         [
             ({"head_sha": THIRD}, ValueError, "not the reviewed candidate"),
+            ({"head_repository": "fork/demo"}, ValueError, "repository"),
             ({"merged": False, "state": "open"}, ValueError, "not merged"),
             ({"base_ref": "develop"}, ValueError, "integration branch"),
             ({"merge_commit_sha": None}, Exception, "no merge commit"),

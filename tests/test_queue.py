@@ -336,6 +336,28 @@ def test_mark_dependency_ready_flips_only_blocked_not_ready_rows(
     ) == 1
 
 
+def test_conditional_transition_refuses_a_changed_source_state(
+    queue_service: QueueService, database: Database
+) -> None:
+    queue_service.admit(request("ENG-9", "chat-9"))
+    queue_service.transition(
+        "ENG-9", IssueState.DONE, actor="worker", reason="completed concurrently"
+    )
+    events_before = int(database.scalar("SELECT count(*) FROM events"))
+
+    result = queue_service.transition_if(
+        "ENG-9",
+        IssueState.QUEUED,
+        from_states={IssueState.PAUSED, IssueState.BLOCKED},
+        actor="remote-operator",
+        reason="remote operator confirmation",
+    )
+
+    assert result is None
+    assert queue_service.get("ENG-9").state is IssueState.DONE
+    assert int(database.scalar("SELECT count(*) FROM events")) == events_before
+
+
 def test_mark_dependency_ready_is_scoped_to_its_project(
     database: Database, clock: MutableClock
 ) -> None:
