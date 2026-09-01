@@ -3,21 +3,45 @@
 Assignment `a14b6b26`, instruction
 `codex-goal:exact-sol-queue-start:20260901`.
 
-## Scope of this pass
+## Scope — corrected by Sol c9b74c0b/e09ff825
 
-The issue carries four sections. This pass implements ONLY the last,
-which the issue itself labels a **"Required narrow correction"**: the
-orphaned `submitted_verdicts` reconciliation that falsely holds the
-pinned Sol transcript open.
+My first pass took only the last section, reading it as the admitted
+slice because the issue labels it a "Required narrow correction". That
+scoping was WRONG: the issue's completion scope is **cumulative**, and
+narrowing it left the operator-visible MVP contract unmet.
 
-Deliberately NOT in this pass — each is substantial and none is the
-live cause of the observed stale state:
+Sol's Critical correction directs: continue with bounded follow-up
+commits implementing the omitted cumulative requirements, preserve the
+stale-submission fix already delivered, keep one primary Sol writer and
+one PR at a time, use `codex queue --thread` for routine wakes, add no
+transport, and **backlog the audit-event atomicity hardening** (Sol
+c9b74c0b) since it risks no incorrect or lost work, security, or
+operator usability today. That backlogged work has been discarded from
+the tree, not shipped half-done.
 
-- the Codex experimental thread-queue APIs, capability handshake and
-  `thread/queue/start` recovery;
-- the per-turn Sol role sandbox policy (approval mode, network for
-  GitHub PR/merge, `runtime-exec` identity);
-- the bounded provisioning helper's attach/exit lifecycle.
+Remaining cumulative requirements, to land as bounded commits:
+
+1. **Exact queue start and recovery.** Codex experimental thread-queue
+   APIs behind an explicit capability handshake; after a turn completes
+   or is interrupted, list the exact thread queue and start the exact
+   idle head; a queued candidate never interrupts an active turn;
+   durable queued/started/settled truth so a successful `codex queue`
+   exit is never itself proof of a started turn; recover an interrupted
+   or unstarted head on reconnect; deduplicate by durable identity.
+2. **Recovered-turn role capability.** The primary Sol role's per-turn
+   sandbox policy — workspace-scoped writes, approval mode `never`,
+   network sufficient for GitHub PR/merge and the guarded Hermes path —
+   and Hermes resolved through the recorded active runtime identity,
+   never a stale checkout `.venv`.
+3. **Bounded helper lifecycle.** The provisioning/recovery app-server
+   exits or is reclaimed by exact process lease once no turn is active,
+   leaving the pinned thread openable in Codex.
+
+Honest limit: items 2 and 3 carry acceptance that is operator-visible
+against the real Codex app (the pinned thread opening without
+"open in another app", a recovered turn creating the PR itself). Those
+can be driven and asserted in tests, but the final live proof needs the
+real app and is not something this lead can assert headlessly.
 
 ## What was measured before planning
 
