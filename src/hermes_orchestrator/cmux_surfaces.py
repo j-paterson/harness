@@ -766,6 +766,14 @@ class CmuxSurfaceBindings:
             "AND a.state = 'active' AND a.prompt_pattern IS NOT NULL "
             "AND a.session_id = b.session_id "
             "AND a.surface_uuid = b.surface_uuid "
+            # Sol finding 2: a stale anchored session and its live
+            # process can outlive the cell that named them, so the
+            # current cell must still name exactly this seat.
+            "JOIN project_cells c ON c.cell_id = b.cell_id "
+            "AND c.state = 'active' "
+            "AND c.session_id = b.session_id "
+            "AND c.profile_alias = b.profile_alias "
+            "AND c.lane_role = b.lane_role "
             "WHERE b.role = 'lead' AND b.state = 'stale' "
             "AND NOT EXISTS (SELECT 1 FROM cmux_surface_bindings "
             "WHERE role = 'lead' AND state = 'active' "
@@ -792,8 +800,65 @@ class CmuxSurfaceBindings:
             raise CmuxBindingConflict("an active binding already owns this cell")
         if ref.surface_uuid != current.surface_uuid:
             raise CmuxBindingConflict("a restored seat must keep its surface")
+        cell_id = str(current.cell_id)
+        identity = (
+            cell_id,
+            current.session_id,
+            current.profile_alias,
+            current.lane_role,
+        )
+        cell_names_seat = (
+            "SELECT 1 FROM project_cells WHERE cell_id = ? "
+            "AND state = 'active' AND session_id = ? "
+            "AND profile_alias = ? AND lane_role = ?"
+        )
+        # Sol finding 2: this cell must still name exactly this seat.
+        if self._database.execute(cell_names_seat, identity).fetchone() is None:
+            raise CmuxBindingConflict("this cell no longer names this seat")
+        # Sol finding 1: the reboot re-mints the workspace, so the
+        # anchor must be carried onto the workspace this binding is
+        # restored into, or the gate compares the live workspace against
+        # the anchor's original one and the seat is unregisterable
+        # either way. ``rebind`` is that contract, re-measuring every
+        # content fact and refusing a pending prompt pattern.
+        anchors = ChannelTrustAnchors(self._database, events=self._events)
+        anchor = anchors.active_for_cell(cell_id)
+        if anchor is None:
+            raise CmuxBindingConflict("a restored seat needs a proven anchor")
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            # Both ownership facts re-proved under the write lock: a
+            # concurrent rotation or rebinding cannot race restoration
+            # into two active owners or an obsolete one.
+            if connection.execute(
+                cell_names_seat + " AND NOT EXISTS "
+                "(SELECT 1 FROM cmux_surface_bindings WHERE role = 'lead' "
+                "AND state = 'active' AND cell_id = ?)",
+                (*identity, cell_id),
+            ).fetchone() is None:
+                raise CmuxBindingConflict("this cell no longer names this seat")
+            # The anchor re-mint rides THIS transaction, so the anchor
+            # and the binding reach the new workspace together or
+            # neither does; a refusal here rolls both back.
+            if anchor.workspace_uuid != ref.workspace_uuid:
+                entry_path = Path(anchor.canonical_entry_path)
+                try:
+                    anchors._rebind_in(
+                        connection,
+                        cell_id=cell_id,
+                        profile_alias=anchor.profile_alias,
+                        entry_path=entry_path,
+                        package_root=entry_path.parents[2],
+                        channel_entry=anchor.channel_entry,
+                        launch_argv_template=anchor.launch_argv_template,
+                        workspace_uuid=ref.workspace_uuid,
+                        surface_uuid=anchor.surface_uuid,
+                        session_id=anchor.session_id,
+                    )
+                except Exception as error:
+                    raise CmuxBindingConflict(
+                        f"the anchor cannot follow the restored seat: {error}"
+                    ) from error
             connection.execute(
                 "UPDATE cmux_surface_bindings SET workspace_uuid = ? "
                 "WHERE binding_id = ?",
