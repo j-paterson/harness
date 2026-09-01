@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Protocol
 
 from hermes_orchestrator.config import ProjectConfig
-from hermes_orchestrator.git import GitError
+from hermes_orchestrator.git import AmbiguousHunkError, GitError
 from hermes_orchestrator.github import (
     GitHubError,
     MergeAmbiguous,
@@ -99,7 +99,16 @@ class ProvenMerge:
     fuzz, or conflict failing closed -- and only then is the patch applied,
     in a throwaway index, reproducing the merge commit's own tree
     byte-for-byte; never a digest comparison, and never just "the context
-    matched somewhere").
+    matched somewhere"), or ``exact_binding_ambiguous_patch`` (INFRA-198,
+    external reconciliation only: the same fourth-relation reconstruction
+    hit the one narrow ``AmbiguousHunkError`` class -- a duplicated block
+    makes the positional proof inconclusive -- after the caller had
+    already independently proven the exact GitHub PR binding: reviewed
+    head SHA equal to the candidate SHA, the pull request merged, and the
+    merge commit reachable from the integration branch; that binding
+    stands on its own as proof for a squash/rebase merge, and the failed
+    hunk reconstruction is recorded honestly as corroboration that could
+    not complete, never silently upgraded to ``patch_equivalent``).
     This object is the only permit for a Linear Done projection.
     """
 
@@ -230,13 +239,28 @@ class IntegrationMerge:
         ProvenMerge permit. Any failure raises
         :class:`ReconciliationRequired` and nothing may be
         reconstructed from it.
+
+        Every caller of this method (``reconcile_external_merge`` and
+        ``_drive_merge``'s direct-Sol-merge branch) independently proves
+        the exact GitHub PR binding -- reviewed head SHA equal to the
+        candidate SHA, the pull request merged, base matching, and a
+        merge commit present -- before ever reaching here, so ``_prove``
+        is told to trust that binding (INFRA-198): a squash/rebase whose
+        fourth-relation hunk reconstruction hits only the narrow
+        ambiguous-duplicate-hunk class still yields a proof instead of
+        :class:`ReconciliationRequired`.
         """
 
         project = self._projects.get(project_key)
         if project is None:
             raise MergeBlocked(f"unknown project {project_key!r}")
         proof = self._prove(
-            project, candidate_sha, merge_sha, merge_method, base_sha=base_sha
+            project,
+            candidate_sha,
+            merge_sha,
+            merge_method,
+            base_sha=base_sha,
+            trust_exact_binding=True,
         )
         return ProvenMerge(
             project_key=project_key,
@@ -262,6 +286,7 @@ class IntegrationMerge:
         merge_method: str,
         *,
         base_sha: str | None = None,
+        trust_exact_binding: bool = False,
     ) -> _Proof:
         """Prove the merge result carries the reviewed work, per method.
 
@@ -283,6 +308,22 @@ class IntegrationMerge:
         touches the user's worktree or real index, onto the merge's first
         parent; accepted only when the resulting tree is byte-identical to
         the merge commit's own tree.
+
+        ``trust_exact_binding`` (INFRA-198) is set only by callers that
+        have already independently proven the exact GitHub PR binding
+        (reviewed head SHA == candidate SHA, merged, base matched, merge
+        commit present) before this method ever runs -- it never applies
+        to the guarded live-merge gate in ``merge_approved``. Even then it
+        changes nothing about the ancestry proof above (a merge commit
+        that is not reachable from the integration branch, or a candidate
+        base that is not reachable from the merge parent, still refuses
+        unconditionally): it only permits the fourth relation to accept
+        the merge on the exact binding alone when the hunk reconstruction
+        fails with exactly the narrow :class:`AmbiguousHunkError` class --
+        a duplicated block making the positional proof inconclusive, not
+        a proven mismatch. A genuine reconstruction failure (a changed
+        target, fuzz, an unexplained offset, or the applied tree not
+        matching the merge tree) still refuses closed regardless.
         """
 
         integration_ref = f"origin/{project.integration_branch}"
@@ -327,9 +368,27 @@ class IntegrationMerge:
                     raise ReconciliationRequired(
                         "merge changed paths differ from the reviewed candidate"
                     )
-                applied = self._git.apply_to_tree(
-                    project.repo_path, base_sha, candidate_sha, parent
-                )
+                try:
+                    applied = self._git.apply_to_tree(
+                        project.repo_path, base_sha, candidate_sha, parent
+                    )
+                except AmbiguousHunkError:
+                    if not trust_exact_binding:
+                        raise
+                    # The exact GitHub PR binding is already durably
+                    # established by the caller and by the ancestry proof
+                    # above; the hunk reconstruction is corroboration, not
+                    # a gate, so an inconclusive (not mismatched) hunk
+                    # proof does not park this in reconciliation_required.
+                    return _Proof(
+                        relation="exact_binding_ambiguous_patch",
+                        base_sha=base_sha,
+                        merge_parent_sha=parent,
+                        merge_tree_sha=self._git.tree_of(
+                            project.repo_path, merge_sha
+                        ),
+                        changed_paths=merge_paths,
+                    )
                 merge_tree = self._git.tree_of(project.repo_path, merge_sha)
                 if applied != merge_tree:
                     raise ReconciliationRequired(

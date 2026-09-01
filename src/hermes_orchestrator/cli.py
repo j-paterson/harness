@@ -55,7 +55,12 @@ from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
-from hermes_orchestrator.handoffs import HandoffService
+from hermes_orchestrator.handoffs import (
+    HandoffRecord,
+    HandoffRejected,
+    HandoffService,
+    derived_handoff_document,
+)
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
 from hermes_orchestrator.lead_assignments import LeadAssignments
@@ -500,6 +505,48 @@ def _parser() -> argparse.ArgumentParser:
     )
     rotate_lead.add_argument("--cell", required=True)
     rotate_lead.add_argument("--json", action="store_true")
+
+    submit_handoff = commands.add_parser(
+        "submit-handoff",
+        help=(
+            "submit the incumbent lead's fresh durable handoff for a "
+            "cell: every mechanical field (identity, git position, "
+            "issue state, environment) is derived from durable rows "
+            "and the worktree probe; the caller provides only "
+            "decisions, caveats, risks, and the exact next action. A "
+            "lead rotation awaiting this handoff resumes automatically "
+            "on the durable submission (INFRA-198, Sol 52d15493)"
+        ),
+    )
+    submit_handoff.add_argument("--cell", required=True)
+    submit_handoff.add_argument(
+        "--decision",
+        action="append",
+        required=True,
+        dest="decisions",
+        help="one decision made so far (repeatable; at least one)",
+    )
+    submit_handoff.add_argument(
+        "--caveat",
+        action="append",
+        default=[],
+        dest="caveats",
+        help="one caveat/blocker the replacement must know (repeatable)",
+    )
+    submit_handoff.add_argument(
+        "--risk",
+        action="append",
+        default=[],
+        dest="risks",
+        help="one open risk (repeatable)",
+    )
+    submit_handoff.add_argument(
+        "--next-action",
+        required=True,
+        dest="next_action",
+        help="the exact next action the replacement should take",
+    )
+    submit_handoff.add_argument("--json", action="store_true")
 
     decision_import = commands.add_parser(
         "decision-import",
@@ -3200,6 +3247,173 @@ def _serve_console(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _compose_lead_rotation(
+    settings: Any, runtime: Any, database: Database, project: Any
+) -> Any:
+    """Build the one-shot ``LeadRotation`` exactly as ``rotate-lead`` does.
+
+    Shared by ``rotate-lead`` and the ``submit-handoff`` continuation so
+    both drive the SAME durable transition with identical collaborators.
+    Raises ``OSError``/``ValueError`` when the collaborators cannot be
+    opened (surfaced by the caller as one actionable message).
+    """
+
+    from hermes_orchestrator.lead_rotation import LeadRotation
+
+    cells, seater = _open_rotation_collaborators(settings, runtime)
+    # Leads and candidates work in a dedicated worktree when the
+    # project configures one; ``repo_path`` itself must stay the stable
+    # primary checkout (see the linked-worktree rejection in
+    # ``load_settings``), so the rotation probe validates the lead's
+    # actual candidate tree instead. Sol correction c5600e31: derived
+    # from the same canonical ``project.lead_cwd`` the seater/cell
+    # composition and bootstrap trust in
+    # ``_open_rotation_collaborators`` use.
+    lead_worktree = project.lead_cwd
+    return LeadRotation(
+        database=database,
+        handoffs=HandoffService(database),
+        cells=cells,
+        bindings=runtime.cmux_bindings,
+        seater=seater,
+        # The gate calls this with the project key, not the cell id;
+        # the exact worktree path is already resolved above, so the key
+        # itself is accepted but unused.
+        worktree_state=lambda _project_key: _worktree_state(lead_worktree),
+        registration_wait_seconds=ROTATION_REGISTRATION_WAIT_SECONDS,
+    )
+
+
+def _submit_handoff(
+    args: argparse.Namespace, settings: Any, runtime: Any, database: Database
+) -> int:
+    """Submit the incumbent's fresh durable handoff and drive the
+    awaiting rotation's event-driven continuation (INFRA-198).
+
+    Every mechanical handoff field is derived from durable rows and the
+    lead-worktree probe; the caller supplies only decisions, caveats,
+    risks, and the exact next action. The submission commits first; the
+    post-commit listener signal then hands each submitted record to
+    ``LeadRotation.resume_on_submission``, which continues an awaiting
+    rotation exactly once and never fires for an ordinary handoff.
+    """
+
+    cell = database.execute(
+        "SELECT project_key, state, session_id, profile_alias "
+        "FROM project_cells WHERE cell_id = ?",
+        (args.cell,),
+    ).fetchone()
+    if cell is None:
+        _print(
+            {"error": f"cell {args.cell!r} does not exist"},
+            json_output=args.json,
+            human=f"cell {args.cell!r} does not exist.",
+        )
+        return 1
+    project_key = str(cell["project_key"])
+    project = settings.projects.get(project_key)
+    if project is None:
+        _print(
+            {"error": "the cell's project is not configured"},
+            json_output=args.json,
+            human="the cell's project is not configured.",
+        )
+        return 1
+    worktree = _worktree_state(project.lead_cwd)
+    issue_rows = database.execute(
+        "SELECT issue_id, state FROM admitted_issues WHERE project_key = ? "
+        "AND state IN ('in_development', 'review') ORDER BY issue_id",
+        (project_key,),
+    ).fetchall()
+    issue_id, issue_state = (
+        (str(issue_rows[0]["issue_id"]), str(issue_rows[0]["state"]))
+        if len(issue_rows) == 1
+        else ("none", "unknown")
+    )
+    document = derived_handoff_document(
+        cell_id=args.cell,
+        project_key=project_key,
+        session_id=str(cell["session_id"]),
+        profile_alias=str(cell["profile_alias"]),
+        issue_id=issue_id,
+        issue_state=issue_state,
+        branch=worktree.branch,
+        head=worktree.head,
+        decisions=list(args.decisions),
+        caveats=list(args.caveats),
+        risks=list(args.risks),
+        next_action=args.next_action,
+    )
+    handoffs = HandoffService(database)
+    submitted: list[HandoffRecord] = []
+    # The existing post-commit listener idiom: the durable submission
+    # commits first, then the signal drives the continuation.
+    handoffs.subscribe(submitted.append)
+    try:
+        record = handoffs.submit(document)
+    except HandoffRejected as error:
+        _print(
+            {"error": str(error)},
+            json_output=args.json,
+            human=f"handoff refused: {error}",
+        )
+        return 1
+    resumed = None
+    continuation_note: str | None = None
+    if settings.cmux is None or runtime.cmux_bindings is None:
+        continuation_note = "cmux is not configured; no rotation was resumed"
+    else:
+        try:
+            rotation = _compose_lead_rotation(settings, runtime, database, project)
+        except (OSError, ValueError) as error:
+            continuation_note = f"rotation collaborators unavailable: {error}"
+        else:
+            for signaled in submitted:
+                resumed = asyncio.run(rotation.resume_on_submission(signaled))
+    payload: dict[str, Any] = {
+        "handoff_id": record.handoff_id,
+        "cell_id": record.cell_id,
+        "state": record.state,
+        "resumed_rotation": (
+            None if resumed is None else dataclasses.asdict(resumed)
+        ),
+        "continuation_note": continuation_note,
+    }
+    if resumed is None:
+        _print(
+            payload,
+            json_output=args.json,
+            human=(
+                f"Handoff {record.handoff_id} submitted for cell "
+                f"{record.cell_id}; no lead rotation was awaiting it"
+                + (f" ({continuation_note})" if continuation_note else "")
+                + "."
+            ),
+        )
+        return 0
+    if resumed.ok:
+        _print(
+            payload,
+            json_output=args.json,
+            human=(
+                f"Handoff {record.handoff_id} submitted; the awaiting "
+                f"rotation resumed and completed: session "
+                f"{resumed.replacement_session} seated on {resumed.profile} "
+                f"(binding {resumed.binding_id})."
+            ),
+        )
+        return 0
+    _print(
+        payload,
+        json_output=args.json,
+        human=(
+            f"Handoff {record.handoff_id} submitted; the awaiting rotation "
+            f"resumed but did not complete: {resumed.failure}"
+        ),
+    )
+    return 1
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     """Run one CLI command and return its process exit code."""
 
@@ -3615,8 +3829,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     human="cmux is not configured (config/cmux.yaml).",
                 )
                 return 1
-            from hermes_orchestrator.lead_rotation import LeadRotation
-
             binding = runtime.cmux_bindings.active_lead(args.cell)
             if binding is not None and binding.project_key is not None:
                 project_key = binding.project_key
@@ -3647,7 +3859,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 )
                 return 1
             try:
-                cells, seater = _open_rotation_collaborators(settings, runtime)
+                rotation = _compose_lead_rotation(
+                    settings, runtime, database, project
+                )
             except (OSError, ValueError) as error:
                 _print(
                     {"error": str(error)},
@@ -3655,29 +3869,26 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     human=f"{error}.",
                 )
                 return 1
-            # Leads and candidates work in a dedicated worktree when
-            # the project configures one; ``repo_path`` itself must
-            # stay the stable primary checkout (see the linked-worktree
-            # rejection in ``load_settings``), so the rotation probe
-            # validates the lead's actual candidate tree instead. Sol
-            # correction c5600e31: derived from the same canonical
-            # ``project.lead_cwd`` the seater/cell composition and
-            # bootstrap trust in ``_open_rotation_collaborators`` use.
-            lead_worktree = project.lead_cwd
-            rotation = LeadRotation(
-                database=database,
-                handoffs=HandoffService(database),
-                cells=cells,
-                bindings=runtime.cmux_bindings,
-                seater=seater,
-                # The gate calls this with the project key, not the
-                # cell id; the exact worktree path is already resolved
-                # above, so the key itself is accepted but unused.
-                worktree_state=lambda _project_key: _worktree_state(lead_worktree),
-                registration_wait_seconds=ROTATION_REGISTRATION_WAIT_SECONDS,
-            )
             report = asyncio.run(rotation.rotate(args.cell))
             payload = dataclasses.asdict(report)
+            if report.phase == "awaiting_handoff":
+                # Non-terminal (Sol 52d15493): the rotation itself filed
+                # the fresh durable handoff request with the incumbent
+                # and resumes automatically once it is submitted — no
+                # operator action and no second rotate-lead required.
+                _print(
+                    payload,
+                    json_output=args.json,
+                    human=(
+                        f"Rotation awaiting a fresh handoff for cell "
+                        f"{report.cell_id}: durable request "
+                        f"{getattr(report, 'request_id', None)} filed with "
+                        "the incumbent lead; the rotation resumes "
+                        "automatically once the handoff is submitted "
+                        "(hermes-orchestrator submit-handoff)."
+                    ),
+                )
+                return 0
             if report.failure:
                 _print(
                     payload,
@@ -3695,6 +3906,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             )
             return 0
+
+        if args.command == "submit-handoff":
+            return _submit_handoff(args, settings, runtime, database)
 
         if args.command == "decision-import":
             try:

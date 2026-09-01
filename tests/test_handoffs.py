@@ -183,3 +183,102 @@ def test_reacknowledgement_backfills_a_legacy_row_without_a_profile(
 
     assert repaired.state == "acknowledged"
     assert repaired.replacement_profile_alias == "max-b"
+
+
+# -- post-commit submission signal and derived documents (INFRA-198) -------
+
+
+def test_submit_signals_subscribers_after_the_durable_commit(
+    handoffs: HandoffService, database: Database
+) -> None:
+    observed: list[tuple[str, int]] = []
+
+    def listener(record: object) -> None:
+        # The durable row exists by the time the signal runs.
+        count = database.scalar(
+            "SELECT count(*) FROM handoffs WHERE handoff_id = ?",
+            (record.handoff_id,),  # type: ignore[attr-defined]
+        )
+        observed.append((record.handoff_id, int(count)))  # type: ignore[attr-defined]
+
+    handoffs.subscribe(listener)
+
+    record = handoffs.submit(valid_handoff())
+
+    assert observed == [(record.handoff_id, 1)]
+
+
+def test_a_failing_listener_never_unsubmits_the_durable_handoff(
+    handoffs: HandoffService, database: Database
+) -> None:
+    def broken(record: object) -> None:
+        raise RuntimeError("listener crashed")
+
+    handoffs.subscribe(broken)
+
+    record = handoffs.submit(valid_handoff())
+
+    assert record.state == "submitted"
+    assert database.scalar("SELECT count(*) FROM handoffs") == 1
+
+
+def test_derived_handoff_document_takes_only_non_derivable_content() -> None:
+    """Every mechanical field comes from durable facts; the incumbent
+    contributes only decisions, caveats, risks, and the next action."""
+
+    from hermes_orchestrator.handoffs import derived_handoff_document
+
+    document = derived_handoff_document(
+        cell_id="cell-demo",
+        project_key="demo",
+        session_id="11111111-1111-4111-8111-111111111111",
+        profile_alias="max-b",
+        issue_id="ENG-9",
+        issue_state="in_development",
+        branch="feature/eng-9",
+        head="abc123",
+        decisions=["Keep the existing public interface."],
+        caveats=["CI flake on the network suite."],
+        risks=["Schema migration is irreversible."],
+        next_action="Run the failing test and correct ENG-9.",
+    )
+
+    assert document.cell_id == "cell-demo"
+    assert document.branch == "feature/eng-9"
+    assert document.commits == ["abc123"]
+    assert "ENG-9" in document.objective
+    assert "in_development" in document.status
+    assert document.decisions == ["Keep the existing public interface."]
+    assert document.blockers == ["CI flake on the network suite."]
+    assert document.risks == ["Schema migration is irreversible."]
+    assert document.next_action == "Run the failing test and correct ENG-9."
+    assert document.remaining_steps == [document.next_action]
+    assert any("max-b" in note for note in document.environment_notes)
+
+
+def test_derived_document_from_an_unreadable_worktree_fails_submission(
+    handoffs: HandoffService,
+) -> None:
+    """A worktree probe that could not resolve the branch/head yields a
+    document whose mechanical fields fail submit()'s revalidation — an
+    unverifiable checkpoint is never stored as a handoff."""
+
+    from hermes_orchestrator.handoffs import derived_handoff_document
+
+    document = derived_handoff_document(
+        cell_id="cell-demo",
+        project_key="demo",
+        session_id="11111111-1111-4111-8111-111111111111",
+        profile_alias="max-b",
+        issue_id="ENG-9",
+        issue_state="in_development",
+        branch="",
+        head="",
+        decisions=["Keep the existing public interface."],
+        caveats=[],
+        risks=[],
+        next_action="Run the failing test and correct ENG-9.",
+    )
+
+    with pytest.raises(HandoffRejected, match=r"branch|commits"):
+        handoffs.submit(document)

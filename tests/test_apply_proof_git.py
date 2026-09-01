@@ -866,9 +866,13 @@ def test_symmetric_repeated_context_untouched_by_parent_rejects_as_ambiguous(
     surrounding context) completely untouched, and the blocks' immediate
     surrounding context is made deliberately identical on both sides so
     the reviewed hunk's exact preimage -- context included -- occurs
-    twice. Neither occurrence is closer or further per any edit; the
-    positional proof must fail closed as ambiguous rather than trust
-    whichever occurrence a search happens to land on first.
+    twice. The positional proof cannot pick an occurrence, but the
+    proof-only ``prove_landed`` entry holds the full exact binding
+    (candidate SHA, merged commit reachable from main, base reachable
+    from its parent), so the merge settles on that binding with the
+    distinct ``exact_binding_ambiguous_patch`` relation instead of
+    trusting either occurrence (Sol b30c55f3); no applied tree is
+    claimed. The guarded live-merge gate keeps refusing ambiguity.
     """
 
     ctx = "# ctx1\n# ctx2\n# ctx3\n"
@@ -896,15 +900,17 @@ def test_symmetric_repeated_context_untouched_by_parent_rejects_as_ambiguous(
     repo.push_main(merge_sha)
     executor = _executor(repo)
 
-    with pytest.raises(ReconciliationRequired, match="ambiguous or relocated"):
-        executor.prove_landed(
-            "demo",
-            candidate_sha=candidate_sha,
-            candidate_branch="candidate",
-            pr_number=1,
-            merge_sha=merge_sha,
-            base_sha=base_sha,
-        )
+    outcome = executor.prove_landed(
+        "demo",
+        candidate_sha=candidate_sha,
+        candidate_branch="candidate",
+        pr_number=1,
+        merge_sha=merge_sha,
+        base_sha=base_sha,
+    )
+
+    assert outcome.relation == "exact_binding_ambiguous_patch"
+    assert outcome.applied_tree_sha is None
 
 
 def test_deletion_above_the_hunk_yields_negative_shift_and_still_proves(
