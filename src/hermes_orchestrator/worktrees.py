@@ -33,7 +33,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -94,6 +94,129 @@ class RegistryPort(Protocol):
     def active(self, project_key: str | None = None) -> tuple[Any, ...]: ...
 
     def request_stop(self, lease_id: str, checkpoint_id: str) -> Any: ...
+
+
+class IssueWorktreeRefused(RuntimeError):
+    """A checkout that may never carry an issue lane's durable lease."""
+
+
+def dedicated_issue_path(repo_path: Path, issue_id: str) -> Path:
+    """The one path an issue lane's checkout may occupy.
+
+    INFRA-214 / reopened INFRA-219: the path is DERIVED from the project
+    repository and the issue id, never discovered by looking for a
+    checkout that happens to hold the issue's branch. That derivation is
+    what makes the safety rule structural rather than a check that could
+    be forgotten: the coordinator's own working directory, the harness
+    lane's checkout and the stable primary checkout can never equal a
+    per-issue derived path, so they can never be leased by construction.
+    """
+
+    return repo_path.parent / f"{repo_path.name}-issue-{issue_id}"
+
+
+def bind_issue_worktree(
+    leases: WorktreeLeases,
+    git: object,
+    *,
+    project_key: str,
+    issue_id: str,
+    repo_path: Path,
+    branch: str,
+    forbidden: Sequence[Path] = (),
+    remote: str = "origin",
+    integration_branch: str = "main",
+) -> WorktreeLease:
+    """Create-or-reuse an issue's dedicated checkout and lease it.
+
+    INFRA-214 / reopened INFRA-219. ``resolve_lane`` needs exactly one
+    live lease per issue — zero refuses and more than one refuses just
+    as hard — so this is idempotent: an existing live lease for the
+    issue is returned unchanged, and the derived path is reused when it
+    already exists rather than duplicated.
+
+    Two designs were rejected before this one and must not creep back:
+    leasing the shared project checkout (``worktree_leases_live_path_idx``
+    is UNIQUE on live ``path``, so one shared checkout admits ONE lease
+    per project and every lane would resolve the same path), and
+    ADOPTING whichever worktree happens to hold the issue's branch (that
+    binds the lease to the coordinator's own working directory, whose
+    branch and HEAD move as the lead changes lanes, so a candidate could
+    freeze an unrelated issue's head).
+
+    Every ``forbidden`` path — the coordinator CWD, the harness lane
+    checkout, the stable primary checkout — is refused FAIL-CLOSED with
+    a reason, never silently skipped, and a blank branch is refused
+    before any git call because a detached checkout cannot satisfy the
+    publication guard's branch comparison.
+    """
+
+    if not branch.strip():
+        raise IssueWorktreeRefused(
+            f"issue {issue_id!r} has no branch; a detached or branchless "
+            "checkout can never satisfy the publication branch check"
+        )
+    for existing in leases.active(project_key):
+        if existing.issue_id == issue_id:
+            return existing
+    path = dedicated_issue_path(repo_path, issue_id)
+    resolved = path.resolve()
+    for denied in (repo_path, *forbidden):
+        if denied is not None and Path(denied).resolve() == resolved:
+            raise IssueWorktreeRefused(
+                f"{resolved} is not leaseable as an issue lane: the "
+                "coordinator, harness and primary checkouts are never "
+                "bound to an issue"
+            )
+    if path.exists():
+        # INFRA-214: a directory already standing at the deterministic
+        # path is NOT evidence of a usable lane. Leasing it blind would
+        # bind a candidate freeze to whatever happens to be there — an
+        # abandoned checkout, a stale branch, or a plain directory — so
+        # it must prove it is a registered worktree of THIS repository
+        # sitting on the expected branch, or be refused fail-closed.
+        try:
+            registered = {
+                str(Path(entry).resolve())
+                for entry in git.worktree_list(repo_path)
+            }
+        except Exception as error:  # pragma: no cover - port guard
+            raise IssueWorktreeRefused(
+                f"could not enumerate worktrees of {repo_path}: {error}"
+            ) from error
+        if str(resolved) not in registered:
+            raise IssueWorktreeRefused(
+                f"{resolved} already exists but is not a registered "
+                f"worktree of {repo_path}; refusing to lease it"
+            )
+        actual = git.branch(path)
+        if actual != branch:
+            raise IssueWorktreeRefused(
+                f"{resolved} is on branch {actual!r}, not the issue's "
+                f"branch {branch!r}; refusing to lease a mismatched lane"
+            )
+    elif git.local_branch_exists(repo_path, branch):
+        # A validated existing issue branch is reused as-is.
+        git.worktree_add_branch(repo_path, path, branch)
+    else:
+        # INFRA-214 first-assignment case: the issue has no branch yet.
+        # Base it on the project's FETCHED integration head, never a
+        # stale local main — a lane based on an old head would produce
+        # candidates whose base is silently behind the remote.
+        git.fetch(repo_path, remote, integration_branch)
+        git.worktree_add_new_branch(
+            repo_path, path, branch, f"{remote}/{integration_branch}"
+        )
+    return leases.register(
+        WorktreeLeaseInput(
+            project_key=project_key,
+            issue_id=issue_id,
+            repo_path=str(repo_path),
+            path=str(path),
+            branch=branch,
+            remote=remote,
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -892,6 +892,23 @@ def open_runtime(
                 # for a lane it actually finds a key for, so with no
                 # harness lane configured this composition is
                 # byte-identical to pre-R5b behavior.
+                worktree_leases=worktree_leases,
+                # INFRA-214: the worktree primitives live on WorktreeGit;
+                # GitVerifier has none of them.
+                issue_git=worktree_git,
+                # ``project_paths`` above is each project's lead_cwd, NOT
+                # its stable repository root, so deriving an issue's
+                # dedicated path from it would place the lane beside the
+                # lead worktree instead of the repo. The stable roots are
+                # passed separately for that derivation.
+                issue_repo_paths={
+                    alias: project.repo_path
+                    for alias, project in settings.projects.items()
+                },
+                issue_integration_branches={
+                    alias: project.integration_branch
+                    for alias, project in settings.projects.items()
+                },
                 lane_project_paths={
                     (alias, HARNESS_LANE): _harness_lead_cwd(project.lead_cwd)
                     for alias, project in settings.projects.items()

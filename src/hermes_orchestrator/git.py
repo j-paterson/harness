@@ -825,6 +825,59 @@ class WorktreeGit:
             ("git", "worktree", "add", "--detach", str(path), sha), repo_path
         )
 
+    def local_branch_exists(self, repo_path: Path, branch: str) -> bool:
+        """Whether ``branch`` already exists locally in this repository.
+
+        INFRA-214: a newly admitted issue normally has NO local feature
+        branch, so a worktree add that assumes one fails. This is the
+        check that decides between reusing a validated existing branch
+        and creating the lane's branch from the fetched integration
+        head.
+        """
+
+        result = self._run(
+            ("git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"),
+            repo_path,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+
+    def worktree_add_new_branch(
+        self, repo_path: Path, path: Path, branch: str, start_point: str
+    ) -> None:
+        """Create ``branch`` at ``start_point`` and check it out at ``path``.
+
+        INFRA-214: the first assignment of an issue has no branch yet.
+        ``start_point`` is the project's FETCHED ``origin/<integration>``
+        — never a stale local ``main``, which may lag the remote by many
+        merges and would silently base the lane on an old head. No
+        ``--force``: an existing populated path fails the underlying git
+        call rather than being overwritten.
+        """
+
+        self._run(
+            ("git", "worktree", "add", "-b", branch, str(path), start_point),
+            repo_path,
+        )
+
+    def worktree_add_branch(
+        self, repo_path: Path, path: Path, branch: str
+    ) -> None:
+        """Materialize one worktree checked out on an existing branch.
+
+        INFRA-214 / reopened INFRA-219: a candidate is frozen from an
+        issue lane's own checkout, and the freeze compares the lane's
+        BRANCH against its durable lease. ``worktree_add_detached``
+        cannot serve that: a detached checkout reports no branch, so a
+        lease bound to one could never satisfy the publication guard.
+        This is the same bounded invocation with a branch instead of a
+        sha — no ``--force``, so an existing populated path fails the
+        underlying git call rather than being silently overwritten.
+        """
+
+        self._run(
+            ("git", "worktree", "add", str(path), branch), repo_path
+        )
+
     def worktree_remove(self, repo_path: Path, path: Path) -> None:
         self._run(("git", "worktree", "remove", "--", str(path)), repo_path)
 

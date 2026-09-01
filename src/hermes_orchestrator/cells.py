@@ -32,6 +32,7 @@ from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
+from hermes_orchestrator.worktrees import bind_issue_worktree
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
@@ -804,6 +805,10 @@ class ProjectCellService:
         packets: SubagentPackets | None = None,
         dispatch_freshness_minutes: int | None = None,
         lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
+        worktree_leases: object | None = None,
+        issue_git: object | None = None,
+        issue_repo_paths: Mapping[str, Path] | None = None,
+        issue_integration_branches: Mapping[str, str] | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -818,6 +823,17 @@ class ProjectCellService:
         # so a caller wiring a harness cell hands its own dedicated
         # checkout here; unset lanes (development, always) fall back to
         # ``self._project_paths`` -- byte-compatible with pre-L2 wiring.
+        self._worktree_leases = worktree_leases
+        self._issue_git = issue_git
+        # The STABLE repository roots, never lead_cwd: an issue lane's
+        # dedicated path is derived from the repo, not from the lead's
+        # own worktree (INFRA-214).
+        self._issue_repo_paths: dict[str, Path] = dict(issue_repo_paths or {})
+        # INFRA-214: a first assignment bases its lane on the project's
+        # FETCHED integration head, so the branch name comes from config.
+        self._issue_integration_branches: dict[str, str] = dict(
+            issue_integration_branches or {}
+        )
         self._lane_project_paths: dict[tuple[str, str], Path] = dict(
             lane_project_paths or {}
         )
@@ -2166,6 +2182,133 @@ class ProjectCellService:
             await _project_in_development(self._linear, issue_id)
         return True, assignment
 
+    def bind_missing_issue_lanes(
+        self,
+        project_key: str,
+        *,
+        issue_id: str,
+        branch: str | None = None,
+    ) -> tuple[str, ...]:
+        """Materialize and bind lanes for already-active admitted issues.
+
+        INFRA-214 migration path, deliberately TARGETED and OBSERVABLE.
+        The dispatch hook binds an issue's dedicated worktree at
+        ASSIGNMENT, but issues admitted before that hook existed are
+        already ``in_development``, so the hook never runs for them.
+
+        It takes ONE exact ``issue_id`` rather than sweeping every
+        occupying issue: a blanket sweep would try to bind legacy issues
+        whose feature branches are already checked out in other
+        worktrees, and each of those failures would be noise obscuring
+        the one binding actually being repaired. It RAISES on failure
+        rather than reporting and continuing, because a silent failure
+        here reproduces the exact defect this repairs — an issue that
+        looks bound but cannot publish.
+
+        ``branch`` overrides the derived lane branch when the issue's
+        work already lives on a differently named branch; it is
+        validated by ``bind_issue_worktree`` like any other, so it can
+        never bind a mismatched or unregistered checkout. Idempotent:
+        an issue with a live lease returns it unchanged.
+        """
+
+        if self._worktree_leases is None or self._issue_git is None:
+            return ()
+        cell = self._find_active_cell(project_key, DEVELOPMENT_LANE)
+        if cell is None:
+            return ()
+        placeholders = ",".join("?" for _ in _OCCUPYING_ISSUE_STATES)
+        row = self._database.execute(
+            "SELECT issue_id FROM admitted_issues "
+            f"WHERE project_key = ? AND issue_id = ? AND state IN ({placeholders})",
+            (project_key, issue_id, *_OCCUPYING_ISSUE_STATES),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"{issue_id!r} is not an occupying admitted issue of "
+                f"{project_key!r}; the catch-up targets one exact issue"
+            )
+        if not self._bind_issue_lane(cell, issue_id, branch=branch):
+            raise RuntimeError(
+                f"issue-lane binding for {issue_id!r} failed; see the "
+                "reported reason above"
+            )
+        return (issue_id,)
+
+    def _bind_issue_lane(
+        self, cell: ProjectCell, issue_id: str, *, branch: str | None = None
+    ) -> bool:
+        """Register the issue lane's dedicated worktree lease, if wired.
+
+        INFRA-214: ``resolve_lane`` refuses publication without exactly
+        one live lease for the issue, and nothing in production created
+        one — ``worktree_leases`` was empty. The binding belongs here,
+        at the assignment boundary, beside the occupancy proof.
+        Optional collaborator: with no lease store wired, behavior is
+        exactly as before.
+        """
+
+        if cell.lane_role != DEVELOPMENT_LANE:
+            # INFRA-214: only the DEVELOPMENT lane owns product issue
+            # lanes. The harness runs on its own dedicated harness
+            # checkout and never publishes product candidates, so it
+            # must neither provision an issue worktree nor be blocked by
+            # one — binding here would make `start-lane --lane harness`
+            # depend on, and fail closed on, a development artifact it
+            # will never use.
+            return True
+        if self._worktree_leases is None or self._issue_git is None:
+            return True
+        repo_path = self._issue_repo_paths.get(cell.project_key)
+        if repo_path is None:
+            return True
+        lane_branch = branch or self._issue_branch(issue_id)
+        try:
+            bind_issue_worktree(
+                self._worktree_leases,
+                self._issue_git,
+                project_key=cell.project_key,
+                issue_id=issue_id,
+                repo_path=repo_path,
+                branch=lane_branch,
+                forbidden=self._forbidden_lane_paths(cell),
+                integration_branch=self._issue_integration_branches.get(
+                    cell.project_key, "main"
+                ),
+            )
+        except Exception as error:
+            # FAIL CLOSED. Swallowing this and activating anyway is what
+            # produced the original defect: an issue that looks assigned
+            # but can never publish, discovered only when candidate-ready
+            # refuses. The issue stays durably queued instead, so the
+            # failure is visible and retryable.
+            print(
+                f"issue-lane worktree binding for {issue_id!r} failed; "
+                f"leaving the issue queued: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _issue_branch(issue_id: str) -> str:
+        """The lane branch this project uses for an admitted issue."""
+
+        return f"feature/{issue_id.lower()}"
+
+    def _forbidden_lane_paths(self, cell: ProjectCell) -> tuple[Path, ...]:
+        """Checkouts that may never carry an issue lane's lease."""
+
+        denied: list[Path] = [Path.cwd()]
+        for lane in (DEVELOPMENT_LANE, HARNESS_LANE):
+            path = self._lane_project_paths.get((cell.project_key, lane))
+            if path is not None:
+                denied.append(Path(path))
+        shared = self._project_paths.get(cell.project_key)
+        if shared is not None:
+            denied.append(Path(shared))
+        return tuple(denied)
+
     def _activate_issue(
         self,
         cell: ProjectCell,
@@ -2194,6 +2337,14 @@ class ProjectCellService:
         — never a second inference of which lane this is.
         """
 
+        # INFRA-214 / reopened INFRA-219: bind the issue's own dedicated
+        # worktree lease at the ASSIGNMENT boundary, so candidate
+        # publication can resolve this exact lane's checkout. Never
+        # allowed to break dispatch — a lead works fine without the
+        # lease; only publication needs it — so a refusal or git failure
+        # is reported and activation continues.
+        if not self._bind_issue_lane(cell, issue_id):
+            return False, None
         return _activate_issue_transaction(
             database=self._database,
             events=self._events,

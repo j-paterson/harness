@@ -190,6 +190,19 @@ def _parser() -> argparse.ArgumentParser:
     observe.add_argument("--json", action="store_true")
 
     reconcile = commands.add_parser("reconcile", help="reconcile durable local state")
+    reconcile.add_argument(
+        "--bind-issue-lane",
+        default=None,
+        help=(
+            "<project>:<issue> — bind one already-active issue's "
+            "dedicated worktree lane"
+        ),
+    )
+    reconcile.add_argument(
+        "--bind-issue-branch",
+        default=None,
+        help="explicit validated branch for --bind-issue-lane",
+    )
     reconcile.add_argument("--json", action="store_true")
 
     daemon = commands.add_parser("daemon", help="run the local supervisor loop")
@@ -4926,6 +4939,40 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "findings": list(result.findings),
                 "admission_open": result.admission_open,
             }
+            # INFRA-214 migration path: issues admitted BEFORE the
+            # assignment-time binding existed are already
+            # in_development, so that hook will never run for them and
+            # their candidates stay unpublishable. This idempotent
+            # catch-up binds any occupying issue that still has no live
+            # lease, and is a no-op for those that do.
+            if runtime.cells is not None and args.bind_issue_lane:
+                # Targeted and observable: one exact issue, and a failure
+                # surfaces rather than being suppressed. A blanket sweep
+                # would try to bind legacy issues whose branches are
+                # checked out elsewhere and bury the real repair in noise.
+                project_key, _, issue_id = args.bind_issue_lane.partition(":")
+                if not issue_id:
+                    _print(
+                        {"error": "expected --bind-issue-lane <project>:<issue>"},
+                        json_output=args.json,
+                        human="--bind-issue-lane takes <project>:<issue>.",
+                    )
+                    return 1
+                try:
+                    payload["bound_issue_lanes"] = list(
+                        runtime.cells.bind_missing_issue_lanes(
+                            project_key,
+                            issue_id=issue_id,
+                            branch=args.bind_issue_branch,
+                        )
+                    )
+                except Exception as error:
+                    _print(
+                        {"error": f"{type(error).__name__}: {error}"},
+                        json_output=args.json,
+                        human=f"issue-lane binding failed: {error}",
+                    )
+                    return 1
             _print(
                 payload,
                 json_output=args.json,
