@@ -54,3 +54,56 @@ immediate retry leaves no residue.
 
 Out of scope: profile retries, new transport/protocol, the Harness Lab
 multi-project cell itself, and anything outside this launch path.
+
+## Amendment — INFRA-219 reopened: issue-specific worktrees and leases
+
+INFRA-219 was reopened 2026-09-01 because its own candidate-publication
+acceptance is incomplete, and that incompleteness is INFRA-214's live
+publication blocker. Verbatim: "`resolve_lane()` requires an
+issue-bound worktree lease, but no production path creates
+issue-specific worktrees or registers their leases; `worktree_leases`
+is empty. A shared project lead checkout cannot substitute because
+multiple issue assignments would collide on the unique live-path
+constraint and recreate the wrong-head hazard."
+
+That rules out the repair this lead first delegated (registering a
+lease against the shared `lead_cwd`), and the reason is durable, not
+stylistic: `worktree_leases_live_path_idx` is UNIQUE on `path` where
+`state != 'reclaimed'` (migration 0018). One shared checkout therefore
+admits exactly ONE live lease for the whole project — a second admitted
+issue would either fail to register or displace the first, and every
+lane that did resolve would resolve the SAME path, which is precisely
+the wrong-head publication hazard L5 exists to prevent. That patch was
+discarded unintegrated.
+
+### Smallest correct shape
+
+Hermes owns issue-worktree creation and lease binding AT ASSIGNMENT:
+
+1. **At assignment** (the boundary where an admitted issue is bound to
+   a lane), Hermes resolves the issue's own checkout — one worktree per
+   admitted issue, never the shared lead checkout — and registers its
+   durable lease through the existing `WorktreeLeases.register`
+   (`worktrees.py:197`; `WorktreeLeaseInput` needs non-empty
+   project_key, issue_id, repo_path, path, branch, remote).
+2. **Adoption before provisioning.** When a checkout for that issue's
+   branch already exists (INFRA-214's own work currently lives in the
+   lead worktree on `feature/infra-214`), ADOPT it — register its lease
+   against its real path and branch — rather than provisioning a
+   duplicate. Only when none exists does Hermes create one, through the
+   existing git worktree surface (`git.py:809 worktree_add_detached`,
+   `:834 worktree_list`), never a bespoke subprocess.
+3. **Exactly one live lease per issue, and distinct paths per issue.**
+   `resolve_lane` refuses zero AND refuses more than one, so
+   registration must be idempotent under repeated assignment; and two
+   admitted issues must resolve DIFFERENT paths, which the unique
+   live-path index enforces durably.
+4. Publication guard in `emission.py` is untouched. No new protocol, no
+   schema change — migration 0018 already carries the binding.
+
+### Acceptance for this amendment
+
+A regression proving TWO admitted issues resolve DISTINCT bound paths
+through `resolve_lane`, and that `candidate-ready` can resolve the
+exact INFRA-214 checkout while the other admitted lanes remain
+independent.
