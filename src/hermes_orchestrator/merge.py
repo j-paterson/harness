@@ -20,6 +20,7 @@ from typing import Protocol
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.git import AmbiguousHunkError, GitError
 from hermes_orchestrator.github import (
+    DiscoveredPull,
     GitHubError,
     MergeAmbiguous,
     MergeBlocked,
@@ -61,6 +62,10 @@ class MergeClient(Protocol):
     ) -> tuple[PullRequestSummary, ...]: ...
 
     def get_pull_request(self, repository: str, number: int) -> PullRequest: ...
+
+    def discover_pull_request(
+        self, repository: str, *, branch: str, head_sha: str
+    ) -> DiscoveredPull | None: ...
 
 
 class AncestryVerifier(Protocol):

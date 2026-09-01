@@ -13,6 +13,7 @@ import pytest
 
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.github import (
+    DiscoveredPull,
     GitHubClient,
     GitHubError,
     GitHubResponse,
@@ -284,6 +285,139 @@ def test_list_open_pulls_rejects_mismatched_base_echo(
     transport.queue("GET", LIST_PATH, GitHubResponse(200, [payload]))
     with pytest.raises(GitHubError, match="stale"):
         github.list_open_pulls(REPOSITORY, base="main")
+
+
+def test_discover_pull_request_returns_open_match(
+    github: GitHubClient, transport: FakeTransport
+) -> None:
+    transport.queue("GET", LIST_PATH, GitHubResponse(200, [list_payload()]))
+    discovered = github.discover_pull_request(
+        REPOSITORY, branch="feature/eng-9", head_sha=HEAD
+    )
+    assert discovered == DiscoveredPull(
+        number=14,
+        state="open",
+        merged=False,
+        head_sha=HEAD,
+        merge_sha=None,
+        repository=REPOSITORY,
+        head_repository=REPOSITORY,
+        base_ref="main",
+    )
+    assert transport.calls == [
+        (
+            "GET",
+            LIST_PATH,
+            {
+                "state": "all",
+                "head": "j-paterson:feature/eng-9",
+                "per_page": "100",
+            },
+            None,
+        )
+    ]
+
+
+def test_discover_pull_request_returns_merged_match_with_merge_sha(
+    github: GitHubClient, transport: FakeTransport
+) -> None:
+    """A closed exact-head match is re-read in full to fill merge_sha."""
+
+    transport.queue(
+        "GET", LIST_PATH, GitHubResponse(200, [list_payload(state="closed")])
+    )
+    transport.queue(
+        "GET",
+        PULLS_PATH,
+        GitHubResponse(
+            200,
+            pull_payload(state="closed", merged=True, merge_commit_sha=MERGE_SHA),
+        ),
+    )
+    discovered = github.discover_pull_request(
+        REPOSITORY, branch="feature/eng-9", head_sha=HEAD
+    )
+    assert discovered == DiscoveredPull(
+        number=14,
+        state="closed",
+        merged=True,
+        head_sha=HEAD,
+        merge_sha=MERGE_SHA,
+        repository=REPOSITORY,
+        head_repository=REPOSITORY,
+        base_ref="main",
+    )
+
+
+def test_discover_pull_request_returns_closed_unmerged_match(
+    github: GitHubClient, transport: FakeTransport
+) -> None:
+    transport.queue(
+        "GET", LIST_PATH, GitHubResponse(200, [list_payload(state="closed")])
+    )
+    transport.queue(
+        "GET",
+        PULLS_PATH,
+        GitHubResponse(200, pull_payload(state="closed", merged=False)),
+    )
+    discovered = github.discover_pull_request(
+        REPOSITORY, branch="feature/eng-9", head_sha=HEAD
+    )
+    assert discovered == DiscoveredPull(
+        number=14,
+        state="closed",
+        merged=False,
+        head_sha=HEAD,
+        merge_sha=None,
+        repository=REPOSITORY,
+        head_repository=REPOSITORY,
+        base_ref="main",
+    )
+
+
+def test_discover_pull_request_returns_none_for_no_match(
+    github: GitHubClient, transport: FakeTransport
+) -> None:
+    transport.queue("GET", LIST_PATH, GitHubResponse(200, []))
+    assert (
+        github.discover_pull_request(
+            REPOSITORY, branch="feature/eng-9", head_sha=HEAD
+        )
+        is None
+    )
+
+
+def test_discover_pull_request_returns_none_for_different_head_sha(
+    github: GitHubClient, transport: FakeTransport
+) -> None:
+    """Same branch, different SHA: not a match even though the branch is."""
+
+    mismatched = list_payload(
+        head={
+            "sha": OLD_HEAD,
+            "ref": "feature/eng-9",
+            "repo": {"full_name": REPOSITORY},
+        }
+    )
+    transport.queue("GET", LIST_PATH, GitHubResponse(200, [mismatched]))
+    assert (
+        github.discover_pull_request(
+            REPOSITORY, branch="feature/eng-9", head_sha=HEAD
+        )
+        is None
+    )
+
+
+def test_discover_pull_request_raises_on_two_exact_matches(
+    github: GitHubClient, transport: FakeTransport
+) -> None:
+    first = list_payload(number=14)
+    second = list_payload(number=15)
+    transport.queue("GET", LIST_PATH, GitHubResponse(200, [first, second]))
+    with pytest.raises(MergeAmbiguous, match="more than one"):
+        github.discover_pull_request(
+            REPOSITORY, branch="feature/eng-9", head_sha=HEAD
+        )
 
 
 def test_merge_refuses_changed_head(

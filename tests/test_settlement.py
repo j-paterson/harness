@@ -451,7 +451,6 @@ def verdict_for(branch: str, number: int, sha: str = GOOD) -> Any:
                 "verdict": "approved",
                 "repository": "j-paterson/demo",
                 "branch": branch,
-                "pr_number": number,
                 "reviewed_sha": sha,
                 "packets": [],
             }
@@ -459,10 +458,9 @@ def verdict_for(branch: str, number: int, sha: str = GOOD) -> Any:
         expected=VerdictBinding(
             repository="j-paterson/demo",
             branch=branch,
-            pr_number=number,
             reviewed_sha=sha,
         ),
-    )
+    ).with_pr_number(number)
 
 
 def replace_reviewer_channel(acceptance: Any) -> None:

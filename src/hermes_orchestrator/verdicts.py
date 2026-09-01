@@ -1,10 +1,19 @@
-"""Strict structured review verdicts and correction packets."""
+"""Strict structured review verdicts and correction packets.
+
+INFRA-217: ``pr_number`` is retired as reviewer-supplied authority. The
+reviewer's document asserts only ``verdict``/``repository``/``branch``/
+``reviewed_sha``/``packets`` (and each packet's own
+severity/repository/branch/reviewed_sha/evidence/etc); PR and merge
+identity are discovered from GitHub by repository, branch, and reviewed
+head SHA elsewhere (``merger_turns.MergerTurnService``), never trusted
+from or vacuously matched against the document under validation.
+"""
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 VERDICTS = ("approved", "corrections_required")
@@ -22,7 +31,6 @@ _ENVELOPE_KEYS = frozenset(
         "verdict",
         "repository",
         "branch",
-        "pr_number",
         "reviewed_sha",
         "packets",
     }
@@ -33,7 +41,6 @@ _PACKET_KEYS = frozenset(
         "severity",
         "repository",
         "branch",
-        "pr_number",
         "reviewed_sha",
         "evidence",
         "acceptance_criterion",
@@ -54,6 +61,10 @@ class CorrectionPacket:
     severity: str
     repository: str
     branch: str
+    #: INFRA-217: not reviewer-supplied — parsed packets carry ``0``
+    #: until :meth:`ReviewVerdict.with_pr_number` stamps the
+    #: GitHub-derived number; internal producers (CI window) stamp
+    #: their own known number directly.
     pr_number: int
     reviewed_sha: str
     evidence: str
@@ -68,7 +79,6 @@ class VerdictBinding:
 
     repository: str
     branch: str
-    pr_number: int
     reviewed_sha: str
 
 
@@ -79,9 +89,27 @@ class ReviewVerdict:
     verdict: str
     repository: str
     branch: str
+    #: INFRA-217: never read from the document — ``0`` at parse until
+    #: :meth:`with_pr_number` stamps the GitHub-derived number.
     pr_number: int
     reviewed_sha: str
     packets: tuple[CorrectionPacket, ...]
+
+    def with_pr_number(self, pr_number: int) -> ReviewVerdict:
+        """Stamp the GitHub-derived pull request number, envelope and
+        packets alike, returning the bound copy (INFRA-217)."""
+
+        return ReviewVerdict(
+            verdict=self.verdict,
+            repository=self.repository,
+            branch=self.branch,
+            pr_number=pr_number,
+            reviewed_sha=self.reviewed_sha,
+            packets=tuple(
+                replace(packet, pr_number=pr_number)
+                for packet in self.packets
+            ),
+        )
 
 
 def parse_turn_report(
@@ -110,12 +138,12 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
     """Parse one structured verdict bound to the admitted candidate.
 
     Stale or foreign verdicts — any envelope or packet whose repository,
-    branch, pull request, or reviewed SHA differs from the admitted
-    candidate — fail closed. ``pr_number`` may be ``0`` (no pull request
-    open yet) only when it matches the admitted binding's ``pr_number``;
-    an ``approved`` verdict against a ``0`` binding is refused since Sol
-    must open the sole pull request before approving, while
-    ``corrections_required`` may be returned with no pull request open.
+    branch, or reviewed SHA differs from the admitted candidate — fail
+    closed. INFRA-217: the document carries no ``pr_number`` anywhere (a
+    document still carrying one fails the strict key check); PR identity
+    is discovered from GitHub by the submission path, which also owns
+    the rule that an approval requires a discovered pull request at the
+    exact reviewed head.
     """
 
     try:
@@ -131,7 +159,7 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
     if verdict not in VERDICTS:
         raise VerdictError(f"unknown verdict {verdict!r}")
     binding = _parse_binding(value)
-    for field in ("repository", "branch", "pr_number", "reviewed_sha"):
+    for field in ("repository", "branch", "reviewed_sha"):
         if getattr(binding, field) != getattr(expected, field):
             raise VerdictError(
                 f"verdict {field} does not match the admitted candidate"
@@ -144,7 +172,6 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
         if (
             packet.repository != expected.repository
             or packet.branch != expected.branch
-            or packet.pr_number != expected.pr_number
             or packet.reviewed_sha != expected.reviewed_sha
         ):
             raise VerdictError(
@@ -159,16 +186,11 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
         raise VerdictError(
             "corrections_required requires at least one correction packet"
         )
-    if verdict == "approved" and binding.pr_number == 0:
-        raise VerdictError(
-            "approval requires the sole open pull request at the candidate "
-            "head; create it before approving"
-        )
     return ReviewVerdict(
         verdict=verdict,
         repository=binding.repository,
         branch=binding.branch,
-        pr_number=binding.pr_number,
+        pr_number=0,
         reviewed_sha=binding.reviewed_sha,
         packets=packets,
     )
@@ -178,11 +200,6 @@ def _parse_binding(value: dict[str, Any]) -> VerdictBinding:
     for field in ("repository", "branch"):
         if not isinstance(value[field], str) or not value[field]:
             raise VerdictError(f"verdict {field} is invalid")
-    pr_number = value["pr_number"]
-    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or (
-        pr_number < 0
-    ):
-        raise VerdictError("verdict pr_number is invalid")
     reviewed_sha = value["reviewed_sha"]
     if (
         not isinstance(reviewed_sha, str)
@@ -192,7 +209,6 @@ def _parse_binding(value: dict[str, Any]) -> VerdictBinding:
     return VerdictBinding(
         repository=value["repository"],
         branch=value["branch"],
-        pr_number=pr_number,
         reviewed_sha=reviewed_sha,
     )
 
@@ -218,11 +234,6 @@ def _parse_packet(entry: Any) -> CorrectionPacket:
     ):
         if not isinstance(entry[field], str) or not entry[field]:
             raise VerdictError(f"correction packet {field} is invalid")
-    pr_number = entry["pr_number"]
-    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or (
-        pr_number < 0
-    ):
-        raise VerdictError("correction packet pr_number is invalid")
     reviewed_sha = entry["reviewed_sha"]
     if (
         not isinstance(reviewed_sha, str)
@@ -240,7 +251,7 @@ def _parse_packet(entry: Any) -> CorrectionPacket:
         severity=entry["severity"],
         repository=entry["repository"],
         branch=entry["branch"],
-        pr_number=pr_number,
+        pr_number=0,
         reviewed_sha=reviewed_sha,
         evidence=entry["evidence"],
         acceptance_criterion=entry["acceptance_criterion"],

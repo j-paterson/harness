@@ -33,6 +33,7 @@ from hermes_orchestrator.codex_rpc import RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.github import DiscoveredPull, GitHubError
 from hermes_orchestrator.manifests import (
     CandidateManifest,
     ManifestError,
@@ -180,6 +181,59 @@ def _outcome_from_json(text: str) -> TurnOutcome:
         review_id=value["review_id"],
         merge_sha=value["merge_sha"],
     )
+
+
+def _approval_ineligibility_reason(
+    discovered: DiscoveredPull | None, project: ProjectConfig
+) -> str | None:
+    """``None`` when GitHub proves an approval-eligible pull; else why not.
+
+    Sol correction 6e1bfe60 (INFRA-217, Important): a *discovered* pull is
+    not automatically an *eligible* one. Before this correction, a
+    closed-unmerged exact-head pull was still returned by discovery, and
+    the only rejection test was ``discovered is None`` — so a closed
+    pull's approval was persisted here and rejected only later by the
+    merge driver, consuming the wake and forcing a corrected retry to
+    conflict with the stale submission. This predicate is the single
+    source of truth for approval eligibility, applied identically at both
+    call sites (``submit_review`` before any persistence, and
+    ``_settle_wake`` before any review/settlement/wake-terminal write):
+    eligible means GitHub proved exactly one same-repository pull at the
+    reviewed branch and SHA, whose head repository is also the project
+    repository (no foreign fork slip-through), that targets the
+    project's integration branch (no wrong-base slip-through), and that
+    is either still open or already merged — closed-unmerged is
+    INELIGIBLE. Head branch and head SHA are already exact by
+    construction of ``discover_pull_request``'s query and need no
+    re-check here.
+    """
+
+    if discovered is None:
+        return (
+            "approval requires a pull request at the exact reviewed head; "
+            "none was discovered on GitHub"
+        )
+    if (
+        discovered.repository != project.github_repo
+        or discovered.head_repository != project.github_repo
+    ):
+        return (
+            "approval requires a same-repository pull request; the "
+            "discovered pull's repository or head repository is not the "
+            "project repository"
+        )
+    if discovered.base_ref != project.integration_branch:
+        return (
+            "approval requires a pull request targeting the project's "
+            "integration branch; the discovered pull targets a different "
+            "base"
+        )
+    if discovered.state != "open" and not discovered.merged:
+        return (
+            "approval requires an open or already-merged pull request; "
+            "the discovered pull is closed and unmerged"
+        )
+    return None
 
 
 class MergerTurnService:
@@ -548,26 +602,21 @@ class MergerTurnService:
                 thread_id=channel.thread_id,
                 generation=channel.generation,
             )
-        pr_number = self._pull_number(project, admitted)
-        if pr_number is None:
-            self._merger.complete_admitted_wake(project_key, event.event_id)
-            return TurnOutcome(
-                project_key, "rejected", event.event_id, event.issue_id,
-                "the candidate is not the head of the sole open pull "
-                "request toward the integration branch",
-            )
-        # Every rejection-capable validation — manifest, channel generation,
-        # branch head, base, issue, intake gates, admission, and the final
-        # live pull-request check — has now passed; only here may an
-        # explicitly authorized rework close its bound failure. Later steps
-        # (report missing or malformed) are not rejections and replay this
-        # event-bound close idempotently.
-        self._close_bound_failure(project_key, admitted.manifest)
+        # INFRA-217: PR and merge identity derive from GitHub discovery
+        # by exact head — repository, head branch, reviewed head SHA,
+        # merged pulls included — never from reviewer input and never
+        # from a sole-open-pull-request rule. A GitHubError here
+        # propagates exactly as the old open-pulls listing's did: the
+        # submitted row stays 'submitted' and recovery resumes it.
+        discovered = self._github.discover_pull_request(
+            project.github_repo,
+            branch=admitted.manifest.branch,
+            head_sha=admitted.manifest.candidate_sha,
+        )
         text = submitted.verdict_json
         binding = VerdictBinding(
             repository=project.github_repo,
             branch=admitted.manifest.branch,
-            pr_number=pr_number,
             reviewed_sha=admitted.manifest.candidate_sha,
         )
         try:
@@ -577,12 +626,43 @@ class MergerTurnService:
                 project_key, "verdict_invalid", event.event_id, event.issue_id,
                 str(error),
             )
+        if verdict is not None and verdict.verdict == "approved":
+            # Sol correction 6e1bfe60: the same eligibility judgement used
+            # before persistence in submit_review is re-applied here, so
+            # an ineligible pull (closed-unmerged, wrong base, foreign
+            # head repository) cannot slip through this recovery/resume
+            # settlement site either. The rejection-capable gate still
+            # runs BEFORE the rework failure close, exactly where the
+            # retired sole-open-pull-request check rejected — a rework
+            # candidate whose approval cannot bind an eligible pull
+            # request must leave its bound failure stored. The no-pull
+            # rejection reason is unchanged from before this correction.
+            ineligibility = _approval_ineligibility_reason(discovered, project)
+            if ineligibility is not None:
+                self._merger.complete_admitted_wake(project_key, event.event_id)
+                return TurnOutcome(
+                    project_key, "rejected", event.event_id, event.issue_id,
+                    ineligibility,
+                )
+        # Every rejection-capable validation — manifest, channel generation,
+        # branch head, base, issue, intake gates, admission, and the
+        # discovery gate above — has now passed; only here may an
+        # explicitly authorized rework close its bound failure. Later
+        # steps replay this event-bound close idempotently.
+        self._close_bound_failure(project_key, admitted.manifest)
         if verdict is None:
             self._merger.complete_admitted_wake(project_key, event.event_id)
             return TurnOutcome(
                 project_key, "idle", event.event_id, event.issue_id,
                 "the Merger reported terminal idle for the admitted candidate",
             )
+        # An already-merged exact-head pull request keeps its discovered
+        # number and converges through the merge driver's existing
+        # already-merged adoption; corrections may proceed with no pull
+        # request at all (number 0), exactly as before.
+        verdict = verdict.with_pr_number(
+            discovered.number if discovered is not None else 0
+        )
         outcome = await self._reviews.complete_review(
             admitted, event.issue_id, verdict
         )
@@ -705,15 +785,41 @@ class MergerTurnService:
         binding = VerdictBinding(
             repository=project.github_repo,
             branch=manifest.branch,
-            pr_number=self._document_pr_number(verdict_json),
             reviewed_sha=candidate_sha,
         )
         try:
-            parse_verdict(verdict_json, expected=binding)
+            document = parse_verdict(verdict_json, expected=binding)
         except VerdictError as error:
             raise SubmissionRejected(
                 f"verdict document is invalid: {error}"
             ) from error
+        # INFRA-217: PR identity is derived from GitHub — by repository,
+        # head branch, and reviewed head SHA, merged pulls included —
+        # never read from the document. The discovery gate runs BEFORE
+        # any persistence, so an approval with no pull request at the
+        # exact reviewed head (and any discovery failure) rejects with
+        # zero durable writes and a corrected retry starts clean.
+        try:
+            discovered = self._github.discover_pull_request(
+                project.github_repo,
+                branch=manifest.branch,
+                head_sha=candidate_sha,
+            )
+        except GitHubError as error:
+            raise SubmissionRejected(
+                f"pull-request discovery failed: {error}"
+            ) from error
+        if document.verdict == "approved":
+            # Sol correction 6e1bfe60: discovery alone is not eligibility.
+            # This full identity-and-state judgement runs before ANY
+            # persistence (submitted_verdict, review, settlement,
+            # correction, or wake-terminal write) below, so a closed-
+            # unmerged, wrong-base, or foreign-head-repository pull
+            # rejects with zero durable writes and a corrected retry for
+            # the same wake starts clean.
+            ineligibility = _approval_ineligibility_reason(discovered, project)
+            if ineligibility is not None:
+                raise SubmissionRejected(ineligibility)
         if stale_existing:
             assert existing is not None
             submission = self._supersede_submission(
@@ -799,32 +905,6 @@ class MergerTurnService:
         )
         self._record_settled(event_id, outcome)
         return outcome
-
-    @staticmethod
-    def _document_pr_number(verdict_json: str) -> int:
-        """Extract the document's own pull-request number for parsing.
-
-        Only the shape is read here; :func:`parse_verdict` re-validates
-        it, and the live single-open-pull-request check inside the shared
-        settlement path binds it to reality.
-        """
-
-        try:
-            value = json.loads(verdict_json)
-        except json.JSONDecodeError as error:
-            raise SubmissionRejected(
-                "verdict document is invalid: not valid JSON"
-            ) from error
-        pr_number = value.get("pr_number") if isinstance(value, dict) else None
-        if (
-            not isinstance(pr_number, int)
-            or isinstance(pr_number, bool)
-            or pr_number < 0
-        ):
-            raise SubmissionRejected(
-                "verdict document is invalid: pr_number is invalid"
-            )
-        return pr_number
 
     def _read_submission(self, event_id: str) -> _Submission | None:
         row = self._database.execute(
@@ -994,34 +1074,6 @@ class MergerTurnService:
             rework=manifest,
             correction_id=correction_id,
         )
-
-    def _pull_number(
-        self, project: ProjectConfig, admitted: AdmittedCandidate
-    ) -> int | None:
-        """Resolve the settled binding's pull request number, or ``None``.
-
-        Zero open pull requests toward the integration branch is
-        admissible — Sol may still be reviewing without one, so this
-        returns ``0``. Exactly one open pull request whose head matches
-        the candidate returns its number. Two or more open pull requests,
-        or one that does not match the candidate, is an invariant breach
-        and returns ``None`` so the caller rejects the settlement.
-        """
-
-        summaries = self._github.list_open_pulls(
-            project.github_repo, base=project.integration_branch
-        )
-        if not summaries:
-            return 0
-        if len(summaries) > 1:
-            return None
-        (only,) = summaries
-        if (
-            only.head_ref == admitted.manifest.branch
-            and only.head_sha == admitted.manifest.candidate_sha
-        ):
-            return only.number
-        return None
 
 
 def _row_to_submission(row: sqlite3.Row) -> _Submission:

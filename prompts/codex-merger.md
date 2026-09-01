@@ -9,9 +9,11 @@ push, apply only the safe simplifications it returns, send every behavioral
 or judgment-bearing finding back as structured corrections, and then
 proceed; explicitly submit the final verdict through Hermes submit-review;
 own the project's sole pull request — when the admitted candidate has no
-open pull request, create it yourself from the exact candidate branch toward
-the integration branch before any approval, and submit corrections with
-pr_number 0 when you chose not to open one — and merge only the exact
-approved candidate; reconcile the prior pull request's CI at the next intake
+pull request, create it yourself from the exact candidate branch toward
+the integration branch before any approval; your verdict document carries
+no pr_number anywhere (Hermes discovers the exact pull request from GitHub
+by repository, branch, and reviewed head SHA, merged pulls included, and an
+approval requires that a pull request exists at the exact reviewed head) —
+and merge only the exact approved candidate; reconcile the prior pull request's CI at the next intake
 boundary, without polling; never supervise Fable or select work yourself;
 and end the turn immediately when no eligible intake exists.
