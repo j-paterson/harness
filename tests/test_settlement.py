@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.domain import IssueState
+from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitError
 from hermes_orchestrator.github import MergeResult
@@ -1574,4 +1574,183 @@ class TestAcceptanceGatedSettlement:
             "In Development",
             "operator",
         )
+        assert self._assignments(acceptance) == []
+
+
+@pytest.mark.asyncio
+class TestAcceptanceReconciliation:
+    """INFRA-198 packet K (Sol 524a38ed finding 2): the durable
+    ``acceptance_gates`` table is read back at every recovery boundary.
+    ``ReviewService.reconcile_acceptance`` rides ``resume_settlements``
+    — the exact pass daemon startup, the intake-boundary resumes, and
+    ``merge-settle --project`` already invoke — and idempotently repairs
+    a premature Done, a missing acceptance assignment, and a
+    satisfied-but-never-completed gate."""
+
+    @staticmethod
+    def _assignments(acceptance: Any) -> list[Any]:
+        return acceptance.database.execute(
+            "SELECT * FROM lead_assignments WHERE issue_id = 'ENG-9' "
+            "ORDER BY rowid"
+        ).fetchall()
+
+    @staticmethod
+    def _transition_count(acceptance: Any, to_state: str) -> int:
+        return int(
+            acceptance.database.scalar(
+                "SELECT COUNT(*) FROM events WHERE event_type = "
+                "'issue.transitioned' AND aggregate_id = 'ENG-9' AND "
+                f"payload_json LIKE '%\"to\":\"{to_state}\"%'"
+            )
+        )
+
+    def _gate(self, acceptance: Any) -> None:
+        acceptance.gates.require(
+            "ENG-9",
+            instruction_id="chat-accept-eng-9",
+            predicates=("live_smoke",),
+        )
+
+    async def test_reconciliation_repairs_a_premature_done_to_the_hold(
+        self, acceptance: Any
+    ) -> None:
+        # Required test 2: an ungated merge completed to Done; only then
+        # does the operator require acceptance — a pending gate beside a
+        # Done issue with a proven merged review. Restart reconciliation
+        # repairs the hold: post_merge_acceptance, the In Development
+        # Linear effect, and exactly one acceptance assignment.
+        acceptance.seat_cell()
+        outcome = await acceptance.submit("ENG-9", GOOD)
+        assert outcome.state == "merged"
+        assert acceptance.queue.get("ENG-9").state is IssueState.DONE
+        self._gate(acceptance)
+
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert acceptance.linear.targets[-1] == (
+            "ENG-9",
+            "In Development",
+            "operator",
+        )
+        rows = self._assignments(acceptance)
+        assert len(rows) == 1
+        assert rows[0]["state"] == "published"
+        assert rows[0]["instruction_id"] == "chat-accept-eng-9"
+        assert rows[0]["queue_transition"] == "done->post_merge_acceptance"
+        assert self._transition_count(acceptance, "post_merge_acceptance") == 1
+        targets_after_repair = list(acceptance.linear.targets)
+
+        # Idempotent, exactly-once: a second recovery pass repeats
+        # nothing.
+        await acceptance.service.resume_settlements("demo")
+        assert len(self._assignments(acceptance)) == 1
+        assert self._transition_count(acceptance, "post_merge_acceptance") == 1
+        assert acceptance.linear.targets == targets_after_repair
+
+    async def test_a_cell_appearing_later_gets_exactly_one_assignment(
+        self, acceptance: Any
+    ) -> None:
+        # Required test 3: a gated merge settled while NO live cell
+        # existed — zero assignments at settlement time. Reconciliation
+        # publishes exactly one assignment once a cell appears.
+        self._gate(acceptance)
+        outcome = await acceptance.submit("ENG-9", GOOD)
+        assert outcome.state == "merged"
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert self._assignments(acceptance) == []
+
+        # Recovery with still no cell: the hold stays, no assignment.
+        assert await acceptance.service.resume_settlements("demo") == ()
+        assert self._assignments(acceptance) == []
+
+        acceptance.seat_cell()
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        rows = self._assignments(acceptance)
+        assert len(rows) == 1
+        assert rows[0]["state"] == "published"
+        assert rows[0]["cell_id"] == "cell-demo"
+        assert (
+            rows[0]["session_id"] == "11111111-1111-4111-8111-111111111111"
+        )
+        assert rows[0]["instruction_id"] == "chat-accept-eng-9"
+
+        # Exactly once across replays.
+        await acceptance.service.resume_settlements("demo")
+        assert len(self._assignments(acceptance)) == 1
+
+    async def test_satisfaction_crash_converges_to_done_exactly_once(
+        self, acceptance: Any
+    ) -> None:
+        # Required test 4: the gate satisfaction persisted, then the
+        # process died before BOTH the queue transition and the Linear
+        # projection. Restart reconciliation completes the issue to Done
+        # with the satisfy path's exact effect-id convention — once.
+        acceptance.seat_cell()
+        self._gate(acceptance)
+        outcome = await acceptance.submit("ENG-9", GOOD)
+        assert outcome.state == "merged"
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+
+        acceptance.gates.satisfy("ENG-9", evidence={"live_smoke": "receipt-1"})
+        # The crash point: nothing after satisfaction ran.
+        assert (
+            acceptance.queue.get("ENG-9").state
+            is IssueState.POST_MERGE_ACCEPTANCE
+        )
+        assert not any(
+            target[1] == "Done" for target in acceptance.linear.targets
+        )
+
+        assert await acceptance.service.resume_settlements("demo") == ()
+
+        assert acceptance.queue.get("ENG-9").state is IssueState.DONE
+        done_targets = [
+            target for target in acceptance.linear.targets if target[1] == "Done"
+        ]
+        assert done_targets == [("ENG-9", "Done", "operator")]
+        assert "linear:ENG-9:acceptance-satisfied:chat-accept-eng-9" in (
+            acceptance.linear.effect_ids
+        )
+        assert self._transition_count(acceptance, "done") == 1
+
+        # Replays converge with no second transition or projection.
+        await acceptance.service.resume_settlements("demo")
+        assert self._transition_count(acceptance, "done") == 1
+        assert [
+            target for target in acceptance.linear.targets if target[1] == "Done"
+        ] == [("ENG-9", "Done", "operator")]
+
+    async def test_a_gate_on_unmerged_work_never_advances(
+        self, acceptance: Any
+    ) -> None:
+        # No proven merged review: the reconciler advances nothing, even
+        # for a satisfied gate.
+        acceptance.queue.admit(
+            AdmissionRequest(
+                issue_id="ENG-9",
+                project_key="demo",
+                linear_priority=1,
+                admitted_by="operator",
+                instruction_id="chat-ENG-9",
+            )
+        )
+        self._gate(acceptance)
+        acceptance.gates.satisfy("ENG-9", evidence={"live_smoke": "receipt-1"})
+
+        repairs = await acceptance.service.reconcile_acceptance("demo")
+
+        assert repairs == ()
+        assert acceptance.queue.get("ENG-9").state is IssueState.QUEUED
+        assert acceptance.linear.targets == []
         assert self._assignments(acceptance) == []

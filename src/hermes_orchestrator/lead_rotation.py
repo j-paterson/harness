@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 
 from hermes_orchestrator.cells import ProjectCellService, RotationBlocked
@@ -45,6 +46,15 @@ from hermes_orchestrator.handoffs import HandoffService
 _LIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
 _RESUMABLE_HANDOFF_STATES = ("submitted", "acknowledged")
+
+# Margin added to ``registration_wait_seconds`` to form the rotation
+# claim-age bound (see ``LeadRotation._claim_attempt``). Between the
+# claim and the transactional transfer a live rotation runs at most the
+# replacement acknowledgement turn plus seat launch plus the bounded
+# registration wait; five minutes of slack over the registration wait
+# is conservative for all of that, so a younger open attempt is treated
+# as a LIVE claimant and a concurrent request fails closed.
+_CLAIM_AGE_MARGIN_SECONDS = 300.0
 
 
 def live_cell_project_key(database: Database, cell_id: str) -> str | None:
@@ -245,7 +255,14 @@ class LeadRotation:
             replacement_session = incumbent_session
             profile_alias = incumbent_profile
         else:
-            self._journal_attempt(cell_id, handoff_id)
+            # Sol 524a38ed finding 3: the claim is acquired atomically,
+            # BEFORE cells.rotate or any runner/seat launch, so two
+            # concurrent rotate-lead processes can never both transfer.
+            refusal = self._claim_attempt(cell_id, handoff_id)
+            if refusal is not None:
+                return self._blocked(
+                    cell_id, handoff_id, phase="claim", failure=refusal
+                )
             try:
                 rotated = await self._cells.rotate(cell_id, handoff_id)
             except RotationBlocked as error:
@@ -404,13 +421,77 @@ class LeadRotation:
             (handoff_id, handoff_id),
         ).fetchone() is not None
 
-    def _journal_attempt(self, cell_id: str, handoff_id: str) -> None:
-        """Write-ahead: bind this rotation attempt to its handoff before
-        the transactional transfer, exactly once per open attempt."""
+    def _claim_attempt(self, cell_id: str, handoff_id: str) -> str | None:
+        """Atomically claim the exclusive rotation attempt for this handoff.
 
-        if self._attempt_open(handoff_id):
-            return
+        Sol 524a38ed finding 3: the open-attempt check used to run
+        OUTSIDE the append transaction, so two concurrent rotate-lead
+        processes could both observe "no open attempt", both journal one,
+        and both enter ``cells.rotate`` — potentially launching two
+        replacements. Here the check AND the write-ahead
+        ``lead_rotation.attempt`` append run inside ONE
+        ``database.transaction()``: ``BEGIN IMMEDIATE`` serializes
+        writers, so exactly one caller finds no open attempt and appends
+        it (the winner); every concurrent caller's own atomic
+        check-then-append observes an open attempt it did not create.
+        The claim is acquired before ``cells.rotate`` or any runner/seat
+        launch, so the loser fails closed with zero side effects.
+
+        Claim-age rule: an open attempt does not by itself prove a LIVE
+        claimant — the winner may have crashed before closing it. The
+        attempt event's ``occurred_at`` is the discriminator, bounded by
+        ``registration_wait_seconds + 300s``: between claiming and the
+        transactional transfer (the only window this claim guards — a
+        committed transfer resumes through the ``transfer_already_
+        committed`` branch instead), a live rotation runs at most the
+        replacement acknowledgement turn, the seat launch, and the
+        bounded registration wait, so five minutes of margin over the
+        registration wait is conservative. An attempt YOUNGER than the
+        bound presumes a live claimant and this call fails closed
+        (returns the refusal reason); an OLDER one presumes the claimant
+        dead and the retry adopts the open attempt (no second append —
+        the journal keeps exactly one open attempt per handoff) and
+        resumes. Adoption is safe because nothing pre-transfer is
+        externally visible and every later phase derives from durable
+        rows. An unparsable timestamp fails closed. Returns ``None``
+        when the claim is acquired, fresh or adopted.
+        """
+
+        now = datetime.now(UTC)
         with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT occurred_at FROM events "
+                "WHERE event_type = 'lead_rotation.attempt' "
+                "AND aggregate_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM events AS closed "
+                "WHERE closed.event_type = 'lead_rotation.completed' "
+                "AND closed.aggregate_id = ?) "
+                "ORDER BY sequence DESC LIMIT 1",
+                (handoff_id, handoff_id),
+            ).fetchone()
+            if row is not None:
+                bound = (
+                    self._registration_wait_seconds + _CLAIM_AGE_MARGIN_SECONDS
+                )
+                try:
+                    occurred = datetime.fromisoformat(str(row["occurred_at"]))
+                    if occurred.tzinfo is None:
+                        occurred = occurred.replace(tzinfo=UTC)
+                    age = (now - occurred).total_seconds()
+                except ValueError:
+                    age = None
+                if age is None or age <= bound:
+                    return (
+                        "rotation attempt already in progress for handoff "
+                        f"{handoff_id!r}: another rotate-lead holds the "
+                        "journaled claim (within the "
+                        f"{bound:g}s liveness bound); nothing was "
+                        "transferred or launched. Retry once it completes "
+                        "or its claim ages out"
+                    )
+                # Aged claim: the claimant is presumed dead; adopt its
+                # open attempt and resume without a second append.
+                return None
             self._events.append(
                 connection,
                 EventInput(
@@ -420,6 +501,7 @@ class LeadRotation:
                     payload={"cell_id": cell_id},
                 ),
             )
+        return None
 
     def _journal_completed(
         self, cell_id: str, handoff_id: str, replacement_session: str

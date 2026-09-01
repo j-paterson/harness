@@ -22,7 +22,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from hermes_orchestrator.acceptance import AcceptanceGate, AcceptanceGates
+from hermes_orchestrator.acceptance import (
+    ACCEPTANCE_PENDING,
+    ACCEPTANCE_SATISFIED,
+    AcceptanceGate,
+    AcceptanceGates,
+)
 from hermes_orchestrator.ci_window import CiWindow
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
@@ -112,6 +117,15 @@ class ReviewRecord:
             reviewed_sha=self.reviewed_sha,
             packets=(),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceRepair:
+    """One acceptance-gate repair applied by the reconciliation pass."""
+
+    issue_id: str
+    gate_state: str
+    action: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,7 +486,123 @@ class ReviewService:
         outcomes: list[MergeOutcome] = []
         for settlement in self._settlements.resumable(project_key):
             outcomes.append(await self.merge_approved(settlement.settlement_id))
+        # INFRA-198 packet K: the acceptance reconciliation pass rides
+        # every resume boundary — daemon startup (MergerSession.startup),
+        # the intake-boundary resumes in merger_turns, and the
+        # `merge-settle --project` CLI all converge on this method, so
+        # composing the pass here reaches every recovery entry without
+        # touching those callers.
+        await self.reconcile_acceptance(project_key)
         return tuple(outcomes)
+
+    async def reconcile_acceptance(
+        self, project_key: str | None = None
+    ) -> tuple[AcceptanceRepair, ...]:
+        """Repair every acceptance gate whose downstream state drifted.
+
+        Sol 524a38ed finding 2: ``acceptance_gates`` was durable but
+        never read by any startup or maintenance path, so a crash (or a
+        lifecycle-blind advance) anywhere between the gate row and the
+        queue/assignment/Linear state it governs stranded the issue
+        forever. This pass re-derives the exact downstream state each
+        gate demands, idempotently and exactly-once:
+
+        - A PENDING gate whose issue has a proven merged review (a
+          ``reviews`` row in state ``merged`` with a non-null
+          ``merge_sha``) but sits in a premature ``done`` — or holds
+          correctly in ``post_merge_acceptance`` with its assignment or
+          Linear hold effect missing — replays the acceptance hold:
+          queue back to ``post_merge_acceptance``, the idempotent
+          ``acceptance-hold`` Linear effect, and exactly one durable
+          acceptance assignment once a live project cell exists (the
+          same ``_dispatch_acceptance_assignment`` identity binding the
+          settlement path uses, so replays are durable no-ops).
+        - A SATISFIED gate whose queue or Linear completion never landed
+          (a crash after ``AcceptanceGates.satisfy`` persisted but
+          before the queue transition / Linear projection) completes the
+          issue: queue to ``done`` and the ``acceptance-satisfied``
+          Linear effect under the satisfy path's exact effect-id
+          convention, so a replay of either entry projects nothing
+          twice.
+        - A gate on an issue with NO proven merged review never advances
+          anything — acceptance can only ever complete merged work.
+
+        Linear availability: every boundary that reaches this pass
+        composes a real Linear projector (``build_merge_flow`` requires
+        ``linear``, and the ``ReviewService`` constructor fails closed
+        without one), so composition is never impossible here; a
+        projector that FAILS at runtime (network, credentials) is
+        contained per gate — the failure is reported to stderr, the
+        durable gate row is left untouched, and the next recovery
+        boundary retries the same repair.
+        """
+
+        if self._acceptance is None:
+            return ()
+        repairs: list[AcceptanceRepair] = []
+        for gate in self._acceptance.all_gates():
+            record = self._merged_review(gate.issue_id)
+            if record is None:
+                # Unmerged (or QA-rejected/superseded) work: the gate
+                # holds no authority to advance anything.
+                continue
+            if project_key is not None and record.project_key != project_key:
+                continue
+            try:
+                issue_state = self._queue.get(gate.issue_id).state
+            except KeyError:
+                continue
+            try:
+                if gate.state == ACCEPTANCE_PENDING and issue_state in (
+                    IssueState.DONE,
+                    IssueState.POST_MERGE_ACCEPTANCE,
+                ):
+                    await self._hold_for_acceptance(record)
+                    repairs.append(
+                        AcceptanceRepair(gate.issue_id, gate.state, "held")
+                    )
+                elif gate.state == ACCEPTANCE_SATISFIED:
+                    self._queue.transition(
+                        gate.issue_id,
+                        IssueState.DONE,
+                        actor="operator_acceptance",
+                        reason=(
+                            "acceptance satisfied for instruction "
+                            f"{gate.instruction_id}"
+                        ),
+                    )
+                    await self._linear.project(
+                        gate.issue_id,
+                        LinearProjection(
+                            status="Done", assignee_alias="operator"
+                        ),
+                        effect_id=(
+                            f"linear:{gate.issue_id}:acceptance-satisfied:"
+                            f"{gate.instruction_id}"
+                        ),
+                    )
+                    repairs.append(
+                        AcceptanceRepair(gate.issue_id, gate.state, "completed")
+                    )
+            except Exception as error:  # fail soft: durable rows retry later
+                print(
+                    "acceptance reconciliation for "
+                    f"{gate.issue_id!r} failed and will retry at the next "
+                    f"recovery boundary: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+        return tuple(repairs)
+
+    def _merged_review(self, issue_id: str) -> ReviewRecord | None:
+        """The newest proven merged review for ``issue_id``, if any."""
+
+        row = self._database.execute(
+            "SELECT * FROM reviews WHERE issue_id = ? AND state = 'merged' "
+            "AND merge_sha IS NOT NULL "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (issue_id,),
+        ).fetchone()
+        return None if row is None else _row_to_record(row)
 
     async def _drive_merge(self, review_id: str) -> MergeOutcome:
         """The idempotent merge body; call only under a settlement claim.

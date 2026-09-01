@@ -258,6 +258,20 @@ class AcceptanceGates:
         ).fetchone()
         return None if row is None else _row_to_gate(row)
 
+    def all_gates(self) -> tuple[AcceptanceGate, ...]:
+        """Read every durable gate, oldest first.
+
+        INFRA-198 packet K: the acceptance reconciliation pass walks the
+        whole table at every recovery boundary — the gate rows are the
+        durable truth that survives any crash between gate satisfaction
+        and the queue/Linear completion it should have driven.
+        """
+
+        rows = self._database.execute(
+            "SELECT * FROM acceptance_gates ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        return tuple(_row_to_gate(row) for row in rows)
+
     def pending(self, issue_id: str) -> bool:
         """True while the issue's gate exists and awaits acceptance."""
 

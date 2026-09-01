@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -996,3 +997,184 @@ async def test_replacement_without_channel_registration_blocks_until_it_lands(
     assert second.binding_id == first.binding_id
     assert len(seater.calls) == calls_after_first
     assert runner.start_count == start_count_after_first
+
+
+# -- atomic rotation attempt claim (Sol 524a38ed finding 3) ---------------
+
+
+def rotation_event_count(database: Database, event_type: str) -> int:
+    return int(
+        database.scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type = ?", (event_type,)
+        )
+    )
+
+
+def backdate_rotation_attempts(database: Database, *, seconds: float) -> None:
+    """Age every journaled rotation attempt past the claim-age bound, as
+    if its claimant crashed long ago."""
+
+    stamp = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE events SET occurred_at = ? "
+            "WHERE event_type = 'lead_rotation.attempt'",
+            (stamp,),
+        )
+
+
+class CountingCells:
+    """Duck-typed pass-through over the real cell service that can stall
+    exactly one transfer between the atomic claim and ``cells.rotate``,
+    so a test deterministically interleaves a second rotate-lead while
+    the first durably holds the journaled claim."""
+
+    def __init__(self, inner: ProjectCellService) -> None:
+        self._inner = inner
+        self.rotate_calls = 0
+        self.stall_next = False
+        self.release = asyncio.Event()
+
+    async def rotate(self, cell_id: str, handoff_id: str) -> object:
+        self.rotate_calls += 1
+        if self.stall_next:
+            self.stall_next = False
+            await self.release.wait()
+        return await self._inner.rotate(cell_id, handoff_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_rotations_one_claim_one_launch_loser_fails_closed(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Sol 524a38ed finding 3, required test 5: two concurrent
+    rotate-lead calls over one handoff produce exactly one claim, one
+    launch, one transfer, and one completion; the loser's atomic claim
+    sees the open attempt it did not create and fails closed with no
+    side effects."""
+
+    await start_cell(cells, queue)
+    submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    winner_cells = CountingCells(cells)
+    winner_cells.stall_next = True
+    winner = make_rotation(database, handoffs, winner_cells, bindings, seater)
+    loser_cells = CountingCells(cells)
+    loser_seater = RecordingSeater(bindings, database)
+    loser = make_rotation(
+        database, handoffs, loser_cells, bindings, loser_seater
+    )
+
+    task = asyncio.create_task(winner.rotate("cell-demo"))
+    while winner_cells.rotate_calls == 0:
+        await asyncio.sleep(0)
+    # The winner committed its atomic claim and stalls BEFORE the
+    # transactional transfer — the exact window the old outside-the-
+    # transaction check let a second process race through.
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+
+    blocked = await loser.rotate("cell-demo")
+
+    assert blocked.ok is False
+    assert blocked.phase == "claim"
+    assert "rotation attempt already in progress" in (blocked.failure or "")
+    # The loser performed NO transfer, NO launch, and journaled nothing.
+    assert loser_cells.rotate_calls == 0
+    assert loser_seater.calls == []
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert rotation_event_count(database, "lead_rotation.completed") == 0
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+    winner_cells.release.set()
+    report = await task
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+    # One claim, one transfer, one launch, one completion — total.
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert rotation_event_count(database, "lead_rotation.completed") == 1
+    assert winner_cells.rotate_calls == 1
+    assert len(seater.calls) == 1
+    assert database.scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'project_cell.rotated'"
+    ) == 1
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)
+
+
+@pytest.mark.asyncio
+async def test_a_live_claim_blocks_a_new_request_until_it_ages(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """An open attempt YOUNGER than the claim-age bound presumes a live
+    claimant: a competing rotate-lead fails closed — no transfer, no
+    launch, no second attempt journaled."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    journal_rotation_attempt(database, handoff_id)  # fresh: presumed live
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "claim"
+    assert "rotation attempt already in progress" in (report.failure or "")
+    assert seater.calls == []
+    assert runner.start_count == 1  # the initial dispatch only
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+
+@pytest.mark.asyncio
+async def test_aged_claim_from_a_crashed_winner_still_rotates(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Crash-resume survives the claim: the winner journaled its attempt
+    and died before the transfer committed. A retry past the claim-age
+    bound presumes the claimant dead, ADOPTS the open attempt (no second
+    append), and completes the rotation."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    journal_rotation_attempt(database, handoff_id)
+    backdate_rotation_attempts(database, seconds=3600.0)
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+    # Adoption, not duplication: still exactly one attempt, one close.
+    assert rotation_event_count(database, "lead_rotation.attempt") == 1
+    assert rotation_event_count(database, "lead_rotation.completed") == 1
+    assert len(seater.calls) == 1
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(REPLACEMENT_SESSION)

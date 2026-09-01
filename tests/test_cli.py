@@ -3600,11 +3600,38 @@ class _RecordingAcceptanceLinear:
         )
 
 
+def _insert_merged_review(database: Any, issue_id: str) -> None:
+    """Persist the proven merged review row a settled merge leaves behind
+    (state ``merged`` with a non-null ``merge_sha``), which the hardened
+    ``satisfy_acceptance`` demands before completing any issue."""
+
+    stamp = "2026-08-28T12:00:00+00:00"
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO reviews("
+            "review_id, project_key, issue_id, event_id, repository, branch, "
+            "pr_number, reviewed_sha, state, merge_sha, reason, "
+            "projection_json, created_at, updated_at"
+            ") VALUES (?, 'demo', ?, ?, 'j-paterson/demo', 'feature/eng-9', "
+            "14, ?, 'merged', ?, 'proven exact', NULL, ?, ?)",
+            (
+                f"review:demo:evt-{issue_id}",
+                issue_id,
+                f"evt-{issue_id}",
+                "c" * 40,
+                "e" * 40,
+                stamp,
+                stamp,
+            ),
+        )
+
+
 def test_hermes_command_require_then_satisfy_acceptance_completes_the_issue(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import hermes_orchestrator.cli as cli_module
     from hermes_orchestrator.db import Database
+    from hermes_orchestrator.domain import IssueState
     from hermes_orchestrator.events import EventStore
     from hermes_orchestrator.linear import ExternalEffectStore
     from hermes_orchestrator.queue import QueueService
@@ -3657,6 +3684,43 @@ def test_hermes_command_require_then_satisfy_acceptance_completes_the_issue(
     )
     queue = QueueService(database, EventStore(database), {"demo"})
 
+    full_evidence = {
+        "tests pass": "pytest output attached",
+        "docs updated": "README diff attached",
+    }
+    # Sol 524a38ed finding 1 — flipped from the J2-era pin of
+    # queued -> Done: full evidence on a merely QUEUED issue is refused.
+    # The gate stays pending and untouched; zero queue or Linear writes.
+    premature = command(
+        {
+            "intent": "satisfy_acceptance",
+            "issue_id": "ENG-9",
+            "evidence": full_evidence,
+        }
+    )
+    assert premature["code"] == "rejected"
+    assert "post_merge_acceptance" in str(premature["state"]["reason"])
+    assert linear.calls == []
+    assert queue.get("ENG-9").state.value == "queued"
+    assert (
+        str(
+            database.scalar(
+                "SELECT state FROM acceptance_gates WHERE issue_id = 'ENG-9'"
+            )
+        )
+        == "pending"
+    )
+
+    # The merge settles and the acceptance hold applies: the issue holds
+    # in post_merge_acceptance with a proven merged review on record.
+    queue.transition(
+        "ENG-9",
+        IssueState.POST_MERGE_ACCEPTANCE,
+        actor="codex_merger",
+        reason="merged; acceptance pending",
+    )
+    _insert_merged_review(database, "ENG-9")
+
     partial = command(
         {
             "intent": "satisfy_acceptance",
@@ -3667,7 +3731,7 @@ def test_hermes_command_require_then_satisfy_acceptance_completes_the_issue(
     assert partial["code"] == "rejected"
     assert "missing" in str(partial["state"]["reason"])
     assert linear.calls == []
-    assert queue.get("ENG-9").state.value == "queued"
+    assert queue.get("ENG-9").state.value == "post_merge_acceptance"
 
     still_pending = command(
         {
@@ -3680,10 +3744,6 @@ def test_hermes_command_require_then_satisfy_acceptance_completes_the_issue(
     assert still_pending["code"] == "accepted"
     assert still_pending["state"]["state"] == "pending"
 
-    full_evidence = {
-        "tests pass": "pytest output attached",
-        "docs updated": "README diff attached",
-    }
     satisfied = command(
         {
             "intent": "satisfy_acceptance",
@@ -3784,3 +3844,132 @@ def test_hermes_command_satisfy_acceptance_refuses_without_a_gate(
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["code"] == "rejected"
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    ["queued", "in_development", "review", "unmerged_hold"],
+)
+def test_hermes_command_satisfy_acceptance_refuses_unmerged_lifecycles(
+    configured_repo: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    lifecycle: str,
+) -> None:
+    """Sol 524a38ed finding 1, required test 1: satisfy_acceptance is
+    refused for queued, in-development, in-review, and unmerged
+    (``post_merge_acceptance`` without a proven merged review) work —
+    zero advancement: the gate stays pending and untouched, the queue
+    does not move, no Linear projector is even composed, and no event
+    of any kind is journaled by the refusal."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.domain import IssueState
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.queue import QueueService
+
+    _repo_root, state_dir = configured_repo
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            "ENG-9",
+            "--project",
+            "demo",
+            "--priority",
+            "1",
+            "--operator-instruction",
+            "chat-9",
+        ]
+    )
+    assert add.exit_code == 0
+    require = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "require_acceptance",
+                    "issue_id": "ENG-9",
+                    "instruction_id": "chat-9",
+                    "predicates": ["tests pass"],
+                }
+            ),
+        ]
+    )
+    assert require.exit_code == 0
+    assert json.loads(require.stdout)["code"] == "accepted"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        queue = QueueService(database, EventStore(database), {"demo"})
+        target = {
+            "queued": IssueState.QUEUED,
+            "in_development": IssueState.IN_DEVELOPMENT,
+            "review": IssueState.REVIEW,
+            "unmerged_hold": IssueState.POST_MERGE_ACCEPTANCE,
+        }[lifecycle]
+        if target is not IssueState.QUEUED:
+            queue.transition(
+                "ENG-9", target, actor="test", reason=f"placed in {lifecycle}"
+            )
+
+        def never_compose(settings: Any, runtime: Any) -> Any:
+            raise AssertionError(
+                "a refused satisfy_acceptance must never compose Linear"
+            )
+
+        monkeypatch.setattr(
+            cli_module, "_open_acceptance_linear", never_compose
+        )
+        events_before = int(database.scalar("SELECT COUNT(*) FROM events"))
+
+        result = invoke(
+            [
+                *base_arguments(configured_repo),
+                "hermes-command",
+                "--json",
+                json.dumps(
+                    {
+                        "intent": "satisfy_acceptance",
+                        "issue_id": "ENG-9",
+                        "evidence": {"tests pass": "pytest output attached"},
+                    }
+                ),
+            ]
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["code"] == "rejected"
+        expected_fragment = (
+            "no proven merged review"
+            if lifecycle == "unmerged_hold"
+            else "post_merge_acceptance"
+        )
+        assert expected_fragment in str(payload["state"]["reason"])
+        # Zero advancement: gate pending and evidence-free, queue
+        # unmoved, and not a single event journaled by the refusal.
+        gate = database.execute(
+            "SELECT state, evidence_json FROM acceptance_gates "
+            "WHERE issue_id = 'ENG-9'"
+        ).fetchone()
+        assert str(gate["state"]) == "pending"
+        assert gate["evidence_json"] is None
+        assert queue.get("ENG-9").state is target
+        assert (
+            int(database.scalar("SELECT COUNT(*) FROM events"))
+            == events_before
+        )
+        assert (
+            int(
+                database.scalar(
+                    "SELECT COUNT(*) FROM events "
+                    "WHERE event_type = 'acceptance.satisfied'"
+                )
+            )
+            == 0
+        )
+    finally:
+        database.close()

@@ -1484,9 +1484,41 @@ def _hermes_handlers(
         return gate.as_dict()
 
     def satisfy_acceptance(command: Any) -> dict[str, Any]:
+        # Sol 524a38ed finding 1: acceptance completes MERGED work only.
+        # The lifecycle checks run BEFORE AcceptanceGates.satisfy so a
+        # refused call persists nothing — the gate stays pending and
+        # untouched, and no queue or Linear write happens. Both refusals
+        # raise ValueError/KeyError, which the command executor maps to
+        # the structured "rejected" result. A gate that is ALREADY
+        # satisfied is past the lifecycle boundary (the issue is Done or
+        # completing): the replay flows through to ``satisfy``'s own
+        # byte-identical replay contract instead of being refused.
         acceptance = AcceptanceGates(
             runtime.database, events=EventStore(runtime.database)
         )
+        issue = runtime.queue.get(command.issue_id)
+        stored = acceptance.get(command.issue_id)
+        already_satisfied = stored is not None and stored.state == "satisfied"
+        if (
+            not already_satisfied
+            and issue.state is not IssueState.POST_MERGE_ACCEPTANCE
+        ):
+            raise ValueError(
+                f"issue {command.issue_id} is in state {issue.state.value!r}, "
+                "not 'post_merge_acceptance'; acceptance can only complete "
+                "an issue whose merge already settled into the acceptance "
+                "hold"
+            )
+        merged = runtime.database.execute(
+            "SELECT 1 FROM reviews WHERE issue_id = ? AND state = 'merged' "
+            "AND merge_sha IS NOT NULL LIMIT 1",
+            (command.issue_id,),
+        ).fetchone()
+        if merged is None:
+            raise ValueError(
+                f"issue {command.issue_id} has no proven merged review; "
+                "acceptance never completes unmerged work"
+            )
         gate = acceptance.satisfy(command.issue_id, evidence=command.evidence)
         runtime.queue.transition(
             command.issue_id,
