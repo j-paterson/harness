@@ -570,6 +570,21 @@ async def test_idle_report_and_missing_report_never_merge(
     assert flow.linear.targets == []
 
 
+
+def _durable_counts(flow: ProductionShapedFlow) -> dict[str, int]:
+    """Row counts a zero-write prevalidation refusal must not change."""
+
+    return {
+        table: int(flow.database.scalar(f"SELECT count(*) FROM {table}"))
+        for table in (
+            "submitted_verdicts",
+            "reviews",
+            "merge_settlements",
+            "lead_corrections",
+        )
+    }
+
+
 @pytest.mark.asyncio
 async def test_stale_rework_rejected_at_intake_leaves_the_ledger_failed(
     tmp_path: Path,
@@ -607,11 +622,20 @@ async def test_stale_rework_rejected_at_intake_leaves_the_ledger_failed(
         flow.github.full_pulls = {
             14: open_pull(number=14, head_sha=SHA_B, head_ref=branch_a)
         }
-        stale = await flow.submit(
-            "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
-        )
-        assert stale.kind == "rejected"
-        assert "not the candidate SHA" in stale.reason
+        # Sol correction c02dc0fe (INFRA-217): the exact-head gate now runs
+        # as read-only PREVALIDATION before any submitted_verdicts row is
+        # written, so a stale rework is refused with ZERO durable writes
+        # instead of being persisted and then terminally recorded as a
+        # rejected settlement. The guarantees this test actually cares
+        # about are unchanged and asserted below: the CI ledger stays
+        # failed and no new merge is attempted.
+        before = _durable_counts(flow)
+        with pytest.raises(SubmissionRejected, match="not the candidate SHA"):
+            await flow.submit(
+                "ENG-9", rework.event.event_id, SHA_C,
+                flow.verdict(SHA_C, branch_a, 14),
+            )
+        assert _durable_counts(flow) == before
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
         assert flow.github.merge_calls[-1]["expected_head_sha"] == SHA_A
     finally:
@@ -725,19 +749,26 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
                 }
 
         flow.github.on_list = move_head_after_admission
-        outcome = await flow.submit(
-            "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
-        )
-        assert outcome.kind == "rejected"
-        # INFRA-217: whichever exact-head check sees the moved head first
-        # — the intake gate's or settlement's discovery — the turn
-        # rejects and the bound failure stays stored.
-        assert (
-            "the open pull request head is not the candidate SHA"
-            in outcome.reason
-            or "approval requires a pull request at the exact reviewed head"
-            in outcome.reason
-        )
+        # Sol correction c02dc0fe (INFRA-217): the exact-head check now
+        # runs as read-only prevalidation before persistence, so a head
+        # that moved after emission is refused with zero durable writes
+        # rather than persisted and terminally recorded. The invariant
+        # this test exists for is unchanged and asserted below: the bound
+        # failure STAYS stored and the ledger stays failed, so a later
+        # authorized rework still binds only its own failure.
+        before = _durable_counts(flow)
+        with pytest.raises(
+            SubmissionRejected,
+            match=(
+                r"the open pull request head is not the candidate SHA"
+                r"|approval requires a pull request at the exact reviewed head"
+            ),
+        ):
+            await flow.submit(
+                "ENG-9", rework.event.event_id, SHA_C,
+                flow.verdict(SHA_C, branch_a, 14),
+            )
+        assert _durable_counts(flow) == before
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "failed"
         assert flow.window.stored_failure("demo") is not None
         assert flow.github.merge_calls[-1]["expected_head_sha"] == SHA_A
@@ -745,19 +776,27 @@ async def test_pr_change_after_admission_rejects_and_leaves_the_failure(
 
         # Required test 3: a later authorized rework still binds only its
         # own failure; replaying the settled turn changes nothing.
+        # Sol correction c02dc0fe: because the refusal above wrote
+        # nothing, the rework wake is STILL OUTSTANDING -- that is the
+        # anti-poisoning guarantee. The corrected retry is therefore a
+        # resubmission of the SAME wake once its pull request head agrees
+        # again, not a fresh emission (a fresh emission would now
+        # correctly refuse: the earlier wake was never consumed).
         flow.clock = flow.clock.replace(minute=30)
-        flow.stage("ENG-9", SHA_B, pr_number=14)
-        later = await flow.emitter.emit(
-            "demo", "ENG-9", verification=(("t", "ok"),), status="FABLE_REWORK_READY"
+        flow.github.open_pulls = (
+            open_summary(number=14, head_sha=SHA_C, head_ref=branch_a),
         )
+        flow.github.full_pulls = {
+            14: open_pull(number=14, head_sha=SHA_C, head_ref=branch_a)
+        }
         settled = await flow.submit(
-            "ENG-9", later.event.event_id, SHA_B, flow.verdict(SHA_B, branch_a, 14)
+            "ENG-9", rework.event.event_id, SHA_C, flow.verdict(SHA_C, branch_a, 14)
         )
         assert settled.kind == "merged"
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "corrected"
         assert (await flow.turns.handle_turn("demo")).kind == "no_outstanding_wake"
         assert flow.ledger_state(merge_sha_for(SHA_A)) == "corrected"
-        assert flow.ledger_state(merge_sha_for(SHA_B)) == "unresolved"
+        assert flow.ledger_state(merge_sha_for(SHA_C)) == "unresolved"
     finally:
         flow.close()
 

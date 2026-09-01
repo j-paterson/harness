@@ -18,6 +18,7 @@ from hermes_orchestrator.merge_flow import (
     merger_contract_path,
 )
 from hermes_orchestrator.queue import QueueService
+from hermes_orchestrator.review_intake import BranchHeadUnknown
 
 
 def test_contract_prefers_the_configuration_root(tmp_path: Path) -> None:
@@ -195,21 +196,55 @@ def test_branch_head_resolves_the_fetched_origin_branch_sha(
     ]
 
 
-def test_branch_head_returns_empty_string_on_fetch_failure(
+def test_branch_head_raises_unknown_on_fetch_failure(
     tmp_path: Path,
 ) -> None:
+    """INFRA-217, Sol correction c02dc0fe: a fetch failure (network,
+    authentication, an unreachable remote) is NEVER authoritative branch
+    absence -- it must raise :class:`BranchHeadUnknown` rather than
+    collapsing to the same "" that a genuinely absent branch returns, so
+    ``review_intake`` cannot mistake a transient failure for proof the
+    branch is gone.
+    """
+
     repo_root, _ = _minimal_repo(tmp_path)
     settings = load_settings(repo_root)
     git = FakeBranchHeadGit(fetch_error=GitError("git fetch failed"))
 
     head = _branch_head(settings, git)
 
-    assert head("demo", "feature/eng-9") == ""
+    with pytest.raises(BranchHeadUnknown):
+        head("demo", "feature/eng-9")
 
 
-def test_branch_head_returns_empty_string_on_resolution_failure(
+def test_branch_head_raises_unknown_on_local_resolution_error_type(
     tmp_path: Path,
 ) -> None:
+    """A local resolution failure that is not the documented ``GitError``
+    outcome (an unexpected exception) also fails closed as unknown, never
+    as absence.
+    """
+
+    repo_root, _ = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root)
+    git = FakeBranchHeadGit(head_of_error=OSError("local git corrupt"))
+
+    head = _branch_head(settings, git)
+
+    with pytest.raises(BranchHeadUnknown):
+        head("demo", "feature/eng-9")
+
+
+def test_branch_head_returns_empty_string_only_after_a_successful_fetch(
+    tmp_path: Path,
+) -> None:
+    """AUTHORITATIVE ABSENCE: the fetch itself succeeds -- the remote was
+    reachable -- and only the subsequent local resolution of
+    ``origin/<branch>`` fails with the documented ``GitError``. This is
+    the normal post-merge state (GitHub deletes the branch) and is still
+    represented by returning "" exactly as before INFRA-217.
+    """
+
     repo_root, _ = _minimal_repo(tmp_path)
     settings = load_settings(repo_root)
     git = FakeBranchHeadGit(head_of_error=GitError("git rev-parse failed"))
@@ -217,6 +252,10 @@ def test_branch_head_returns_empty_string_on_resolution_failure(
     head = _branch_head(settings, git)
 
     assert head("demo", "feature/eng-9") == ""
+    assert git.calls == [
+        ("fetch", str(repo_root), "origin", "feature/eng-9"),
+        ("head_of", str(repo_root), "origin/feature/eng-9"),
+    ]
 
 
 @dataclass

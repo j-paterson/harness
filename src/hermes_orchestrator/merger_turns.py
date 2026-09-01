@@ -820,6 +820,48 @@ class MergerTurnService:
             ineligibility = _approval_ineligibility_reason(discovered, project)
             if ineligibility is not None:
                 raise SubmissionRejected(ineligibility)
+        # INFRA-217, Sol correction c02dc0fe: the complete read-only
+        # candidate-admission checks -- exact remote-head (or
+        # proven-deleted-branch) validation, base policy, and the intake
+        # gate -- previously ran for the FIRST time inside
+        # ``_settle_wake``'s call to ``CandidateAdmission.admit``, AFTER
+        # this method had already persisted the submitted_verdicts row
+        # below. A stale or mismatched remote branch could therefore
+        # create a durable submission before the exact-head gate rejected
+        # it, and ``_record_settled`` would then terminally record the
+        # rejection, poisoning a corrected retry. ``validate_only`` runs
+        # the identical checks here -- read-only, zero durable writes --
+        # BEFORE ``_persist_submission``/``_supersede_submission``, so a
+        # rejection here leaves every durable table and wake state
+        # untouched and a corrected retry starts clean. This only applies
+        # while the wake is still ``delivered``: an already-``admitted``
+        # wake ran these same checks durably when it was admitted, and
+        # ``_settle_wake`` does not re-run them for that state either, so
+        # prevalidation stays consistent with the settlement-time gate it
+        # mirrors. The settlement-time call to ``CandidateAdmission.admit``
+        # inside ``_settle_wake`` is UNCHANGED and still re-runs the same
+        # checks immediately before the actual admission, to catch races
+        # between this prevalidation and settlement.
+        if state == "delivered":
+            try:
+                self._admission.validate_only(
+                    project_key, event, received_generation=channel.generation
+                )
+            except (MergeWindowExhausted, PriorMergeFailed):
+                # NOT prevalidation refusals. A full merge window defers
+                # the wake back to pending, and a bound prior failure
+                # routes a correction packet to the lead -- both are
+                # recoverable outcomes the settlement path already
+                # produces ('deferred' / 'blocked_prior_failure'), not
+                # zero-write rejections of the submission. Converting
+                # them here would turn a retryable deferral into a hard
+                # refusal, so they deliberately fall through to
+                # persistence and let ``_settle_wake`` handle them
+                # exactly as before this correction. Both subclass
+                # CandidateRejected, so this handler MUST precede it.
+                pass
+            except CandidateRejected as rejected:
+                raise SubmissionRejected(str(rejected)) from rejected
         if stale_existing:
             assert existing is not None
             submission = self._supersede_submission(
