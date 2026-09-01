@@ -50,6 +50,33 @@ Recording this rather than quietly running a surrogate is the point.
 The previous Critical arose precisely from claiming a supported path
 worked when only module-level behavior had been exercised.
 
+## Acceptance order (operator-authorized, 2026-09-01)
+
+This is a POST-MERGE acceptance gate. It does not block implementation
+and it is never satisfied by activating an unmerged branch runtime —
+that is explicitly prohibited. The order is:
+
+1. **Code review and merge first.** Sol reviews the corrected INFRA-219
+   candidate and merges it to `main` through the normal single-PR path.
+2. **Back up the live durable state.** Before any activation, copy the
+   production database aside (the established idiom in this state
+   directory is a suffixed sibling, e.g.
+   `state.db.pre-infra-219-live`, alongside its `-wal`/`-shm`), and
+   record the source SHA-256 and the ACTIVE runtime id in the receipt.
+3. **Activate ONLY the merged runtime.** Never a branch build. The
+   activation applies migrations 0054-0056 to production state; the
+   backup from step 2 is what makes that reversible.
+4. **Run the six-step dual-lane proof** below, capturing durable rows
+   and cmux evidence at every step.
+5. **On ANY failure: roll back both.** Re-activate the previous runtime
+   (`74518c21e24c08afe0b3ebd59b066355740f3164` at the time of writing —
+   re-measure before rolling back) AND restore the database backup from
+   step 2. A partially migrated production database with a rolled-back
+   runtime is the worst outcome; the two must move together.
+
+INFRA-219 stays OPEN until this proof succeeds. Implementation work
+continues meanwhile — the open gate is not a reason to stop.
+
 ## Proof procedure (exact, once the precondition clears)
 
 Preconditions to re-measure immediately before starting, and to record
