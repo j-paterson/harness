@@ -14,6 +14,11 @@ class IssueState(StrEnum):
     IN_DEVELOPMENT = "in_development"
     REVIEW = "review"
     QA = "qa"
+    # INFRA-198 J1: merged, held short of Done until the configured
+    # acceptance predicates are satisfied. Deliberately outside every
+    # dispatchable filter: ``list_ranked`` selects only queued/blocked,
+    # so a gated issue is never re-seated as new development work.
+    POST_MERGE_ACCEPTANCE = "post_merge_acceptance"
     DONE = "done"
     PAUSED = "paused"
     BLOCKED = "blocked"

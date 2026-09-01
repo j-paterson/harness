@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from hermes_orchestrator.acceptance import AcceptanceGates
 from hermes_orchestrator.ci_window import CircleCiIntakeGate, CiWindow
 from hermes_orchestrator.circleci import CiCheck
 from hermes_orchestrator.codex_merger import CodexMerger
@@ -26,6 +27,7 @@ from hermes_orchestrator.github import (
     MergeEffectJournal,
     MergeResult,
 )
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.manifests import (
     MANIFEST_VERSION,
@@ -234,6 +236,12 @@ class Acceptance:
         self.settlements = MergeSettlements(
             self.database, self.events, now=lambda: NOW
         )
+        self.gates = AcceptanceGates(
+            self.database, events=self.events, now=lambda: NOW
+        )
+        self.assignments = LeadAssignments(
+            self.database, events=self.events, now=lambda: NOW
+        )
         self.guarded_github = JournalledGitHub(self.github, self.database)
         self.service = ReviewService(
             database=self.database,
@@ -250,12 +258,38 @@ class Acceptance:
             lead=self.claude,
             settlements=self.settlements,
             merge_journal=self.guarded_github.journal,
+            acceptance=self.gates,
+            assignments=self.assignments,
             now=lambda: NOW,
         )
         self._events = 0
 
     def close(self) -> None:
         self.database.close()
+
+    def seat_cell(
+        self,
+        *,
+        cell_id: str = "cell-demo",
+        session_id: str = "11111111-1111-4111-8111-111111111111",
+        profile_alias: str = "max-a",
+    ) -> None:
+        """Insert the project's live cell so acceptance can dispatch to it."""
+
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at"
+                ") VALUES (?, 'demo', 'active', ?, ?, ?, ?)",
+                (
+                    cell_id,
+                    profile_alias,
+                    session_id,
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                ),
+            )
 
     def prepare(
         self,
@@ -406,6 +440,64 @@ async def test_codex_defect_then_corrected_merge(acceptance: Acceptance) -> None
 @pytest.mark.asyncio
 async def test_ordinary_merge_completes_done(acceptance: Acceptance) -> None:
     outcome = await acceptance.submit("ENG-9", sha=GOOD)
+    assert outcome.state == "merged"
+    assert acceptance.linear.targets == [
+        ("ENG-9", "Review", "operator"),
+        ("ENG-9", "Done", "operator"),
+    ]
+    assert acceptance.queue.get("ENG-9").state is IssueState.DONE
+
+
+@pytest.mark.asyncio
+async def test_gated_merge_holds_for_operator_acceptance(
+    acceptance: Acceptance,
+) -> None:
+    """INFRA-198 J1: a merge records implementation completion, not
+    operator acceptance — the gated canonical flow holds short of Done,
+    returns Linear to the operator, and dispatches the acceptance
+    action as one durable assignment bound to the live project cell."""
+
+    acceptance.seat_cell()
+    acceptance.gates.require(
+        "ENG-9",
+        instruction_id="chat-accept-eng-9",
+        predicates=("live_smoke", "operator_signoff"),
+    )
+
+    outcome = await acceptance.submit("ENG-9", sha=GOOD)
+
+    assert outcome.state == "merged"
+    assert acceptance.linear.targets == [
+        ("ENG-9", "Review", "operator"),
+        ("ENG-9", "In Development", "operator"),
+    ]
+    assert acceptance.queue.get("ENG-9").state is IssueState.POST_MERGE_ACCEPTANCE
+    rows = acceptance.database.execute(
+        "SELECT * FROM lead_assignments WHERE issue_id = 'ENG-9'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["state"] == "published"
+    assert rows[0]["instruction_id"] == "chat-accept-eng-9"
+    assert rows[0]["queue_transition"] == "review->post_merge_acceptance"
+    assert rows[0]["cell_id"] == "cell-demo"
+    assert rows[0]["session_id"] == "11111111-1111-4111-8111-111111111111"
+    # The gate itself is untouched by the merge: still pending.
+    assert acceptance.gates.pending("ENG-9") is True
+
+
+@pytest.mark.asyncio
+async def test_satisfied_gate_completes_exactly_like_today(
+    acceptance: Acceptance,
+) -> None:
+    """A satisfied gate restores the ordinary Done path byte-for-byte."""
+
+    acceptance.gates.require(
+        "ENG-9", instruction_id="chat-accept-eng-9", predicates=("live_smoke",)
+    )
+    acceptance.gates.satisfy("ENG-9", evidence={"live_smoke": "receipt-1"})
+
+    outcome = await acceptance.submit("ENG-9", sha=GOOD)
+
     assert outcome.state == "merged"
     assert acceptance.linear.targets == [
         ("ENG-9", "Review", "operator"),

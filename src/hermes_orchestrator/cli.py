@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
+from hermes_orchestrator.acceptance import AcceptanceGates
 from hermes_orchestrator.cells import ProfileCapacityEvidence, ProjectCellService
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
@@ -57,6 +58,7 @@ from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.lead_intake import LeadIntakeRouter
 from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.lead_wakes import (
@@ -64,6 +66,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeDelivery,
     LeadWakeReconciler,
 )
+from hermes_orchestrator.linear import LinearProjection, ProjectLinearRouter
 from hermes_orchestrator.merge_flow import MergeFlow, build_merge_flow
 from hermes_orchestrator.merger_session import MergerSession
 from hermes_orchestrator.merger_turns import SubmissionRejected, TurnOutcome
@@ -939,15 +942,47 @@ def _open_merge_flow(settings: Any, runtime: Runtime) -> MergeFlow:
     linear = build_linear_router(
         settings, database=runtime.database, queue=runtime.queue, keychain=keychain
     )
+    events = EventStore(runtime.database)
     return build_merge_flow(
         settings,
         database=runtime.database,
-        events=EventStore(runtime.database),
+        events=events,
         queue=runtime.queue,
         linear=linear,
         keychain=keychain,
         base_env=os.environ,
         processes=runtime.processes,
+        # INFRA-198 J1: a CLI-driven settlement publishes the same
+        # durable acceptance assignment the daemon would — the packet
+        # store is the shared database, not the process.
+        assignments=LeadAssignments(runtime.database, events=events),
+    )
+
+
+def _open_acceptance_linear(settings: Any, runtime: Runtime) -> ProjectLinearRouter:
+    """Compose only the Linear projector ``satisfy_acceptance`` needs.
+
+    INFRA-198 J2: satisfying an acceptance gate still must project the
+    completed issue through Linear's exact idempotent effect path — the
+    same :class:`~hermes_orchestrator.linear.ExternalEffectStore`-backed
+    ``project()`` every merge settlement already uses, so a replayed
+    ``satisfy_acceptance`` call produces no duplicate Linear effect.
+    Unlike ``_open_merge_flow`` it never opens the rest of the merge
+    graph (GitHub, CircleCI, the Codex RPC client): those collaborators
+    would cost extra Keychain reads and process wiring this single
+    status projection never touches, so composing the full merge flow
+    here would be disproportionate. This builds a fresh router from the
+    same validated per-project routing config and Keychain token the
+    daemon uses; a fresh object is safe every call because the effect's
+    idempotency lives in the durable ``external_effects`` table, keyed
+    by ``effect_id``, not in this object's identity.
+    """
+
+    return build_linear_router(
+        settings,
+        database=runtime.database,
+        queue=runtime.queue,
+        keychain=Keychain(),
     )
 
 
@@ -1484,6 +1519,78 @@ def _hermes_handlers(
             "reason": outcome.reason,
         }
 
+    def require_acceptance(command: Any) -> dict[str, Any]:
+        # The gate binds an instruction to a queued issue; an issue that
+        # was never admitted has nothing to hold, so this refuses before
+        # touching the acceptance table (KeyError -> "rejected", the
+        # same idiom every other unknown-issue refusal here uses).
+        runtime.queue.get(command.issue_id)
+        acceptance = AcceptanceGates(
+            runtime.database, events=EventStore(runtime.database)
+        )
+        gate = acceptance.require(
+            command.issue_id,
+            instruction_id=command.instruction_id,
+            predicates=command.predicates,
+        )
+        return gate.as_dict()
+
+    def satisfy_acceptance(command: Any) -> dict[str, Any]:
+        # Sol 524a38ed finding 1: acceptance completes MERGED work only.
+        # The lifecycle checks run BEFORE AcceptanceGates.satisfy so a
+        # refused call persists nothing — the gate stays pending and
+        # untouched, and no queue or Linear write happens. Both refusals
+        # raise ValueError/KeyError, which the command executor maps to
+        # the structured "rejected" result. A gate that is ALREADY
+        # satisfied is past the lifecycle boundary (the issue is Done or
+        # completing): the replay flows through to ``satisfy``'s own
+        # byte-identical replay contract instead of being refused.
+        acceptance = AcceptanceGates(
+            runtime.database, events=EventStore(runtime.database)
+        )
+        issue = runtime.queue.get(command.issue_id)
+        stored = acceptance.get(command.issue_id)
+        already_satisfied = stored is not None and stored.state == "satisfied"
+        if (
+            not already_satisfied
+            and issue.state is not IssueState.POST_MERGE_ACCEPTANCE
+        ):
+            raise ValueError(
+                f"issue {command.issue_id} is in state {issue.state.value!r}, "
+                "not 'post_merge_acceptance'; acceptance can only complete "
+                "an issue whose merge already settled into the acceptance "
+                "hold"
+            )
+        merged = runtime.database.execute(
+            "SELECT 1 FROM reviews WHERE issue_id = ? AND state = 'merged' "
+            "AND merge_sha IS NOT NULL LIMIT 1",
+            (command.issue_id,),
+        ).fetchone()
+        if merged is None:
+            raise ValueError(
+                f"issue {command.issue_id} has no proven merged review; "
+                "acceptance never completes unmerged work"
+            )
+        gate = acceptance.satisfy(command.issue_id, evidence=command.evidence)
+        runtime.queue.transition(
+            command.issue_id,
+            IssueState.DONE,
+            actor="operator_acceptance",
+            reason=f"acceptance satisfied for instruction {gate.instruction_id}",
+        )
+        linear = _open_acceptance_linear(settings, runtime)
+        asyncio.run(
+            linear.project(
+                command.issue_id,
+                LinearProjection(status="Done", assignee_alias="operator"),
+                effect_id=(
+                    f"linear:{command.issue_id}:acceptance-satisfied:"
+                    f"{gate.instruction_id}"
+                ),
+            )
+        )
+        return gate.as_dict()
+
     playbooks = PlaybookService(
         runtime.database,
         EventStore(runtime.database),
@@ -1653,6 +1760,8 @@ def _hermes_handlers(
         "accept_packet": accept_packet,
         "reject_packet": reject_packet,
         "record_direct_exception": record_direct_exception,
+        "require_acceptance": require_acceptance,
+        "satisfy_acceptance": satisfy_acceptance,
     }
 
 
@@ -4085,10 +4194,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
         if args.command == "merge-settle":
             flow = _open_merge_flow(settings, runtime)
+
+            async def _settle_single_review(review_id: str) -> Any:
+                # Sol 04d013b0 finding 3: the per-review maintenance
+                # entry must repair acceptance drift exactly like the
+                # project-wide resume (which composes the pass inside
+                # resume_settlements) — a satisfied gate stranded by a
+                # crash between satisfaction and completion converges to
+                # Done through EITHER supported merge-settle shape. The
+                # pass is scoped to this invocation's project and is
+                # idempotent, so a review with no gated issue repairs
+                # nothing.
+                outcome = await flow.reviews.merge_approved(review_id)
+                await flow.reviews.reconcile_acceptance(args.project)
+                return outcome
+
             try:
                 if args.review is not None:
                     outcomes = (
-                        asyncio.run(flow.reviews.merge_approved(args.review)),
+                        asyncio.run(_settle_single_review(args.review)),
                     )
                 else:
                     outcomes = asyncio.run(

@@ -5,7 +5,9 @@ one durable, restart-safe flow. A recorded verdict either returns structured
 correction packets to the Claude lead or becomes an approved review; an
 approved review is merged only through :class:`IntegrationMerge`, journaled
 in the CircleCI merge window without any CI query, and only then projected
-to Done or QA by the :class:`QaRouter`. Any failure before ancestry proof
+to Done or QA by the :class:`QaRouter` — unless a pending acceptance gate
+(INFRA-198 J1) holds the issue in ``post_merge_acceptance`` with the next
+acceptance action dispatched durably. Any failure before ancestry proof
 leaves Linear in Review. A QA rejection supersedes the merged review,
 projects In Development to the operator, and returns a Critical packet to
 the lead. CircleCI is never polled here.
@@ -20,12 +22,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from hermes_orchestrator.acceptance import (
+    ACCEPTANCE_PENDING,
+    ACCEPTANCE_SATISFIED,
+    AcceptanceGate,
+    AcceptanceGates,
+)
 from hermes_orchestrator.ci_window import CiWindow
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.github import MergeBlocked, MergeEffectJournal
+from hermes_orchestrator.lead_assignments import LeadAssignments
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.manifests import CandidateManifest
 from hermes_orchestrator.merge import (
@@ -111,6 +120,15 @@ class ReviewRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptanceRepair:
+    """One acceptance-gate repair applied by the reconciliation pass."""
+
+    issue_id: str
+    gate_state: str
+    action: str
+
+
+@dataclass(frozen=True, slots=True)
 class MergeOutcome:
     """The result of driving one review as far as it can safely go."""
 
@@ -140,6 +158,8 @@ class ReviewService:
         lead: LeadCorrectionPort,
         settlements: MergeSettlements,
         merge_journal: MergeEffectJournal | None = None,
+        acceptance: AcceptanceGates | None = None,
+        assignments: LeadAssignments | None = None,
         now: Callable[[], datetime] | None = None,
         on_merged: Callable[..., None] | None = None,
     ) -> None:
@@ -166,6 +186,12 @@ class ReviewService:
         self._lead = lead
         self._settlements = settlements
         self._merge_journal = merge_journal
+        # INFRA-198 J1: optional post-merge acceptance policy. When wired
+        # and a pending gate exists, a proven merge holds the issue in
+        # ``post_merge_acceptance`` instead of completing it; ``None``
+        # keeps the pre-gate behavior byte-for-byte.
+        self._acceptance = acceptance
+        self._assignments = assignments
         self._now = now or (lambda: datetime.now(UTC))
         # INFRA-198 P2: an optional accelerator over durable rows, wired
         # by the caller (never by this constructor's own defaults) as a
@@ -460,7 +486,145 @@ class ReviewService:
         outcomes: list[MergeOutcome] = []
         for settlement in self._settlements.resumable(project_key):
             outcomes.append(await self.merge_approved(settlement.settlement_id))
+        # INFRA-198 packet K: the acceptance reconciliation pass rides
+        # every resume boundary — daemon startup (MergerSession.startup),
+        # the intake-boundary resumes in merger_turns, and the
+        # `merge-settle --project` CLI all converge on this method, so
+        # composing the pass here reaches every recovery entry without
+        # touching those callers.
+        await self.reconcile_acceptance(project_key)
         return tuple(outcomes)
+
+    async def reconcile_acceptance(
+        self, project_key: str | None = None
+    ) -> tuple[AcceptanceRepair, ...]:
+        """Repair every acceptance gate whose downstream state drifted.
+
+        Sol 524a38ed finding 2: ``acceptance_gates`` was durable but
+        never read by any startup or maintenance path, so a crash (or a
+        lifecycle-blind advance) anywhere between the gate row and the
+        queue/assignment/Linear state it governs stranded the issue
+        forever. This pass re-derives the exact downstream state each
+        gate demands, idempotently and exactly-once:
+
+        - A PENDING gate whose issue has a proven merged review (a
+          ``reviews`` row in state ``merged`` with a non-null
+          ``merge_sha``) but sits in a premature ``done`` — or holds
+          correctly in ``post_merge_acceptance`` with its assignment or
+          Linear hold effect missing — replays the acceptance hold:
+          queue back to ``post_merge_acceptance``, the idempotent
+          ``acceptance-hold`` Linear effect, and exactly one durable
+          acceptance assignment once a live project cell exists (the
+          same ``_dispatch_acceptance_assignment`` identity binding the
+          settlement path uses, so replays are durable no-ops).
+        - Sol 04d013b0 finding 2 (option a — reconcile QA into the
+          hold): a PENDING gate on a proven merged review whose issue
+          was routed to ``qa`` BEFORE the gate existed (a late gate; a
+          gate pending at merge time always wins over QA routing in
+          ``_project_after_merge``) transitions into the same hold.
+          Option (a) is chosen over refusing late gate creation because
+          the ``("QA", "In Development")`` Linear pair is already
+          allowed (``linear._ALLOWED_STATUS_TRANSITIONS`` — the
+          ``qa_reject`` return path projects exactly it), a merged
+          QA-routed issue is a legitimate target for a late acceptance
+          requirement, and a creation-time refusal could not bind the
+          lifecycle anyway: the issue's state keeps moving after the
+          gate row persists, so drift must be repaired at this
+          reconciliation boundary regardless.
+        - Sol 04d013b0 finding 1: the reconciliation replay of the hold
+          is gate-scoped-deduplicated — an existing non-superseded
+          assignment for the issue and instruction (``published`` OR
+          ``acknowledged``) means the action is already dispatched, so
+          recovery never supersedes an acknowledged packet into a
+          duplicate. Only the genuine re-queue path (the merge-time
+          dispatch) keeps ``publish_in``'s consumed-epoch supersession.
+        - A SATISFIED gate whose queue or Linear completion never landed
+          (a crash after ``AcceptanceGates.satisfy`` persisted but
+          before the queue transition / Linear projection) completes the
+          issue: queue to ``done`` and the ``acceptance-satisfied``
+          Linear effect under the satisfy path's exact effect-id
+          convention, so a replay of either entry projects nothing
+          twice.
+        - A gate on an issue with NO proven merged review never advances
+          anything — acceptance can only ever complete merged work.
+
+        Linear availability: every boundary that reaches this pass
+        composes a real Linear projector (``build_merge_flow`` requires
+        ``linear``, and the ``ReviewService`` constructor fails closed
+        without one), so composition is never impossible here; a
+        projector that FAILS at runtime (network, credentials) is
+        contained per gate — the failure is reported to stderr, the
+        durable gate row is left untouched, and the next recovery
+        boundary retries the same repair.
+        """
+
+        if self._acceptance is None:
+            return ()
+        repairs: list[AcceptanceRepair] = []
+        for gate in self._acceptance.all_gates():
+            record = self._merged_review(gate.issue_id)
+            if record is None:
+                # Unmerged (or QA-rejected/superseded) work: the gate
+                # holds no authority to advance anything.
+                continue
+            if project_key is not None and record.project_key != project_key:
+                continue
+            try:
+                issue_state = self._queue.get(gate.issue_id).state
+            except KeyError:
+                continue
+            try:
+                if gate.state == ACCEPTANCE_PENDING and issue_state in (
+                    IssueState.DONE,
+                    IssueState.POST_MERGE_ACCEPTANCE,
+                    IssueState.QA,
+                ):
+                    await self._hold_for_acceptance(record, reconciling=True)
+                    repairs.append(
+                        AcceptanceRepair(gate.issue_id, gate.state, "held")
+                    )
+                elif gate.state == ACCEPTANCE_SATISFIED:
+                    self._queue.transition(
+                        gate.issue_id,
+                        IssueState.DONE,
+                        actor="operator_acceptance",
+                        reason=(
+                            "acceptance satisfied for instruction "
+                            f"{gate.instruction_id}"
+                        ),
+                    )
+                    await self._linear.project(
+                        gate.issue_id,
+                        LinearProjection(
+                            status="Done", assignee_alias="operator"
+                        ),
+                        effect_id=(
+                            f"linear:{gate.issue_id}:acceptance-satisfied:"
+                            f"{gate.instruction_id}"
+                        ),
+                    )
+                    repairs.append(
+                        AcceptanceRepair(gate.issue_id, gate.state, "completed")
+                    )
+            except Exception as error:  # fail soft: durable rows retry later
+                print(
+                    "acceptance reconciliation for "
+                    f"{gate.issue_id!r} failed and will retry at the next "
+                    f"recovery boundary: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+        return tuple(repairs)
+
+    def _merged_review(self, issue_id: str) -> ReviewRecord | None:
+        """The newest proven merged review for ``issue_id``, if any."""
+
+        row = self._database.execute(
+            "SELECT * FROM reviews WHERE issue_id = ? AND state = 'merged' "
+            "AND merge_sha IS NOT NULL "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (issue_id,),
+        ).fetchone()
+        return None if row is None else _row_to_record(row)
 
     async def _drive_merge(self, review_id: str) -> MergeOutcome:
         """The idempotent merge body; call only under a settlement claim.
@@ -473,7 +637,16 @@ class ReviewService:
 
         record = self._get(review_id)
         if record.state == "merged":
-            await self._project_after_merge(record)
+            # Replay, not a fresh merge (Sol Critical a626cf1f): the
+            # review already recorded "merged" on a prior pass — this
+            # call is a resumed settlement (crashed between
+            # ``mark_merged`` and ``mark_settled``) or a settled replay
+            # — never the merge that just happened. The acceptance hold
+            # this re-derives must dedup against a live (published or
+            # acknowledged) assignment instead of opening a fresh
+            # dispatch epoch that supersedes one the lead already
+            # acknowledged.
+            await self._project_after_merge(record, reconciling=True)
             return _outcome(record, reason=record.reason or "merged")
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
@@ -860,7 +1033,14 @@ class ReviewService:
             },
         )
         if record.state == "merged":
-            await self._project_after_merge(record)
+            # Same replay character as ``_drive_merge``'s already-merged
+            # branch (Sol Critical a626cf1f): reaching here with the
+            # review already ``merged`` means a prior pass completed
+            # ``_settle_proven`` and crashed before this method's own
+            # ``mark_merged``/``mark_settled`` tail below, so this is a
+            # resumed reconciliation, never the merge that just
+            # happened. Dedup against a live assignment instead.
+            await self._project_after_merge(record, reconciling=True)
             outcome = _outcome(record, reason=record.reason or "merged")
         else:
             outcome = await self._settle_proven(
@@ -1074,7 +1254,29 @@ class ReviewService:
             effect_id=effect_id,
         )
 
-    async def _project_after_merge(self, record: ReviewRecord) -> None:
+    async def _project_after_merge(
+        self, record: ReviewRecord, *, reconciling: bool = False
+    ) -> None:
+        """Project a merged review onward; ``reconciling`` marks a replay.
+
+        ``reconciling`` is threaded to :meth:`_hold_for_acceptance` (and
+        from there to ``_dispatch_acceptance_assignment``) so that every
+        caller re-deriving this projection for a review that was
+        already ``merged`` on a prior pass — not the fresh merge that
+        just happened — dedups against a live acceptance assignment
+        instead of opening a fresh dispatch epoch over one the lead may
+        have already acknowledged. The one FRESH caller is
+        ``_settle_proven``, right after ``_transition`` first marks the
+        review ``merged``; every REPLAY caller (``_drive_merge``'s
+        already-merged branch, and ``reconcile_external_merge``'s) must
+        pass ``reconciling=True``.
+        """
+
+        if self._acceptance is not None and self._acceptance.pending(
+            record.issue_id
+        ):
+            await self._hold_for_acceptance(record, reconciling=reconciling)
+            return
         projection = record.projection
         if projection is None:
             raise RuntimeError("merged review has no stored projection")
@@ -1089,6 +1291,122 @@ class ReviewService:
             projection,
             effect_id=f"linear:{record.issue_id}:after-merge:{record.review_id}",
         )
+
+    async def _hold_for_acceptance(
+        self, record: ReviewRecord, *, reconciling: bool = False
+    ) -> None:
+        """Hold a merged, acceptance-gated issue short of completion.
+
+        INFRA-198 J1: the merge recorded implementation completion, not
+        operator acceptance. The queue holds the issue in
+        ``post_merge_acceptance``, exactly one durable acceptance
+        assignment dispatches the next post-merge action to the live
+        project cell, and Linear returns to In Development for the
+        operator. Every step is idempotent, so a settlement replay
+        produces one queue transition, one durable assignment, and one
+        Linear effect. Once the gate is satisfied (or absent), replays
+        of this projection complete the issue exactly as before.
+        ``reconciling`` marks a recovery replay of an already-projected
+        merge (Sol 04d013b0 finding 1; scope widened by Sol Critical
+        a626cf1f to every replay caller of ``_project_after_merge``, not
+        only the ``reconcile_acceptance`` pass): dispatch then dedups
+        against any live assignment instead of opening a fresh dispatch
+        epoch over an acknowledged one.
+        """
+
+        assert self._acceptance is not None
+        gate = self._acceptance.get(record.issue_id)
+        assert gate is not None
+        prior_state = self._queue.get(record.issue_id).state
+        self._queue.transition(
+            record.issue_id,
+            IssueState.POST_MERGE_ACCEPTANCE,
+            actor="codex_merger",
+            reason=f"merged {record.merge_sha}; acceptance pending",
+        )
+        self._dispatch_acceptance_assignment(
+            record, gate, prior_state=prior_state.value, reconciling=reconciling
+        )
+        await self._linear.project(
+            record.issue_id,
+            LinearProjection(status="In Development", assignee_alias="operator"),
+            effect_id=(
+                f"linear:{record.issue_id}:acceptance-hold:{record.review_id}"
+            ),
+        )
+
+    def _dispatch_acceptance_assignment(
+        self,
+        record: ReviewRecord,
+        gate: AcceptanceGate,
+        *,
+        prior_state: str,
+        reconciling: bool = False,
+    ) -> None:
+        """Publish the durable acceptance assignment packet, exactly once.
+
+        Follows the classic-dispatch contract: the packet commits inside
+        one transaction with the live project cell's exact identity, and
+        ``publish_in``'s own supersede/no-op logic makes replays durable
+        no-ops (an unconsumed ``published`` packet is never duplicated).
+        Without the wired :class:`LeadAssignments` collaborator, or when
+        the project has no live cell to return the acceptance action to,
+        the assignment is skipped — the issue still holds in
+        ``post_merge_acceptance``, and the reconciliation repair (packet
+        K) re-derives the missing dispatch from the durable gate.
+
+        Sol 04d013b0 finding 1: ``publish_in`` treats an acknowledged
+        row as a consumed dispatch epoch and supersedes it with a fresh
+        packet — right for a genuine re-queue, wrong for recovery, which
+        must repair a MISSING dispatch, never replace a delivered one.
+        On any REPLAY path — the ``reconcile_acceptance`` pass, or a
+        resumed settlement/external-merge reconciliation whose review
+        was already ``merged`` on a prior pass (Sol Critical a626cf1f)
+        — a gate-scoped durable dedup runs in the same transaction
+        first: any non-superseded assignment for this issue and
+        instruction (``published`` OR ``acknowledged``) proves the
+        action already dispatched, and the replay does nothing. Only
+        the genuine merge-time dispatch (a review transitioning to
+        ``merged`` for the first time) keeps its epoch semantics.
+        """
+
+        if self._assignments is None:
+            return
+        assignment = None
+        with self._database.transaction() as connection:
+            if reconciling:
+                dispatched = connection.execute(
+                    "SELECT 1 FROM lead_assignments WHERE issue_id = ? "
+                    "AND instruction_id = ? AND state != 'superseded' "
+                    "LIMIT 1",
+                    (record.issue_id, gate.instruction_id),
+                ).fetchone()
+                if dispatched is not None:
+                    return
+            cell = connection.execute(
+                "SELECT cell_id, session_id, profile_alias FROM project_cells "
+                "WHERE project_key = ? AND state IN "
+                "('starting', 'active', 'handoff_required', 'paused')",
+                (record.project_key,),
+            ).fetchone()
+            if cell is None or cell["session_id"] is None:
+                return
+            assignment = self._assignments.publish_in(
+                connection,
+                project_key=record.project_key,
+                issue_id=record.issue_id,
+                cell_id=str(cell["cell_id"]),
+                session_id=str(cell["session_id"]),
+                profile_alias=str(cell["profile_alias"] or ""),
+                instruction_id=gate.instruction_id,
+                queue_transition=(
+                    f"{prior_state}->{IssueState.POST_MERGE_ACCEPTANCE.value}"
+                ),
+            )
+        if assignment is not None:
+            # The durable row is already the truth; this only routes it
+            # to the channel immediately instead of the next repair tick.
+            self._assignments.notify_committed(assignment)
 
 
 def _outcome(

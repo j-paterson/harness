@@ -618,6 +618,10 @@ def open_runtime(
                 keychain=reader,
                 base_env=environment,
                 processes=processes,
+                # INFRA-198 J1: the settlement's acceptance hold
+                # publishes its durable acceptance assignment through
+                # the same store the channel router watches.
+                assignments=lead_assignments,
             )
             # INFRA-198 P2: composed only in live/active mode, where a
             # durable database exists. ReviewService is built inside
