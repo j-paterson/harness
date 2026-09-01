@@ -385,7 +385,11 @@ class MergerTurnService:
         return cursor.rowcount == 1
 
     def _obsolete_wake_reason(
-        self, project_key: str, event_id: str
+        self,
+        project_key: str,
+        event_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> str | None:
         """``'unreviewed'``/``'correction-completed'`` iff obsolete, else ``None``.
 
@@ -399,16 +403,25 @@ class MergerTurnService:
         row awaiting settlement, or a review that is ``'approved'``,
         ``'merged'``, or otherwise still in flight -- is NOT obsolete and
         answers ``None``, so it can never be retired here.
+
+        INFRA-218 Sol correction 44eb2806 (c): accepts an optional
+        transaction ``connection`` so ``_reconcile_superseded_wake`` can
+        RE-PROVE this exact predicate on the same connection immediately
+        before its retiring UPDATE -- a true compare-and-set read,
+        never a stale read taken before the transaction started.
+        Defaults to ``self._database`` (an out-of-transaction read) for
+        every other caller, unchanged.
         """
 
-        submitted = self._database.execute(
+        executor = connection if connection is not None else self._database
+        submitted = executor.execute(
             "SELECT 1 FROM submitted_verdicts WHERE project_key = ? "
             "AND event_id = ? LIMIT 1",
             (project_key, event_id),
         ).fetchone()
         if submitted is None:
             return "unreviewed"
-        review = self._database.execute(
+        review = executor.execute(
             "SELECT state FROM reviews WHERE project_key = ? AND event_id = ? "
             "LIMIT 1",
             (project_key, event_id),
@@ -450,6 +463,26 @@ class MergerTurnService:
         scanning past it); ``False`` leaves it exactly as it was, still
         outstanding. Idempotent: once retired the row is no longer
         ``admitted``/``delivered`` and a later pass never reconsiders it.
+
+        INFRA-218 Sol correction 44eb2806 (c): steps 1-3 above classify
+        obsolescence and prove descendant ancestry OUTSIDE any
+        transaction, and the retiring UPDATE below used to guard only on
+        the wake's own ``state`` -- so a verdict submitted for this
+        EXACT event, concurrently with this method's read window, could
+        be orphaned: its wake would complete underneath it (state
+        ``'completed'``) with nothing left outstanding to settle it,
+        even though the verdict now genuinely needs settlement. Retiring
+        a wake is now a transactional compare-and-set: immediately
+        before the UPDATE, inside the SAME transaction, the obsolete
+        predicate is RE-PROVEN from ``_obsolete_wake_reason`` against
+        that transaction's own connection. Only an identical
+        classification to the one this call started with (no live
+        ``submitted`` row now exists for this event, and the review
+        state is still the one that made it obsolete) proceeds to
+        retirement; any drift -- most critically a verdict submitted in
+        the interim -- refuses retirement outright and leaves the wake
+        exactly as it was, still outstanding, so its now-live verdict is
+        never orphaned.
         """
 
         event_id = str(row["event_id"])
@@ -492,6 +525,16 @@ class MergerTurnService:
             return False
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
+            # INFRA-218 Sol correction 44eb2806 (c): the transactional
+            # compare-and-set re-proof -- refuse retirement if a
+            # concurrently submitted verdict (or any other drift) has
+            # made this wake no longer obsolete for the reason it was
+            # classified under, above.
+            live_reason = self._obsolete_wake_reason(
+                project_key, event_id, connection=connection
+            )
+            if live_reason != reason:
+                return False
             cursor = connection.execute(
                 "UPDATE wake_deliveries SET state = 'completed', "
                 "updated_at = ? WHERE project_key = ? AND event_id = ? "

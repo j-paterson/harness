@@ -2065,7 +2065,7 @@ class TestAcceptanceGatedSettlement:
         assert acceptance.settlements.get("review:demo:evt-1").state == "settled"
         self._assert_held_exactly_once(acceptance)
 
-    async def test_an_acknowledged_hold_survives_the_pre_settle_crash(
+    async def test_a_pre_settle_crash_projects_nothing_and_resumes_once(
         self, acceptance: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Sol Critical a626cf1f: the settlement's ``mark_merged`` durably
@@ -2081,27 +2081,32 @@ class TestAcceptanceGatedSettlement:
         original_mark_settled = acceptance.settlements.mark_settled
         calls = {"count": 0}
 
-        def crash_after_ack(settlement_id: str, *, token: str) -> None:
+        def crash_before_settle(settlement_id: str, *, token: str) -> None:
+            # INFRA-218 (Sol correction 44eb2806): the projection now runs
+            # only AFTER the settlement is terminal, so at this point
+            # nothing has been published yet — the ack-before-settle
+            # interleaving this hook used to construct no longer exists,
+            # which is exactly the stranding window the fix removes.
             calls["count"] += 1
             if calls["count"] == 1:
-                [published] = self._assignments(acceptance)
-                assert published["state"] == "published"
-                assert acceptance.assignments.acknowledge(
-                    str(published["assignment_id"]),
-                    session_id="11111111-1111-4111-8111-111111111111",
-                )
+                assert self._assignments(acceptance) == []
                 raise RuntimeError("simulated crash before mark_settled")
             original_mark_settled(settlement_id, token=token)
 
         monkeypatch.setattr(
-            acceptance.settlements, "mark_settled", crash_after_ack
+            acceptance.settlements, "mark_settled", crash_before_settle
         )
         with pytest.raises(RuntimeError, match="simulated crash"):
             await acceptance.submit("ENG-9", GOOD)
 
+        # INFRA-218 (Sol correction 44eb2806): the post-merge projection
+        # no longer runs while the merge lease is open — the settlement
+        # reaches its terminal state FIRST and the projection is separate
+        # recoverable work. So at this crash point the merge is proven but
+        # nothing has been projected yet: no assignment exists, which is
+        # precisely why an interruption here can no longer strand anything.
         assert acceptance.settlements.get("review:demo:evt-1").state == "merged"
-        [acknowledged] = self._assignments(acceptance)
-        assert acknowledged["state"] == "acknowledged"
+        assert self._assignments(acceptance) == []
 
         [first] = await acceptance.service.resume_settlements("demo")
         assert first.state == "merged"
@@ -2110,10 +2115,10 @@ class TestAcceptanceGatedSettlement:
             # Now terminal: further resumes find nothing to drive and
             # change nothing.
             assert await acceptance.service.resume_settlements("demo") == ()
+        # The resume settles the merge AND applies the hold exactly once:
+        # one assignment, never a duplicate or a superseded predecessor.
         rows = self._assignments(acceptance)
         assert len(rows) == 1
-        assert rows[0]["assignment_id"] == acknowledged["assignment_id"]
-        assert rows[0]["state"] == "acknowledged"
         assert int(
             acceptance.database.scalar(
                 "SELECT COUNT(*) FROM events "

@@ -466,6 +466,14 @@ class ReviewService:
         # An unexpected exception leaves the settlement 'merging' under
         # its lease: nothing is released (the mutation state is
         # unknown) and exactly one resumer re-drives after expiry.
+        #
+        # INFRA-218 Sol correction 44eb2806 (a): captured BEFORE the
+        # drive, so it reflects whether this call is the fresh merge
+        # (the review entered ``approved``) or a resumed convergence of
+        # an already-``merged`` review — the exact ``reconciling``
+        # distinction ``_project_after_merge`` requires, now threaded
+        # from here instead of from inside ``_drive_merge``.
+        was_already_merged = record.state == "merged"
         outcome = await self._drive_merge(review_id)
         if outcome.state == "merged":
             self._settlements.mark_merged(
@@ -479,6 +487,22 @@ class ReviewService:
                 ),
             )
             self._settlements.mark_settled(review_id, token=token)
+            # INFRA-218 Sol correction 44eb2806 (a): the durable
+            # settlement is now TERMINAL — ``merged`` and ``settled``,
+            # carrying the real ``merge_sha`` — before the post-merge
+            # Linear projection is attempted at all. No projection call
+            # is ever awaited while the ``merging`` lease is open, so a
+            # cancellation, a killed process, or an indefinitely hung
+            # Linear call can no longer strand a proven merge behind a
+            # non-terminal settlement: the worst it can do now is leave
+            # the ALREADY-terminal settlement's projection pending,
+            # which ``reconcile_post_merge_projections`` (riding the
+            # same ``resume_settlements`` boundary) replays from the
+            # intent ``_project_after_merge`` journals before its first
+            # live Linear read (Sol correction deb5ec49).
+            await self._project_fail_soft(
+                self._get(review_id), reconciling=was_already_merged
+            )
         elif outcome.state in ("deferred", STALE_SETTLEMENT):
             # Nothing external happened under the claim: a stale
             # pre-mutation revalidation releases back to ``recorded`` so
@@ -672,6 +696,26 @@ class ReviewService:
         no-op, and each failure here is reported and left for the next
         boundary exactly like ``reconcile_acceptance`` already does per
         gate.
+
+        INFRA-218 Sol correction 44eb2806 (b): a stored pending target
+        can predate a NEW acceptance gate created after the ordinary
+        (non-gated) projection was journaled — the gate pending at
+        merge time always wins in ``_project_after_merge``, but a LATE
+        gate arriving after journaling has no way to intercept a
+        replay of the already-stored target, which would otherwise
+        project the stale Done/QA target and override the required
+        acceptance hold. Before replaying any stored target, this loop
+        re-evaluates current acceptance policy with the exact same
+        read ``_project_after_merge`` uses for a fresh merge
+        (``self._acceptance.pending(issue_id)``) — the same predicate
+        ``reconcile_acceptance`` polices from the gate's side. When a
+        gate now requires a hold, the stale stored target is suppressed
+        entirely (never projected) and replaced with the required
+        ``_hold_for_acceptance`` projection (post_merge_acceptance /
+        In Development) instead, then the original pending effect is
+        marked completed so it is never reconsidered — the hold is the
+        durable terminal projection for this merge now, exactly as if
+        the gate had existed at merge time.
         """
 
         rows = self._database.execute(
@@ -697,6 +741,24 @@ class ReviewService:
             if record is None:
                 continue
             if project_key is not None and record.project_key != project_key:
+                continue
+            if self._acceptance is not None and self._acceptance.pending(issue_id):
+                # INFRA-218 Sol correction 44eb2806 (b): a gate now
+                # requires a hold — suppress the stale stored Done/QA
+                # target and replace it with the required hold instead
+                # of replaying stale completion over it.
+                try:
+                    await self._hold_for_acceptance(record, reconciling=True)
+                    self._complete_post_merge_effect(effect_id)
+                    replayed.append(effect_id)
+                except Exception as error:  # fail soft: retries later
+                    print(
+                        "post-merge acceptance-hold recovery for "
+                        f"{effect_id!r} failed and will retry at the "
+                        f"next recovery boundary: {type(error).__name__}: "
+                        f"{error}",
+                        file=sys.stderr,
+                    )
                 continue
             try:
                 await self._linear.project(issue_id, target, effect_id=effect_id)
@@ -768,14 +830,16 @@ class ReviewService:
             # exactly the live INFRA-216 blocker, where a settlement
             # already ``merging`` with an ``externally_merged`` path
             # re-raised on every resume and never reached ``settled``.
-            # Fail soft here, the same contract ``reconcile_acceptance``
-            # already uses: report and leave the durable projection
-            # inputs (the acceptance gate row, the queue state) for the
-            # next recovery boundary to repair, while this pass still
-            # converges the settlement to ``settled`` under the real,
-            # already-proven ``merge_sha`` — no new merge is ever
+            # INFRA-218 Sol correction 44eb2806 (a): no projection call
+            # here either — this branch performs no mutation at all,
+            # and ``merge_approved`` now performs the projection, as
+            # separately recoverable work, only after ITS OWN
+            # ``mark_merged``/``mark_settled`` tail (which runs right
+            # after this method returns) has converged the settlement
+            # to ``settled``. Leave the durable projection inputs (the
+            # acceptance gate row, the queue state, the stored review
+            # projection) exactly as they are — no new merge is ever
             # performed on this path.
-            await self._project_fail_soft(record, reconciling=True)
             return _outcome(record, reason=record.reason or "merged")
         if record.state != "approved":
             return _outcome(record, reason=record.reason or record.state)
@@ -919,7 +983,36 @@ class ReviewService:
     async def _settle_proven(
         self, record: ReviewRecord, proven: Any, *, reason: str
     ) -> MergeOutcome:
-        """Journal, transition, and project one proven merge; idempotent."""
+        """Journal and transition one proven merge to ``merged``; idempotent.
+
+        INFRA-218 Sol correction 44eb2806 (a): this method used to also
+        AWAIT the post-merge Linear projection here, before either of
+        its callers (``_drive_merge`` and ``reconcile_external_merge``)
+        had run the settlement's own ``mark_merged``/``mark_settled``
+        tail -- so the durable settlement row sat in its ``merging``
+        lease for the full duration of a Linear call. ``_project_fail_
+        soft`` only catches ``Exception``, so ``asyncio.CancelledError``
+        (a ``BaseException``), a killed process, or an indefinitely
+        hung Linear call left a genuinely proven merge (``reviews.state
+        == 'merged'``, real ``merge_sha``) stuck behind a settlement
+        that never reached ``settled``. A targeted cancellation probe
+        reproduced exactly this split.
+
+        The fix is ordering, not exception handling: this method now
+        performs ONLY the durable, already-local writes -- the CI
+        window record, the review's ``merged`` transition with its
+        proven ``merge_sha``, the fast-path callback, and the
+        ``merge.proven`` event -- and returns. It never calls
+        ``self._linear`` (directly or via ``_project_fail_soft``) at
+        all. Both callers now run the settlement's ``mark_merged``/
+        ``mark_settled`` tail against this already-terminal review
+        BEFORE performing the post-merge projection as separate,
+        independently recoverable work -- so no projection is ever
+        awaited while the merge lease is open, and the projection
+        intent journaled by ``_project_after_merge`` (Sol correction
+        deb5ec49) together with ``reconcile_post_merge_projections``
+        still replays it if this process never gets that far.
+        """
 
         self._window.record_merge(proven)
         projection = self._qa.after_merge(record.issue_id)
@@ -949,22 +1042,12 @@ class ReviewService:
                     file=sys.stderr,
                 )
         self._record_merge_proven(record, proven, reason=reason)
-        # INFRA-218 (S3): this is the ONE fresh caller of
-        # ``_project_after_merge`` (the docstring on that method names
-        # it exactly) — everything durable is already proven and
-        # written above (the review row transitioned to ``merged``
-        # with its real ``merge_sha``, and the ``merge.proven`` event
-        # appended) before this projection ever runs. Both callers of
-        # ``_settle_proven`` (``_drive_merge``'s fresh-merge branch and
-        # ``reconcile_external_merge``'s) still owe their settlement
-        # row its ``mark_merged``/``mark_settled`` tail after this
-        # returns; an unguarded raise here would propagate out of
-        # BOTH before that tail runs, leaving a just-claimed settlement
-        # stuck ``merging`` under its lease for a projection failure —
-        # the identical class of stall S1(a) closed for the REPLAY
-        # branches, just one step earlier, on the very first pass. Fail
-        # soft the same way, so the settlement tail always completes.
-        await self._project_fail_soft(record, reconciling=False)
+        # INFRA-218 Sol correction 44eb2806 (a): no projection call here
+        # any more — see the docstring above. The caller's settlement
+        # tail (``mark_merged``/``mark_settled``) runs against this
+        # already-``merged`` review immediately after this returns, and
+        # ONLY THEN does the caller perform the post-merge projection as
+        # separately recoverable work.
         return _outcome(record, reason=record.reason or "merged")
 
     def _record_merge_proven(
@@ -1263,20 +1346,21 @@ class ReviewService:
                 state="deferred",
                 reason="the exclusive merge claim is held elsewhere",
             )
-        if record.state == "merged":
+        # INFRA-218 Sol correction 44eb2806 (a): captured before either
+        # branch runs, mirroring ``merge_approved`` — reflects whether
+        # this call is the fresh reconciliation (the review enters
+        # anything other than ``merged``) or a resumed convergence of
+        # an already-``merged`` review, the exact ``reconciling``
+        # distinction ``_project_after_merge`` requires.
+        was_already_merged = record.state == "merged"
+        if was_already_merged:
             # Same replay character as ``_drive_merge``'s already-merged
             # branch (Sol Critical a626cf1f): reaching here with the
             # review already ``merged`` means a prior pass completed
             # ``_settle_proven`` and crashed before this method's own
             # ``mark_merged``/``mark_settled`` tail below, so this is a
             # resumed reconciliation, never the merge that just
-            # happened. Dedup against a live assignment instead.
-            #
-            # INFRA-218 (a): same fail-soft contract as ``_drive_merge``
-            # — a downstream projection failure must never block the
-            # settlement tail below from converging this already-proven
-            # merge to ``settled``.
-            await self._project_fail_soft(record, reconciling=True)
+            # happened. No projection call here — see below.
             outcome = _outcome(record, reason=record.reason or "merged")
         else:
             outcome = await self._settle_proven(
@@ -1288,6 +1372,14 @@ class ReviewService:
             review_id, token=token, merge_sha=proven.merge_sha
         )
         self._settlements.mark_settled(review_id, token=token)
+        # INFRA-218 Sol correction 44eb2806 (a): the settlement is now
+        # TERMINAL before the post-merge Linear projection is ever
+        # attempted — see ``merge_approved`` for the full rationale.
+        # Dedup against a live assignment on a replay via
+        # ``reconciling``, exactly as before.
+        await self._project_fail_soft(
+            self._get(review_id), reconciling=was_already_merged
+        )
         return outcome
 
     # -- QA ---------------------------------------------------------------
