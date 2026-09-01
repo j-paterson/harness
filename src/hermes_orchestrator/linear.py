@@ -44,13 +44,6 @@ _ALLOWED_STATUS_TRANSITIONS = frozenset(
         ("Review", "Done"),
         ("QA", "In Development"),
         ("QA", "Done"),
-        # Post-merge ACCEPTANCE only (INFRA-198, Sol 52d15493): the gate
-        # machinery moves a merged issue done -> post_merge_acceptance
-        # and projects the acceptance hold back to Linear as
-        # Done -> In Development (observed refused live on merged
-        # e8d5757). No other regression out of Done is permitted; every
-        # remaining Done -> * transition still fails closed below.
-        ("Done", "In Development"),
     }
 )
 
@@ -493,7 +486,17 @@ class LinearClient:
 
         if target_state_id is not None and issue.state_id != target_state_id:
             current_status = self._logical_status(issue.state_id)
-            if (current_status, target.status) not in _ALLOWED_STATUS_TRANSITIONS:
+            acceptance_hold = (
+                current_status == "Done"
+                and target.status == "In Development"
+                and effect_id.startswith(
+                    f"linear:{issue_id}:acceptance-hold:"
+                )
+            )
+            if (
+                (current_status, target.status) not in _ALLOWED_STATUS_TRANSITIONS
+                and not acceptance_hold
+            ):
                 raise ValueError(
                     f"Linear status transition {current_status} -> "
                     f"{target.status} is not allowed"

@@ -168,7 +168,7 @@ async def test_done_to_in_development_accepted_for_acceptance_projection(
     result = await linear_client.project(
         "ENG-9",
         LinearProjection(status="In Development", assignee_alias="operator"),
-        effect_id="effect-acceptance-hold",
+        effect_id="linear:ENG-9:acceptance-hold:review-1",
     )
 
     assert result.changed_fields == ("status",)
