@@ -419,6 +419,11 @@ async def test_codex_defect_then_corrected_merge(acceptance: Acceptance) -> None
     assert acceptance.claude.last_packet.reviewed_sha == BAD
     assert acceptance.claude.last_packet.severity == "Critical"
     assert acceptance.github.merge_calls == []
+    # INFRA-212: the correction is returned durably with no credential;
+    # its Linear projection is journaled and applied at the next
+    # recovery boundary.
+    assert acceptance.linear.last_target is None
+    await acceptance.service.resume_settlements("demo")
     assert acceptance.linear.last_target == ("ENG-10", "In Development", "operator")
     assert acceptance.queue.get("ENG-10").state is IssueState.IN_DEVELOPMENT
 

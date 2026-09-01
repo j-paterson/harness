@@ -730,6 +730,14 @@ class MergerTurnService:
         outcome, the row stays ``submitted``, and only a fresh submission
         from the new binding (which supersedes the stale identity) can
         settle the event.
+
+        INFRA-212: the credentialed steps -- the admission gates' remote
+        head, base policy and intake gate, and pull-request discovery --
+        are the ones that authorize crossing an external boundary, so
+        they run for an APPROVAL. A ``corrections_required`` verdict
+        (and a terminal idle report) settles through the identical
+        durable path with none of them, which is what lets a correction
+        be submitted from a workspace holding no credentials at all.
         """
 
         live = self._merger.read_channel(project_key)
@@ -747,10 +755,49 @@ class MergerTurnService:
                 "'submitted' and non-settling until the new binding submits",
             )
         channel = live
+        # INFRA-212: the submitted document is parsed against its
+        # immutable manifest BEFORE admission, because the verdict is
+        # what decides whether this settlement may cross an external
+        # boundary at all. Nothing about the parse changed -- the same
+        # digest-and-identity-checked snapshot, the same binding, the
+        # same failure outcome -- only the order of two pure reads.
+        try:
+            snapshot = read_manifest_snapshot(
+                Path(event.manifest_path),
+                root=self._manifest_root,
+                expected_digest=event.manifest_digest,
+            )
+        except ManifestError as error:
+            return TurnOutcome(
+                project_key, "manifest_invalid", event.event_id,
+                event.issue_id, str(error),
+            )
+        binding = VerdictBinding(
+            repository=project.github_repo,
+            branch=snapshot.manifest.branch,
+            reviewed_sha=snapshot.manifest.candidate_sha,
+        )
+        try:
+            verdict = parse_turn_report(submitted.verdict_json, expected=binding)
+        except VerdictError as error:
+            return TurnOutcome(
+                project_key, "verdict_invalid", event.event_id, event.issue_id,
+                str(error),
+            )
+        # INFRA-212: only an approval crosses an external boundary. A
+        # corrections_required verdict (and a terminal idle report) opens
+        # no pull request and merges nothing, so it needs neither the
+        # credentialed admission gates (see
+        # ``CandidateAdmission._run_checks``) nor pull-request discovery,
+        # and settles from Sol's own workspace with no credential read.
+        needs_external = verdict is not None and verdict.verdict == "approved"
         if state == "delivered":
             try:
                 admitted = self._admission.admit(
-                    project_key, event, received_generation=channel.generation
+                    project_key,
+                    event,
+                    received_generation=channel.generation,
+                    external_gates=needs_external,
                 )
             except PriorMergeFailed as rejected:
                 packet = rejected.packet
@@ -807,48 +854,25 @@ class MergerTurnService:
                     f"{rejected}",
                 )
         else:
-            try:
-                snapshot = read_manifest_snapshot(
-                    Path(event.manifest_path),
-                    root=self._manifest_root,
-                    expected_digest=event.manifest_digest,
-                )
-            except ManifestError as error:
-                return TurnOutcome(
-                    project_key, "manifest_invalid", event.event_id,
-                    event.issue_id, str(error),
-                )
             admitted = AdmittedCandidate(
                 project_key=project_key,
                 manifest=snapshot.manifest,
                 thread_id=channel.thread_id,
                 generation=channel.generation,
             )
-        # INFRA-217: PR and merge identity derive from GitHub discovery
-        # by exact head — repository, head branch, reviewed head SHA,
-        # merged pulls included — never from reviewer input and never
-        # from a sole-open-pull-request rule. A GitHubError here
-        # propagates exactly as the old open-pulls listing's did: the
-        # submitted row stays 'submitted' and recovery resumes it.
-        discovered = self._github.discover_pull_request(
-            project.github_repo,
-            branch=admitted.manifest.branch,
-            head_sha=admitted.manifest.candidate_sha,
-        )
-        text = submitted.verdict_json
-        binding = VerdictBinding(
-            repository=project.github_repo,
-            branch=admitted.manifest.branch,
-            reviewed_sha=admitted.manifest.candidate_sha,
-        )
-        try:
-            verdict = parse_turn_report(text, expected=binding)
-        except VerdictError as error:
-            return TurnOutcome(
-                project_key, "verdict_invalid", event.event_id, event.issue_id,
-                str(error),
+        discovered = None
+        if needs_external:
+            # INFRA-217: PR and merge identity derive from GitHub discovery
+            # by exact head — repository, head branch, reviewed head SHA,
+            # merged pulls included — never from reviewer input and never
+            # from a sole-open-pull-request rule. A GitHubError here
+            # propagates exactly as the old open-pulls listing's did: the
+            # submitted row stays 'submitted' and recovery resumes it.
+            discovered = self._github.discover_pull_request(
+                project.github_repo,
+                branch=admitted.manifest.branch,
+                head_sha=admitted.manifest.candidate_sha,
             )
-        if verdict is not None and verdict.verdict == "approved":
             # Sol correction 6e1bfe60: the same eligibility judgement used
             # before persistence in submit_review is re-applied here, so
             # an ineligible pull (closed-unmerged, wrong base, foreign
@@ -932,6 +956,17 @@ class MergerTurnService:
         to the new identity inside one transaction, and persistence
         itself is conditioned on the channel still holding that exact
         binding.
+
+        INFRA-212: every validation named above -- project, reviewer
+        channel, thread, generation, outstanding wake, event, issue,
+        candidate SHA, immutable manifest, and the verdict document
+        itself -- is proven from durable local state, so a
+        ``corrections_required`` submission validates, persists and
+        settles with no Linear, GitHub, CircleCI, App Server, Keychain,
+        network or cmux access at all. Only an approval, which must
+        cross the merge boundary, reaches the credentialed steps, and
+        those still fail closed exactly as before when a credential
+        cannot be read.
         """
 
         project = self._projects.get(project_key)
@@ -1015,23 +1050,31 @@ class MergerTurnService:
             raise SubmissionRejected(
                 f"verdict document is invalid: {error}"
             ) from error
-        # INFRA-217: PR identity is derived from GitHub — by repository,
-        # head branch, and reviewed head SHA, merged pulls included —
-        # never read from the document. The discovery gate runs BEFORE
-        # any persistence, so an approval with no pull request at the
-        # exact reviewed head (and any discovery failure) rejects with
-        # zero durable writes and a corrected retry starts clean.
-        try:
-            discovered = self._github.discover_pull_request(
-                project.github_repo,
-                branch=manifest.branch,
-                head_sha=candidate_sha,
-            )
-        except GitHubError as error:
-            raise SubmissionRejected(
-                f"pull-request discovery failed: {error}"
-            ) from error
-        if document.verdict == "approved":
+        # INFRA-212: everything above is proven from durable local state
+        # alone -- the outstanding wake, the immutable manifest, the
+        # ready reviewer-channel binding, and the submitted document.
+        # Everything below is needed only by a verdict that will cross an
+        # external boundary, so a corrections_required submission reaches
+        # persistence and settlement without a single credential read.
+        needs_external = document.verdict == "approved"
+        if needs_external:
+            # INFRA-217: PR identity is derived from GitHub — by
+            # repository, head branch, and reviewed head SHA, merged
+            # pulls included — never read from the document. The
+            # discovery gate runs BEFORE any persistence, so an approval
+            # with no pull request at the exact reviewed head (and any
+            # discovery failure) rejects with zero durable writes and a
+            # corrected retry starts clean.
+            try:
+                discovered = self._github.discover_pull_request(
+                    project.github_repo,
+                    branch=manifest.branch,
+                    head_sha=candidate_sha,
+                )
+            except GitHubError as error:
+                raise SubmissionRejected(
+                    f"pull-request discovery failed: {error}"
+                ) from error
             # Sol correction 6e1bfe60: discovery alone is not eligibility.
             # This full identity-and-state judgement runs before ANY
             # persistence (submitted_verdict, review, settlement,
@@ -1042,6 +1085,7 @@ class MergerTurnService:
             ineligibility = _approval_ineligibility_reason(discovered, project)
             if ineligibility is not None:
                 raise SubmissionRejected(ineligibility)
+
         # INFRA-217, Sol correction c02dc0fe: the complete read-only
         # candidate-admission checks -- exact remote-head (or
         # proven-deleted-branch) validation, base policy, and the intake
@@ -1064,10 +1108,18 @@ class MergerTurnService:
         # inside ``_settle_wake`` is UNCHANGED and still re-runs the same
         # checks immediately before the actual admission, to catch races
         # between this prevalidation and settlement.
+        #
+        # INFRA-212: ``external_gates`` mirrors exactly what
+        # ``_settle_wake`` will run for this same verdict, so
+        # prevalidation stays a faithful dry run of the settlement gate
+        # rather than a stricter or looser one.
         if state == "delivered":
             try:
                 self._admission.validate_only(
-                    project_key, event, received_generation=channel.generation
+                    project_key,
+                    event,
+                    received_generation=channel.generation,
+                    external_gates=needs_external,
                 )
             except (MergeWindowExhausted, PriorMergeFailed):
                 # NOT prevalidation refusals. A full merge window defers

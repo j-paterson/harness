@@ -422,8 +422,14 @@ class ReviewService:
             self._dispatch_packets(
                 record, verdict.packets, "review.corrections", source="codex_review"
             )
+            # INFRA-212: the correction is durably delivered above; its
+            # Linear projection is journaled and applied at the next
+            # recovery boundary, so ``submit_review`` -- which this
+            # branch runs inside -- needs no credential at all.
             await self._return_to_lead(
-                record, effect_id=f"linear:{issue_id}:corrections:{review_id}"
+                record,
+                effect_id=f"linear:{issue_id}:corrections:{review_id}",
+                apply_projection=False,
             )
         elif record.state == "approved":
             self._queue.transition(
@@ -582,6 +588,13 @@ class ReviewService:
         # ordinary (non-acceptance-gated) post-merge Linear projection
         # left durably pending by a first-read outage.
         await self.reconcile_post_merge_projections(project_key)
+        # INFRA-212: the same replay for a return-to-lead projection
+        # (corrections / QA rejection) left pending — always, for a
+        # correction settled by ``submit_review``, which must work from
+        # a workspace holding no Linear credential at all. The
+        # correction itself is already durably delivered; this converges
+        # the workflow projection behind it.
+        await self.reconcile_returned_projections(project_key)
         return tuple(outcomes)
 
     async def reconcile_acceptance(
@@ -809,7 +822,7 @@ class ReviewService:
         against the journaled target — no new GitHub merge, no new
         protocol, just an idempotent replay of the same
         ``LinearClient.project`` call. A row already completed (by the
-        live projector or by :meth:`_complete_post_merge_effect`) is
+        live projector or by :meth:`_complete_projection_effect`) is
         never selected again, so a repeated recovery pass is a stable
         no-op, and each failure here is reported and left for the next
         boundary exactly like ``reconcile_acceptance`` already does per
@@ -882,7 +895,7 @@ class ReviewService:
                 f"linear:{record.issue_id}:after-merge:{record.review_id}"
             )
             if effect_id != current_effect_id:
-                self._complete_post_merge_effect(effect_id)
+                self._complete_projection_effect(effect_id)
                 replayed.append(effect_id)
                 continue
             if record.projection is None or target != record.projection:
@@ -900,7 +913,7 @@ class ReviewService:
                 # of replaying stale completion over it.
                 try:
                     await self._hold_for_acceptance(record, reconciling=True)
-                    self._complete_post_merge_effect(effect_id)
+                    self._complete_projection_effect(effect_id)
                     replayed.append(effect_id)
                 except Exception as error:  # fail soft: retries later
                     print(
@@ -925,8 +938,80 @@ class ReviewService:
                 )
         return tuple(replayed)
 
-    def _complete_post_merge_effect(self, effect_id: str) -> None:
-        """Complete a post-merge Linear effect a live client left pending.
+    async def reconcile_returned_projections(
+        self, project_key: str | None = None
+    ) -> tuple[str, ...]:
+        """Replay every return-to-lead Linear projection left pending.
+
+        INFRA-212: the mirror of
+        :meth:`reconcile_post_merge_projections`, for the other
+        direction. ``_return_to_lead`` always journals the exact
+        target-only row, and the ``corrections_required`` branch (which
+        runs inside ``submit_review``, required to work from a
+        credential-free workspace) deliberately leaves the projection
+        for this pass. Riding the identical ``resume_settlements``
+        recovery boundary every daemon entry crosses, it re-drives those
+        rows through the same idempotent ``LinearClient.project`` call.
+        No new protocol, no new transport, and no GitHub or merge effect
+        is involved.
+
+        A row is replayed only while it is still the LIVE return for its
+        issue: the effect id carries the review it was journaled for, so
+        a return that a newer review has already superseded is completed
+        without being projected, never replayed over the newer state.
+        Each failure is reported and left pending for the next boundary,
+        exactly as the post-merge pass does.
+        """
+
+        rows = self._database.execute(
+            "SELECT effect_id, request_json FROM external_effects "
+            "WHERE adapter = 'linear' AND operation = 'project' "
+            "AND state = 'pending' AND (effect_id LIKE 'linear:%:corrections:%' "
+            "OR effect_id LIKE 'linear:%:qa-rejected:%')"
+        ).fetchall()
+        replayed: list[str] = []
+        for row in rows:
+            effect_id = str(row["effect_id"])
+            try:
+                request = json.loads(row["request_json"])
+                issue_id = str(request["issue_id"])
+                target = LinearProjection.model_validate(request["target"])
+            except (KeyError, TypeError, ValueError) as error:
+                print(
+                    "return-to-lead projection recovery could not parse "
+                    f"{effect_id!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            record = self.current_review(issue_id)
+            if record is None:
+                continue
+            if project_key is not None and record.project_key != project_key:
+                continue
+            live_ids = {
+                f"linear:{issue_id}:{kind}:{record.review_id}"
+                for kind in ("corrections", "qa-rejected")
+            }
+            if effect_id not in live_ids:
+                self._complete_projection_effect(effect_id)
+                replayed.append(effect_id)
+                continue
+            try:
+                await self._linear.project(issue_id, target, effect_id=effect_id)
+            except Exception as error:  # fail soft: the durable row retries
+                print(
+                    "return-to-lead projection recovery for "
+                    f"{effect_id!r} failed and will retry at the next "
+                    f"recovery boundary: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            self._complete_projection_effect(effect_id)
+            replayed.append(effect_id)
+        return tuple(replayed)
+
+    def _complete_projection_effect(self, effect_id: str) -> None:
+        """Complete a journaled Linear effect a live client left pending.
 
         A real ``LinearClient.project`` already completes its own
         journal row internally before returning successfully, so this
@@ -1752,18 +1837,70 @@ class ReviewService:
             )
         self._lead.deliver(record.issue_id, packets, source=source)
 
-    async def _return_to_lead(self, record: ReviewRecord, *, effect_id: str) -> None:
+    async def _return_to_lead(
+        self,
+        record: ReviewRecord,
+        *,
+        effect_id: str,
+        apply_projection: bool = True,
+    ) -> None:
+        """Return the issue to its lead, then project that return to Linear.
+
+        INFRA-212: the durable half of a return -- the correction
+        packets ``_dispatch_packets`` has already delivered to the lead
+        outbox, and the queue transition below -- is authoritative and
+        is what actually returns the work. The Linear status move is an
+        eventually consistent PROJECTION of that durable state, so it is
+        now always JOURNALED first as a target-only pending
+        ``external_effects`` row, through the same client-free primitive
+        activation (``ExternalEffectStore.begin_in`` in
+        ``cells._activate_issue_transaction``) and the post-merge path
+        (``_project_after_merge``) already use. Whatever happens next,
+        the intent survives.
+
+        ``apply_projection`` then says whether this caller may cross the
+        Linear boundary itself:
+
+        - ``True`` (every credentialed caller: the QA rejection driven
+          from the daemon or the operator CLI) projects inline exactly
+          as before.
+        - ``False`` is passed by ``record_verdict``'s
+          ``corrections_required`` branch, because that branch runs
+          inside ``submit_review``, which INFRA-212 requires to be
+          executable from Sol's own Codex workspace -- where composing a
+          live Linear client reads a macOS Keychain credential that does
+          not exist. A correction already durably delivered to its lead
+          must never depend on that.
+
+        Deferring is not skipping. The pending row is durable and exact,
+        the live client ADOPTS it (same effect id, byte-identical
+        target-only request) so replay is naturally idempotent and can
+        never double-apply, :meth:`reconcile_returned_projections`
+        applies it at the next recovery boundary -- the same
+        ``resume_settlements`` boundary every daemon entry crosses
+        (startup, each Merger turn, each submission, ``merge-settle``)
+        -- and ``ReconcileService._stage_linear`` surfaces anything
+        still pending as a durable finding. Both callers journal the
+        identical row and converge through the identical projection;
+        only the boundary that applies it differs.
+        """
+
         self._queue.transition(
             record.issue_id,
             IssueState.IN_DEVELOPMENT,
             actor="codex_merger",
             reason=f"{record.state} {record.reviewed_sha}",
         )
-        await self._linear.project(
-            record.issue_id,
-            self._qa.after_rejection(record.issue_id),
-            effect_id=effect_id,
+        target = self._qa.after_rejection(record.issue_id)
+        self._effects.begin(
+            effect_id,
+            target=record.issue_id,
+            request=projection_request(record.issue_id, target),
         )
+        if not apply_projection:
+            return
+        await self._linear.project(record.issue_id, target, effect_id=effect_id)
+        self._complete_projection_effect(effect_id)
 
     async def _project_fail_soft(
         self, record: ReviewRecord, *, reconciling: bool
@@ -1881,7 +2018,7 @@ class ReviewService:
 
         try:
             await self._linear.project(issue_id, target, effect_id=effect_id)
-            self._complete_post_merge_effect(effect_id)
+            self._complete_projection_effect(effect_id)
             return
         except ValueError as error:
             match = _TRANSITION_NOT_ALLOWED.match(str(error))
@@ -1909,10 +2046,10 @@ class ReviewService:
                 ),
                 effect_id=hop_effect_id,
             )
-            self._complete_post_merge_effect(hop_effect_id)
+            self._complete_projection_effect(hop_effect_id)
 
         await self._linear.project(issue_id, target, effect_id=effect_id)
-        self._complete_post_merge_effect(effect_id)
+        self._complete_projection_effect(effect_id)
 
     async def _hold_for_acceptance(
         self, record: ReviewRecord, *, reconciling: bool = False
