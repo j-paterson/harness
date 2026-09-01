@@ -2451,6 +2451,7 @@ def _install_fake_lane_dispatch(
     *,
     dispatch_result: object | None = None,
     dispatch_should_be_called: bool = True,
+    active_cell: object | None = None,
 ) -> list[dict[str, object]]:
     """Stub ``_open_rotation_collaborators`` so ``start-lane`` tests never
     touch the real cmux/profile-pool machinery ``rotate-lead``'s own
@@ -2465,6 +2466,9 @@ def _install_fake_lane_dispatch(
     the CLI's own pre-dispatch guard actually fires -- a validation
     that only happened to work because ``dispatch`` itself refused
     would not prove the CLI-side guard exists.
+
+    ``active_cell`` supplies the durable cell row this lane already
+    holds (default: none), so the adoption branch can be exercised.
     """
 
     import hermes_orchestrator.cli as cli_module
@@ -2472,8 +2476,8 @@ def _install_fake_lane_dispatch(
     calls: list[dict[str, object]] = []
 
     class _FakeCells:
-        def active_cell(self, project_key: str, lane_role: str) -> None:
-            return None
+        def active_cell(self, project_key: str, lane_role: str) -> object | None:
+            return active_cell
 
         async def dispatch(
             self,
@@ -2511,6 +2515,133 @@ def _install_fake_lane_dispatch(
         ),
     )
     return calls
+
+
+def _harness_cell(session_id: str) -> object:
+    """The durable harness-lane cell ``active_cell`` hands back."""
+
+    import uuid
+
+    from hermes_orchestrator.cells import HARNESS_LANE, ProjectCell
+
+    return ProjectCell(
+        cell_id="cell-harness",
+        project_key="demo",
+        state="active",
+        profile_alias="max-a",
+        session_id=uuid.UUID(session_id),
+        lane_role=HARNESS_LANE,
+    )
+
+
+def test_start_lane_refuses_an_active_cell_whose_worker_is_dead(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-198 (observed live): cmux workspace C39EBCDC / surface
+    F5B1BD55 still existed, but ``claude --resume 9b539c86`` had exited
+    with "No conversation found" and the pane was a bare shell prompt.
+    ``start-lane --lane harness`` returned ``already_running`` and
+    exited 0 purely on ``cells.active_cell(...)``, with no liveness
+    test at all -- so the operator's only signal was that the lane was
+    fine while it was in fact down. A DEFINITIVELY absent worker must
+    refuse instead, nonzero, naming the dead session, and must never
+    reach ``dispatch``."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    session_id = "9b539c86-c52f-43b2-b077-57491066ebcf"
+    calls = _install_fake_lane_dispatch(
+        monkeypatch,
+        dispatch_should_be_called=False,
+        active_cell=_harness_cell(session_id),
+    )
+    monkeypatch.setattr(
+        cli_module, "managed_claude_worker_alive", lambda _session_id: False
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "harness",
+            "--harness-run",
+            "run-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload.get("status") != "already_running"
+    assert payload["error"] == "dead_worker"
+    assert payload["session_id"] == session_id
+    assert calls == []
+
+    human_result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "harness",
+            "--harness-run",
+            "run-1",
+        ]
+    )
+    assert human_result.exit_code == 1
+    assert session_id in human_result.output
+
+
+@pytest.mark.parametrize("worker_alive", [True, None])
+def test_start_lane_still_adopts_a_cell_whose_worker_is_not_provably_dead(
+    configured_repo: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    worker_alive: bool | None,
+) -> None:
+    """The other half of the tri-state: a running worker (``True``) and
+    an UNMEASURABLE one (``None`` -- ``ps`` failed or matched
+    ambiguously) are both still adopted and reported
+    ``already_running``. Refusing on an unknown would break every
+    healthy re-run of ``start-lane`` on a transient ``ps`` hiccup."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    session_id = "9b539c86-c52f-43b2-b077-57491066ebcf"
+    _install_fake_lane_dispatch(
+        monkeypatch,
+        dispatch_should_be_called=False,
+        active_cell=_harness_cell(session_id),
+    )
+    monkeypatch.setattr(
+        cli_module, "managed_claude_worker_alive", lambda _session_id: worker_alive
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "harness",
+            "--harness-run",
+            "run-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "already_running"
+    assert payload["session_id"] == session_id
 
 
 def test_start_lane_harness_without_harness_run_refuses_nonzero(

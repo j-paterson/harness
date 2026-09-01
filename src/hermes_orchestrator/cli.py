@@ -51,6 +51,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxLeadSeater,
     CmuxSurfaceReconciler,
     RegistryProfileDirectory,
+    managed_claude_worker_alive,
 )
 from hermes_orchestrator.config import Settings, load_settings
 from hermes_orchestrator.context import ContextMonitor
@@ -1450,7 +1451,9 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
     :meth:`ProjectCellService.dispatch`. Idempotent: an already-live
     cell in the requested lane is adopted and reported (L1's
     ``(project_key, lane_role)`` uniqueness refuses a duplicate row
-    before this command would ever attempt one), never a traceback.
+    before this command would ever attempt one), never a traceback --
+    but only when that cell's worker is not provably dead (INFRA-198;
+    see the ``existing is not None`` branch).
 
     Sol correction 110ed759 / INFRA-219 R1: L3 made ``harness_run`` a
     MANDATORY ``ProjectCellService.dispatch`` argument for a harness
@@ -1501,6 +1504,37 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
 
     existing = cells.active_cell(args.project, lane_role)
     if existing is not None:
+        # INFRA-198 (observed live): an active cell row is NOT proof of a
+        # running worker. Workspace C39EBCDC / surface F5B1BD55 still
+        # existed while ``claude --resume 9b539c86`` had exited with "No
+        # conversation found", so ``start-lane --lane harness`` reported
+        # ``already_running`` and exited 0 for a corpse -- the operator's
+        # only signal that the lane was down. The worker is measured
+        # here, tri-state: ``True`` (running) and ``None`` (unknown --
+        # ``ps`` failed or was ambiguous, therefore treated as alive) are
+        # both adopted as before; only a DEFINITIVE absence refuses.
+        # Retirement stays the daemon's ``CmuxDeadLeadSweep``'s alone --
+        # this command never tears down durable state on its own.
+        if managed_claude_worker_alive(str(existing.session_id)) is False:
+            _print(
+                {
+                    "error": "dead_worker",
+                    "lane": lane_role,
+                    "cell_id": existing.cell_id,
+                    "session_id": str(existing.session_id),
+                },
+                json_output=args.json,
+                human=(
+                    f"{lane_role} lane cell {existing.cell_id} for "
+                    f"{args.project} is still marked active but its worker "
+                    f"(session {existing.session_id}) is gone: no managed "
+                    "claude process is running for it. Nothing was started. "
+                    "The daemon's dead-lead sweep retires this cell on its "
+                    "next tick; re-run start-lane after that to seat the "
+                    "replacement."
+                ),
+            )
+            return 1
         _print(
             {
                 "status": "already_running",

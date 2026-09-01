@@ -32,6 +32,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxSurfaceReconciler,
     HibernationDecision,
     classic_channel_command,
+    managed_claude_worker_alive,
 )
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
@@ -3180,7 +3181,16 @@ def _dead_lead_sweep(
     *,
     control: ControlOperations | None = None,
     leases: object | None = None,
+    worker_alive: bool | None = True,
 ) -> CmuxDeadLeadSweep:
+    """The sweep with its worker probe injected, never a live ``ps``.
+
+    ``worker_alive`` is the tri-state answer the injected probe returns
+    for every session: ``True`` (running), ``False`` (definitively
+    absent) or ``None`` (unknown). It defaults to ``True`` so the
+    surface-only tests keep measuring exactly the surface probe.
+    """
+
     return CmuxDeadLeadSweep(
         bindings=bindings,
         port=port,
@@ -3188,6 +3198,7 @@ def _dead_lead_sweep(
         events=EventStore(database),
         control=control,
         leases=leases,
+        worker_alive=lambda _session_id: worker_alive,
     )
 
 
@@ -3268,6 +3279,126 @@ async def test_dead_lead_sweep_leaves_a_live_seat_untouched(
 
     retired = await _dead_lead_sweep(
         database, bindings, port, control=control
+    ).tick()
+
+    assert retired == ()
+    live = bindings.active_lead("cell-demo")
+    assert live is not None
+    assert live.binding_id == binding.binding_id
+    assert _cell_state(database, "cell-demo") == "active"
+    assert control_operation_kinds(database) == []
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        # Exactly one managed process for this session: alive.
+        ([f"claude --resume {SESSION} --dangerously-skip-permissions"], True),
+        # ``ps`` succeeded and nothing matched: the ONLY definitive
+        # absence, and the only answer a caller may retire on.
+        (["/bin/zsh -l", f"claude --resume {SESSION_2}"], False),
+        # Two matches: ambiguous, so no single root can be identified.
+        (
+            [
+                f"claude --resume {SESSION}",
+                f"claude --session-id {SESSION} --print",
+            ],
+            None,
+        ),
+    ],
+)
+def test_managed_claude_worker_alive_is_tri_state(
+    monkeypatch: pytest.MonkeyPatch, lines: list[str], expected: bool | None
+) -> None:
+    """The primitive the sweep and ``start-lane`` both decide on.
+    ``live_claude_argv`` collapses "absent" and "unmeasurable" into the
+    same empty list; retirement destroys durable state, so it needs the
+    two kept apart."""
+
+    import subprocess
+
+    from hermes_orchestrator import cmux_surfaces
+
+    monkeypatch.setattr(
+        cmux_surfaces.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["ps"], returncode=0, stdout="\n".join(lines)
+        ),
+    )
+
+    assert managed_claude_worker_alive(SESSION) is expected
+
+
+def test_managed_claude_worker_alive_is_unknown_when_ps_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A measurement that could not run is not evidence of a dead
+    worker -- it must read as unknown, never as a definitive absence."""
+
+    from hermes_orchestrator import cmux_surfaces
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("ps unavailable")
+
+    monkeypatch.setattr(cmux_surfaces.subprocess, "run", _boom)
+
+    assert managed_claude_worker_alive(SESSION) is None
+
+
+@pytest.mark.asyncio
+async def test_dead_lead_sweep_retires_a_live_surface_whose_worker_is_gone(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """The exact observed INFRA-198 failure: cmux workspace C39EBCDC /
+    surface F5B1BD55 still EXISTED, but ``claude --resume 9b539c86``
+    had exited with "No conversation found" and the pane was a bare
+    shell prompt. The sweep's only liveness test was
+    ``surface_alive``, which answered True forever, so the corpse was
+    never retired and ``start-lane`` kept reporting ``already_running``
+    for it. A definitively absent worker must condemn the seat even
+    while its surface answers."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    # The surface is alive -- exactly as observed live.
+    port = FakePort(live={LEAD})
+    binding = bind_demo_lead(bindings)
+
+    retired = await _dead_lead_sweep(
+        database, bindings, port, control=control, worker_alive=False
+    ).tick()
+
+    assert retired == (binding.binding_id,)
+    assert bindings.active_lead("cell-demo") is None
+    assert _cell_state(database, "cell-demo") == "failed"
+    assert control_operation_kinds(database) == ["lead.dead_worker_retired"]
+    # The receipt names WHICH signal condemned the seat, so an operator
+    # can tell a closed workspace from a dead worker inside a live one.
+    row = database.execute(
+        "SELECT result_json FROM control_operations "
+        "WHERE kind = 'lead.dead_worker_retired'"
+    ).fetchone()
+    assert json.loads(str(row["result_json"]))["condemning_signal"] == "worker_absent"
+
+
+@pytest.mark.asyncio
+async def test_dead_lead_sweep_keeps_a_seat_whose_worker_liveness_is_unknown(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """The regression that guards the fix: the worker probe is
+    tri-state, and only its definitive ``False`` may retire anything.
+    ``None`` means ``ps`` failed or matched ambiguously -- retiring on
+    that would tear down every healthy seat at once on a transient
+    hiccup, on every tick."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    port = FakePort(live={LEAD})
+    binding = bind_demo_lead(bindings)
+
+    retired = await _dead_lead_sweep(
+        database, bindings, port, control=control, worker_alive=None
     ).tick()
 
     assert retired == ()

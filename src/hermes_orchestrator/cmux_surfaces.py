@@ -1598,10 +1598,16 @@ _DEAD_LEAD_RETIRED_CELL_STATE = "failed"
 #: The binding-closure reason a dead worker's seat carries, so the
 #: journal distinguishes this retirement from a rotation or a close.
 _DEAD_LEAD_BINDING_REASON = "dead_worker_surface_missing"
+#: Which of the two independent probes condemned a seat, recorded on
+#: the retirement receipt so an operator reading the journal can tell
+#: "the workspace was closed" from "the workspace is still open but
+#: the worker inside it exited".
+_DEAD_LEAD_SIGNAL_SURFACE = "surface_absent"
+_DEAD_LEAD_SIGNAL_WORKER = "worker_absent"
 
 
 class CmuxDeadLeadSweep:
-    """Retire lead seats whose cmux surface provably no longer exists.
+    """Retire lead seats whose surface OR whose worker is provably gone.
 
     INFRA-198: :meth:`CmuxSurfaceReconciler.reconcile` runs exactly once,
     before the supervisor starts, so a lead whose workspace was closed
@@ -1631,6 +1637,19 @@ class CmuxDeadLeadSweep:
       workspace.
     * A :class:`CmuxError` mid-pass ends the sweep with the remaining
       bindings untouched; the next tick re-derives everything.
+
+    INFRA-198 (observed live): the surface probe alone is not enough.
+    Workspace C39EBCDC / surface F5B1BD55 still EXISTED while the
+    worker inside it — ``claude --resume 9b539c86`` — had exited with
+    "No conversation found", leaving a bare shell prompt in the pane.
+    ``surface_alive`` answered True forever, so the seat was never
+    retired and ``start-lane`` kept reporting ``already_running`` for a
+    dead worker. A seat is now dead when EITHER probe is definitive
+    about absence: the surface is provably gone, OR
+    :func:`managed_claude_worker_alive` returns exactly ``False``. Its
+    ``None`` (``ps`` failed, or ambiguous matches) is an UNKNOWN and
+    never retires anything — the same fail-closed rule the surface
+    probe already follows.
     """
 
     def __init__(
@@ -1644,6 +1663,7 @@ class CmuxDeadLeadSweep:
         leases: WorktreeLeases | None = None,
         profiles: Any | None = None,
         now: Callable[[], datetime] | None = None,
+        worker_alive: Callable[[str], bool | None] | None = None,
     ) -> None:
         self._bindings = bindings
         self._port = port
@@ -1653,9 +1673,14 @@ class CmuxDeadLeadSweep:
         self._leases = leases
         self._profiles = profiles
         self._now = now or (lambda: datetime.now(UTC))
+        # Seam only: the default IS the real measurement, so production
+        # composition needs no wiring and tests need no live ``ps``.
+        self._worker_alive = (
+            worker_alive if worker_alive is not None else managed_claude_worker_alive
+        )
 
     async def tick(self) -> tuple[str, ...]:
-        """Retire every active lead binding whose surface is gone."""
+        """Retire every active lead binding whose seat is provably dead."""
 
         try:
             await self._port.ping()
@@ -1668,9 +1693,10 @@ class CmuxDeadLeadSweep:
             for binding in self._bindings.active():
                 if binding.role != "lead":
                     continue
-                if await self._port.surface_alive(binding.ref):
+                signal = await self._condemning_signal(binding)
+                if signal is None:
                     continue
-                self._retire(binding)
+                self._retire(binding, signal=signal)
                 retired.append(binding.binding_id)
         except CmuxError:
             # cmux failed mid-pass. Absence is only ever a successful
@@ -1679,7 +1705,30 @@ class CmuxDeadLeadSweep:
             return tuple(retired)
         return tuple(retired)
 
-    def _retire(self, binding: CmuxBinding) -> None:
+    async def _condemning_signal(self, binding: CmuxBinding) -> str | None:
+        """Which probe proves this seat dead, or ``None`` for "alive".
+
+        Two independent probes, each of which must be DEFINITIVE about
+        absence before it condemns anything. The surface probe runs
+        first and short-circuits, so a seat whose workspace is already
+        gone never pays for a ``ps``.
+        """
+
+        if not await self._port.surface_alive(binding.ref):
+            return _DEAD_LEAD_SIGNAL_SURFACE
+        try:
+            alive = self._worker_alive(str(binding.session_id))
+        except Exception:
+            # A probe that could not run is not evidence of a dead
+            # worker; the seat keeps its durable state for the next tick.
+            alive = None
+        if alive is False:
+            return _DEAD_LEAD_SIGNAL_WORKER
+        # True (alive) and None (unknown, therefore treated as alive)
+        # both leave the seat exactly as found.
+        return None
+
+    def _retire(self, binding: CmuxBinding, *, signal: str) -> None:
         """Retire one exact dead identity, in the fail-closed order."""
 
         project_key = str(binding.project_key)
@@ -1706,10 +1755,16 @@ class CmuxDeadLeadSweep:
                     "lane_role": binding.lane_role,
                     "cell_retired": cell_retired,
                     "worktree_lease_released": lease_id,
+                    "condemning_signal": signal,
                 },
                 reason=(
-                    "the lead's cmux surface is provably gone; its "
-                    "binding is closed and the cell released so a "
+                    (
+                        "the lead's cmux surface is provably gone"
+                        if signal == _DEAD_LEAD_SIGNAL_SURFACE
+                        else "the lead's cmux surface still exists but its "
+                        "managed claude worker is provably gone"
+                    )
+                    + "; its binding is closed and the cell released so a "
                     "deliberate start-lane can seat the replacement"
                 ),
             )
@@ -1837,6 +1892,39 @@ class CmuxDeadLeadSweep:
         return None
 
 
+def _managed_claude_process_lines(session_id: str) -> list[str] | None:
+    """The ``ps`` lines of managed ``claude`` processes for one session.
+
+    The single measurement and the single matching predicate both
+    :func:`live_claude_argv` and :func:`managed_claude_worker_alive`
+    read, so the argv the trust gate compares and the liveness the
+    dead-lead sweep decides on can never disagree about what "the
+    managed worker for this session" means. ``None`` means the
+    measurement itself failed (``ps`` unavailable, denied, or timed
+    out) and is therefore no evidence at all — distinct from an empty
+    list, which is a successful ``ps`` that found nothing.
+    """
+
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "args="],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return [
+        line.strip()
+        for line in listing.splitlines()
+        if session_id in line
+        and "claude" in line
+        and (" --resume " in line or " --session-id " in line)
+        and "ps -axo" not in line
+    ]
+
+
 def live_claude_argv(session_id: str) -> list[str]:
     """The live ``claude`` process argv for one exact session.
 
@@ -1849,27 +1937,49 @@ def live_claude_argv(session_id: str) -> list[str]:
     closed on the template comparison rather than guessing.
     """
 
-    try:
-        listing = subprocess.run(
-            ["ps", "-axo", "args="],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    matches = [
-        line.strip()
-        for line in listing.splitlines()
-        if session_id in line
-        and "claude" in line
-        and (" --resume " in line or " --session-id " in line)
-        and "ps -axo" not in line
-    ]
-    if len(matches) != 1:
+    matches = _managed_claude_process_lines(session_id)
+    if matches is None or len(matches) != 1:
         return []
     return matches[0].split()
+
+
+def managed_claude_worker_alive(session_id: str) -> bool | None:
+    """Tri-state: is this session's managed ``claude`` root process up?
+
+    INFRA-198 (observed live): cmux workspace C39EBCDC / surface
+    F5B1BD55 still EXISTED while ``claude --resume 9b539c86`` had
+    exited with "No conversation found", leaving a bare shell prompt in
+    the pane. A surface-existence probe therefore proves nothing about
+    the worker: the seat was alive by that measure and dead in fact, so
+    the per-tick sweep never retired it and ``start-lane`` reported
+    ``already_running`` for a corpse. A seat is live only when its
+    exact managed Claude root process for that exact session is live.
+
+    :func:`live_claude_argv` cannot answer this, because it collapses
+    "no such process" and "the measurement failed or was ambiguous"
+    into the same empty list. Retirement destroys durable state, so it
+    needs those kept apart:
+
+    * ``True``  — ``ps`` succeeded and exactly one managed ``claude``
+      process carries this session id. Definitively alive.
+    * ``False`` — ``ps`` succeeded and ZERO matched. This is the only
+      definitive absence, and the only answer a caller may retire on.
+    * ``None``  — unknown, THEREFORE TREAT AS ALIVE. Either ``ps``
+      raised (``OSError``/``SubprocessError``), or two or more
+      processes matched and no single root can be identified. Retiring
+      on an unknown would tear down healthy seats every time ``ps``
+      hiccups — on every tick, across every seat at once — so an
+      unknown must always fail closed toward leaving the seat alone.
+    """
+
+    matches = _managed_claude_process_lines(session_id)
+    if matches is None:
+        return None
+    if len(matches) == 1:
+        return True
+    if not matches:
+        return False
+    return None
 
 
 class ChannelTrustConfirmer:
