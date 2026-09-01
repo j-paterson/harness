@@ -5447,6 +5447,303 @@ def test_submit_handoff_without_an_awaiting_rotation_just_submits(
         database.close()
 
 
+# -- seat-derived handoff issue and branch (INFRA-198) ---------------------
+
+_SEAT_SESSION = "11111111-1111-4111-8111-111111111111"
+
+
+def _seed_admitted_issues(
+    state_dir: Path, *issue_ids: str, state: str = "in_development"
+) -> None:
+    """Durably admit each issue as active work on the demo project."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            for issue_id in issue_ids:
+                connection.execute(
+                    "INSERT INTO admitted_issues("
+                    "issue_id, project_key, priority, state, instruction_id, "
+                    "dependency_ready, overlap_risk, admitted_at, updated_at"
+                    ") VALUES (?, 'demo', 1, ?, ?, 1, 0, ?, ?)",
+                    (issue_id, state, f"instr-{issue_id}", now, now),
+                )
+    finally:
+        database.close()
+
+
+def _seed_lead_assignment(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    cell_id: str = "cell-demo",
+    session_id: str = _SEAT_SESSION,
+) -> None:
+    """Publish the seat's own durable lead assignment for ``issue_id``."""
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_assignments import LeadAssignments
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assignments = LeadAssignments(database, events=EventStore(database))
+        with database.transaction() as connection:
+            assignments.publish_in(
+                connection,
+                project_key="demo",
+                issue_id=issue_id,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias="max-b",
+                instruction_id=f"instr-{issue_id}",
+                queue_transition="queued->in_development",
+            )
+    finally:
+        database.close()
+
+
+def _seed_worktree_lease(
+    state_dir: Path, *, issue_id: str, path: Path, branch: str
+) -> None:
+    """Register one ACTIVE worktree lease binding ``issue_id`` to a lane."""
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.worktrees import WorktreeLeaseInput, WorktreeLeases
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        WorktreeLeases(database, EventStore(database)).register(
+            WorktreeLeaseInput(
+                project_key="demo",
+                issue_id=issue_id,
+                repo_path=str(state_dir.parent),
+                path=str(path),
+                branch=branch,
+                remote="origin",
+            )
+        )
+    finally:
+        database.close()
+
+
+def _install_detached_coordinator_probe(
+    monkeypatch: pytest.MonkeyPatch, lanes: dict[Path, str]
+) -> list[str]:
+    """Probe git per PATH: each leased lane reports its own branch, and
+    every other checkout -- the coordinator's own ``lead_cwd`` -- reports
+    the DETACHED shape ``_worktree_state`` maps an unreadable branch to.
+
+    Returns the list of paths probed, in order.
+    """
+
+    import hermes_orchestrator.cli as cli_module
+
+    probed: list[str] = []
+    branches = {str(path): branch for path, branch in lanes.items()}
+
+    def _probe(path: Path) -> Any:
+        probed.append(str(path))
+        return cli_module.WorktreeState(
+            branch=branches.get(str(path), ""),
+            head="a",
+            origin_head="a",
+            dirty=False,
+        )
+
+    monkeypatch.setattr(cli_module, "_worktree_state", _probe)
+    return probed
+
+
+def _submit_handoff_for_demo_cell(
+    configured_repo: tuple[Path, Path],
+) -> CliResult:
+    return invoke(
+        [
+            *base_arguments(configured_repo),
+            "submit-handoff",
+            "--cell",
+            "cell-demo",
+            "--decision",
+            "Keep the existing public interface.",
+            "--next-action",
+            "Run the failing test and correct ENG-9.",
+            "--json",
+        ]
+    )
+
+
+def test_submit_handoff_derives_issue_and_branch_from_the_seat(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live INFRA-198 defect: the project has SEVERAL active issues
+    and the coordinator's own checkout is detached, so the old
+    project-wide derivation yielded issue ``none`` and an empty branch
+    ("handoff field is incomplete: branch"). The cell's own live lead
+    assignment names its issue, and that issue's single active worktree
+    lease names the tree to probe -- so the submission succeeds carrying
+    both."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane,
+        branch="feature/infra-215-lane",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    probed = _install_detached_coordinator_probe(
+        monkeypatch, {lane: "feature/infra-215-lane"}
+    )
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert str(lane) in probed
+    database = Database.open(state_dir / "state.db")
+    try:
+        document = json.loads(
+            str(
+                database.scalar(
+                    "SELECT document_json FROM handoffs WHERE handoff_id = ?",
+                    (payload["handoff_id"],),
+                )
+            )
+        )
+    finally:
+        database.close()
+    assert document["branch"] == "feature/infra-215-lane"
+    assert "INFRA-215" in document["objective"]
+    assert "issue INFRA-215 is in_development" in document["status"]
+
+
+def test_submit_handoff_refuses_an_unassigned_cell_in_an_ambiguous_project(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No live assignment binds the cell and the project has several
+    active issues: the handoff's identity is underivable, so the command
+    refuses with an actionable message and writes nothing."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_detached_coordinator_probe(monkeypatch, {})
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 1
+    message = json.loads(result.stdout)["error"]
+    assert "no live lead assignment" in message
+    assert "2 active issues (INFRA-212, INFRA-215)" in message
+    assert "assign the cell its issue" in message
+    database = Database.open(state_dir / "state.db")
+    try:
+        # Only the handoff seeded by the incumbent state exists.
+        assert database.scalar("SELECT count(*) FROM handoffs") == 1
+    finally:
+        database.close()
+
+
+def test_submit_handoff_refuses_when_the_assigned_issue_has_no_one_lease(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seat's issue is unambiguous but its lane is not: zero active
+    leases and several active leases each refuse with their own
+    actionable message, and never fall back to the coordinator's tree."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_detached_coordinator_probe(monkeypatch, {})
+
+    without_lease = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert without_lease.exit_code == 1
+    message = json.loads(without_lease.stdout)["error"]
+    assert "is assigned issue 'INFRA-215'" in message
+    assert "has no active worktree lease" in message
+    assert "leave exactly one active worktree lease" in message
+
+    for suffix in ("a", "b"):
+        _seed_worktree_lease(
+            state_dir,
+            issue_id="INFRA-215",
+            path=repo_root / f"lane-215-{suffix}",
+            branch=f"feature/infra-215-{suffix}",
+        )
+
+    with_two_leases = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert with_two_leases.exit_code == 1
+    ambiguous = json.loads(with_two_leases.stdout)["error"]
+    assert "has 2 active worktree leases" in ambiguous
+    database = Database.open(state_dir / "state.db")
+    try:
+        assert database.scalar("SELECT count(*) FROM handoffs") == 1
+    finally:
+        database.close()
+
+
+def test_submit_handoff_keeps_the_single_active_issue_fallback(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preserved: a cell with no assignment in a project with exactly one
+    active issue still derives that issue and still probes the
+    coordinator's own worktree, exactly as before."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212")
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    database = Database.open(state_dir / "state.db")
+    try:
+        document = json.loads(
+            str(
+                database.scalar(
+                    "SELECT document_json FROM handoffs WHERE handoff_id = ?",
+                    (payload["handoff_id"],),
+                )
+            )
+        )
+    finally:
+        database.close()
+    assert document["branch"] == "main"
+    assert "issue INFRA-212 is in_development" in document["status"]
+
+
 def test_open_rotation_collaborators_validates_or_provisions_harness_checkout(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

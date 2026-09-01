@@ -3706,17 +3706,93 @@ def _submit_handoff(
             human="the cell's project is not configured.",
         )
         return 1
-    worktree = _worktree_state(project.lead_cwd)
     issue_rows = database.execute(
         "SELECT issue_id, state FROM admitted_issues WHERE project_key = ? "
         "AND state IN ('in_development', 'review') ORDER BY issue_id",
         (project_key,),
     ).fetchall()
-    issue_id, issue_state = (
-        (str(issue_rows[0]["issue_id"]), str(issue_rows[0]["state"]))
-        if len(issue_rows) == 1
-        else ("none", "unknown")
-    )
+    # INFRA-198: derive the issue and the git position from the SEAT
+    # being handed off, not from the project as a whole. The cell's
+    # latest live lead assignment names its issue unambiguously even
+    # when the project has several active issues, and that issue's own
+    # active worktree lease names the tree to probe -- the coordinator's
+    # ``project.lead_cwd`` checkout is frequently detached, which is
+    # what made ``branch`` empty and the field "incomplete".
+    assignment = database.execute(
+        "SELECT issue_id FROM lead_assignments "
+        "WHERE cell_id = ? AND session_id = ? AND state != 'superseded' "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (args.cell, str(cell["session_id"])),
+    ).fetchone()
+    if assignment is not None:
+        issue_id = str(assignment["issue_id"])
+        # ``resolve_lane`` is the codebase's fail-closed reader for
+        # "this issue's ONE active worktree lease": zero leases and
+        # several leases both refuse rather than guess.
+        leases = WorktreeLeases(database, events=EventStore(database))
+        try:
+            lane = resolve_lane(leases, project_key, issue_id)
+        except EmissionBlocked:
+            live = [
+                lease
+                for lease in leases.active(project_key)
+                if lease.issue_id == issue_id
+            ]
+            detail = (
+                "has no active worktree lease"
+                if not live
+                else f"has {len(live)} active worktree leases"
+            )
+            message = (
+                f"handoff refused: cell {args.cell!r} is assigned issue "
+                f"{issue_id!r}, but that issue {detail} in project "
+                f"{project_key!r}, so the handoff's branch cannot be "
+                f"derived; leave exactly one active worktree lease for "
+                f"{issue_id} and submit again"
+            )
+            _print(
+                {"error": message},
+                json_output=args.json,
+                human=f"{message}.",
+            )
+            return 1
+        worktree = _worktree_state(lane.path)
+        issue_state = next(
+            (
+                str(row["state"])
+                for row in issue_rows
+                if str(row["issue_id"]) == issue_id
+            ),
+            "unknown",
+        )
+    elif len(issue_rows) > 1:
+        # No seat-scoped assignment AND a genuinely ambiguous project:
+        # the old project-wide derivation would silently emit issue
+        # "none" against the coordinator's tree. Refuse instead.
+        named = ", ".join(str(row["issue_id"]) for row in issue_rows)
+        message = (
+            f"handoff refused: cell {args.cell!r} has no live lead "
+            f"assignment and project {project_key!r} has "
+            f"{len(issue_rows)} active issues ({named}), so the handoff's "
+            "issue and branch cannot be derived; assign the cell its issue "
+            "before submitting"
+        )
+        _print(
+            {"error": message},
+            json_output=args.json,
+            human=f"{message}.",
+        )
+        return 1
+    else:
+        # Preserved fallback: an unassigned cell in a project with at
+        # most one active issue behaves exactly as it did before, down
+        # to the coordinator worktree probe.
+        worktree = _worktree_state(project.lead_cwd)
+        issue_id, issue_state = (
+            (str(issue_rows[0]["issue_id"]), str(issue_rows[0]["state"]))
+            if len(issue_rows) == 1
+            else ("none", "unknown")
+        )
     document = derived_handoff_document(
         cell_id=args.cell,
         project_key=project_key,
