@@ -243,6 +243,24 @@ class ControlAttentionFact:
 
 
 @dataclass(frozen=True, slots=True)
+class LaneCellFact:
+    """One lead cell's lane row (INFRA-219 L2).
+
+    Minimal by design: lane role, durable identity, state, and a
+    best-effort current issue. Per-lead subagents, head/event, resource
+    pressure, and blockers are the fuller contract display and are
+    explicitly deferred past this packet.
+    """
+
+    project_key: str
+    lane_role: str
+    cell_id: str
+    session_id: str
+    state: str
+    issue_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardSnapshot:
     """One frozen tick's worth of dashboard facts."""
 
@@ -258,6 +276,7 @@ class DashboardSnapshot:
     transitions: tuple[TransitionFact, ...] = ()
     attention_control: ControlAttentionFact | None = None
     idle: tuple[IdleFact, ...] = ()
+    lanes: tuple[LaneCellFact, ...] = ()
 
 
 class UsageAggregator:
@@ -478,6 +497,46 @@ class TaskProvider:
             )
             for row in rows
         }
+
+    def lane_cells(self) -> tuple[LaneCellFact, ...]:
+        """One row per live lead cell, development and harness alike
+        (INFRA-219 L2).
+
+        ``issue_id`` is a best-effort read of the project's currently
+        occupying issue (``admitted_issues`` in ``in_development`` or
+        ``review``) -- occupancy is tracked per project today, not per
+        lane, so a project running both lanes reports the same current
+        issue on both rows until the occupancy model itself grows a
+        lane dimension (left for a later packet).
+        """
+
+        rows = self._database.execute(
+            "SELECT cell_id, project_key, lane_role, session_id, state "
+            "FROM project_cells WHERE state IN (?, ?, ?, ?) "
+            "ORDER BY project_key, lane_role",
+            _ACTIVE_CELL_STATES,
+        ).fetchall()
+        issue_rows = self._database.execute(
+            "SELECT project_key, issue_id FROM admitted_issues "
+            "WHERE state IN ('in_development', 'review') "
+            "ORDER BY project_key, updated_at DESC",
+        ).fetchall()
+        current_issue: dict[str, str] = {}
+        for issue_row in issue_rows:
+            current_issue.setdefault(
+                str(issue_row["project_key"]), str(issue_row["issue_id"])
+            )
+        return tuple(
+            LaneCellFact(
+                project_key=str(row["project_key"]),
+                lane_role=str(row["lane_role"]),
+                cell_id=str(row["cell_id"]),
+                session_id=str(row["session_id"]),
+                state=str(row["state"]),
+                issue_id=current_issue.get(str(row["project_key"])),
+            )
+            for row in rows
+        )
 
     def _latest_reviews(self) -> dict[str, tuple[int, str]]:
         rows = self._database.execute(
@@ -982,4 +1041,5 @@ class DashboardSources:
             transitions=self._transitions.transitions(),
             attention_control=self._control_attention.latest(),
             idle=self._tasks.idle_notes(resource),
+            lanes=self._tasks.lane_cells(),
         )

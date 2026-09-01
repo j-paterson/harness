@@ -4868,3 +4868,131 @@ async def test_paused_issue_is_never_touched_by_a_dispatch_of_a_different_issue(
     assert queue.get("ENG-9").state == IssueState.PAUSED
     assert queue.get("ENG-10").state == IssueState.IN_DEVELOPMENT
     assert all(target[0] != "ENG-9" for target in linear.targets)
+
+
+@pytest.mark.asyncio
+async def test_harness_dispatch_is_still_blocked_by_project_occupancy(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 L2 RECORDED GAP: lane-scoped cells are not enough.
+
+    L1 made cell uniqueness per (project, lane) and L2 made dispatch,
+    worktrees, and the dashboard lane-aware — but ISSUE OCCUPANCY is
+    still tracked per project in ``admitted_issues`` (no lane
+    dimension), and both the coarse ``project_busy`` pre-check and the
+    transactional activation predicate read it. So while the
+    development lead occupies the project with its issue, a harness
+    dispatch for a different issue is refused as ``project_busy``.
+
+    This test pins that ACTUAL behavior rather than the desired one:
+    INFRA-219's acceptance ("with the development lead actively
+    working an issue, one Hermes command starts the visible harness
+    lead") cannot pass until occupancy itself grows a lane dimension,
+    which is a durable-model change beyond L2's boundary. The
+    development lane's rows must at least stay untouched by the
+    refusal, which is what the assertions below prove.
+    """
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter(
+        [
+            UUID("22222222-2222-4222-8222-222222222222"),
+            UUID("33333333-3333-4333-8333-333333333333"),
+        ]
+    )
+    cells = iter(["cell-dev", "cell-harness"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    development = await service.dispatch("ENG-9")
+    assert development.status == "working"
+    dev_cell = service.active_cell("demo")
+    assert dev_cell is not None
+    dev_before = database.execute(
+        "SELECT cell_id, session_id, state FROM project_cells "
+        "WHERE lane_role = 'development'"
+    ).fetchall()
+
+    admit(queue, "ENG-11")
+    harness = await service.dispatch("ENG-11", lane_role="harness")
+
+    # The recorded gap: per-project occupancy refuses the harness lane.
+    assert harness.status == "project_busy"
+    assert service.active_cell("demo", "harness") is None
+    # The refusal is a plain read: the development lane is untouched and
+    # no harness process was ever launched.
+    dev_after = database.execute(
+        "SELECT cell_id, session_id, state FROM project_cells "
+        "WHERE lane_role = 'development'"
+    ).fetchall()
+    assert [tuple(row) for row in dev_after] == [tuple(row) for row in dev_before]
+    assert dev_cell is not None
+    assert all(
+        request.cwd != harness_cwd for request in runner.start_requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_harness_dispatch_resumes_rather_than_duplicating(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-219 L2: starting the harness lane twice adopts the live cell
+    (L1's per-lane uniqueness), never a second row."""
+
+    sessions = iter(
+        [
+            UUID("44444444-4444-4444-8444-444444444444"),
+            UUID("55555555-5555-4555-8555-555555555555"),
+        ]
+    )
+    cells = iter(["cell-harness", "cell-extra"])
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cells),
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    first = await service.dispatch("ENG-9", lane_role="harness")
+    admit(queue, "ENG-11")
+    second = await service.dispatch("ENG-11", lane_role="harness")
+
+    assert first.status == "working"
+    # The lane is already occupied by its own live cell: the second
+    # dispatch is refused as busy rather than creating a second harness
+    # cell (L1's per-lane uniqueness), and never touches the first.
+    assert second.status == "project_busy"
+    rows = database.execute(
+        "SELECT cell_id FROM project_cells WHERE lane_role = 'harness'"
+    ).fetchall()
+    assert [str(row["cell_id"]) for row in rows] == ["cell-harness"]

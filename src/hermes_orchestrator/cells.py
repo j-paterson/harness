@@ -597,6 +597,7 @@ class ProjectCellService:
         assignments: LeadAssignments | None = None,
         packets: SubagentPackets | None = None,
         dispatch_freshness_minutes: int | None = None,
+        lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
     ) -> None:
         self._database = database
         self._events = events
@@ -605,6 +606,15 @@ class ProjectCellService:
         self._runner = runner
         self._linear = linear
         self._project_paths = dict(project_paths)
+        # INFRA-219 L2: a lane-specific worktree override, keyed by
+        # (project_key, lane_role). The harness lane's whole point is
+        # that it never shares the development lead's worktree/session,
+        # so a caller wiring a harness cell hands its own dedicated
+        # checkout here; unset lanes (development, always) fall back to
+        # ``self._project_paths`` -- byte-compatible with pre-L2 wiring.
+        self._lane_project_paths: dict[tuple[str, str], Path] = dict(
+            lane_project_paths or {}
+        )
         self._session_ids = session_ids
         self._cell_ids = cell_ids or (lambda: str(uuid.uuid4()))
         self._now = now
@@ -663,11 +673,49 @@ class ProjectCellService:
         ).fetchall()
         return frozenset(str(row["project_key"]) for row in rows)
 
-    async def dispatch(self, issue_id: str) -> DispatchResult:
-        """Start or resume the issue's project lead after explicit admission."""
+    def active_cell(
+        self, project_key: str, lane_role: str = DEVELOPMENT_LANE
+    ) -> ProjectCell | None:
+        """Public read of the project's live cell in ``lane_role``.
+
+        INFRA-219 L2: the launch/recover surface (``cli.py``'s
+        ``start-lane`` and the dashboard) needs the same lane-scoped
+        lookup :meth:`dispatch` uses internally, without reaching into
+        the private :meth:`_find_active_cell`.
+        """
+
+        return self._find_active_cell(project_key, lane_role)
+
+    def _cell_cwd(self, project_key: str, lane_role: str) -> Path:
+        """The worktree a cell in ``lane_role`` launches/resumes into.
+
+        INFRA-219 L2: a harness cell never shares the development
+        lead's worktree -- ``lane_project_paths`` (constructor) is
+        consulted first for an explicit override, keyed by
+        ``(project_key, lane_role)``, and only development (or an
+        unconfigured lane) falls back to the historical
+        ``self._project_paths`` mapping.
+        """
+
+        override = self._lane_project_paths.get((project_key, lane_role))
+        if override is not None:
+            return override
+        return self._project_paths[project_key]
+
+    async def dispatch(
+        self, issue_id: str, *, lane_role: str = DEVELOPMENT_LANE
+    ) -> DispatchResult:
+        """Start or resume the issue's project lead after explicit admission.
+
+        INFRA-219 L2: ``lane_role`` (development by default) scopes
+        every cell lookup/creation this dispatch performs, so a
+        harness-lane dispatch can never find, resume, or collide with
+        the project's development cell, and vice versa.
+        """
 
         issue = self._queue.get(issue_id)
-        lock = self._dispatch_locks.setdefault(issue.project_key, asyncio.Lock())
+        lock_key = f"{issue.project_key}:{lane_role}"
+        lock = self._dispatch_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
             if self._decisions is not None:
                 pending = self._decisions.pending_for_issue(issue_id)
@@ -675,9 +723,11 @@ class ProjectCellService:
                     return DispatchResult(
                         status="awaiting_operator_decision", issue_id=issue_id
                     )
-            return await self._dispatch_locked(issue_id)
+            return await self._dispatch_locked(issue_id, lane_role=lane_role)
 
-    async def _dispatch_locked(self, issue_id: str) -> DispatchResult:
+    async def _dispatch_locked(
+        self, issue_id: str, lane_role: str = DEVELOPMENT_LANE
+    ) -> DispatchResult:
         """Dispatch one issue while holding its project-wide in-process lock."""
 
         issue = self._queue.get(issue_id)
@@ -711,11 +761,13 @@ class ProjectCellService:
         # before mutating anything — so a routing problem surfaces as a
         # durable pending `external_effects` row for reconciliation, never
         # as a block on local activation.
-        cell = self._find_active_cell(issue.project_key)
+        cell = self._find_active_cell(issue.project_key, lane_role)
         created = False
         if cell is None:
             try:
-                cell, created = self._create_cell(issue.project_key, issue_id)
+                cell, created = self._create_cell(
+                    issue.project_key, issue_id, lane_role=lane_role
+                )
             except _IssueAlreadyCompleted:
                 return DispatchResult(status="already_completed", issue_id=issue_id)
             if cell is None:
@@ -739,7 +791,7 @@ class ProjectCellService:
 
         request = LeadTurnRequest(
             session_id=cell.session_id,
-            cwd=self._project_paths[issue.project_key],
+            cwd=self._cell_cwd(issue.project_key, lane_role),
             prompt=(
                 f"Work only on Hermes-queued issue {issue_id}. "
                 "Plan it, coordinate safe parallel work, and report checkpoints."

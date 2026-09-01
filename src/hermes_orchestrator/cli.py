@@ -23,7 +23,12 @@ from typing import Any
 
 from hermes_orchestrator import migration_env as migration_env_module
 from hermes_orchestrator.acceptance import AcceptanceGates
-from hermes_orchestrator.cells import ProfileCapacityEvidence, ProjectCellService
+from hermes_orchestrator.cells import (
+    DEVELOPMENT_LANE,
+    HARNESS_LANE,
+    ProfileCapacityEvidence,
+    ProjectCellService,
+)
 from hermes_orchestrator.channel_hub import (
     ChannelHub,
     hub_socket_path,
@@ -512,6 +517,30 @@ def _parser() -> argparse.ArgumentParser:
     )
     rotate_lead.add_argument("--cell", required=True)
     rotate_lead.add_argument("--json", action="store_true")
+
+    start_lane = commands.add_parser(
+        "start-lane",
+        help=(
+            "start or recover a project's visible lead cell in one lane "
+            "(development or harness) through Hermes' existing cell "
+            "creation/launch path -- idempotent: a live cell in that "
+            "lane is adopted and reported, never duplicated "
+            "(INFRA-219 L2)"
+        ),
+    )
+    start_lane.add_argument("--project", required=True)
+    start_lane.add_argument(
+        "--lane", choices=("development", "harness"), default="development"
+    )
+    start_lane.add_argument(
+        "--issue",
+        default=None,
+        help=(
+            "explicit issue to launch a NEW cell against; omit to only "
+            "recover an already-running cell in this lane"
+        ),
+    )
+    start_lane.add_argument("--json", action="store_true")
 
     submit_handoff = commands.add_parser(
         "submit-handoff",
@@ -1118,8 +1147,26 @@ class _NoDispatchLinear:
         raise AssertionError("lead rotation never projects a Linear status")
 
 
+def _harness_lead_cwd(lead_cwd: Path) -> Path:
+    """The harness lane's dedicated worktree for a project's ``lead_cwd``.
+
+    INFRA-219 L2: a sibling checkout, never the development lead's own
+    directory -- ``start-lane --lane harness`` never launches or
+    resumes a lead in the same worktree a development lead uses, so
+    the two lanes' sessions can never collide on working-tree state.
+    The path is a deterministic convention (no new config surface);
+    provisioning the actual worktree there is out of this packet's
+    scope -- see the L2 report.
+    """
+
+    return lead_cwd.parent / f"{lead_cwd.name}-harness"
+
+
 def _open_rotation_collaborators(
-    settings: Settings, runtime: Runtime
+    settings: Settings,
+    runtime: Runtime,
+    *,
+    lane_role: str = DEVELOPMENT_LANE,
 ) -> tuple[ProjectCellService, CmuxLeadSeater]:
     """Compose the project cell service and classic seater rotation needs.
 
@@ -1196,7 +1243,12 @@ def _open_rotation_collaborators(
     # ``managed_repo_paths`` above — the seater and cell service must
     # launch into exactly the directory bootstrap already trusted.
     project_paths: Mapping[str, Path] = {
-        alias: project.lead_cwd for alias, project in settings.projects.items()
+        alias: (
+            _harness_lead_cwd(project.lead_cwd)
+            if lane_role == HARNESS_LANE
+            else project.lead_cwd
+        )
+        for alias, project in settings.projects.items()
     }
     cmux_port = CmuxCliAdapter(
         settings.cmux.cli,
@@ -1253,6 +1305,85 @@ def _open_rotation_collaborators(
         surfaces=seater,
     )
     return cells, seater
+
+
+def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
+    """``start-lane``: launch or recover one project's lead cell in one
+    lane through Hermes' existing cell creation/launch path.
+
+    INFRA-219 L2. Reuses :func:`_open_rotation_collaborators` --
+    exactly the collaborators (profile pool, ``ClaudeRunner``,
+    ``CmuxLeadSeater``) ``rotate-lead`` already composes -- so this
+    command is never a bespoke launcher, only a thin wire onto
+    :meth:`ProjectCellService.dispatch`. Idempotent: an already-live
+    cell in the requested lane is adopted and reported (L1's
+    ``(project_key, lane_role)`` uniqueness refuses a duplicate row
+    before this command would ever attempt one), never a traceback.
+    """
+
+    if settings.cmux is None or runtime.cmux_bindings is None:
+        _print(
+            {"error": "cmux is not configured"},
+            json_output=args.json,
+            human="cmux is not configured (config/cmux.yaml).",
+        )
+        return 1
+    if settings.projects.get(args.project) is None:
+        _print(
+            {"error": "unknown project"},
+            json_output=args.json,
+            human=f"unknown project {args.project!r}.",
+        )
+        return 1
+    lane_role = HARNESS_LANE if args.lane == "harness" else DEVELOPMENT_LANE
+    try:
+        cells, _seater = _open_rotation_collaborators(
+            settings, runtime, lane_role=lane_role
+        )
+    except (OSError, ValueError) as error:
+        _print({"error": str(error)}, json_output=args.json, human=f"{error}.")
+        return 1
+
+    existing = cells.active_cell(args.project, lane_role)
+    if existing is not None:
+        _print(
+            {
+                "status": "already_running",
+                "lane": lane_role,
+                "cell_id": existing.cell_id,
+                "session_id": str(existing.session_id),
+            },
+            json_output=args.json,
+            human=(
+                f"{lane_role} lane already running for {args.project}: "
+                f"cell {existing.cell_id} (session {existing.session_id}) "
+                "-- adopted, not duplicated."
+            ),
+        )
+        return 0
+
+    if not args.issue:
+        _print(
+            {"error": "no live cell in this lane and no --issue to start one"},
+            json_output=args.json,
+            human=(
+                f"no live {lane_role} lane cell for {args.project}; pass "
+                "--issue to start one."
+            ),
+        )
+        return 1
+
+    result = asyncio.run(cells.dispatch(args.issue, lane_role=lane_role))
+    payload = dataclasses.asdict(result)
+    _print(
+        payload,
+        json_output=args.json,
+        human=(
+            f"{lane_role} lane for {args.project}: {result.status} "
+            f"(cell {result.cell_id}, session {result.session_id})."
+        ),
+    )
+    return 0 if result.status not in ("waiting_for_profile", "start_failed") else 1
 
 
 async def _candidate_ready(flow: MergeFlow, args: Any) -> dict[str, Any]:
@@ -3914,6 +4045,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ),
             )
             return 0
+
+        if args.command == "start-lane":
+            return _start_lane(args, settings, runtime)
 
         if args.command == "submit-handoff":
             return _submit_handoff(args, settings, runtime, database)

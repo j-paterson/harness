@@ -17,6 +17,7 @@ from hermes_orchestrator.dashboard_sources import (
     CodexFact,
     DashboardSnapshot,
     IdleFact,
+    LaneCellFact,
     ProfileLeaseFact,
     ProfileUsage,
     ResourceFact,
@@ -51,9 +52,25 @@ def render_dashboard(
             for usage in snapshot.usage
         ),
         _codex_line(snapshot.codex),
+        *(_lane_line(lane) for lane in snapshot.lanes),
         _status_line(failure),
     ]
     return tuple(_fit(line, width) for line in lines)
+
+
+def _lane_line(lane: LaneCellFact) -> str:
+    """One lead-cell row: lane role, active issue, and state.
+
+    INFRA-219 L2: deliberately minimal -- subagents, head/event,
+    resource pressure, and blockers are the fuller contract display,
+    left for a later packet.
+    """
+
+    issue_text = lane.issue_id if lane.issue_id is not None else "-"
+    return (
+        f"lane     {lane.project_key}/{lane.lane_role:<11} "
+        f"issue {issue_text:<12} {lane.state}"
+    )
 
 
 def _profile_line(usage: ProfileUsage, lease: ProfileLeaseFact | None) -> str:

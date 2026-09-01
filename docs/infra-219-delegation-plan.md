@@ -75,3 +75,40 @@ transition.
 
 Gate: focused suites in this worktree; the coordinator serializes the
 one full-suite gate across lanes and owns push + candidate emission.
+
+## L2 integration record and the blocking gap (2026-09-01)
+
+L2's child was timeboxed after writing the implementation but before
+its tests; the lead integrated the diff, bumped L1's schema pins
+(53 → 54, mechanical), and authored the regressions.
+
+Landed: `start-lane --project <key> --lane development|harness
+[--issue <id>]`, lane-scoped `dispatch(..., lane_role=)` with
+per-lane dispatch locks, a `lane_project_paths` worktree override
+(harness resolves to a sibling `<lead_cwd>-harness` checkout, so the
+lanes can never collide on working-tree state), a public
+`active_cell(project, lane)` read, and minimal dashboard lane rows
+(`LaneCellFact`, one row per live cell: lane role, active issue,
+state).
+
+**Blocking acceptance gap — needs its own packet.** Issue occupancy
+is still tracked per PROJECT in `admitted_issues`, with no lane
+dimension, and both the coarse `project_busy` pre-check and the
+transactional activation predicate read it. So while the development
+lead occupies the project with its issue, a harness dispatch for a
+different issue is refused `project_busy`. INFRA-219's acceptance —
+"with the development lead actively working an issue, one Hermes
+command starts the visible harness lead" — therefore CANNOT pass
+yet. `test_harness_dispatch_is_still_blocked_by_project_occupancy`
+pins this actual behavior deliberately (it also proves the refusal
+leaves the development lane untouched and launches no harness
+process) rather than asserting the desired behavior. Closing it is a
+durable-model change (occupancy gains a lane dimension, or harness
+dispatch is exempted from product-issue occupancy per the contract's
+"the harness lead does not select or implement unrelated product
+issues") and is out of L2's boundary.
+
+Also deferred from the contract's dashboard requirement: per-lead
+subagents, current head/event, resource pressure, and blockers.
+Harness worktree PROVISIONING (creating `<lead_cwd>-harness`) is a
+convention here, not yet automated.
