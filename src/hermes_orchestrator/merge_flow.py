@@ -31,7 +31,6 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import CandidateEmitter
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import (
-    GitError,
     GitRunner,
     GitVerifier,
     SubprocessGitRunner,
@@ -271,24 +270,35 @@ def build_merge_flow(
 
 
 def _branch_head(settings: Settings, git: GitVerifier) -> Callable[[str, str], str]:
-    """Resolve the remote branch head from git, never from open pull requests.
+    """Resolve the remote branch head via a typed ref query, never a fetch.
 
-    Fetches the branch from ``origin`` and resolves ``origin/<branch>`` to
-    its commit SHA (INFRA-202). INFRA-217, Sol correction c02dc0fe: the
-    two failure shapes below are represented DISTINCTLY rather than
-    collapsed into one empty string, so a transient fetch, authentication,
-    or local Git failure can never be mistaken for authoritative ref
-    absence by :mod:`review_intake`:
+    INFRA-217, Sol correction 43152bf8: production previously used
+    ``git fetch -- origin <branch>`` and treated ANY fetch failure as
+    authoritative absence, but a genuinely deleted remote branch makes
+    that exact command exit 128 with ``fatal: couldn't find remote ref``
+    -- indistinguishable from a network, auth, or invocation failure at
+    the process boundary, so the required already-merged/deleted-branch
+    case never reached the GitHub proof below. The prior ``head_of``-
+    based fallback made the opposite mistake: every
+    :class:`~hermes_orchestrator.git.GitError` from local resolution was
+    read as authoritative absence, even though
+    :class:`~hermes_orchestrator.git.GitVerifier` raises that identical
+    exception for missing refs, corrupt repositories, invalid output, and
+    other local failures alike.
 
-    - AUTHORITATIVE ABSENCE: the fetch itself SUCCEEDS -- the remote was
-      reachable and its ref namespace is authoritative -- and only the
-      subsequent local resolution of ``origin/<branch>`` fails (a
-      :class:`~hermes_orchestrator.git.GitError` from ``head_of``). This
-      is the normal state AFTER a merge, since GitHub deletes the branch,
-      and is still represented by returning ``""`` exactly as before.
-    - EVERY OTHER FAILURE: the fetch fails (network, auth, an unreachable
-      remote) or ``head_of`` raises something other than the documented
-      ``GitError`` outcomes. This is NEVER branch absence, so it raises
+    :meth:`~hermes_orchestrator.git.GitVerifier.remote_head` replaces
+    both with one typed remote-ref query (``git ls-remote --heads``)
+    whose three outcomes stay distinct end to end:
+
+    - AUTHORITATIVE ABSENCE: the remote was reached and its ref
+      namespace is authoritative, and it reports zero matching refs.
+      This is the normal state AFTER a merge, since GitHub deletes the
+      branch, and is represented by returning ``""`` exactly as before.
+    - EXISTS: the remote reports exactly one matching
+      ``refs/heads/<branch>`` entry. Its SHA is returned.
+    - EVERY OTHER FAILURE: transport, authentication, invocation,
+      malformed-output, or local-repository failures. This is NEVER
+      branch absence, so it raises
       :class:`~hermes_orchestrator.review_intake.BranchHeadUnknown`
       instead of returning ``""``, and callers must fail closed on it.
     """
@@ -296,23 +306,13 @@ def _branch_head(settings: Settings, git: GitVerifier) -> Callable[[str, str], s
     def head(project_key: str, branch: str) -> str:
         project = settings.projects[project_key]
         try:
-            git.fetch(project.repo_path, "origin", branch)
+            sha = git.remote_head(project.repo_path, "origin", branch)
         except Exception as error:
             raise BranchHeadUnknown(
-                f"fetch of {branch!r} failed for {project_key!r}: {error}"
+                f"remote ref query for {branch!r} failed for "
+                f"{project_key!r}: {error}"
             ) from error
-        try:
-            return git.head_of(project.repo_path, f"origin/{branch}")
-        except GitError:
-            # The fetch above succeeded, so the remote was reachable and
-            # its ref namespace is authoritative; a failure to resolve the
-            # ref here means the branch genuinely does not exist.
-            return ""
-        except Exception as error:
-            raise BranchHeadUnknown(
-                f"resolution of origin/{branch} failed for {project_key!r}: "
-                f"{error}"
-            ) from error
+        return sha if sha is not None else ""
 
     return head
 

@@ -323,6 +323,62 @@ class GitVerifier:
         if result.returncode != 0:
             raise GitError(f"git fetch failed with exit code {result.returncode}")
 
+    def remote_head(self, repo_path: Path, remote: str, branch: str) -> str | None:
+        """Typed remote-ref query: the authoritative alternative to fetch.
+
+        INFRA-217, Sol correction 43152bf8: production inferred branch
+        absence from ``git fetch -- origin <branch>``'s failure, but a
+        genuinely deleted remote branch makes that same command exit 128
+        with ``fatal: couldn't find remote ref`` -- indistinguishable at
+        the process boundary from a network, authentication, or transport
+        failure. The local-``head_of`` fallback that replaced it made the
+        opposite mistake: every :class:`GitError` from local resolution
+        was read as authoritative absence, even though :class:`GitError`
+        is also raised for missing refs, corrupt repositories, and
+        invalid output alike.
+
+        ``git ls-remote --heads <remote> <branch>`` is one typed remote
+        query with exactly three distinguishable outcomes, kept distinct
+        here rather than collapsed:
+
+        - exit 0, empty stdout: the remote was reached and its ref
+          namespace is authoritative -- the branch genuinely does not
+          exist. Returns ``None``. This is the deleted-branch case.
+        - exit 0, exactly one well-formed ``<sha>\\trefs/heads/<branch>``
+          line: the ref exists. Returns its SHA.
+        - anything else -- a nonzero exit (network, auth, unknown remote,
+          invocation failure) or a zero exit whose stdout does not parse
+          as exactly that one expected line (malformed/unexpected
+          output) -- is NEVER read as absence. Raises :class:`GitError`.
+        """
+
+        _require_ref(remote, "remote")
+        _require_ref(branch, "branch")
+        result = self._runner.run(
+            ("git", "ls-remote", "--heads", remote, branch), repo_path
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git ls-remote failed with exit code {result.returncode}"
+            )
+        stdout = result.stdout.strip("\n")
+        if stdout == "":
+            return None
+        lines = [line for line in stdout.split("\n") if line]
+        if len(lines) != 1:
+            raise GitError(
+                "git ls-remote returned an unexpected number of matching refs"
+            )
+        parts = lines[0].split("\t")
+        if len(parts) != 2:
+            raise GitError("git ls-remote returned malformed output")
+        sha, ref = parts
+        if _SHA_PATTERN.match(sha) is None:
+            raise GitError("git ls-remote returned an invalid commit identity")
+        if ref != f"refs/heads/{branch}":
+            raise GitError("git ls-remote returned an unexpected ref")
+        return sha
+
     def is_ancestor(self, repo_path: Path, commit: str, ref: str) -> bool:
         """Return whether ``commit`` is reachable from ``ref``.
 
