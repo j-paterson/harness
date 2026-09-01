@@ -5630,6 +5630,176 @@ def test_submit_handoff_derives_issue_and_branch_from_the_seat(
     assert "issue INFRA-215 is in_development" in document["status"]
 
 
+def test_submit_handoff_derives_the_seat_whose_assignment_was_superseded(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real dual-lane sequence: the harness cell takes its issue, and
+    the SAME issue is then assigned to a different cell, which marks the
+    harness row ``superseded``. Supersession is per-ISSUE, so it says
+    nothing about whether the harness cell is still bound and working --
+    that cell must still derive its issue and its leased branch."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    # The other lane later takes the same issue: per-issue supersession
+    # rewrites the bound harness seat's row without unbinding the seat.
+    _seed_lead_assignment(
+        state_dir,
+        issue_id="INFRA-215",
+        cell_id="cell-other",
+        session_id="66666666-6666-4666-8666-666666666666",
+    )
+    lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane,
+        branch="feature/infra-215-lane",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    probed = _install_detached_coordinator_probe(
+        monkeypatch, {lane: "feature/infra-215-lane"}
+    )
+    database = Database.open(state_dir / "state.db")
+    try:
+        # Precondition: the sequence really did supersede the seat's row.
+        assert (
+            database.scalar(
+                "SELECT state FROM lead_assignments WHERE cell_id = 'cell-demo'"
+            )
+            == "superseded"
+        )
+    finally:
+        database.close()
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert str(lane) in probed
+    database = Database.open(state_dir / "state.db")
+    try:
+        document = json.loads(
+            str(
+                database.scalar(
+                    "SELECT document_json FROM handoffs WHERE handoff_id = ?",
+                    (payload["handoff_id"],),
+                )
+            )
+        )
+    finally:
+        database.close()
+    assert document["branch"] == "feature/infra-215-lane"
+    assert "INFRA-215" in document["objective"]
+    assert "issue INFRA-215 is in_development" in document["status"]
+
+
+def test_submit_handoff_prefers_the_newest_assignment_for_the_same_seat(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freshness for the seat comes from the ordering, not from the row
+    state: with two assignments for the SAME cell and session, the newer
+    one names the issue and the branch."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-212")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    older = repo_root / "lane-212"
+    newer = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-212",
+        path=older,
+        branch="feature/infra-212-lane",
+    )
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=newer,
+        branch="feature/infra-215-lane",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_detached_coordinator_probe(
+        monkeypatch,
+        {older: "feature/infra-212-lane", newer: "feature/infra-215-lane"},
+    )
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    database = Database.open(state_dir / "state.db")
+    try:
+        document = json.loads(
+            str(
+                database.scalar(
+                    "SELECT document_json FROM handoffs WHERE handoff_id = ?",
+                    (payload["handoff_id"],),
+                )
+            )
+        )
+    finally:
+        database.close()
+    assert document["branch"] == "feature/infra-215-lane"
+    assert "issue INFRA-215 is in_development" in document["status"]
+
+
+def test_submit_handoff_refuses_a_cell_and_session_no_assignment_names(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping the state filter widens nothing beyond the exact bound
+    identity: an assignment naming a different cell, and one naming this
+    cell under a stale session, both leave the seat underivable and the
+    ambiguous project still refuses with the actionable message."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(
+        state_dir,
+        issue_id="INFRA-215",
+        cell_id="cell-other",
+        session_id="66666666-6666-4666-8666-666666666666",
+    )
+    _seed_lead_assignment(
+        state_dir,
+        issue_id="INFRA-212",
+        cell_id="cell-demo",
+        session_id="77777777-7777-4777-8777-777777777777",
+    )
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_detached_coordinator_probe(monkeypatch, {})
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 1
+    message = json.loads(result.stdout)["error"]
+    assert "no live lead assignment" in message
+    assert "2 active issues (INFRA-212, INFRA-215)" in message
+    assert "assign the cell its issue" in message
+    database = Database.open(state_dir / "state.db")
+    try:
+        assert database.scalar("SELECT count(*) FROM handoffs") == 1
+    finally:
+        database.close()
+
+
 def test_submit_handoff_refuses_an_unassigned_cell_in_an_ambiguous_project(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5701,6 +5871,21 @@ def test_submit_handoff_refuses_when_the_assigned_issue_has_no_one_lease(
     assert with_two_leases.exit_code == 1
     ambiguous = json.loads(with_two_leases.stdout)["error"]
     assert "has 2 active worktree leases" in ambiguous
+
+    # A per-issue supersession of the seat's own row relaxes nothing: the
+    # issue is still derived from the bound seat and still demands
+    # exactly one active lease.
+    _seed_lead_assignment(
+        state_dir,
+        issue_id="INFRA-215",
+        cell_id="cell-other",
+        session_id="66666666-6666-4666-8666-666666666666",
+    )
+
+    superseded = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert superseded.exit_code == 1
+    assert "has 2 active worktree leases" in json.loads(superseded.stdout)["error"]
     database = Database.open(state_dir / "state.db")
     try:
         assert database.scalar("SELECT count(*) FROM handoffs") == 1

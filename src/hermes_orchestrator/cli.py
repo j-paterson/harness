@@ -3713,14 +3713,22 @@ def _submit_handoff(
     ).fetchall()
     # INFRA-198: derive the issue and the git position from the SEAT
     # being handed off, not from the project as a whole. The cell's
-    # latest live lead assignment names its issue unambiguously even
-    # when the project has several active issues, and that issue's own
+    # latest lead assignment names its issue unambiguously even when
+    # the project has several active issues, and that issue's own
     # active worktree lease names the tree to probe -- the coordinator's
     # ``project.lead_cwd`` checkout is frequently detached, which is
     # what made ``branch`` empty and the field "incomplete".
+    #
+    # The row's ``state`` is deliberately NOT filtered. Supersession is
+    # per-ISSUE, not per-cell: a later assignment of the same issue to a
+    # DIFFERENT cell marks this row ``superseded`` while saying nothing
+    # about whether THIS cell is still bound and working, so excluding
+    # superseded rows discarded the one durable fact identifying the
+    # seat. Freshness for the seat comes from the ordering below, which
+    # guarantees a newer assignment for this same cell/session wins.
     assignment = database.execute(
         "SELECT issue_id FROM lead_assignments "
-        "WHERE cell_id = ? AND session_id = ? AND state != 'superseded' "
+        "WHERE cell_id = ? AND session_id = ? "
         "ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (args.cell, str(cell["session_id"])),
     ).fetchone()
