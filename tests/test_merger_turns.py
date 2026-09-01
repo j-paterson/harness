@@ -9,15 +9,12 @@ import pytest
 
 from hermes_orchestrator.circleci import CiCheck
 from hermes_orchestrator.codex_rpc import RpcNotification
-from hermes_orchestrator.github import DiscoveredPull
 from hermes_orchestrator.merger_turns import (
     CodexThreadReports,
     SubmissionRejected,
-    _approval_ineligibility_reason,
 )
 from hermes_orchestrator.verdicts import IDLE_TERMINAL_REPORT
 from tests.integration.test_fable_ready_acceptance import (
-    REPOSITORY,
     SHA_A,
     SHA_B,
     SHA_C,
@@ -1376,6 +1373,10 @@ async def test_already_merged_pull_reconciles_without_a_second_merge(
             merge_commit_sha=merge_sha,
         )
     }
+    # The production branch-head probe is independent of GitHub's open-PR
+    # list; this fixture normally derives both from one fake collection.
+    flow.admission._branch_head = lambda _project, _branch: SHA_A
+    flow.github.open_pulls = ()
     flow.git.ancestor[(merge_sha, "origin/main")] = True
     flow.git.trees[merge_sha] = "tree-" + SHA_A
 
@@ -1386,27 +1387,7 @@ async def test_already_merged_pull_reconciles_without_a_second_merge(
         ),
     )
 
-    # Eligibility itself accepts an already-merged pull (merged, not
-    # open). This entry point still refuses, but from the UPSTREAM
-    # intake gate — which independently requires an open pull at
-    # admission — not from the approval-eligibility gate, and the
-    # decisive property holds either way: no NEW merge mutation is ever
-    # attempted against an already-merged pull. The already-merged
-    # CONVERGENCE path proper is the settlement-resume path exercised in
-    # tests/test_settlement.py, not a fresh submission.
-    assert outcome.kind == "rejected"
-    assert "no longer open" in outcome.reason
-    assert _approval_ineligibility_reason(
-        flow.github.full_pulls[14] and DiscoveredPull(
-            number=14,
-            state="closed",
-            merged=True,
-            head_sha=SHA_A,
-            merge_sha=merge_sha,
-            repository=REPOSITORY,
-            head_repository=REPOSITORY,
-            base_ref="main",
-        ),
-        flow.projects["demo"],
-    ) is None
+    assert outcome.kind == "merged"
+    assert outcome.merge_sha == merge_sha
+    assert "externally merged; reconciled" in outcome.reason
     assert flow.github.merge_calls == []
