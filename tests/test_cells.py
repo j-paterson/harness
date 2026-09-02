@@ -11,6 +11,7 @@ import pytest
 
 from hermes_orchestrator.cells import (
     DEVELOPMENT_LANE,
+    HARNESS_LANE,
     MAX_DEVELOPMENT_ISSUE_LANES,
     DevSeatRecovery,
     DispatchResult,
@@ -6288,3 +6289,84 @@ async def test_recovery_contains_a_dispatch_failure(
     cells.dispatch_error = RuntimeError("dispatch exploded")
     await DevSeatRecovery(cells, queue, database).tick(("demo",))
     assert cells.dispatched == [("REC-4", DEVELOPMENT_LANE)]
+
+
+def _seed_assignment_owner_cell(
+    database: Database, lane_role: str, state: str = "failed"
+) -> None:
+    """The (possibly dead) cell that owns _publish_assignment's rows:
+    recovery matches the assignment's owner by exact cell AND session
+    identity, never by liveness -- the owner being retired is the very
+    situation recovery exists for."""
+
+    now = datetime.now(UTC).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at, lane_role) "
+            "VALUES ('cell-recovery', 'demo', ?, 'max-a', "
+            "'99999999-9999-4999-8999-999999999999', ?, ?, ?)",
+            (state, now, now, lane_role),
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_ignores_a_harness_owned_assignment(
+    database: Database, queue: QueueService
+) -> None:
+    """Observed live 2026-09-02: the only live INFRA-198 assignment
+    belonged to the HARNESS cell, and the recovery picker proposed it
+    for a development seat -- a create/start_failed churn loop for work
+    the development lane does not own. A harness-owned assignment must
+    never be proposed."""
+
+    admit(queue, "REC-6")
+    queue.transition(
+        "REC-6",
+        IssueState.IN_DEVELOPMENT,
+        actor="orchestrator",
+        reason="occupying its owner lane",
+    )
+    _publish_assignment(database, "REC-6")
+    _seed_assignment_owner_cell(database, HARNESS_LANE)
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_picks_a_development_owned_assignment(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "REC-7")
+    queue.transition(
+        "REC-7",
+        IssueState.IN_DEVELOPMENT,
+        actor="orchestrator",
+        reason="occupying its owner lane",
+    )
+    _publish_assignment(database, "REC-7")
+    _seed_assignment_owner_cell(database, DEVELOPMENT_LANE)
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == [("REC-7", DEVELOPMENT_LANE)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_never_proposes_an_unstartable_assigned_state(
+    database: Database, queue: QueueService
+) -> None:
+    """A development-owned assignment whose issue is in a state the
+    activation can neither start nor resume (e.g. paused) is never
+    proposed: dispatching it could only recreate the seat churn."""
+
+    admit(queue, "REC-8")
+    queue.transition(
+        "REC-8", IssueState.PAUSED, actor="orchestrator", reason="hold"
+    )
+    _publish_assignment(database, "REC-8")
+    _seed_assignment_owner_cell(database, DEVELOPMENT_LANE)
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == []

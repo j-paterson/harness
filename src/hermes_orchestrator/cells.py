@@ -3184,16 +3184,28 @@ class DevSeatRecovery:
         await self._cells.dispatch(issue_id, lane_role=DEVELOPMENT_LANE)
 
     def _pick_issue(self, project_key: str) -> str | None:
-        # (a) an already-in-development issue with a live (non-superseded)
-        # lead_assignments row -- the exact predicate ``lane_cells``
-        # (dashboard_sources.py) uses to attribute live work to a lane.
+        # (a) a DEVELOPMENT-owned live (non-superseded) assignment.
+        # Observed live (2026-09-02): the sole live INFRA-198 assignment
+        # belonged to the HARNESS cell, and picking it here dispatched a
+        # development seat for work the development lane does not own --
+        # a create-seat/start_failed churn loop. The assignment's owner
+        # cell must therefore BE the project's development lane (joined
+        # on the exact cell AND session that own the assignment), and
+        # the issue must be in a state ``_activate_issue_body`` can
+        # actually start or resume; anything else (paused, acceptance
+        # without the replay path, a foreign lane) is never proposed.
+        states = (*_RUNNABLE_ISSUE_STATES, IssueState.IN_DEVELOPMENT.value)
+        placeholders = ", ".join("?" for _ in states)
         row = self._database.execute(
             "SELECT la.issue_id AS issue_id FROM lead_assignments AS la "
             "JOIN admitted_issues AS ai ON ai.issue_id = la.issue_id "
+            "JOIN project_cells AS pc ON pc.cell_id = la.cell_id "
+            "AND pc.session_id = la.session_id "
+            "AND pc.lane_role = 'development' "
             "WHERE la.project_key = ? AND la.state != 'superseded' "
-            "AND ai.state != ? "
+            f"AND ai.state IN ({placeholders}) "
             "ORDER BY la.updated_at DESC LIMIT 1",
-            (project_key, IssueState.DONE.value),
+            (project_key, *states),
         ).fetchone()
         if row is not None:
             return str(row["issue_id"])
