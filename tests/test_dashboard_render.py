@@ -471,14 +471,16 @@ def test_attention_prioritizes_red_pressure_over_everything() -> None:
     assert "pressure" in attention_line
 
 
-def test_attention_falls_back_to_the_most_recent_transition() -> None:
+def test_attention_does_not_repeat_a_nonactionable_transition() -> None:
     transitions = (
         TransitionFact("proj", "2026-08-31T11:00:00+00:00", "rotated max-b→max-c"),
     )
     snapshot = _frame_snapshot(transitions=transitions)
     lines = render_frame(snapshot, width=60, height=20, now=_NOW)
-    joined = "\n".join(lines)
-    assert "rotated max-b→max-c" in joined
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+    assert attention_line.strip() == "nothing needs attention"
 
 
 def test_attention_reports_nothing_needs_attention_when_all_clear() -> None:
