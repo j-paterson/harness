@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import types
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1386,6 +1387,259 @@ def test_record_direct_exception_refuses_before_any_packet_when_unmeasurable(
     # (covered end-to-end above); confirm no stray packets were left behind
     # by any of the three refused attempts.
     assert packets.for_issue("ENG-9") == ()
+
+
+_CONTINUE_WORK_SESSION = "11111111-1111-1111-1111-111111111111"
+
+
+def _seed_continue_work_seat(
+    runtime: object,
+    *,
+    project_key: str = "demo",
+    cell_id: str = "cell-1",
+    session_id: str = _CONTINUE_WORK_SESSION,
+    assign_issue_id: str | None = "ENG-9",
+    pressure: str | None = "green",
+    sampled_at: str | None = None,
+    other_occupying_issues: int = 0,
+) -> None:
+    """Seed one active development cell, plus optionally its live
+    assignment for ``assign_issue_id``, a resource sample, and however
+    many OTHER occupying issues the caller wants for saturation."""
+
+    now = datetime.now(UTC).isoformat()
+    with runtime.database.transaction() as connection:  # type: ignore[attr-defined]
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "lane_role, created_at, updated_at) VALUES "
+            "(?, ?, 'active', 'max-a', ?, 'development', ?, ?)",
+            (cell_id, project_key, session_id, now, now),
+        )
+        if assign_issue_id is not None:
+            connection.execute(
+                "INSERT INTO lead_assignments("
+                "assignment_id, schema_version, project_key, issue_id, "
+                "cell_id, session_id, profile_alias, instruction_id, "
+                "queue_transition, state, created_at, updated_at, "
+                "acknowledged_at) VALUES "
+                "('asn-1', 1, ?, ?, ?, ?, 'max-a', 'instr-1', 'dispatch', "
+                "'acknowledged', ?, ?, ?)",
+                (project_key, assign_issue_id, cell_id, session_id, now, now, now),
+            )
+        if pressure is not None:
+            connection.execute(
+                "INSERT INTO resource_samples("
+                "sample_id, sampled_at, pressure, available_memory_bytes, "
+                "total_memory_bytes, swap_used_bytes, load_one, "
+                "logical_cpus, disk_json, managed_rss_bytes) VALUES "
+                "('s', ?, ?, 1, 2, 0, 0.1, 1, '{}', 1)",
+                (sampled_at if sampled_at is not None else now, pressure),
+            )
+        for index in range(other_occupying_issues):
+            occupant = f"OCC-{index}"
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at) "
+                "VALUES (?, ?, 1, 'in_development', ?, 1, 0, "
+                "?, ?)",
+                (occupant, project_key, f"instr-occ-{index}", now, now),
+            )
+
+
+def _continue_work_handler(
+    runtime: object, tmp_path: Path
+) -> Callable[..., dict[str, object]]:
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.lead_wakes import LeadTerminalWakes
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    events = EventStore(runtime.database)  # type: ignore[attr-defined]
+    runtime.lead_wakes = LeadTerminalWakes(  # type: ignore[attr-defined]
+        database=runtime.database, events=events  # type: ignore[attr-defined]
+    )
+    outbox = LeadCorrectionOutbox(
+        database=runtime.database,  # type: ignore[attr-defined]
+        events=events,
+        project_for_issue=lambda issue_id: "demo",
+    )
+    packets = SubagentPackets(runtime.database, events=events)  # type: ignore[attr-defined]
+    settings = SimpleNamespace(
+        repo_root=tmp_path,
+        policy=SimpleNamespace(resource_sample_freshness_minutes=5),
+    )
+    handlers = _hermes_handlers(settings, runtime, outbox, packets)
+    return handlers["continue_work"]
+
+
+def _continue_work_command(**overrides: object) -> object:
+    from types import SimpleNamespace
+
+    base: dict[str, object] = {"issue_id": "ENG-9", "request_id": "req-1"}
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_continue_work_commits_exactly_one_work_ready_wake_for_the_bound_seat(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    result = handler(_continue_work_command())
+
+    assert result["kind"] == "work_ready"
+    assert result["issue_id"] == "ENG-9"
+    assert result["cell_id"] == "cell-1"
+    assert result["session_id"] == _CONTINUE_WORK_SESSION
+    assert result["profile_alias"] == "max-a"
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes WHERE kind = 'work_ready'"
+        )
+        == 1
+    )
+
+
+def test_continue_work_repeated_request_id_commits_nothing_further(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    first = handler(_continue_work_command())
+    second = handler(_continue_work_command())
+
+    assert second["wake_id"] == first["wake_id"]
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes"
+        )
+        == 1
+    )
+
+
+def test_continue_work_distinct_request_id_commits_a_second_wake(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    first = handler(_continue_work_command(request_id="req-1"))
+    second = handler(_continue_work_command(request_id="req-2"))
+
+    assert second["wake_id"] != first["wake_id"]
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes"
+        )
+        == 2
+    )
+
+
+def test_continue_work_refuses_when_issue_not_assigned_to_the_seat(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime, assign_issue_id=None)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    with pytest.raises(ValueError, match="not assigned to the bound"):
+        handler(_continue_work_command())
+
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes"
+        )
+        == 0
+    )
+
+
+def test_continue_work_refuses_when_the_development_lane_is_saturated(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime, other_occupying_issues=6)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    with pytest.raises(ValueError, match="saturated"):
+        handler(_continue_work_command())
+
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes"
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("pressure", "sampled_at", "match"),
+    [
+        (None, None, "resource sample"),
+        ("green", "2020-01-01T00:00:00+00:00", "resource sample"),
+        ("red", None, "resource sample"),
+    ],
+)
+def test_continue_work_refuses_on_missing_stale_or_red_resource_sample(
+    tmp_path: Path, pressure: str | None, sampled_at: str | None, match: str
+) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime, pressure=pressure, sampled_at=sampled_at)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    with pytest.raises(ValueError, match=match):
+        handler(_continue_work_command())
+
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes"
+        )
+        == 0
+    )
+
+
+def test_continue_work_never_queues_admits_or_assigns(tmp_path: Path) -> None:
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    before_admitted = runtime.database.scalar(  # type: ignore[attr-defined]
+        "SELECT count(*) FROM admitted_issues"
+    )
+    before_assignments = runtime.database.scalar(  # type: ignore[attr-defined]
+        "SELECT count(*) FROM lead_assignments"
+    )
+
+    handler(_continue_work_command())
+
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM admitted_issues"
+        )
+        == before_admitted
+    )
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_assignments"
+        )
+        == before_assignments
+    )
 
 
 def _recording_hermes_config(tmp_path: Path, *, exit_code: int = 0) -> Path:
