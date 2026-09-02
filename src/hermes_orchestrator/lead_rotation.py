@@ -149,12 +149,14 @@ class WorktreeState:
     head: str
     origin_head: str
     dirty: bool
-    # The remote's default/integration branch head (``origin/HEAD``), as
-    # last fetched into local remote-tracking refs. Only ever consulted
-    # by the zero-work exception below — never part of the strict
-    # ``head != origin_head`` comparison itself. Defaults to "" so every
-    # existing constructor call keeps working.
-    origin_integration_head: str = ""
+    # Whether ``head`` is a PROVEN ancestor of the fetched integration
+    # head (``origin/HEAD``, as last fetched into local
+    # remote-tracking refs). Only ever consulted by the zero-work
+    # exception below — never part of the strict
+    # ``head != origin_head`` comparison itself. Fails closed to
+    # False: absence of proof, a missing ``origin/HEAD``, or a broken
+    # git probe must never read as an ancestor relationship.
+    head_is_integration_ancestor: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,16 +262,20 @@ class LeadRotation:
         # remote counterpart (rev-parse of the remote-tracking ref
         # failed) — a clean zero-work seat can never push one into
         # existence just to satisfy this gate. When that is so AND HEAD
-        # exactly equals the fetched integration head, zero implementation
-        # delta is proven and the handoff needs no remote checkpoint. Any
-        # remote issue branch (``origin_head != ""``) or any local delta
-        # (``head != origin_integration_head``) keeps today's strict
-        # refusal verbatim — and a broken git probe still refuses because
-        # ``head`` itself resolves to "".
+        # is a proven ancestor of the fetched integration head, zero
+        # implementation delta is proven and the handoff needs no
+        # remote checkpoint: local implementation commits are never
+        # ancestors of ``origin/HEAD``, so an ancestor HEAD can only be
+        # the (possibly older, still-reachable) integration head itself
+        # — equality is just the trivial ancestor case. Any remote
+        # issue branch (``origin_head != ""``) or any unproven/absent
+        # ancestor relationship keeps today's strict refusal verbatim —
+        # and a broken git probe still refuses because ``head`` itself
+        # resolves to "".
         zero_work = (
             worktree.origin_head == ""
             and worktree.head != ""
-            and worktree.head == worktree.origin_integration_head
+            and worktree.head_is_integration_ancestor
         )
         if worktree.head != worktree.origin_head and not zero_work:
             return self._blocked(

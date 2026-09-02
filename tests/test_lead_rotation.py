@@ -173,14 +173,14 @@ def make_worktree_state(
     dirty: bool = False,
     head: str = "deadbeef",
     origin_head: str = "deadbeef",
-    origin_integration_head: str = "",
+    head_is_integration_ancestor: bool = False,
 ) -> WorktreeState:
     return WorktreeState(
         branch="feature/infra-197",
         head=head,
         origin_head=origin_head,
         dirty=dirty,
-        origin_integration_head=origin_integration_head,
+        head_is_integration_ancestor=head_is_integration_ancestor,
     )
 
 
@@ -439,7 +439,7 @@ async def test_head_behind_origin_blocks_precondition(
 
 
 @pytest.mark.asyncio
-async def test_zero_work_head_matches_integration_head_passes_precondition(
+async def test_zero_work_head_is_integration_ancestor_passes_precondition(
     database: Database,
     queue: QueueService,
     cells: ProjectCellService,
@@ -449,9 +449,14 @@ async def test_zero_work_head_matches_integration_head_passes_precondition(
     runner: RecordingRunner,
 ) -> None:
     """A leased seat with no remote issue branch (``origin_head == ""``)
-    whose HEAD exactly matches the fetched integration head proves zero
-    implementation delta — the gate must let it proceed past the
-    worktree precondition rather than refuse for an unpushed head."""
+    whose HEAD is a proven ancestor of the fetched integration head
+    proves zero implementation delta — the gate must let it proceed
+    past the worktree precondition rather than refuse for an unpushed
+    head. The producer maps BOTH "HEAD is strictly behind the
+    integration head" (generation 97's clean, older-integration-based
+    worktree) and "HEAD exactly equals the integration head" (the
+    trivial ancestor case) to ``head_is_integration_ancestor=True``, so
+    this one case covers both."""
     await start_cell(cells, queue)
     handoff_id = submit_handoff(handoffs)
     runner.emit_handoff_ack = True
@@ -462,7 +467,7 @@ async def test_zero_work_head_matches_integration_head_passes_precondition(
         bindings,
         seater,
         worktree=make_worktree_state(
-            head="integration1", origin_head="", origin_integration_head="integration1"
+            head="integration1", origin_head="", head_is_integration_ancestor=True
         ),
     )
 
@@ -474,7 +479,7 @@ async def test_zero_work_head_matches_integration_head_passes_precondition(
 
 
 @pytest.mark.asyncio
-async def test_zero_work_head_diverges_from_integration_head_blocks(
+async def test_zero_work_head_not_integration_ancestor_blocks(
     database: Database,
     queue: QueueService,
     cells: ProjectCellService,
@@ -482,9 +487,12 @@ async def test_zero_work_head_diverges_from_integration_head_blocks(
     bindings: CmuxSurfaceBindings,
     seater: RecordingSeater,
 ) -> None:
-    """No remote issue branch, but local HEAD carries unpushed work not
-    reflected in the fetched integration head — this is not the
-    zero-work shape, so the strict refusal still applies."""
+    """No remote issue branch, but local HEAD is NOT a proven ancestor
+    of the fetched integration head — either it carries unpushed local
+    implementation commits (which are never ancestors of
+    ``origin/HEAD``), or the ancestor probe itself could not prove the
+    relationship. Either way this is not the zero-work shape, so the
+    strict refusal still applies."""
     await start_cell(cells, queue)
     submit_handoff(handoffs)
     rotation = make_rotation(
@@ -494,7 +502,7 @@ async def test_zero_work_head_diverges_from_integration_head_blocks(
         bindings,
         seater,
         worktree=make_worktree_state(
-            head="local1", origin_head="", origin_integration_head="integration1"
+            head="local1", origin_head="", head_is_integration_ancestor=False
         ),
     )
 
@@ -507,7 +515,7 @@ async def test_zero_work_head_diverges_from_integration_head_blocks(
 
 
 @pytest.mark.asyncio
-async def test_remote_issue_branch_present_still_blocks_despite_integration_match(
+async def test_remote_issue_branch_present_still_blocks_despite_ancestor_proof(
     database: Database,
     queue: QueueService,
     cells: ProjectCellService,
@@ -517,8 +525,8 @@ async def test_remote_issue_branch_present_still_blocks_despite_integration_matc
 ) -> None:
     """A remote issue branch exists but disagrees with local HEAD: the
     zero-work exception only ever applies when ``origin_head == ""``,
-    so this keeps today's strict refusal verbatim regardless of how
-    the integration head compares."""
+    so this keeps today's strict refusal verbatim regardless of the
+    ancestor proof."""
     await start_cell(cells, queue)
     submit_handoff(handoffs)
     rotation = make_rotation(
@@ -530,7 +538,7 @@ async def test_remote_issue_branch_present_still_blocks_despite_integration_matc
         worktree=make_worktree_state(
             head="local1",
             origin_head="origin1",
-            origin_integration_head="local1",
+            head_is_integration_ancestor=True,
         ),
     )
 
@@ -566,7 +574,7 @@ async def test_dirty_zero_work_shaped_worktree_still_blocks_precondition(
             dirty=True,
             head="integration1",
             origin_head="",
-            origin_integration_head="integration1",
+            head_is_integration_ancestor=True,
         ),
     )
 
