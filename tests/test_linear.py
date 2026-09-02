@@ -180,6 +180,30 @@ async def test_done_to_in_development_accepted_for_acceptance_projection(
 
 
 @pytest.mark.asyncio
+async def test_in_development_to_done_accepted_for_acceptance_completion(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    transport.issue(
+        status="In Development",
+        state_id="state-development",
+        assignee_id="user-operator",
+        revision="development-r1",
+    )
+    result = await linear_client.project(
+        "ENG-9",
+        LinearProjection(status="Done", assignee_alias="operator"),
+        effect_id="linear:ENG-9:acceptance-satisfied:chat-9",
+    )
+
+    assert result.changed_fields == ("status",)
+    assert transport.variables[1] == {
+        "id": "linear-eng-9",
+        "input": {"stateId": "state-done"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_projection_refuses_every_other_done_regression(
     linear_client: LinearClient,
     transport: RecordingLinearTransport,
