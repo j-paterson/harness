@@ -651,10 +651,14 @@ class WorktreeCustodian:
                 if inspection.modified or inspection.untracked:
                     skipped.append({**item, "reason": "dirty"})
                     continue
-                if inspection.ahead is None:
-                    skipped.append({**item, "reason": "upstream_unavailable"})
-                    continue
-                if inspection.ahead:
+                path = Path(lease.path)
+                self._git.fetch(path, lease.remote, lease.branch)
+                if not self._git.remote_contains(
+                    path,
+                    self._git.head_sha(path),
+                    lease.remote,
+                    lease.branch,
+                ):
                     skipped.append({**item, "reason": "unpushed"})
                     continue
                 checkpoint = self.checkpoint(lease.lease_id, lease.issue_id)
