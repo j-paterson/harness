@@ -205,6 +205,75 @@ def checkpointed_proof(custodian: WorktreeCustodian, lease_id: str):
     return custodian.verify_remote(checkpoint)
 
 
+def test_reclaim_completed_removes_clean_pushed_issue(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+
+    result = custodian.reclaim_completed("demo", {"ENG-431"})
+
+    assert result == {
+        "reclaimed": [
+            {
+                "issue_id": "ENG-431",
+                "lease_id": lease_id,
+                "path": WORKTREE,
+            }
+        ],
+        "skipped": [],
+    }
+    assert leases.get(lease_id).state == "reclaimed"
+    assert WORKTREE not in fake_git.worktree_paths
+
+
+def test_reclaim_completed_leaves_unfinished_issue_untouched(
+    custodian: WorktreeCustodian, leases: WorktreeLeases, fake_git: FakeGit
+) -> None:
+    lease_id = register(leases)
+
+    result = custodian.reclaim_completed("demo", set())
+
+    assert result["reclaimed"] == []
+    assert result["skipped"] == [
+        {
+            "issue_id": "ENG-431",
+            "lease_id": lease_id,
+            "path": WORKTREE,
+            "reason": "issue_not_done",
+        }
+    ]
+    assert leases.get(lease_id).state == "active"
+    assert fake_git.commands == []
+
+
+@pytest.mark.parametrize(
+    ("status", "ahead", "reason"),
+    [
+        (WorktreeStatus(modified=("src/a.py",), untracked=()), 0, "dirty"),
+        (WorktreeStatus(modified=(), untracked=()), 1, "unpushed"),
+        (WorktreeStatus(modified=(), untracked=()), None, "upstream_unavailable"),
+    ],
+)
+def test_reclaim_completed_leaves_unsafe_completed_issue_untouched(
+    custodian: WorktreeCustodian,
+    leases: WorktreeLeases,
+    fake_git: FakeGit,
+    status: WorktreeStatus,
+    ahead: int | None,
+    reason: str,
+) -> None:
+    lease_id = register(leases)
+    fake_git.status = status
+    fake_git.ahead_count = ahead
+
+    result = custodian.reclaim_completed("demo", {"ENG-431"})
+
+    assert result["reclaimed"] == []
+    assert result["skipped"][0]["reason"] == reason
+    assert leases.get(lease_id).state == "active"
+    assert not any(command[0] == "worktree" for command in fake_git.commands)
+
+
 # -- lease registration ----------------------------------------------------
 
 

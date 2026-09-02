@@ -2258,6 +2258,19 @@ def _hermes_handlers(
             "applied_at": decision.applied_at,
         }
 
+    def request_cleanup(command: Any) -> dict[str, Any]:
+        custodian = runtime.worktree_custodian
+        if custodian is None:
+            raise ValueError("worktree cleanup is unavailable")
+        rows = runtime.database.execute(
+            "SELECT issue_id FROM admitted_issues "
+            "WHERE project_key = ? AND state = 'done'",
+            (command.project_key,),
+        ).fetchall()
+        return custodian.reclaim_completed(
+            command.project_key, {str(row["issue_id"]) for row in rows}
+        )
+
     def qa_reject(command: Any) -> dict[str, Any]:
         flow = _open_merge_flow(settings, runtime)
         outcome = asyncio.run(
@@ -2584,6 +2597,7 @@ def _hermes_handlers(
 
     return {
         "retry": _retry_handler(runtime.queue),
+        "request_cleanup": request_cleanup,
         "continue_work": continue_work,
         "pending_corrections": pending_corrections,
         "fetch_correction": fetch_correction,
