@@ -3003,6 +3003,63 @@ def test_start_lane_refuses_an_active_cell_whose_worker_is_dead(
     assert session_id in human_result.output
 
 
+def test_start_lane_retires_a_dead_worker_and_seats_its_replacement(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live recovery completes in one start-lane invocation."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.cells import DispatchResult
+
+    repo_root, _state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    session_id = "9b539c86-c52f-43b2-b077-57491066ebcf"
+    calls = _install_fake_lane_dispatch(
+        monkeypatch,
+        active_cell=_harness_cell(session_id),
+        dispatch_result=DispatchResult(
+            status="seated", issue_id="ENG-1", cell_id="cell-replacement"
+        ),
+    )
+    retired: list[str] = []
+
+    class _Sweep:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def retire_dead_lead_cell(self, cell_id: str) -> bool:
+            retired.append(cell_id)
+            return True
+
+    monkeypatch.setattr(cli_module, "CmuxDeadLeadSweep", _Sweep)
+    monkeypatch.setattr(
+        cli_module, "managed_claude_worker_alive", lambda _session_id: False
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "start-lane",
+            "--project",
+            "demo",
+            "--lane",
+            "harness",
+            "--issue",
+            "ENG-1",
+            "--harness-run",
+            "run-1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "seated"
+    assert retired == ["cell-harness"]
+    assert calls == [
+        {"issue_id": "ENG-1", "lane_role": "harness", "harness_run": "run-1"}
+    ]
+
+
 @pytest.mark.parametrize("worker_alive", [True, None])
 def test_start_lane_still_adopts_a_cell_whose_worker_is_not_provably_dead(
     configured_repo: tuple[Path, Path],
