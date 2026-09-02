@@ -1793,6 +1793,7 @@ def context_cells(
     *,
     clock: list[datetime],
     completion_sink: object | None = None,
+    context_window_tokens: int = 100_000,
 ) -> tuple[ProjectCellService, HandoffService]:
     from hermes_orchestrator.config import PolicyConfig
     from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
@@ -1812,7 +1813,7 @@ def context_cells(
         handoffs=handoffs,
         context=ContextMonitor(database, events, policy=PolicyConfig()),
         active_time=ActiveTimeTracker(database),
-        context_window_tokens=100_000,
+        context_window_tokens=context_window_tokens,
         now=lambda: clock[-1],
         completion_sink=completion_sink,
     )
@@ -2702,6 +2703,87 @@ async def test_top_level_subagent_start_usage_still_counts(
     assert result.status == "handoff_required"
     assert handoff_reasons(database) == ["context_rotation"]
     assert _context_evidence(database)[1] == 86.0
+
+
+def _context_uncertainty_events(database: Database) -> list[str]:
+    rows = database.execute(
+        "SELECT payload_json FROM events WHERE event_type = "
+        "'context.measurement_uncertain' "
+        f"AND aggregate_id = 'cell-demo:{SESSION_ID}' ORDER BY sequence"
+    ).fetchall()
+    return [str(json.loads(str(row["payload_json"]))["uncertainty"]) for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_cumulative_cache_reads_never_produce_impossible_percent(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # The observed shape (INFRA-184): cache_read_input_tokens on
+    # successive top-level assistant invocations grows as a
+    # cumulative-across-turns counter (150k, then 300k, then 3.4M)
+    # against a 200k window. Trusting that field outright turned a fresh
+    # turn into a false "1704% full" rotation; each record must be
+    # treated as one invocation's own measurement -- individually
+    # impossible for the latter two -- never accumulated.
+    runner.script = [
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            usage={"cache_read_input_tokens": 150_000},
+        ),
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            usage={"cache_read_input_tokens": 300_000},
+        ),
+        _stream_event(
+            kind="stream.assistant",
+            original_type="assistant",
+            usage={"cache_read_input_tokens": 3_400_000},
+        ),
+    ]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(
+        database, queue, profiles, runner, clock=clock, context_window_tokens=200_000
+    )
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    # 150k/200k = 75% is a legitimate, trustworthy prepare-range reading
+    # and the only percent ever durably stored; neither the impossible
+    # 150% nor the impossible 1700% reading is ever recorded or acted on,
+    # and no rotation decision is produced from either of them.
+    assert handoff_reasons(database) == ["context_prepare"]
+    state, percent = _context_evidence(database)
+    assert state == "prepare"
+    assert percent == 75.0
+    assert percent is not None and 0.0 <= percent <= 100.0
+    uncertainties = _context_uncertainty_events(database)
+    assert uncertainties == ["impossible_percent:150.0", "impossible_percent:1700.0"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_stream_record_is_not_double_counted(
+    database: Database, queue: QueueService, profiles: ProfilePool
+) -> None:
+    clock = [datetime(2026, 8, 26, 12, tzinfo=UTC)]
+    runner = ScriptedContextRunner()
+    # A duplicated stream delivery (identical timestamp and usage) of the
+    # same top-level assistant record is ignored on the repeat: it must
+    # never be counted as a second, distinct occupancy observation.
+    duplicated = _stream_event(
+        kind="stream.assistant",
+        original_type="assistant",
+        usage={"input_tokens": 40_000},
+    )
+    runner.script = [duplicated, duplicated]
+    admit(queue, "ENG-9")
+    cells, _ = context_cells(database, queue, profiles, runner, clock=clock)
+    result = await cells.dispatch("ENG-9")
+    assert result.status == "working"
+    assert handoff_reasons(database) == []
+    assert _context_evidence(database) == ("healthy", 40.0)
 
 
 class RecordingSink:

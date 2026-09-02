@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import sys
 import uuid
@@ -11,13 +12,18 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.claude import ClaudeEvent, LeadTurnRequest
 from hermes_orchestrator.cmux_surfaces import classic_resume_command
-from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor, ContextSignal
+from hermes_orchestrator.context import (
+    ActiveTimeTracker,
+    ContextMonitor,
+    ContextSignal,
+    derive_context_occupancy,
+)
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
@@ -300,6 +306,20 @@ class LeadCompletionSink(Protocol):
     """
 
     def commit(self, wake: TerminalWakeInput) -> object: ...
+
+
+RotationKind = Literal["session", "account"]
+
+# INFRA-184: the ONE reason string that means "the provider itself
+# refused the incumbent profile" -- written by ``_require_handoff``'s
+# provider.limit callers (dispatch's mid-turn cap and the replacement
+# acknowledgement's own escalation) and by nothing else. Every other
+# durably recorded ``project_cell.handoff_required`` reason
+# ("context_rotation", "context_error", an operator's
+# ``request_checkpoint`` text, a six-hour-renewal caller, ...) names a
+# cause that leaves the current profile healthy -- only its SESSION
+# needs replacing.
+_PROVIDER_LIMIT_HANDOFF_REASON = "subscription_limit"
 
 
 class RotationBlocked(RuntimeError):
@@ -1793,6 +1813,62 @@ class ProjectCellService:
                 )
         return recorded.event_id
 
+    def _derive_rotation_kind(self, cell_id: str) -> RotationKind:
+        """Mechanically derive whether this rotation needs a new ACCOUNT
+        or only a new SESSION on the incumbent's own healthy profile.
+
+        The durable ``project_cell.handoff_required`` event that put the
+        cell into its current handoff episode names the cause in its
+        ``reason`` field (``_require_handoff`` writes exactly one such
+        event per episode; a repeat transition while already
+        ``handoff_required`` is a no-op, so the newest row IS this
+        episode's cause). The mapping:
+
+        - ``reason == "subscription_limit"`` (the provider itself
+          refused the incumbent's profile, via ``provider.limit``) ->
+          ``"account"``: only a different eligible profile can serve
+          the next turn.
+        - a reason beginning with ``"lead_rotation:"`` -> ``"account"``.
+          This is ``_request_fresh_handoff``'s OWN internal bookkeeping
+          text (``"lead_rotation:fresh_handoff_required ..."`` /
+          ``"lead_rotation:stale_handoff_detected ..."``), filed when a
+          rotation resubmits its request because the prior handoff was
+          consumed or stale -- it names a bookkeeping continuation, not
+          a fact about the incumbent's context or provider health, so it
+          carries no session-safe evidence and falls back to the same
+          default as no evidence at all.
+        - any OTHER recorded reason (``"context_rotation"``,
+          ``"context_error"``, ``"context_prepare"``-derived
+          checkpoints, a six-hour-renewal or ordinary operator
+          ``request_checkpoint`` text such as ``"stall:..."``, ...) ->
+          ``"session"``: the profile itself is still healthy, only its
+          session is stale.
+        - no ``handoff_required`` event found at all (a handoff
+          submitted without going through that channel -- e.g. an
+          operator-authored or test-authored submission) -> ``"account"``,
+          preserving today's existing behavior exactly rather than
+          guessing a cause that was never recorded.
+        """
+
+        row = self._database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE aggregate_type = 'project_cell' AND aggregate_id = ? "
+            "AND event_type = 'project_cell.handoff_required' "
+            "ORDER BY sequence DESC LIMIT 1",
+            (cell_id,),
+        ).fetchone()
+        if row is None:
+            return "account"
+        payload = json.loads(str(row["payload_json"]))
+        reason = payload.get("reason")
+        if not isinstance(reason, str):
+            return "account"
+        if reason == _PROVIDER_LIMIT_HANDOFF_REASON:
+            return "account"
+        if reason.startswith("lead_rotation:"):
+            return "account"
+        return "session"
+
     async def rotate(self, cell_id: str, handoff_id: str) -> ProjectCell:
         """Transfer a cell only after its replacement acknowledged the handoff."""
 
@@ -1835,37 +1911,49 @@ class ProjectCellService:
                 "no capacity was reserved and no lead was launched"
             )
 
+        kind: RotationKind = self._derive_rotation_kind(cell_id)
         capped_attempts: list[tuple[str, datetime]] = []
         attempted_profiles: set[str] = set()
         while True:
-            reservation = self._profiles.reserve_replacement(
-                current.project_key,
-                current.profile_alias,
-                lane_role=current.lane_role,
-            )
-            if reservation is None:
-                message = "no different healthy profile is available"
-                details = [
-                    str(value)
-                    for value in (getattr(self._profiles, "last_refusal", None),)
-                    if value
-                ]
-                details.extend(
-                    f"{alias}: fable-capped until {resets_at.isoformat()}"
-                    for alias, resets_at in capped_attempts
-                )
-                if details:
-                    message = f"{message}: {'; '.join(details)}"
-                raise RotationBlocked(message)
-            if reservation.profile_alias in attempted_profiles:
-                self._profiles.cancel_replacement(
+            if kind == "session":
+                # INFRA-184: context threshold, six-hour renewal,
+                # compaction/refill, context error, and ordinary handoff
+                # all leave the incumbent's own profile healthy — only a
+                # fresh session is needed, so the incumbent seat is
+                # retained rather than consuming another profile's
+                # occupancy or demanding fresh capacity evidence.
+                reservation = self._profiles.reserve_context_only(
                     current.project_key, lane_role=current.lane_role
                 )
-                raise RotationBlocked(
-                    "replacement selection repeated an already attempted profile: "
-                    f"{reservation.profile_alias}"
+            else:
+                reservation = self._profiles.reserve_replacement(
+                    current.project_key,
+                    current.profile_alias,
+                    lane_role=current.lane_role,
                 )
-            attempted_profiles.add(reservation.profile_alias)
+                if reservation is None:
+                    message = "no different healthy profile is available"
+                    details = [
+                        str(value)
+                        for value in (getattr(self._profiles, "last_refusal", None),)
+                        if value
+                    ]
+                    details.extend(
+                        f"{alias}: fable-capped until {resets_at.isoformat()}"
+                        for alias, resets_at in capped_attempts
+                    )
+                    if details:
+                        message = f"{message}: {'; '.join(details)}"
+                    raise RotationBlocked(message)
+                if reservation.profile_alias in attempted_profiles:
+                    self._profiles.cancel_replacement(
+                        current.project_key, lane_role=current.lane_role
+                    )
+                    raise RotationBlocked(
+                        "replacement selection repeated an already attempted "
+                        f"profile: {reservation.profile_alias}"
+                    )
+                attempted_profiles.add(reservation.profile_alias)
             if persisted_session is not None:
                 # The durable column is TEXT; parse rather than minting a new
                 # session id for an acknowledgement that already named one.
@@ -1881,6 +1969,11 @@ class ProjectCellService:
                     "Acknowledge this handoff and restate the exact next action."
                 ),
                 profile_alias=reservation.profile_alias,
+                # INFRA-184: acknowledgement is a compact, mechanically
+                # derived read-and-restate turn, not open-ended work — the
+                # smallest suitable effort is always enough, regardless of
+                # rotation kind.
+                effort="low",
                 output_schema={
                     "type": "object",
                     "properties": {
@@ -1907,14 +2000,26 @@ class ProjectCellService:
                                 replacement_session=replacement_session,
                                 replacement_profile=reservation.profile_alias,
                                 limit_kind=event.limit_kind,
+                                attempted_kind=kind,
                             )
                             capped_attempts.append(
                                 (reservation.profile_alias, resets_at)
                             )
                             replacement_capped = True
-                            self._profiles.cancel_replacement(
-                                current.project_key, lane_role=current.lane_role
-                            )
+                            if kind == "session":
+                                # The incumbent's own profile just proved
+                                # provider-capped: a same-profile session
+                                # rotation can never succeed here, so
+                                # escalate to an account rotation on the
+                                # very next pass of this same retry loop.
+                                # reserve_context_only never created a pool
+                                # reservation, so there is nothing to
+                                # cancel for this attempt.
+                                kind = "account"
+                            else:
+                                self._profiles.cancel_replacement(
+                                    current.project_key, lane_role=current.lane_role
+                                )
                             break
                         elif (
                             event.kind == "handoff.acknowledged"
@@ -1962,6 +2067,7 @@ class ProjectCellService:
             replacement_session=replacement_session,
             replacement_profile=reservation.profile_alias,
             recovering=False,
+            kind=kind,
         )
 
     async def _recover_acknowledged_rotation(
@@ -1999,23 +2105,32 @@ class ProjectCellService:
         # global PRIMARY KEY on profile_leases, so this conflict check
         # already asks "does ANY lease anywhere hold this profile" --
         # exactly the global shared-resource limit migration 0055 left
-        # untouched ("one profile serves one lease at a time").
-        conflict = self._database.execute(
-            "SELECT project_key FROM profile_leases WHERE profile_alias = ?",
-            (replacement_profile,),
-        ).fetchone()
-        if conflict is not None:
-            raise RotationBlocked(
-                f"recovered replacement profile {replacement_profile!r} "
-                "already holds a profile lease "
-                f"(project {str(conflict['project_key'])!r})"
-            )
+        # untouched ("one profile serves one lease at a time"). Skipped
+        # entirely when the recovered replacement profile IS the
+        # incumbent's own (a session-kind rotation, INFRA-184): the only
+        # row that could ever hold that globally-unique alias is the
+        # cell's own current lease, never a genuine conflict.
+        if replacement_profile != current.profile_alias:
+            conflict = self._database.execute(
+                "SELECT project_key FROM profile_leases WHERE profile_alias = ?",
+                (replacement_profile,),
+            ).fetchone()
+            if conflict is not None:
+                raise RotationBlocked(
+                    f"recovered replacement profile {replacement_profile!r} "
+                    "already holds a profile lease "
+                    f"(project {str(conflict['project_key'])!r})"
+                )
+        recovered_kind: RotationKind = (
+            "session" if replacement_profile == current.profile_alias else "account"
+        )
         return await self._finalize_transfer(
             current,
             handoff_id,
             replacement_session=replacement_session,
             replacement_profile=replacement_profile,
             recovering=True,
+            kind=recovered_kind,
         )
 
     async def _finalize_transfer(
@@ -2026,6 +2141,7 @@ class ProjectCellService:
         replacement_session: UUID,
         replacement_profile: str,
         recovering: bool,
+        kind: RotationKind,
     ) -> ProjectCell:
         """Run the one transactional lease/cell transfer and its follow-ups."""
 
@@ -2091,6 +2207,7 @@ class ProjectCellService:
                             "to_profile": rotated.profile_alias,
                             "handoff_id": handoff_id,
                             "session_id": str(rotated.session_id),
+                            "kind": kind,
                         },
                     ),
                 )
@@ -2115,12 +2232,16 @@ class ProjectCellService:
                 self._aware_now(),
                 lane_role=current.lane_role,
             )
-        else:
+        elif kind == "account":
             self._profiles.commit_rotation(
                 current.project_key,
                 current.profile_alias,
                 lane_role=current.lane_role,
             )
+        # else: kind == "session" retained the incumbent's own lease via
+        # reserve_context_only, which never created a pool reservation to
+        # commit -- the profile_leases row rewritten above already
+        # reflects the (unchanged) profile with its refreshed acquired_at.
         if self._safety is not None:
             self._safety.invalidate(rotated.cell_id, reason="session_rotated")
         if self._context is not None:
@@ -2696,6 +2817,7 @@ class ProjectCellService:
         worker = self._worker_key(cell)
         now = self._aware_now()
         percent = None
+        uncertainty = None
         compaction = False
         context_error = False
         if event is not None:
@@ -2705,27 +2827,44 @@ class ProjectCellService:
                 context_error = True
             elif (
                 event.original_type == "assistant"
-                and event.kind != "provider.limit"
+                and event.kind not in ("provider.limit", "handoff.acknowledged")
                 and event.parent_tool_use_id is None
                 and event.usage
+                and not self._is_duplicate_context_event(worker, event)
             ):
                 # Only an individual top-level assistant invocation reports
                 # this session's live context occupancy. A result record's
                 # usage is the cumulative run total (all invocations plus
                 # children), a user/tool-result record can forward a child
-                # worker's usage, and a synthetic limit notice is not an
-                # invocation at all: any of them would poison the sticky
-                # monitor into a false rotation.
-                occupied = (
-                    event.usage.get("input_tokens", 0)
-                    + event.usage.get("cache_read_input_tokens", 0)
-                    + event.usage.get("cache_creation_input_tokens", 0)
+                # worker's usage, a synthetic limit notice is not an
+                # invocation at all, and a handoff-acknowledgement turn is
+                # the lead's own structured sign-off rather than new work:
+                # any of them would poison the sticky monitor into a false
+                # rotation. A byte-identical repeat of the last eligible
+                # record (duplicate stream delivery) is likewise ignored.
+                #
+                # INFRA-184: the occupancy itself is derived from THIS ONE
+                # invocation's usage only, never summed across calls or
+                # records -- that summation is exactly what turned a fresh
+                # turn into a false "1704% full" rotation. Telemetry that
+                # is impossible for a single call (e.g. a monotonically
+                # growing cache_read_input_tokens field, which is a
+                # cumulative-across-turns counter rather than a live
+                # window size) is clamped and surfaced as measurement
+                # uncertainty instead of being trusted outright.
+                measurement = derive_context_occupancy(
+                    event.usage, window_tokens=self._context_window_tokens
                 )
-                if occupied > 0:
-                    percent = 100.0 * occupied / self._context_window_tokens
+                if measurement.occupied_tokens > 0 or measurement.uncertainty:
+                    percent = measurement.percent
+                    uncertainty = measurement.uncertainty
         previous = self._context.state(worker)
         rapid_refill = False
-        if percent is not None and previous in ("prepare", "rotation_pending"):
+        if (
+            percent is not None
+            and uncertainty is None
+            and previous in ("prepare", "rotation_pending")
+        ):
             row = self._database.execute(
                 "SELECT compactions, last_percent FROM context_evidence "
                 "WHERE worker_id = ?",
@@ -2753,6 +2892,7 @@ class ProjectCellService:
                 context_error=context_error,
                 active_hours=active_hours,
                 safe_boundary=safe_boundary,
+                uncertainty=uncertainty,
             )
         )
         if decision.state == previous:
@@ -2772,6 +2912,28 @@ class ProjectCellService:
                 self._handoffs.request(cell.cell_id, reason)
             return True
         return False
+
+    def _is_duplicate_context_event(self, worker: str, event: ClaudeEvent) -> bool:
+        """True when ``event`` repeats the last context-eligible record.
+
+        INFRA-184: a duplicated stream delivery must never be counted as
+        a second, distinct occupancy observation. ``ClaudeEvent`` carries
+        no per-message id or sequence marker, so its stream ``timestamp``
+        paired with its ``usage`` dict is the only identity it exposes;
+        that pair is cached per worker in-process (not durably) purely to
+        catch an immediate repeat of the same record within one process
+        lifetime -- not a general cross-restart de-duplication.
+        """
+
+        cache: dict[str, tuple[str | None, tuple[tuple[str, int], ...]]] | None
+        cache = getattr(self, "_context_event_seen", None)
+        if cache is None:
+            cache = {}
+            self._context_event_seen = cache
+        key = (event.timestamp, tuple(sorted(event.usage.items())))
+        duplicate = cache.get(worker) == key
+        cache[worker] = key
+        return duplicate
 
     def reconcile_freeze(
         self, cell: ProjectCell, *, reasons: tuple[str, ...] = ()
@@ -3100,8 +3262,17 @@ class ProjectCellService:
         replacement_session: UUID,
         replacement_profile: str,
         limit_kind: str | None,
+        attempted_kind: RotationKind = "account",
     ) -> datetime:
-        """Persist replacement cap evidence before its reservation is released."""
+        """Persist replacement cap evidence before its reservation is released.
+
+        ``attempted_kind`` is the rotation kind THIS attempt used (Sol
+        INFRA-184): when it is ``"session"``, the incumbent's own
+        profile just proved provider-capped, so the same evidence
+        journal that already records every capped attempt also records
+        the escalation to an ``"account"`` rotation — no separate
+        mechanism.
+        """
 
         observed_at = self._aware_now()
         resets_at = self._cap_cooldown(observed_at, limit_kind)
@@ -3112,20 +3283,24 @@ class ProjectCellService:
                 observed_at=observed_at,
                 resets_at=resets_at,
             )
+            payload: dict[str, object] = {
+                "phase": "replacement_acknowledgement",
+                "handoff_id": handoff_id,
+                "profile_alias": replacement_profile,
+                "session_id": str(replacement_session),
+                "limit_kind": limit_kind,
+                "resets_at": resets_at.isoformat(),
+                "attempted_kind": attempted_kind,
+            }
+            if attempted_kind == "session":
+                payload["escalated_to"] = "account"
             self._events.append(
                 connection,
                 EventInput(
                     event_type="provider.limit",
                     aggregate_type="project_cell",
                     aggregate_id=current.cell_id,
-                    payload={
-                        "phase": "replacement_acknowledgement",
-                        "handoff_id": handoff_id,
-                        "profile_alias": replacement_profile,
-                        "session_id": str(replacement_session),
-                        "limit_kind": limit_kind,
-                        "resets_at": resets_at.isoformat(),
-                    },
+                    payload=payload,
                 ),
             )
         self._profiles.set_cooldown(replacement_profile, resets_at)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -608,6 +610,211 @@ def test_context_only_rotation_retains_the_incumbent_profile(
     other = pool.acquire("other")
     assert other is not None
     assert other.profile_alias == "max-b"
+
+
+class _EscalatingRunner(RecordingRunner):
+    """A ``RecordingRunner`` whose FIRST turn (after ``rotation_attempt``
+    is armed) hits the provider's own limit and whose SECOND turn
+    acknowledges normally -- simulating a same-profile session rotation
+    attempt that the provider itself refuses, forcing the retry loop to
+    escalate to an account rotation. Counting starts only once armed, so
+    the cell's own (unrelated) dispatch turn never consumes an attempt."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rotation_attempt = 0
+        self.armed = False
+
+    def start_lead(self, request: LeadTurnRequest):  # type: ignore[no-untyped-def]
+        if self.armed:
+            self.rotation_attempt += 1
+            if self.rotation_attempt >= 2:
+                self.emit_limit = False
+                self.emit_handoff_ack = True
+        return super().start_lead(request)
+
+
+def _rotation_kind_harness(
+    tmp_path: Path,
+    name: str,
+    *,
+    runner_factory: Callable[[], RecordingRunner] = RecordingRunner,
+) -> tuple[Database, QueueService, ProjectCellService, HandoffService, RecordingRunner]:
+    """An isolated cell/handoff/pool fixture set, in the style of
+    ``test_old_lead_retires_only_after_acknowledgement``: a fresh
+    profiles.yaml/state.db pair per ``name`` so two scenarios in one
+    test never share durable state."""
+
+    root = tmp_path / name
+    root.mkdir()
+    config = root / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        "  - {alias: max-a, config_dir: /tmp/max-a}\n"
+        "  - {alias: max-b, config_dir: /tmp/max-b}\n"
+        "  - {alias: max-c, config_dir: /tmp/max-c}\n"
+        "  - {alias: max-d, config_dir: /tmp/max-d}\n",
+        encoding="utf-8",
+    )
+    registry = ProfileRegistry.load(config)
+    profiles = ProfilePool(registry)
+    for profile in registry.profiles:
+        profiles.record_health(
+            ProfileHealth(
+                profile_alias=profile.alias,
+                eligible=True,
+                reason="eligible",
+                last_checked_at=datetime(2026, 8, 26, tzinfo=UTC),
+            )
+        )
+    database = Database.open(root / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, {"demo"})
+    runner = runner_factory()
+    handoffs = HandoffService(database, handoff_ids=lambda: "handoff-1")
+    cells = ProjectCellService(
+        database=database,
+        events=events,
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=RecordingLinear(),
+        project_paths={"demo": root},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: UUID(
+            "22222222-2222-4222-8222-222222222222"
+        ),
+    )
+    return database, queue, cells, handoffs, runner
+
+
+@pytest.mark.asyncio
+async def test_context_rotation_keeps_profile_and_provider_limit_switches_account(
+    tmp_path: Path,
+) -> None:
+    """INFRA-184: the rotation kind is derived from the ``reason`` on the
+    durable ``project_cell.handoff_required`` event that put the cell into
+    its current handoff episode. A context-caused episode reuses the
+    incumbent's own healthy profile (``reserve_context_only``) on a fresh
+    session; a provider-limit-caused episode switches to a genuinely
+    different profile (``reserve_replacement``), exactly as before."""
+
+    replacement_session = UUID("22222222-2222-4222-8222-222222222222")
+
+    # Scenario A: a context-threshold cause keeps the incumbent's profile.
+    database, queue, cells, handoffs, runner = _rotation_kind_harness(
+        tmp_path, "session"
+    )
+    try:
+        admit(queue, "ENG-9")
+        await cells.dispatch("ENG-9")
+        assert cells.request_checkpoint("cell-demo", "context_rotation") is True
+        record = handoffs.submit(valid_handoff())
+        runner.emit_handoff_ack = True
+
+        rotated = await cells.rotate("cell-demo", record.handoff_id)
+
+        assert rotated.profile_alias == "max-a"
+        assert rotated.session_id == replacement_session
+        replacement_request = runner.start_requests[-1]
+        assert replacement_request.profile_alias == "max-a"
+    finally:
+        database.close()
+
+    # Scenario B: a provider-limit cause switches to a different profile.
+    database, queue, cells, handoffs, runner = _rotation_kind_harness(
+        tmp_path, "account"
+    )
+    try:
+        admit(queue, "ENG-9")
+        await cells.dispatch("ENG-9")
+        assert cells.request_checkpoint("cell-demo", "subscription_limit") is True
+        record = handoffs.submit(valid_handoff())
+        runner.emit_handoff_ack = True
+
+        rotated = await cells.rotate("cell-demo", record.handoff_id)
+
+        assert rotated.profile_alias == "max-b"
+        assert rotated.session_id == replacement_session
+        replacement_request = runner.start_requests[-1]
+        assert replacement_request.profile_alias == "max-b"
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_session_rotation_escalates_to_account_on_provider_limit(
+    tmp_path: Path,
+) -> None:
+    """INFRA-184: a same-profile session rotation whose attempt itself
+    hits the provider's own limit can never succeed on that profile --
+    the retry loop escalates to an account rotation on a genuinely
+    different profile, and the escalation is journaled on the SAME
+    ``provider.limit`` evidence structure every capped attempt already
+    uses."""
+
+    database, queue, cells, handoffs, runner = _rotation_kind_harness(
+        tmp_path, "escalate", runner_factory=_EscalatingRunner
+    )
+    try:
+        admit(queue, "ENG-9")
+        await cells.dispatch("ENG-9")
+        assert cells.request_checkpoint("cell-demo", "context_rotation") is True
+        record = handoffs.submit(valid_handoff())
+
+        # Arm the escalation ONLY for the rotation's own attempts: the
+        # unrelated dispatch turn above must never count toward it.
+        runner.armed = True
+        runner.emit_limit = True
+        runner.limit_kind = "fable"
+
+        rotated = await cells.rotate("cell-demo", record.handoff_id)
+
+        assert rotated.profile_alias == "max-b"
+        ack_attempts = runner.start_requests[1:]
+        assert len(ack_attempts) == 2
+        first_attempt, second_attempt = ack_attempts
+        assert first_attempt.profile_alias == "max-a"
+        assert second_attempt.profile_alias == "max-b"
+
+        limit_events = database.execute(
+            "SELECT payload_json FROM events "
+            "WHERE aggregate_type = 'project_cell' AND aggregate_id = 'cell-demo' "
+            "AND event_type = 'provider.limit' "
+            "ORDER BY sequence"
+        ).fetchall()
+        assert len(limit_events) == 1
+        payload = json.loads(str(limit_events[0]["payload_json"]))
+        assert payload["attempted_kind"] == "session"
+        assert payload["escalated_to"] == "account"
+        assert payload["profile_alias"] == "max-a"
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_ack_turn_requests_low_effort(tmp_path: Path) -> None:
+    """INFRA-184: the acknowledgement turn is a compact, mechanically
+    bounded read-and-restate turn, so it always requests the smallest
+    suitable effort -- regardless of rotation kind."""
+
+    database, queue, cells, handoffs, runner = _rotation_kind_harness(
+        tmp_path, "effort"
+    )
+    try:
+        admit(queue, "ENG-9")
+        await cells.dispatch("ENG-9")
+        record = handoffs.submit(valid_handoff())
+        runner.emit_handoff_ack = True
+
+        await cells.rotate("cell-demo", record.handoff_id)
+
+        replacement_request = runner.start_requests[-1]
+        assert replacement_request.effort == "low"
+    finally:
+        database.close()
 
 
 @pytest.mark.asyncio

@@ -99,6 +99,11 @@ class LeadTurnRequest:
     resume: bool = False
     output_schema: dict[str, Any] | None = None
     project_key: str | None = None
+    # INFRA-184: an optional override for the smallest suitable effort a
+    # turn needs -- set only by callers building a compact, mechanically
+    # bounded turn (the handoff acknowledgement), never by ordinary lead
+    # turns, which keep the tier's own configured default effort.
+    effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,8 +530,11 @@ class ClaudeRunner:
             "--model",
             "fable",
             "--effort",
-            # INFRA-211: the fable tier's configured default, not a literal.
-            tier_default_effort("fable"),
+            # INFRA-211: the fable tier's configured default, not a
+            # literal -- unless the request itself names the smallest
+            # suitable effort for a compact turn (INFRA-184's handoff
+            # acknowledgement), in which case that override wins.
+            request.effort or tier_default_effort("fable"),
         ]
         if self._freeze_dir is not None:
             command.extend(["--settings", self.hook_settings()])
