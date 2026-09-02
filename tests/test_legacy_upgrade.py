@@ -18,7 +18,7 @@ from hermes_orchestrator.db import Database
 MIGRATIONS = Path("src/hermes_orchestrator/migrations")
 
 # Deliberate explicit pin of the current schema version (keep as a literal).
-CURRENT_SCHEMA = 56
+CURRENT_SCHEMA = 57
 
 LEGACY_0003 = """
 BEGIN IMMEDIATE;
