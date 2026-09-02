@@ -147,7 +147,10 @@ test("after parking, a subsequent successful registration restores normal event 
     const notif = await fx.sidecar.nextMessage(
       (m) => m.method === "notifications/claude/channel"
     );
-    assert.equal(notif.params.content, `HERMES_WORK_READY ${packetId}`);
+    assert.equal(
+      notif.params.content,
+      `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`
+    );
 
     fx.sidecar.send({
       jsonrpc: "2.0",

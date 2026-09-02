@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { startFixture, initializeSidecar } from "./setup.js";
 import { FakeHubConnection } from "./harness.js";
 import { sleep } from "./harness.js";
+import { composeNotificationContent } from "../src/validate.js";
 
 async function registerAndGetConn(fx: Awaited<ReturnType<typeof startFixture>>) {
   const conn = await fx.hub.nextConnection();
@@ -31,7 +32,10 @@ test("valid event produces a notification with the correct envelope shape", asyn
     // The client contract: a required string `content` (the bounded
     // envelope) plus identifier-keyed string meta. A missing `content`
     // is a live-proven ProtocolError that drops the whole connection.
-    assert.equal(notif1.params.content, `HERMES_WORK_READY ${"a".repeat(32)}`);
+    assert.equal(
+      notif1.params.content,
+      `Hermes: work is ready to continue. Retrieve and confirm packet ${"a".repeat(32)}, then proceed.`
+    );
     assert.deepEqual(notif1.params.meta, {
       kind: "HERMES_WORK_READY",
       packet_id: "a".repeat(32),
@@ -47,6 +51,26 @@ test("valid event produces a notification with the correct envelope shape", asyn
   } finally {
     await fx.teardown();
   }
+});
+
+test("every visible event kind uses concise action-oriented text", () => {
+  const packet = "a".repeat(32);
+  assert.equal(
+    composeNotificationContent("HERMES_ASSIGNMENT_READY", packet),
+    `Hermes: a new assignment is ready. Retrieve and confirm packet ${packet}, then begin it.`
+  );
+  assert.equal(
+    composeNotificationContent("HERMES_CORRECTION_READY", packet),
+    `Hermes: Sol returned corrections. Retrieve and confirm packet ${packet}, then resume work.`
+  );
+  assert.equal(
+    composeNotificationContent("HERMES_WORK_READY", packet),
+    `Hermes: work is ready to continue. Retrieve and confirm packet ${packet}, then proceed.`
+  );
+  assert.equal(
+    composeNotificationContent("HERMES_CONTROL_READY", packet),
+    `Hermes: a control update needs attention. Retrieve and confirm packet ${packet}.`
+  );
 });
 
 test("distinct event ids always forward independently", async () => {
@@ -113,7 +137,10 @@ test("an event delivered before initialize is queued and flushed exactly once af
     const notif1 = await fx.sidecar.nextMessage(
       (m) => m.method === "notifications/claude/channel"
     );
-    assert.equal(notif1.params.content, `HERMES_WORK_READY ${packetId}`);
+    assert.equal(
+      notif1.params.content,
+      `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`
+    );
     assert.deepEqual(notif1.params.meta, {
       kind: "HERMES_WORK_READY",
       packet_id: packetId,
