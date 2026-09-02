@@ -13,9 +13,12 @@ import pytest
 
 from hermes_orchestrator.codex_merger import (
     MERGER_CONTRACT_VERSION,
+    MERGER_MODEL,
+    MERGER_PROVIDER,
     CodexMerger,
     ContractAwareDelivery,
     MergerAuthRequired,
+    MergerModelMismatch,
     MergerThreadUncertain,
     StaleChannelError,
 )
@@ -238,14 +241,27 @@ def stored_thread(
     state: str = "ready",
     thread_id: str = "thr_stored",
     generation: int = 1,
+    model: str | None = None,
+    provider: str | None = None,
+    model_verified_at: str | None = None,
 ) -> None:
     stamp = datetime(2026, 8, 27, tzinfo=UTC).isoformat()
     with database.transaction() as connection:
         connection.execute(
             "INSERT INTO reviewer_channels("
-            "project_key, thread_id, generation, state, created_at, updated_at"
-            ") VALUES ('demo', ?, ?, ?, ?, ?)",
-            (thread_id, generation, state, stamp, stamp),
+            "project_key, thread_id, generation, state, model, provider, "
+            "model_verified_at, created_at, updated_at"
+            ") VALUES ('demo', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                thread_id,
+                generation,
+                state,
+                model,
+                provider,
+                model_verified_at,
+                stamp,
+                stamp,
+            ),
         )
 
 
@@ -1553,3 +1569,137 @@ def test_ponytail_guard_binds_nowhere_but_the_managed_sol_boundary() -> None:
             continue
         source = module.read_text(encoding="utf-8")
         assert "codex_ponytail_guard" not in source, module.name
+
+
+# --- INFRA-187: Sol model identity persisted and validated -----------------
+
+
+@pytest.mark.asyncio
+async def test_creation_persists_sol_model_and_provider(
+    merger: CodexMerger, database: Database
+) -> None:
+    """A freshly created channel is proven Sol as soon as it is ready."""
+
+    await merger.ensure_thread("demo")
+
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.model == MERGER_MODEL
+    assert channel.provider == MERGER_PROVIDER
+    assert channel.model_verified_at is not None
+    assert merger.model_proven("demo") is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_refuses_mismatched_model(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    """A channel proven under a different model fails closed on recovery,
+    before any RPC beyond the auth check, and its row stays untouched."""
+
+    stored_thread(
+        database,
+        model="gpt-5.6-other",
+        provider=MERGER_PROVIDER,
+        model_verified_at=datetime(2026, 8, 1, tzinfo=UTC).isoformat(),
+    )
+
+    with pytest.raises(MergerModelMismatch):
+        await merger.ensure_thread("demo")
+
+    assert rpc.methods == ["account/read"]
+    assert "thread/read" not in rpc.methods
+    assert "thread/resume" not in rpc.methods
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.model == "gpt-5.6-other"
+    assert channel.state == "ready"
+    assert merger.model_proven("demo") is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_reconciles_unproven_legacy_channel(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    """A NULL-model pre-migration channel is reconciled: once the
+    authenticated resume succeeds under our Sol configuration, the
+    reconciliation proof is durably written."""
+
+    stored_thread(database)  # model/provider/model_verified_at all NULL
+    rpc.respond_sequence(
+        "thread/read",
+        [
+            {"thread": {"id": "thr_stored", "status": {"type": "notLoaded"}}},
+            {"thread": {"id": "thr_stored", "status": {"type": "idle"}}},
+        ],
+    )
+
+    before = merger.read_channel("demo")
+    assert before is not None
+    assert before.model is None
+    assert merger.model_proven("demo") is False
+
+    thread = await merger.ensure_thread("demo")
+
+    assert thread.thread_id == "thr_stored"
+    assert "thread/resume" in rpc.methods
+    after = merger.read_channel("demo")
+    assert after is not None
+    assert after.model == MERGER_MODEL
+    assert after.provider == MERGER_PROVIDER
+    assert after.model_verified_at is not None
+    assert merger.model_proven("demo") is True
+
+
+@pytest.mark.asyncio
+async def test_replacement_with_non_sol_model_fails_closed(
+    merger: CodexMerger, database: Database
+) -> None:
+    stored_thread(
+        database,
+        model=MERGER_MODEL,
+        provider=MERGER_PROVIDER,
+        model_verified_at=datetime(2026, 8, 1, tzinfo=UTC).isoformat(),
+    )
+    merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        reason="thread lost",
+    )
+
+    with pytest.raises(MergerModelMismatch):
+        merger.complete_replacement(
+            "demo",
+            expected_thread_id="thr_stored",
+            expected_generation=1,
+            new_thread_id="thr_new",
+            model="gpt-5.6-other",
+        )
+
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.state == "replacing"
+    assert channel.generation == 1
+    assert channel.thread_id == "thr_stored"
+    assert channel.model == MERGER_MODEL
+
+
+def test_constructor_refuses_non_sol_model(
+    database: Database, rpc: FakeRpc
+) -> None:
+    with pytest.raises(ValueError, match="gpt-5\\.6-sol"):
+        CodexMerger(
+            rpc=rpc,
+            database=database,
+            projects={
+                "demo": ProjectConfig(
+                    linear_team="infrastructure",
+                    repo_path=Path("/repo/demo"),
+                    integration_branch="main",
+                    github_repo="j-paterson/demo",
+                )
+            },
+            prompt_file=PROMPT_PATH,
+            model="gpt-5.6-other",
+        )

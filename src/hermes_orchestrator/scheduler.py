@@ -61,6 +61,7 @@ class Scheduler:
         mode: str,
         active_projects: Iterable[str] | Callable[[], Iterable[str]] = (),
         now: Callable[[], datetime] = _utc_now,
+        ready_pairs: Iterable[str] | Callable[[], Iterable[str]] | None = None,
     ) -> None:
         if mode not in {"observe", "active"}:
             raise ValueError(f"unsupported scheduler mode: {mode}")
@@ -72,6 +73,21 @@ class Scheduler:
             else lambda: frozenset(active_projects)
         )
         self._now = now
+        # INFRA-187 wave 2: optional so every existing caller (none of
+        # which know about project-team pairs yet) keeps today's
+        # behavior exactly -- a live Fable cell alone is enough to
+        # resume. Only once a caller supplies this does the scheduler
+        # additionally require the project's pair to be ready before
+        # resuming its cell.
+        self._ready_pairs = (
+            None
+            if ready_pairs is None
+            else (
+                ready_pairs
+                if callable(ready_pairs)
+                else lambda: frozenset(ready_pairs)
+            )
+        )
 
     def plan(self, snapshot: AdmissionSnapshot) -> list[PlannedAction]:
         """Describe the next safe project-cell starts without side effects."""
@@ -100,16 +116,46 @@ class Scheduler:
         # deduplicated away by this development-lane plan, or vice versa.
         planned_projects: set[tuple[str, str]] = set()
         active_projects = frozenset(self._active_projects())
+        # INFRA-187 wave 2: None (the default) keeps every existing
+        # caller's behavior byte-for-byte unchanged -- the pair-ready
+        # gate below only ever activates once a caller supplies
+        # ``ready_pairs``.
+        ready_pairs = (
+            None if self._ready_pairs is None else frozenset(self._ready_pairs())
+        )
         held: list[str] = []
         for issue in self._queue.list_ranked(self._now()):
             plan_key = (issue.project_key, _DEVELOPMENT_LANE)
             if plan_key in planned_projects:
                 continue
+            active = issue.project_key in active_projects
+            not_ready = ready_pairs is not None and issue.project_key not in ready_pairs
+            if active and not_ready:
+                # A live Fable cell alone does not make the project's
+                # execution unit complete -- consult the ready pair
+                # (Fable + proven Sol) rather than inferring
+                # completeness from the cell alone, and hold every
+                # issue for this project until the pair is ready.
+                planned_projects.add(plan_key)
+                actions.append(
+                    PlannedAction(
+                        kind="pair_not_ready",
+                        project_key=issue.project_key,
+                        issue_id=issue.issue_id,
+                        reason=(
+                            "project pair is not ready: Fable cell live "
+                            "but Sol merge lead unproven or unbound"
+                        ),
+                        execute=False,
+                        evidence={"project_key": issue.project_key},
+                        lane_role=_DEVELOPMENT_LANE,
+                    )
+                )
+                continue
             if issue.linear_priority > max_priority:
                 held.append(issue.issue_id)
                 continue
             planned_projects.add(plan_key)
-            active = issue.project_key in active_projects
             actions.append(
                 PlannedAction(
                     kind=(

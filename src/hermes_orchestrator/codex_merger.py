@@ -43,6 +43,12 @@ MERGER_MODEL = "gpt-5.6-sol"
 MERGER_CONTRACT_VERSION = "fif-1"
 
 _CONTRACT_HEADER_PREFIX = "Hermes Sol Merger contract"
+# INFRA-187: the merge lead model is explicitly Sol, authenticated through
+# the ChatGPT provider boundary -- never the raw OpenAI API surface. Every
+# reviewer channel persists both alongside its model_verified_at proof, and
+# every construction, creation, and recovery path validates them and fails
+# closed on a mismatch.
+MERGER_PROVIDER = "chatgpt"
 
 
 # The narrow writable Codex workspace mode (INFRA-194 operator scope):
@@ -184,6 +190,15 @@ class StaleChannelError(RuntimeError):
     """Raised when a compare-and-swap expectation no longer matches."""
 
 
+class MergerModelMismatch(Exception):
+    """Raised when a persisted or proposed model/provider is not Sol.
+
+    Fail closed: raised before any mutating write, so a mismatched
+    replacement or a channel proven under a different model never gets
+    silently adopted.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class MergerThread:
     """One usable project Merger thread."""
@@ -217,6 +232,9 @@ class ReviewerChannel:
     last_delivery_failure_at: str | None
     heartbeat_enabled: bool
     contract_version: str | None
+    model: str | None
+    provider: str | None
+    model_verified_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +281,14 @@ class CodexMerger:
             raise ValueError("request timeout must be positive")
         if wake_claim_lease_seconds < 0:
             raise ValueError("wake claim lease must not be negative")
+        if model != MERGER_MODEL:
+            # INFRA-187: fail closed at construction -- the merge lead
+            # model is explicitly Sol, never a substitute, so a caller
+            # asking for anything else is refused before any thread or
+            # channel exists.
+            raise ValueError(
+                f"merger model must be {MERGER_MODEL!r}, got {model!r}"
+            )
         self._wake_claim_lease_seconds = wake_claim_lease_seconds
         self._rpc = rpc
         self._database = database
@@ -306,7 +332,8 @@ class CodexMerger:
                 "prior_thread_id, "
                 "replacement_reason, last_delivered_event_id, "
                 "last_delivered_candidate_sha, last_delivery_failure_at, "
-                "heartbeat_enabled, contract_version FROM reviewer_channels "
+                "heartbeat_enabled, contract_version, model, provider, "
+                "model_verified_at FROM reviewer_channels "
                 "WHERE project_key = ?",
                 (project_key,),
             ).fetchone()
@@ -325,6 +352,26 @@ class CodexMerger:
             last_delivery_failure_at=row["last_delivery_failure_at"],
             heartbeat_enabled=bool(row["heartbeat_enabled"]),
             contract_version=row["contract_version"],
+            model=row["model"],
+            provider=row["provider"],
+            model_verified_at=row["model_verified_at"],
+        )
+
+    def model_proven(self, project_key: str) -> bool:
+        """True only when this channel's model identity is Sol and proven.
+
+        Read-only: a pair coordinator uses this to decide whether a
+        channel's model/provider identity has been explicitly validated
+        (at creation, or by the recovery-time reconciliation of a legacy
+        pre-migration channel) rather than merely assumed.
+        """
+
+        channel = self.read_channel(project_key)
+        return (
+            channel is not None
+            and channel.model == MERGER_MODEL
+            and channel.provider == MERGER_PROVIDER
+            and channel.model_verified_at is not None
         )
 
     def read_status(self, project_key: str) -> MergerStatus:
@@ -382,24 +429,42 @@ class CodexMerger:
         expected_thread_id: str,
         expected_generation: int,
         new_thread_id: str,
+        model: str = MERGER_MODEL,
+        provider: str = MERGER_PROVIDER,
     ) -> ReviewerChannel:
-        """Atomically install the new thread and increment the generation."""
+        """Atomically install the new thread and increment the generation.
+
+        INFRA-187: the replacement's model/provider are validated against
+        Sol BEFORE any write -- a mismatched replacement fails closed and
+        the channel stays untouched, exactly like the recovery-time check
+        in :meth:`_resume_current`. On success the fresh identity is
+        persisted with a new ``model_verified_at`` proof.
+        """
 
         self._project(project_key)
         if not new_thread_id:
             raise ValueError("replacement thread id must not be empty")
+        if model != MERGER_MODEL or provider != MERGER_PROVIDER:
+            raise MergerModelMismatch(
+                f"replacement for {project_key} requested model={model!r} "
+                f"provider={provider!r}, expected {MERGER_MODEL!r}/"
+                f"{MERGER_PROVIDER!r}"
+            )
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE reviewer_channels SET thread_id = ?, "
                 "generation = generation + 1, state = 'ready', "
                 "prior_thread_id = ?, contract_version = NULL, "
-                "updated_at = ? "
+                "updated_at = ?, model = ?, provider = ?, model_verified_at = ? "
                 "WHERE project_key = ? AND thread_id = ? AND generation = ? "
                 "AND state = 'replacing'",
                 (
                     new_thread_id,
                     expected_thread_id,
+                    stamp,
+                    model,
+                    provider,
                     stamp,
                     project_key,
                     expected_thread_id,
@@ -1169,6 +1234,23 @@ class CodexMerger:
                     f"reviewer channel for {project_key} is not ready and "
                     "requires operator reconciliation"
                 )
+            # INFRA-187: validate BEFORE any RPC. A channel proven under a
+            # different model/provider fails closed here -- no thread/read,
+            # no thread/resume, and the row is never touched. A NULL
+            # model/provider is a legacy pre-migration channel, unproven
+            # but not yet mismatched; it is reconciled below once the
+            # authenticated resume succeeds.
+            if (
+                channel.model is not None or channel.provider is not None
+            ) and (
+                channel.model != MERGER_MODEL
+                or channel.provider != MERGER_PROVIDER
+            ):
+                raise MergerModelMismatch(
+                    f"reviewer channel for {project_key} is proven under "
+                    f"model={channel.model!r} provider={channel.provider!r}, "
+                    f"expected {MERGER_MODEL!r}/{MERGER_PROVIDER!r}"
+                )
             thread_id = channel.thread_id
             try:
                 await self._load_persisted_thread(thread_id)
@@ -1186,12 +1268,46 @@ class CodexMerger:
                 continue
             await self._set_goal(project_key, thread_id)
             if self._channel_is_current(project_key, channel):
+                if channel.model is None or channel.provider is None:
+                    # Explicit reconciliation proof (INFRA-187): the
+                    # authenticated thread/resume-or-read above succeeded
+                    # against this session's Sol configuration, so the
+                    # legacy channel's identity is now provably Sol.
+                    self._reconcile_legacy_model(project_key, channel)
                 return MergerThread(
                     project_key=project_key, thread_id=thread_id
                 )
         raise StaleChannelError(
             f"reviewer channel for {project_key} was replaced while resuming"
         )
+
+    def _reconcile_legacy_model(
+        self, project_key: str, channel: ReviewerChannel
+    ) -> None:
+        """Persist the Sol reconciliation proof for a legacy NULL channel.
+
+        Bound to the exact thread/generation just verified as current, so
+        a concurrent replacement between the check and this write cannot
+        stamp the wrong row.
+        """
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE reviewer_channels SET model = ?, provider = ?, "
+                "model_verified_at = ?, updated_at = ? "
+                "WHERE project_key = ? AND thread_id = ? AND generation = ? "
+                "AND state = 'ready' AND model IS NULL AND provider IS NULL",
+                (
+                    MERGER_MODEL,
+                    MERGER_PROVIDER,
+                    stamp,
+                    stamp,
+                    project_key,
+                    channel.thread_id,
+                    channel.generation,
+                ),
+            )
 
     async def _load_persisted_thread(self, thread_id: str) -> str | None:
         """Verify the persisted thread by reading it; load only if needed.
@@ -1369,10 +1485,19 @@ class CodexMerger:
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE reviewer_channels SET generation = 1, "
-                "state = 'ready', integration_branch = ?, updated_at = ? "
+                "state = 'ready', integration_branch = ?, updated_at = ?, "
+                "model = ?, provider = ?, model_verified_at = ? "
                 "WHERE project_key = ? AND state = 'configuring' "
                 "AND thread_id = ?",
-                (project.integration_branch, stamp, project_key, thread_id),
+                (
+                    project.integration_branch,
+                    stamp,
+                    self._model,
+                    MERGER_PROVIDER,
+                    stamp,
+                    project_key,
+                    thread_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise StaleChannelError(

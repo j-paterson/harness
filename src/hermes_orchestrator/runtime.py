@@ -50,7 +50,8 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxWakeAnnouncer,
     RegistryProfileDirectory,
 )
-from hermes_orchestrator.config import Settings
+from hermes_orchestrator.codex_merger import ReviewerChannel
+from hermes_orchestrator.config import ProjectConfig, Settings
 from hermes_orchestrator.context import ActiveTimeTracker, ContextMonitor
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
@@ -101,6 +102,7 @@ from hermes_orchestrator.profiles import (
     ProfilePool,
     ProfileRegistry,
 )
+from hermes_orchestrator.project_teams import ProjectTeamService
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.reconcile import (
     CircleCiKnownState,
@@ -477,6 +479,87 @@ def _harness_lead_cwd(lead_cwd: Path) -> Path:
     return lead_cwd.parent / f"{lead_cwd.name}-harness"
 
 
+def reconcile_project_teams(
+    teams: ProjectTeamService,
+    *,
+    cells: ProjectCellService,
+    merger_channels: Callable[[str], ReviewerChannel | None],
+    model_proven: Callable[[str], bool],
+    projects: Mapping[str, ProjectConfig],
+) -> None:
+    """Converge every configured project's durable pair onto its members.
+
+    INFRA-187 wave 2: for each configured project, reads today's live
+    Fable development cell (``cells.active_cell``, development lane)
+    and the durable reviewer-channel row (``merger_channels`` --
+    ``CodexMerger.read_channel`` in production) and feeds both through
+    :meth:`ProjectTeamService.reconcile_existing`. That call binds
+    whichever member is observed live and not yet bound, and never
+    silently rebinds a member that disagrees with what is already
+    bound (it marks the pair ``uncertain`` instead, closing admission
+    until an operator resolves it).
+
+    The channel is only ever passed through as a candidate Sol member
+    when its own state is ``ready``; ``channel=None`` otherwise. Even
+    when passed through, ``reconcile_existing`` only binds it once
+    ``model_proven`` (``CodexMerger.model_proven`` in production)
+    confirms the model/provider identity was explicitly validated --
+    at creation, or by the merger's own recovery-time reconciliation of
+    a legacy pre-INFRA-187 channel. This is the "existing channels
+    require an explicit migration/reconciliation proof before their
+    pair becomes ready" requirement: an unproven legacy channel is
+    read every time but never bound, so its project's pair stays short
+    of ``ready`` until that proof lands.
+
+    Callers (see ``open_runtime`` below):
+      (a) once at runtime construction, right after ``cells`` is
+          assembled, so every already-live member converges before the
+          daemon's first scheduling tick;
+      (b) at the start of every scheduler cycle -- ``OrchestratorService``'s
+          dispatch loop lives in ``service.py``, out of this packet's
+          boundary, so this is wired instead by wrapping the
+          ``ready_pairs`` callable passed to ``Scheduler``: each call to
+          ``Scheduler.plan`` invokes ``ready_pairs()`` exactly once, so
+          reconciliation runs exactly once per plan call before the
+          pair-ready gate reads it;
+      (c) immediately after a successful ``cells.dispatch`` return (a
+          live ``cell_id`` on the result), scoped to just that issue's
+          project, so a freshly created or resumed Fable cell binds into
+          its project's team without waiting for the next scheduler
+          cycle.
+
+    Pure with respect to its own state: every effect is either a read
+    of ``cells``/``merger_channels``/``model_proven`` or a durable
+    compare-and-swap performed inside ``teams.reconcile_existing``
+    itself.
+    """
+
+    for project_key, project in projects.items():
+        cell = cells.active_cell(project_key)
+        cell_identity: tuple[str, str, str] | None = None
+        if cell is not None:
+            cell_identity = (cell.cell_id, str(cell.session_id), cell.profile_alias)
+        channel = merger_channels(project_key)
+        channel_identity: tuple[str, int, str | None, str | None] | None = None
+        channel_proven = False
+        if channel is not None and channel.state == "ready":
+            channel_identity = (
+                channel.thread_id,
+                channel.generation,
+                channel.model,
+                channel.provider,
+            )
+            channel_proven = model_proven(project_key)
+        teams.reconcile_existing(
+            project_key,
+            repo_path=project.repo_path,
+            integration_branch=project.integration_branch,
+            cell=cell_identity,
+            channel=channel_identity,
+            channel_proven=channel_proven,
+        )
+
+
 def open_runtime(
     settings: Settings,
     *,
@@ -517,6 +600,13 @@ def open_runtime(
         worktree_git = WorktreeGit()
         worktree_leases = WorktreeLeases(database, events)
         custodian = WorktreeCustodian(worktree_leases, processes, worktree_git)
+        # INFRA-187 wave 2: the durable pair coordinator is a thin
+        # database wrapper, so it is built for every runtime (live or
+        # observe) exactly like ``queue`` above -- ``Scheduler`` below
+        # always gets a ``ready_pairs`` callable, and reconciliation
+        # against live members only ever runs once ``cells``/the merger
+        # exist (enable_live), never in observe mode.
+        teams = ProjectTeamService(database)
 
         reader: KeychainReader | None = None
         reconciler_ports: dict[str, Any] = {}
@@ -976,12 +1066,64 @@ def open_runtime(
                 assignments=lead_assignments,
                 packets=subagent_packets,
             )
-            dispatch = cells.dispatch
+            # INFRA-187 wave 2 (a): converge the durable pair against
+            # whatever members are already live the moment ``cells``
+            # exists, so a restart resumes with the pair already
+            # reconciled instead of waiting for the first scheduler
+            # cycle or the first dispatch.
+            reconcile_project_teams(
+                teams,
+                cells=cells,
+                merger_channels=merge_flow.merger.read_channel,
+                model_proven=merge_flow.merger.model_proven,
+                projects=settings.projects,
+            )
+
+            async def _dispatch_and_reconcile(issue_id: str) -> DispatchResult:
+                result = await cells.dispatch(issue_id)
+                # INFRA-187 wave 2 (c): a freshly created or resumed
+                # Fable cell (a live ``cell_id`` on the result) binds
+                # into its project's team immediately, rather than
+                # waiting for the next scheduler cycle's
+                # ``ready_pairs()`` call.
+                if result.cell_id is not None:
+                    issue = queue.get(issue_id)
+                    project = settings.projects.get(issue.project_key)
+                    if project is not None:
+                        reconcile_project_teams(
+                            teams,
+                            cells=cells,
+                            merger_channels=merge_flow.merger.read_channel,
+                            model_proven=merge_flow.merger.model_proven,
+                            projects={issue.project_key: project},
+                        )
+                return result
+
+            dispatch = _dispatch_and_reconcile
+
+        def _ready_pairs() -> frozenset[str]:
+            # INFRA-187 wave 2 (b): ``OrchestratorService``'s dispatch
+            # loop (service.py) is out of this packet's editable
+            # boundary, so reconciliation is wired instead through this
+            # callable -- ``Scheduler.plan`` invokes ``ready_pairs()``
+            # exactly once per plan call, which reconciles once per
+            # scheduler cycle, before the pair-ready gate reads the
+            # result.
+            if cells is not None and merge_flow is not None:
+                reconcile_project_teams(
+                    teams,
+                    cells=cells,
+                    merger_channels=merge_flow.merger.read_channel,
+                    model_proven=merge_flow.merger.model_proven,
+                    projects=settings.projects,
+                )
+            return teams.ready_projects()
 
         scheduler = Scheduler(
             queue,
             mode="active" if enable_live else "observe",
             active_projects=(cells.active_projects if cells is not None else ()),
+            ready_pairs=_ready_pairs,
         )
         repository_paths = {
             alias: project.repo_path

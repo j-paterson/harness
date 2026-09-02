@@ -22,6 +22,11 @@ from hermes_orchestrator.manifests import (
     wake_event_for,
     write_manifest,
 )
+from hermes_orchestrator.project_teams import (
+    SOL_MODEL,
+    SOL_PROVIDER,
+    ProjectTeamService,
+)
 from hermes_orchestrator.review_drift import DriftVerdict
 from hermes_orchestrator.review_intake import (
     AdmittedCandidate,
@@ -70,13 +75,22 @@ def merger(database: Database) -> CodexMerger:
 
 
 def stored_channel(database: Database, generation: int = 1) -> None:
+    """Seed a ``ready`` reviewer channel with the one proven Sol
+    identity (model/provider/model_verified_at) already persisted --
+    INFRA-187 correction a63d6197 requires ``ProjectTeamService.bind_sol``
+    to verify the persisted model/provider before a pair may bind, so
+    every test whose pair must actually reach ``ready`` (via
+    ``ready_team`` below) needs that proof on the row, not just the
+    thread/generation key."""
+
     stamp = datetime(2026, 8, 28, tzinfo=UTC).isoformat()
     with database.transaction() as connection:
         connection.execute(
             "INSERT INTO reviewer_channels("
-            "project_key, thread_id, generation, state, created_at, updated_at"
-            ") VALUES ('demo', 'thr_stored', ?, 'ready', ?, ?)",
-            (generation, stamp, stamp),
+            "project_key, thread_id, generation, state, model, provider, "
+            "model_verified_at, created_at, updated_at"
+            ") VALUES ('demo', 'thr_stored', ?, 'ready', ?, ?, ?, ?, ?)",
+            (generation, SOL_MODEL, SOL_PROVIDER, stamp, stamp, stamp),
         )
 
 
@@ -160,6 +174,7 @@ def admission(
     head: str = HEAD,
     base_ok: bool = True,
     intake_gate: Any = None,
+    teams: ProjectTeamService | None = None,
 ) -> CandidateAdmission:
     return CandidateAdmission(
         channels=merger,
@@ -167,7 +182,63 @@ def admission(
         branch_head=lambda project_key, branch: head,
         base_policy=lambda project_key, base_sha: base_ok,
         intake_gate=intake_gate if intake_gate is not None else PassingGate(),
+        teams=teams,
     )
+
+
+def seed_fable_cell(
+    database: Database,
+    *,
+    cell_id: str = "cell-1",
+    project_key: str = "demo",
+    state: str = "active",
+) -> None:
+    stamp = datetime(2026, 8, 28, tzinfo=UTC).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at, lane_role) "
+            "VALUES (?, ?, ?, 'max-c', 'sess-fable-1', ?, ?, 'development')",
+            (cell_id, project_key, state, stamp, stamp),
+        )
+
+
+def ready_team(
+    database: Database,
+    *,
+    project_key: str = "demo",
+    cell_id: str = "cell-1",
+    thread_id: str = "thr_stored",
+    sol_generation: int = 1,
+) -> ProjectTeamService:
+    """A durable ready pair bound to the given Fable cell + Sol channel.
+
+    Assumes the caller already seeded both the ``project_cells`` row
+    (``seed_fable_cell``) and the ``reviewer_channels`` row
+    (``stored_channel``) it references.
+    """
+
+    teams = ProjectTeamService(database)
+    team = teams.reserve(
+        project_key, repo_path="/repo/demo", integration_branch="main"
+    )
+    team = teams.bind_fable(
+        project_key,
+        expected_generation=team.generation,
+        cell_id=cell_id,
+        session_id="sess-fable-1",
+        profile_alias="max-c",
+    )
+    teams.bind_sol(
+        project_key,
+        expected_generation=team.generation,
+        thread_id=thread_id,
+        sol_generation=sol_generation,
+        model=SOL_MODEL,
+        provider=SOL_PROVIDER,
+    )
+    return teams
 
 
 def test_admits_exactly_one_validated_candidate(
@@ -777,6 +848,9 @@ def _ready_channel(
         last_delivery_failure_at=None,
         heartbeat_enabled=False,
         contract_version=None,
+        model=SOL_MODEL,
+        provider=SOL_PROVIDER,
+        model_verified_at="2026-09-02T00:00:00+00:00",
     )
 
 
@@ -869,3 +943,124 @@ def test_stale_generation_wake_fails_closed_even_when_drift_is_administrative(
         ).admit("demo", event, received_generation=1)
 
     assert store.admit_calls == []
+def test_ready_pair_admits_as_before(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """Supplying ``teams`` changes nothing for a wake whose Sol channel
+    identity matches the project's ready pair exactly."""
+
+    stored_channel(database)
+    seed_fable_cell(database)
+    teams = ready_team(database)
+    event = delivered_event(merger, tmp_path)
+
+    admitted = admission(merger, tmp_path, teams=teams).admit(
+        "demo", event, received_generation=1
+    )
+
+    assert isinstance(admitted, AdmittedCandidate)
+    assert admitted.thread_id == "thr_stored"
+    assert admitted.generation == 1
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) == "admitted"
+
+
+def test_no_team_service_keeps_behavior_unchanged(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """``teams=None`` (the default) is exactly today's behavior: no
+    project_teams row exists at all, and admission neither reads nor
+    requires one."""
+
+    stored_channel(database)
+    event = delivered_event(merger, tmp_path)
+
+    admitted = admission(merger, tmp_path).admit(
+        "demo", event, received_generation=1
+    )
+
+    assert isinstance(admitted, AdmittedCandidate)
+    assert database.scalar("SELECT COUNT(*) FROM project_teams") == 0
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) == "admitted"
+
+
+def test_wake_to_stale_sol_generation_refuses_through_pair(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """The reviewer channel rotates to generation 2 (a replacement Sol
+    thread/generation) while the durable ready pair is still bound to
+    generation 1 -- a wake delivered against the now-current channel
+    must refuse through the pair, exactly like the existing generation
+    check refuses a wake that is itself stale against the channel."""
+
+    stored_channel(database, generation=1)
+    seed_fable_cell(database)
+    teams = ready_team(database, sol_generation=1)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE reviewer_channels SET generation = 2 WHERE project_key = 'demo'"
+        )
+    event = delivered_event(merger, tmp_path)
+
+    with pytest.raises(CandidateRejected, match="pair"):
+        admission(merger, tmp_path, teams=teams).admit(
+            "demo", event, received_generation=2
+        )
+
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) == "delivered"
+    assert database.scalar("SELECT COUNT(*) FROM project_teams") == 1
+    live = teams.live_team("demo")
+    assert live is not None
+    assert live.sol_generation == 1
+
+
+def test_candidate_from_stale_fable_generation_refuses_through_pair(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """``WakeEvent``/``CandidateManifest`` carry no Fable cell identity
+    today, so admission resolves the pair through the Sol member alone
+    -- but a pair whose Fable member has drifted underneath it (a live
+    cell reconciliation observes disagrees with the one the ready team
+    is bound to) is marked ``uncertain`` and is therefore no longer
+    *ready* at all, so resolution still refuses fail-closed even though
+    the Sol identity itself never changed."""
+
+    stored_channel(database)
+    seed_fable_cell(database, cell_id="cell-a")
+    teams = ready_team(database, cell_id="cell-a")
+    assert teams.live_team("demo").state == "ready"  # type: ignore[union-attr]
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET state = 'released' WHERE cell_id = 'cell-a'"
+        )
+    seed_fable_cell(database, cell_id="cell-b")
+    uncertain = teams.reconcile_existing(
+        "demo",
+        repo_path="/repo/demo",
+        integration_branch="main",
+        cell=("cell-b", "sess-fable-1", "max-c"),
+        channel=None,
+        channel_proven=False,
+    )
+    assert uncertain is not None
+    assert uncertain.state == "uncertain"
+
+    event = delivered_event(merger, tmp_path)
+
+    with pytest.raises(CandidateRejected, match="pair"):
+        admission(merger, tmp_path, teams=teams).admit(
+            "demo", event, received_generation=1
+        )
+
+    assert database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
+    ) == "delivered"
+    live = teams.live_team("demo")
+    assert live is not None
+    assert live.state == "uncertain"

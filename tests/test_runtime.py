@@ -20,14 +20,19 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxLeadSeater,
     CmuxSurfaceRef,
 )
+from hermes_orchestrator.codex_merger import MERGER_MODEL, MERGER_PROVIDER
 from hermes_orchestrator.config import load_settings
+from hermes_orchestrator.db import Database
+from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.profiles import JsonCommand
+from hermes_orchestrator.project_teams import ProjectTeamService
 from hermes_orchestrator.runtime import (
     DaemonAlreadyRunning,
     _harness_lead_cwd,
     open_runtime,
     resolve_sidecar_entry,
 )
+from hermes_orchestrator.scheduler import Scheduler
 
 
 class EligibleProfileCommand(JsonCommand):
@@ -110,6 +115,77 @@ def active_repo(
         encoding="utf-8",
     )
     return tmp_path, tmp_path / "state"
+
+
+@dataclass(frozen=True)
+class _FakeSnapshot:
+    pressure: str
+    can_admit: bool
+
+
+def seed_live_fable_cell(
+    state_dir: Path,
+    *,
+    cell_id: str = "cell-1",
+    project_key: str = "demo",
+) -> None:
+    """Seed a durable, already-live development-lane cell before the
+    daemon is opened, so ``open_runtime``'s INFRA-187 reconciliation has
+    an existing Fable member to converge onto immediately."""
+
+    stamp = datetime(2026, 8, 28, tzinfo=UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at, lane_role) "
+                "VALUES (?, ?, 'active', 'max-c', "
+                "'11111111-1111-1111-1111-111111111111', ?, ?, "
+                "'development')",
+                (cell_id, project_key, stamp, stamp),
+            )
+    finally:
+        database.close()
+
+
+def seed_ready_reviewer_channel(
+    state_dir: Path,
+    *,
+    project_key: str = "demo",
+    thread_id: str = "thr-1",
+    generation: int = 1,
+    proven: bool,
+) -> None:
+    """Seed a durable ``ready`` reviewer channel before the daemon is
+    opened. ``proven=False`` reproduces a legacy pre-INFRA-187 channel
+    (NULL model/provider/model_verified_at) that requires the merger's
+    own recovery-time reconciliation before it may ever bind."""
+
+    stamp = datetime(2026, 8, 28, tzinfo=UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reviewer_channels("
+                "project_key, thread_id, generation, state, "
+                "integration_branch, model, provider, model_verified_at, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, 'ready', 'main', ?, ?, ?, ?, ?)",
+                (
+                    project_key,
+                    thread_id,
+                    generation,
+                    MERGER_MODEL if proven else None,
+                    MERGER_PROVIDER if proven else None,
+                    stamp if proven else None,
+                    stamp,
+                    stamp,
+                ),
+            )
+    finally:
+        database.close()
 
 
 def test_active_runtime_assembles_live_dispatch_without_identity_persistence(
@@ -1306,3 +1382,101 @@ def test_resolve_prompt_file_falls_back_only_before_activation(
         )
         == expected
     )
+
+
+def test_runtime_reconciles_existing_cell_and_proven_channel_into_ready_pair(
+    tmp_path: Path,
+) -> None:
+    """INFRA-187 wave 2: a live Fable cell and an already-proven Sol
+    reviewer channel, both created before this daemon ever started
+    (e.g. a restart, or a pre-INFRA-187 project), converge into a
+    ready pair the moment ``open_runtime`` runs -- with no scheduler
+    cycle or dispatch required first."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    seed_live_fable_cell(state_dir)
+    seed_ready_reviewer_channel(state_dir, proven=True)
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        teams = ProjectTeamService(runtime.database)
+        assert "demo" in teams.ready_projects()
+        team = teams.live_team("demo")
+        assert team is not None
+        assert team.state == "ready"
+        assert team.fable_cell_id == "cell-1"
+        assert team.sol_thread_id == "thr-1"
+        assert team.sol_model == MERGER_MODEL
+        assert team.sol_provider == MERGER_PROVIDER
+    finally:
+        runtime.close()
+
+
+def test_unproven_channel_leaves_pair_not_ready_and_scheduler_holds(
+    tmp_path: Path,
+) -> None:
+    """A reviewer channel that is durably ``ready`` but has never been
+    proven (NULL model/provider/model_verified_at -- exactly what a
+    legacy pre-INFRA-187 channel looks like) must never bind as the
+    pair's Sol member on reconciliation alone; the pair stays short of
+    ``ready`` and the scheduler holds queued work for that project
+    behind ``pair_not_ready`` rather than resuming it off the live
+    Fable cell alone."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    seed_live_fable_cell(state_dir)
+    seed_ready_reviewer_channel(state_dir, proven=False)
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        teams = ProjectTeamService(runtime.database)
+        assert "demo" not in teams.ready_projects()
+        team = teams.live_team("demo")
+        assert team is not None
+        assert team.state == "fable_bound"
+        assert team.fable_cell_id == "cell-1"
+        assert team.sol_thread_id is None
+
+        assert runtime.cells is not None
+        runtime.queue.admit(
+            AdmissionRequest(
+                issue_id="ENG-1",
+                project_key="demo",
+                linear_priority=1,
+                admitted_by="operator",
+                instruction_id="chat-ENG-1",
+            )
+        )
+        # The exact ``ready_pairs`` shape ``open_runtime`` wires into its
+        # own scheduler -- a live cell is active for "demo", but the
+        # unproven channel never let the pair become ready, so this
+        # must hold rather than resume.
+        scheduler = Scheduler(
+            runtime.queue,
+            mode="active",
+            active_projects=runtime.cells.active_projects,
+            ready_pairs=teams.ready_projects,
+        )
+
+        actions = scheduler.plan(_FakeSnapshot(pressure="green", can_admit=True))
+
+        assert [(action.kind, action.execute) for action in actions] == [
+            ("pair_not_ready", False)
+        ]
+        assert actions[0].project_key == "demo"
+    finally:
+        runtime.close()

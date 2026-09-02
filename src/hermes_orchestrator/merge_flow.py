@@ -47,6 +47,7 @@ from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
 from hermes_orchestrator.merge import GitHubIntakeGate, IntegrationMerge
 from hermes_orchestrator.merger_turns import CodexThreadReports, MergerTurnService
 from hermes_orchestrator.processes import ProcessRegistry
+from hermes_orchestrator.project_teams import ProjectTeamService
 from hermes_orchestrator.qa import QaRouter
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.review_intake import (
@@ -355,6 +356,12 @@ def build_merge_flow(
         describe_candidate=_describe_candidate(
             settings, GitVerifier(runner=runner), runner
         ),
+        # INFRA-187 wave 2: a thin database wrapper, built here rather
+        # than reused from ``runtime.py``'s own instance -- the two
+        # instances share the same durable ``project_teams`` table, so
+        # constructing a second one costs nothing and keeps this
+        # module's composition self-contained.
+        teams=ProjectTeamService(database),
     )
     qa = QaRouter(database=database, events=events)
     settlements = MergeSettlements(database, events)

@@ -171,6 +171,57 @@ def test_multiple_ready_issues_for_active_project_plan_exactly_one_per_cycle(
     assert starts[0].issue_id == "ENG-7"
 
 
+def test_live_cell_without_ready_pair_is_held(queue_service: QueueService) -> None:
+    admit(queue_service, "ENG-7", "demo", 1)
+    scheduler = Scheduler(
+        queue_service,
+        mode="active",
+        active_projects={"demo"},
+        ready_pairs=frozenset(),
+    )
+
+    actions = scheduler.plan(FakeSnapshot(pressure="green", can_admit=True))
+
+    assert [(action.kind, action.execute) for action in actions] == [
+        ("pair_not_ready", False)
+    ]
+    assert not any(
+        action.kind in {"resume_project_cell", "start_project_cell"}
+        for action in actions
+    )
+    assert actions[0].project_key == "demo"
+    assert actions[0].evidence == {"project_key": "demo"}
+
+
+def test_ready_pair_resumes_as_before(queue_service: QueueService) -> None:
+    admit(queue_service, "ENG-7", "demo", 1)
+    scheduler = Scheduler(
+        queue_service,
+        mode="active",
+        active_projects={"demo"},
+        ready_pairs={"demo"},
+    )
+
+    actions = scheduler.plan(FakeSnapshot(pressure="green", can_admit=True))
+
+    assert [(action.kind, action.issue_id, action.execute) for action in actions] == [
+        ("resume_project_cell", "ENG-7", True)
+    ]
+
+
+def test_scheduler_without_ready_pairs_is_unchanged(
+    queue_service: QueueService,
+) -> None:
+    admit(queue_service, "ENG-7", "demo", 1)
+    scheduler = Scheduler(queue_service, mode="active", active_projects={"demo"})
+
+    actions = scheduler.plan(FakeSnapshot(pressure="green", can_admit=True))
+
+    assert [(action.kind, action.issue_id, action.execute) for action in actions] == [
+        ("resume_project_cell", "ENG-7", True)
+    ]
+
+
 def test_yellow_pressure_admits_only_priority_one_work(
     queue_service: QueueService,
 ) -> None:

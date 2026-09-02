@@ -27,6 +27,7 @@ from hermes_orchestrator.manifests import (
     WakeEvent,
     read_manifest_snapshot,
 )
+from hermes_orchestrator.project_teams import ProjectTeamService, StaleTeamMember
 from hermes_orchestrator.review_drift import DriftVerdict, classify_drift
 
 #: ``(project_key, branch) -> sha``. Three outcomes, represented
@@ -163,6 +164,7 @@ class CandidateAdmission:
         intake_gate: IntakeGate,
         merged_candidate_proof: MergedCandidateProof | None = None,
         describe_candidate: DescribeCandidate | None = None,
+        teams: ProjectTeamService | None = None,
     ) -> None:
         if branch_head is None:
             raise ValueError("candidate admission requires a branch head")
@@ -185,6 +187,16 @@ class CandidateAdmission:
         # default, in which case ``_drift_verdict`` always returns None
         # and every existing caller is byte-for-byte unaffected.
         self._describe_candidate = describe_candidate
+        # INFRA-187 wave 2: optional so every existing caller (none of
+        # which know about project-team pairs yet) keeps today's
+        # behavior exactly. Once supplied, a candidate must additionally
+        # resolve through the project's *ready* Fable+Sol pair -- the
+        # Sol member identity (thread + generation) admission already
+        # trusts (the channel it just read) must also be the ready
+        # team's bound Sol member, so no candidate, correction, or merge
+        # can ever cross a project boundary through a stale or
+        # cross-project team.
+        self._teams = teams
 
     def validate_only(
         self,
@@ -357,6 +369,28 @@ class CandidateAdmission:
             raise CandidateRejected(
                 "wake generation is stale for the current reviewer channel"
             )
+        if self._teams is not None:
+            # INFRA-187 wave 2: the channel this admission just read
+            # must also be the project's currently *ready* pair's bound
+            # Sol member -- a channel that is locally "ready" but does
+            # not (or no longer) match the durable pair's own bound
+            # generation is refused here, exactly like the generation
+            # check above, before any external boundary is touched.
+            # ``WakeEvent``/``CandidateManifest`` carry no Fable cell
+            # identity today, so only the Sol member is resolved through
+            # the pair; a future packet that adds a cell id to the wake
+            # envelope should also pass ``fable_cell_id=`` here.
+            try:
+                self._teams.resolve(
+                    project_key,
+                    sol_thread_id=channel.thread_id,
+                    sol_generation=channel.generation,
+                )
+            except StaleTeamMember as error:
+                raise CandidateRejected(
+                    "project pair not ready or member generation stale: "
+                    f"{error}"
+                ) from error
         drift = self._drift_verdict(channel, manifest)
         if not external_gates:
             return snapshot, manifest, channel, drift
