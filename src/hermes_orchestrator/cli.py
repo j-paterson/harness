@@ -105,7 +105,11 @@ from hermes_orchestrator.lead_wakes import (
     LeadWakeReconciler,
     TerminalWakeInput,
 )
-from hermes_orchestrator.linear import LinearProjection, ProjectLinearRouter
+from hermes_orchestrator.linear import (
+    LinearIssueReader,
+    LinearProjection,
+    ProjectLinearRouter,
+)
 from hermes_orchestrator.merge_flow import (
     DeferredCollaborator,
     MergeFlow,
@@ -1320,6 +1324,32 @@ class _LazyIdleLinearProjector:
             self._settings, database=self._database, queue=self._queue
         )
         return await router.project(issue_id, target, effect_id)
+
+
+class _LazyLinearReads:
+    """Read one Linear issue only when a command actually needs one.
+
+    INFRA-227: ``hermes-command`` runs with ``enable_live=False`` (only
+    ``daemon`` sets it), so ``open_runtime`` never builds a
+    ``LinearIssueReader`` for this path -- ``Runtime`` has nothing to
+    reuse. Building one eagerly here would touch the Keychain on every
+    ``hermes-command`` invocation, including the vast majority (status,
+    pause, resume, ...) that never reach reactivation. The read --
+    Keychain included -- is deferred to the first ``get_issue`` call, so
+    a Keychain outage only ever surfaces to a command that actually
+    needs Linear, and ``HermesCommandService`` turns any exception raised
+    here into an ``admission_denied`` result rather than a traceback.
+    """
+
+    def __init__(self, keychain: Keychain) -> None:
+        self._keychain = keychain
+        self._reader: LinearIssueReader | None = None
+
+    def get_issue(self, issue_id: str) -> Any:
+        if self._reader is None:
+            token = self._keychain.read("hermes-orchestrator-linear", "default")
+            self._reader = LinearIssueReader(token)
+        return self._reader.get_issue(issue_id)
 
 
 ROTATION_REGISTRATION_WAIT_SECONDS = 60.0
@@ -5777,6 +5807,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 queue,
                 qa=QaRouter(database=database, events=events),
                 handlers=_hermes_handlers(settings, runtime, outbox, packets),
+                linear_reads=_LazyLinearReads(Keychain()),
             ).execute(request)
             print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             rejected = {"invalid_command", "intent_not_allowed"}

@@ -549,3 +549,123 @@ def test_list_ranked_excludes_post_merge_acceptance(
     ranked = queue_service.list_ranked(clock.now())
 
     assert [item.issue_id for item in ranked] == ["ENG-8"]
+
+
+def _done_issue(
+    queue_service: QueueService,
+    issue_id: str = "ENG-7",
+    instruction_id: str = "chat-123",
+) -> None:
+    queue_service.admit(request(issue_id, instruction_id))
+    queue_service.complete(
+        issue_id,
+        reason="linear_completed",
+        evidence=f"https://linear.example/{issue_id}",
+    )
+
+
+def test_reactivate_done_issue_when_linear_is_non_terminal(
+    queue_service: QueueService, database: Database
+) -> None:
+    _done_issue(queue_service)
+
+    reactivated = queue_service.reactivate(
+        request("ENG-7", "chat-456", priority=1, dependency_ready=False),
+        linear_status="In Development",
+    )
+
+    assert reactivated.state is IssueState.QUEUED
+    assert reactivated.instruction_id == "chat-456"
+    assert reactivated.linear_priority == 1
+    assert reactivated.dependency_ready is False
+    event_types = [
+        row["event_type"]
+        for row in database.execute(
+            "SELECT event_type FROM events ORDER BY sequence"
+        ).fetchall()
+    ]
+    assert event_types == ["issue.admitted", "issue.completed", "issue.reactivated"]
+    reactivated_event = database.execute(
+        "SELECT actor, correlation_id, payload_json FROM events "
+        "WHERE event_type = 'issue.reactivated'"
+    ).fetchone()
+    assert reactivated_event["actor"] == "operator"
+    assert reactivated_event["correlation_id"] == "chat-456"
+    assert reactivated_event["payload_json"] == (
+        '{"dependency_ready":false,"from":"done","linear_status":'
+        '"In Development","priority":1,"project_key":"demo","to":"queued"}'
+    )
+
+
+@pytest.mark.parametrize("linear_status", ["Done", "Canceled", "Cancelled", None])
+def test_reactivate_refuses_when_linear_is_terminal(
+    queue_service: QueueService, linear_status: str | None
+) -> None:
+    _done_issue(queue_service)
+
+    with pytest.raises(AdmissionDenied):
+        queue_service.reactivate(
+            request("ENG-7", "chat-456"), linear_status=linear_status
+        )
+
+
+def test_reactivate_refuses_locally_non_terminal_issue(
+    queue_service: QueueService,
+) -> None:
+    queue_service.admit(request("ENG-7", "chat-123"))
+
+    with pytest.raises(AdmissionDenied, match="already admitted"):
+        queue_service.reactivate(
+            request("ENG-7", "chat-456"), linear_status="In Development"
+        )
+
+
+def test_reactivate_refuses_project_mismatch(
+    database: Database, clock: MutableClock
+) -> None:
+    queue_service = QueueService(
+        database=database,
+        events=EventStore(database),
+        registered_projects={"demo", "other"},
+        now=clock.now,
+    )
+    _done_issue(queue_service)
+    mismatched = AdmissionRequest(
+        issue_id="ENG-7",
+        project_key="other",
+        linear_priority=2,
+        admitted_by="operator",
+        instruction_id="chat-456",
+    )
+
+    with pytest.raises(AdmissionDenied):
+        queue_service.reactivate(mismatched, linear_status="In Development")
+
+
+def test_reactivate_is_idempotent_for_the_same_instruction(
+    queue_service: QueueService, database: Database
+) -> None:
+    _done_issue(queue_service)
+    first = queue_service.reactivate(
+        request("ENG-7", "chat-456", priority=1), linear_status="In Development"
+    )
+
+    second = queue_service.reactivate(
+        request("ENG-7", "chat-456", priority=1), linear_status="In Development"
+    )
+
+    assert second == first
+    count = database.execute("SELECT count(*) AS n FROM events").fetchone()
+    assert count["n"] == 3
+
+
+def test_reactivate_conflicts_on_reused_instruction_of_another_issue(
+    queue_service: QueueService,
+) -> None:
+    _done_issue(queue_service, issue_id="ENG-7", instruction_id="chat-123")
+    queue_service.admit(request("ENG-8", "chat-999"))
+
+    with pytest.raises(IdempotencyConflict, match="chat-999"):
+        queue_service.reactivate(
+            request("ENG-7", "chat-999"), linear_status="In Development"
+        )
