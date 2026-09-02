@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -11,7 +12,9 @@ from typing import Any, ClassVar
 import pytest
 
 from hermes_orchestrator.codex_merger import (
+    MERGER_CONTRACT_VERSION,
     CodexMerger,
+    ContractAwareDelivery,
     MergerAuthRequired,
     MergerThreadUncertain,
     StaleChannelError,
@@ -78,6 +81,9 @@ class FakeRpc:
         "threadSection/list": {"cursor", "limit"},
         "thread/section/move": {"beforeThreadId", "sectionId", "threadId"},
         "turn/interrupt": {"threadId", "turnId"},
+        # INFRA-200: used only to deliver the versioned Sol contract text
+        # into a thread as a plain message turn (deliver_contract).
+        "turn/start": {"threadId", "message"},
     }
     _REQUIRED_KEYS: ClassVar[dict[str, set[str]]] = {
         "thread/read": {"threadId"},
@@ -87,6 +93,7 @@ class FakeRpc:
         "thread/metadata/update": {"threadId"},
         "thread/section/move": {"sectionId", "threadId"},
         "turn/interrupt": {"threadId", "turnId"},
+        "turn/start": {"threadId", "message"},
     }
     _SANDBOX_MODES = frozenset(
         {"read-only", "workspace-write", "danger-full-access"}
@@ -280,6 +287,64 @@ async def test_new_merger_uses_the_writable_workspace_and_persists(
     assert database.scalar(
         "SELECT state FROM reviewer_channels WHERE project_key = 'demo'"
     ) == "ready"
+
+
+@pytest.mark.asyncio
+async def test_new_thread_receives_versioned_contract_at_launch(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    """INFRA-200: a brand-new thread receives the full versioned
+    forward-implementation-first contract as its own turn at launch, and
+    the delivery is durably recorded against the exact (thread_id,
+    generation) the channel just went ready under."""
+
+    await merger.ensure_thread("demo")
+
+    turn = rpc.request_for("turn/start")["params"]
+    assert turn["threadId"] == "thr_demo"
+    assert turn["message"].startswith(
+        f"Hermes Sol Merger contract {MERGER_CONTRACT_VERSION}"
+    )
+    assert "Sol merge lead" in turn["message"]
+    # The contract turn is sent AFTER the channel is durably ready, not
+    # before -- a launch-time RPC hiccup here must never leave a brand
+    # new thread stuck in "configuring".
+    assert rpc.methods.index("turn/start") > rpc.methods.index("thread/goal/set")
+    assert database.scalar(
+        "SELECT contract_version FROM reviewer_channels "
+        "WHERE project_key = 'demo'"
+    ) == MERGER_CONTRACT_VERSION
+    channel = merger.read_channel("demo")
+    assert channel is not None
+    assert channel.contract_version == MERGER_CONTRACT_VERSION
+    assert channel.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_thread_not_woken_for_contract(
+    merger: CodexMerger, rpc: FakeRpc, database: Database
+) -> None:
+    """INFRA-200: resuming an already-ready thread sends only the durable
+    goal, exactly as before -- an idle thread is never woken solely to
+    restate the contract, and its (NULL, meaning never-delivered)
+    ``contract_version`` is left untouched for a real intake to adopt
+    later."""
+
+    stored_thread(database)  # state="ready"; contract_version stays NULL
+
+    thread = await merger.ensure_thread("demo")
+
+    assert thread.thread_id == "thr_stored"
+    assert rpc.methods == [
+        "account/read",
+        "thread/read",
+        "thread/goal/set",
+    ]
+    assert "turn/start" not in rpc.methods
+    assert database.scalar(
+        "SELECT contract_version FROM reviewer_channels "
+        "WHERE project_key = 'demo'"
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -903,6 +968,40 @@ async def test_channel_replacement_is_compare_and_swap_safe(
 
 
 @pytest.mark.asyncio
+async def test_replacement_resets_contract_version(
+    merger: CodexMerger, database: Database
+) -> None:
+    """INFRA-200: a replacement thread is a new durable identity, so it
+    must re-adopt the contract at its own next real intake rather than
+    silently inheriting the prior thread's delivery receipt."""
+
+    stored_thread(database)
+    assert merger.record_contract_delivered(
+        "demo", thread_id="thr_stored", generation=1
+    ) is True
+    delivered = merger.read_channel("demo")
+    assert delivered is not None
+    assert delivered.contract_version == MERGER_CONTRACT_VERSION
+
+    merger.begin_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        reason="thread lost",
+    )
+    completed = merger.complete_replacement(
+        "demo",
+        expected_thread_id="thr_stored",
+        expected_generation=1,
+        new_thread_id="thr_new",
+    )
+
+    assert completed.thread_id == "thr_new"
+    assert completed.generation == 2
+    assert completed.contract_version is None
+
+
+@pytest.mark.asyncio
 async def test_stale_replacement_expectations_fail_closed(
     merger: CodexMerger, database: Database
 ) -> None:
@@ -1159,6 +1258,81 @@ def wake_fixture(root: Path) -> Any:
     if not path.exists():
         write_manifest(root, manifest, head_sha="1" * 40)
     return wake_event_for(manifest, path)
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeDeliveryResult:
+    delivered: bool
+    thread_id: str | None
+    generation: int | None
+    reason: str = "delivered"
+
+
+class _FakeDelivery:
+    """A ``WakeDeliverer`` double that never touches the network.
+
+    Records exactly what ``ContractAwareDelivery`` hands it, so a test
+    can assert both the message it received and that it was called
+    exactly once -- proving no extra turn was ever sent for the
+    contract alone.
+    """
+
+    def __init__(self, *, thread_id: str, generation: int) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self._thread_id = thread_id
+        self._generation = generation
+
+    async def deliver(self, project_key: str, event: Any) -> _FakeDeliveryResult:
+        self.calls.append((project_key, event))
+        return _FakeDeliveryResult(
+            delivered=True,
+            thread_id=self._thread_id,
+            generation=self._generation,
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_thread_adopts_contract_at_next_real_intake(
+    merger: CodexMerger, database: Database, tmp_path: Path
+) -> None:
+    """INFRA-200: an existing thread whose ``contract_version`` is still
+    NULL (it predates this feature, or its launch-time delivery failed)
+    adopts the contract prepended to its next real candidate intake
+    message -- one delivery call, one message, no separate turn for the
+    contract alone -- and the column is only updated once that delivery
+    is confirmed."""
+
+    stored_thread(database)  # state="ready"; contract_version is NULL
+    event = wake_fixture(tmp_path / "wake-manifests")
+    inner = _FakeDelivery(thread_id="thr_stored", generation=1)
+    wrapped = ContractAwareDelivery(merger=merger, inner=inner)
+
+    result = await wrapped.deliver("demo", event)
+
+    assert result.delivered is True
+    assert len(inner.calls) == 1
+    delivered_project_key, delivered_event = inner.calls[0]
+    assert delivered_project_key == "demo"
+    rendered = delivered_event.render(1)
+    assert rendered.startswith(f"Hermes Sol Merger contract {MERGER_CONTRACT_VERSION}")
+    assert "Sol merge lead" in rendered
+    # The wrapped event still carries the exact original wake fields.
+    assert delivered_event.event_id == event.event_id
+    assert delivered_event.status == event.status
+    assert database.scalar(
+        "SELECT contract_version FROM reviewer_channels "
+        "WHERE project_key = 'demo'"
+    ) == MERGER_CONTRACT_VERSION
+
+    # A second real intake, now that the channel has adopted the
+    # contract, is delivered completely unprefixed -- a transparent
+    # pass-through of the caller's own event.
+    inner.calls.clear()
+    await wrapped.deliver("demo", event)
+    assert len(inner.calls) == 1
+    _, second_event = inner.calls[0]
+    assert second_event is event
+    assert second_event.render(1) == event.render(1)
 
 
 @pytest.mark.asyncio
