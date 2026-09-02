@@ -725,6 +725,52 @@ def _admit(runtime: object, issue_id: str, state: str) -> None:
         )
 
 
+def test_request_cleanup_passes_only_done_issues_to_the_custodian(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hermes_orchestrator.cli import _hermes_handlers
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.hermes_tools import HermesCommandService
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-1", "done")
+    _admit(runtime, "ENG-2", "in_development")
+
+    class RecordingCustodian:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, set[str]]] = []
+
+        def reclaim_completed(
+            self, project_key: str, issue_ids: set[str]
+        ) -> dict[str, list[dict[str, str]]]:
+            self.calls.append((project_key, issue_ids))
+            return {"reclaimed": [], "skipped": []}
+
+    runtime.worktree_custodian = RecordingCustodian()
+    events = EventStore(runtime.database)
+    handlers = _hermes_handlers(
+        SimpleNamespace(repo_root=tmp_path),
+        runtime,
+        LeadCorrectionOutbox(
+            database=runtime.database,
+            events=events,
+            project_for_issue=lambda issue_id: "demo",
+        ),
+        SubagentPackets(runtime.database, events=events),
+    )
+
+    result = HermesCommandService(runtime.queue, handlers=handlers).execute(
+        {"intent": "request_cleanup", "project_key": "demo"}
+    )
+    assert result.code == "accepted"
+    assert result.state == {"reclaimed": [], "skipped": []}
+    assert runtime.worktree_custodian.calls == [("demo", {"ENG-1"})]
+
+
 @pytest.mark.asyncio
 async def test_pause_issue_pauses_exactly_the_selected_issue(tmp_path: Path) -> None:
     from hermes_orchestrator.cli import _remedy_executor

@@ -230,6 +230,7 @@ class Runtime:
     # deliberately builds no cell service.
     worktree_leases: WorktreeLeases | None = None
     worktree_git: WorktreeGit | None = None
+    worktree_custodian: WorktreeCustodian | None = None
     dashboard_refresh: DashboardRefreshAction | None = None
     # Sol correction b4b545f3 (v5): production composition no longer
     # builds a fakechat wake plane, so this is always None from
@@ -1023,6 +1024,7 @@ def open_runtime(
             dashboard_refresh=dashboard_refresh,
             worktree_leases=worktree_leases,
             worktree_git=worktree_git,
+            worktree_custodian=custodian,
             fakechat_router=None,
             _daemon_lock=daemon_lock,
         )

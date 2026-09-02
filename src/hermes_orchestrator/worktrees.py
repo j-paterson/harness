@@ -630,6 +630,48 @@ class WorktreeCustodian:
             ),
         )
 
+    def reclaim_completed(
+        self, project_key: str, completed_issue_ids: set[str]
+    ) -> dict[str, list[dict[str, str]]]:
+        """Reclaim clean, fully pushed leases for completed issues only."""
+
+        reclaimed: list[dict[str, str]] = []
+        skipped: list[dict[str, str]] = []
+        for lease in self._leases.active(project_key):
+            item = {
+                "issue_id": lease.issue_id,
+                "lease_id": lease.lease_id,
+                "path": lease.path,
+            }
+            if lease.issue_id not in completed_issue_ids:
+                skipped.append({**item, "reason": "issue_not_done"})
+                continue
+            try:
+                inspection = self.inspect(Path(lease.path))
+                if inspection.modified or inspection.untracked:
+                    skipped.append({**item, "reason": "dirty"})
+                    continue
+                if inspection.ahead is None:
+                    skipped.append({**item, "reason": "upstream_unavailable"})
+                    continue
+                if inspection.ahead:
+                    skipped.append({**item, "reason": "unpushed"})
+                    continue
+                checkpoint = self.checkpoint(lease.lease_id, lease.issue_id)
+                proof = self.verify_remote(checkpoint)
+                self.reclaim(lease.lease_id, proof)
+            except Exception as error:
+                skipped.append(
+                    {
+                        **item,
+                        "reason": "cleanup_blocked",
+                        "detail": f"{type(error).__name__}: {error}",
+                    }
+                )
+                continue
+            reclaimed.append(item)
+        return {"reclaimed": reclaimed, "skipped": skipped}
+
     def checkpoint(self, lease_id: str, issue_id: str) -> Checkpoint:
         """Checkpoint the worktree; safe to repeat after any crash.
 
