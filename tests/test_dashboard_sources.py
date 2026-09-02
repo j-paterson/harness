@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_orchestrator.codex_rpc import CodexRateLimits
+from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_sources import (
     CapacityProvider,
     ClaudeUsageCacheProvider,
@@ -1124,6 +1125,34 @@ def test_transition_provider_tracks_the_latest_whitelisted_event_per_project(
     # A second advance with no new rows must not change anything.
     provider.advance()
     assert {t.project_key: t.phrase for t in provider.transitions()} == transitions
+    database.close()
+
+
+def test_control_prompts_are_attention_only_while_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    events = EventStore(database)
+    provider = TransitionProvider(database)
+    operations = ControlOperations(database, events=events, ids=lambda: "op-1")
+    operation = operations.record(
+        kind="channel.approval_required",
+        project_key="proj-a",
+        cell_id="cell-1",
+        session_id="session-1",
+        result={},
+    )
+    assert operation is not None
+
+    provider.advance()
+    assert provider.transitions() == ()
+    assert ControlAttentionProvider(database).latest() is not None
+
+    assert operations.acknowledge("op-1", session_id="session-1") is True
+
+    provider.advance()
+    assert provider.transitions() == ()
+    assert ControlAttentionProvider(database).latest() is None
     database.close()
 
 
