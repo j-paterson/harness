@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -23,9 +24,39 @@ from hermes_orchestrator.provider_routes import (
     ProviderRoutes,
     classify,
     launch,
+    parse_fable_capacity,
     resolve_executable,
     shell_init,
 )
+
+
+def test_parse_fable_capacity_accepts_exact_success() -> None:
+    result = parse_fable_capacity(
+        "CAPACITY_OK\n", now=datetime(2026, 9, 2, 5, tzinfo=UTC)
+    )
+
+    assert result.state == "available"
+    assert result.resets_at is None
+
+
+def test_parse_fable_capacity_uses_provider_reset_clock() -> None:
+    result = parse_fable_capacity(
+        "You've hit your monthly spend limit · your session limit resets "
+        "12:20am (America/Chicago)",
+        now=datetime(2026, 9, 2, 5, 5, tzinfo=UTC),
+    )
+
+    assert result.state == "capped"
+    assert result.resets_at == datetime(2026, 9, 2, 5, 20, tzinfo=UTC)
+
+
+def test_parse_fable_capacity_refuses_unknown_or_horizonless_failures() -> None:
+    now = datetime(2026, 9, 2, 5, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="unrecognized"):
+        parse_fable_capacity("network unavailable", now=now)
+    with pytest.raises(ValueError, match="exact reset"):
+        parse_fable_capacity("You've hit your Fable limit", now=now)
 
 
 @pytest.fixture
