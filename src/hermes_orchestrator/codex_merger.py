@@ -32,6 +32,18 @@ class _WakeCasMiss(Exception):
 
 MERGER_MODEL = "gpt-5.6-sol"
 
+# INFRA-200: the versioned forward-implementation-first review contract
+# (prompts/codex-merger.md, adapted from Vuk97/forward-implementation-first
+# at pinned commit 91fa46a0108ecfc612a55cf587a2086621a31161, MIT license; no
+# runtime dependency). Bumping this string is the ONLY signal that forces
+# every reviewer channel to redeliver the contract -- a new thread gets it
+# at launch, and an existing thread whose ``contract_version`` no longer
+# matches adopts it at its next real candidate intake, never from an idle
+# wake.
+MERGER_CONTRACT_VERSION = "fif-1"
+
+_CONTRACT_HEADER_PREFIX = "Hermes Sol Merger contract"
+
 
 # The narrow writable Codex workspace mode (INFRA-194 operator scope):
 # the bounded ACCEPT_WITH_REVIEWER_FIX path must be able to write and
@@ -66,8 +78,9 @@ MERGER_GOAL = (
     "checked optimistically at intake and merge boundaries only; and "
     "when no eligible intake exists you report exactly "
     "BLOCKED_ON_EXTERNAL_INTAKE and complete the turn. The detailed "
-    "role contract and protocol mechanics live durably in "
-    "prompts/codex-merger.md and in Hermes code, never in this goal."
+    "role contract and protocol mechanics live durably in the versioned "
+    "prompts/codex-merger.md contract (fif-1) and in Hermes code, never "
+    "in this goal."
 )
 _SERVICE_NAME = "hermes_orchestrator"
 
@@ -203,6 +216,7 @@ class ReviewerChannel:
     last_delivered_candidate_sha: str | None
     last_delivery_failure_at: str | None
     heartbeat_enabled: bool
+    contract_version: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,7 +306,7 @@ class CodexMerger:
                 "prior_thread_id, "
                 "replacement_reason, last_delivered_event_id, "
                 "last_delivered_candidate_sha, last_delivery_failure_at, "
-                "heartbeat_enabled FROM reviewer_channels "
+                "heartbeat_enabled, contract_version FROM reviewer_channels "
                 "WHERE project_key = ?",
                 (project_key,),
             ).fetchone()
@@ -310,6 +324,7 @@ class CodexMerger:
             last_delivered_candidate_sha=row["last_delivered_candidate_sha"],
             last_delivery_failure_at=row["last_delivery_failure_at"],
             heartbeat_enabled=bool(row["heartbeat_enabled"]),
+            contract_version=row["contract_version"],
         )
 
     def read_status(self, project_key: str) -> MergerStatus:
@@ -378,7 +393,8 @@ class CodexMerger:
             cursor = connection.execute(
                 "UPDATE reviewer_channels SET thread_id = ?, "
                 "generation = generation + 1, state = 'ready', "
-                "prior_thread_id = ?, updated_at = ? "
+                "prior_thread_id = ?, contract_version = NULL, "
+                "updated_at = ? "
                 "WHERE project_key = ? AND thread_id = ? AND generation = ? "
                 "AND state = 'replacing'",
                 (
@@ -449,6 +465,36 @@ class CodexMerger:
                 "heartbeat_enabled = 1, updated_at = ? "
                 "WHERE project_key = ? AND thread_id = ? AND generation = ?",
                 (stamp, stamp, project_key, thread_id, generation),
+            )
+        return cursor.rowcount == 1
+
+    def record_contract_delivered(
+        self, project_key: str, *, thread_id: str, generation: int
+    ) -> bool:
+        """CAS-record that the versioned contract reached this exact thread.
+
+        INFRA-200: written once a delivery that carried the contract text
+        (new-thread launch or an existing thread's next real candidate
+        intake) is confirmed, never speculatively. The compare-and-swap on
+        the exact ``thread_id``/``generation`` invoked keeps a late write
+        from a replaced or stale channel from ever marking the WRONG
+        generation adopted -- exactly the discipline every other
+        per-generation delivery fact on this table already follows.
+        """
+
+        self._project(project_key)
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE reviewer_channels SET "
+                "contract_version = ?, updated_at = ? "
+                "WHERE project_key = ? AND thread_id = ? AND generation = ?",
+                (
+                    MERGER_CONTRACT_VERSION,
+                    self._now().isoformat(),
+                    project_key,
+                    thread_id,
+                    generation,
+                ),
             )
         return cursor.rowcount == 1
 
@@ -1337,6 +1383,17 @@ class CodexMerger:
             # fallback flag, so every transition to ready derives it from
             # the outstanding recoverable wakes in the same transaction.
             self._recompute_heartbeat(connection, project_key, stamp)
+        # INFRA-200: the thread just became ready for the first time, so
+        # this is exactly the "new thread receives the versioned contract
+        # at launch" boundary -- generation is always 1 here, since this
+        # transaction only ever sets it to 1. Never called from
+        # _resume_current or any heartbeat/idle path: an existing thread
+        # that already went ready under an older deploy adopts the
+        # contract later, at its next real candidate intake (see
+        # ContractAwareDelivery), not by being woken here.
+        await self.deliver_contract(
+            project_key, thread_id=thread_id, generation=1
+        )
         return MergerThread(project_key=project_key, thread_id=thread_id)
 
     async def _resolve_pinned_section(self) -> str:
@@ -1380,6 +1437,47 @@ class CodexMerger:
             )
         return matches[0]
 
+    def _contract_message(self) -> str:
+        """The versioned contract text, headed for delivery into a thread.
+
+        The header names the exact version so a durable transcript (or an
+        operator reading the thread) can see which contract text an old
+        turn actually carried, even after :data:`MERGER_CONTRACT_VERSION`
+        moves on.
+        """
+
+        header = f"{_CONTRACT_HEADER_PREFIX} {MERGER_CONTRACT_VERSION}"
+        return f"{header}\n\n{self._contract}"
+
+    async def deliver_contract(
+        self, project_key: str, *, thread_id: str, generation: int
+    ) -> None:
+        """Send the full versioned contract into the thread, once.
+
+        INFRA-200: called only at the exact moment a NEW thread first
+        becomes ready (from :meth:`_finish_configuration`) -- never from
+        :meth:`_resume_current` and never from any heartbeat or idle path,
+        so an already-ready thread is never woken solely to restate the
+        rule. An existing thread that predates this feature (or whose
+        launch-time delivery below failed) instead adopts the contract at
+        its next real candidate intake, prepended to that intake message
+        by :class:`ContractAwareDelivery` -- not by a second call to this
+        method. A transport failure here propagates like every other
+        ``_finish_configuration`` step; the channel is already durably
+        ``ready`` by the time this runs, so a failure here is recovered
+        by that same next-real-intake adoption rather than by retrying
+        thread setup.
+        """
+
+        await self._rpc.request(
+            "turn/start",
+            {"threadId": thread_id, "message": self._contract_message()},
+            self._timeout,
+        )
+        self.record_contract_delivered(
+            project_key, thread_id=thread_id, generation=generation
+        )
+
     async def _set_goal(self, project_key: str, thread_id: str) -> None:
         project = self._project(project_key)
         objective = (
@@ -1415,3 +1513,82 @@ class CodexMerger:
         if project is None:
             raise ValueError(f"unknown merger project {project_key}")
         return project
+
+
+class _PrefixedWakeEvent:
+    """A ``WakeEvent`` view whose rendered text carries the contract too.
+
+    INFRA-200: every field the delivery path reads (status, issue_id,
+    candidate_sha, base_sha, manifest_path, event_id, manifest_digest) is
+    forwarded unchanged to the wrapped event, so this is transparent to
+    :func:`register_wake`, manifest verification, and every other
+    consumer -- the immutable :class:`~hermes_orchestrator.manifests.
+    WakeEvent` shape itself is never touched. Only :meth:`render`
+    differs, so the ONE message that ever reaches the thread for this
+    delivery already carries the contract; nothing sends a second turn
+    for it.
+    """
+
+    __slots__ = ("_inner", "_prefix")
+
+    def __init__(self, inner: WakeEvent, prefix: str) -> None:
+        self._inner = inner
+        self._prefix = prefix
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def render(self, generation: int) -> str:
+        return f"{self._prefix}\n\n{self._inner.render(generation)}"
+
+
+class _WakeDeliveryPort(Protocol):
+    """The existing wake delivery boundary this wraps, unchanged.
+
+    Structurally identical to ``merger_turns.WakeDeliverer`` and
+    ``emission.WakeDeliverer`` -- both are satisfied by an instance of
+    this class without importing either module, avoiding a cycle.
+    """
+
+    async def deliver(self, project_key: str, event: WakeEvent) -> object: ...
+
+
+class ContractAwareDelivery:
+    """Wrap the ordinary wake delivery adapter with contract adoption.
+
+    INFRA-200: existing threads adopt the versioned contract at their
+    next real candidate intake, never from a standalone wake. This is
+    the one seam every real candidate delivery already passes through --
+    a brand-new admission from :class:`~hermes_orchestrator.emission.
+    CandidateEmitter` and a queued release from
+    :meth:`MergerTurnService.release_next_candidate` alike -- so wrapping
+    it here, once, in ``build_merge_flow``, covers both without adding a
+    second delivery path. When the live channel's ``contract_version``
+    already matches, this is a transparent pass-through: exactly the
+    caller's own event, exactly one call to the wrapped adapter, nothing
+    extra recorded.
+    """
+
+    def __init__(self, *, merger: CodexMerger, inner: _WakeDeliveryPort) -> None:
+        self._merger = merger
+        self._inner = inner
+
+    async def deliver(self, project_key: str, event: WakeEvent) -> object:
+        channel = self._merger.read_channel(project_key)
+        if (
+            channel is None
+            or channel.state != "ready"
+            or channel.contract_version == MERGER_CONTRACT_VERSION
+        ):
+            return await self._inner.deliver(project_key, event)
+        prefixed = _PrefixedWakeEvent(event, self._merger._contract_message())
+        result = await self._inner.deliver(project_key, prefixed)
+        if getattr(result, "delivered", False):
+            thread_id = getattr(result, "thread_id", None) or channel.thread_id
+            generation = getattr(result, "generation", None)
+            if generation is None:
+                generation = channel.generation
+            self._merger.record_contract_delivered(
+                project_key, thread_id=thread_id, generation=generation
+            )
+        return result

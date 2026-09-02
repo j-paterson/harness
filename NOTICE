@@ -1,0 +1,42 @@
+Third-party attribution
+=======================
+
+This repository's forward-implementation-first Merger contract and
+administrative-drift classification (see
+docs/infra-200-forward-implementation-first.md) adapt ideas and wording
+from the upstream project:
+
+    Vuk97/forward-implementation-first
+    https://github.com/Vuk97/forward-implementation-first
+    pinned commit: 91fa46a0108ecfc612a55cf587a2086621a31161
+    SKILL.md SHA-256: 411a6de1df78dc0bf27572ddd1f88aeca8b1da23537152316e7a581e5e9e5b67
+
+That upstream project is licensed under the MIT License. The MIT license
+text below applies to the adapted ideas and wording carried into this
+repository from that pinned commit. No file from the upstream repository
+is vendored, embedded, or fetched by this repository, and no code in this
+repository executes or depends on the upstream installer at runtime; the
+adaptation is original wording and code written for this repository's own
+Merger review boundary.
+
+MIT License
+-----------
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.

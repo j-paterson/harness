@@ -19,6 +19,27 @@ from typing import Any
 VERDICTS = ("approved", "corrections_required")
 SEVERITIES = ("Critical", "Important")
 
+#: INFRA-200: the canonical reviewer-fix labels, each mapped to the
+#: durable value already recorded in state. Accepted by
+#: :func:`normalize_verdict` in addition to the durable values
+#: themselves (which normalize to themselves) — ``ACCEPT`` and
+#: ``ACCEPT_WITH_REVIEWER_FIX`` both settle as an ``approved`` durable
+#: verdict, and ``REWORK_REQUIRED`` settles as ``corrections_required``.
+#: :func:`parse_verdict` calls :func:`normalize_verdict` on the
+#: document's own ``verdict`` field, so a Sol verdict carrying one of
+#: these three labels parses exactly as its durable value — no schema
+#: change: no jsonschema (or other) validator in this codebase
+#: enforces ``schemas/review-verdict.json``'s narrower two-value enum
+#: against an inbound document before it reaches ``parse_verdict``;
+#: that file is read only by
+#: ``test_schema_files_mirror_the_typed_contract``, which asserts on
+#: its own content and stays unmodified and green.
+VERDICT_LABELS: dict[str, str] = {
+    "ACCEPT": "approved",
+    "ACCEPT_WITH_REVIEWER_FIX": "approved",
+    "REWORK_REQUIRED": "corrections_required",
+}
+
 # The exact terminal/idle turn report. With no eligible intake the Merger
 # completes its turn with this token and leaves no active goal continuation;
 # only a validated explicit FABLE_* queue wake may reactivate it, and the
@@ -65,6 +86,38 @@ class VerdictError(ValueError):
     """Raised for any structured verdict that violates the schema."""
 
 
+def normalize_verdict(value: str) -> tuple[str, dict[str, Any]]:
+    """Normalize one verdict spelling to its durable value (INFRA-200).
+
+    Accepts both the durable values already recorded in state
+    (``approved``, ``corrections_required``) and the three canonical
+    reviewer-facing labels in :data:`VERDICT_LABELS` — ``ACCEPT``,
+    ``ACCEPT_WITH_REVIEWER_FIX``, and ``REWORK_REQUIRED``. Anything
+    else raises :class:`VerdictError`.
+
+    Returns the durable value paired with the marker fields a caller
+    merges into a stored ``verdict_json`` payload. No schema change is
+    needed to retain the original spelling: it always rides along
+    under ``label`` in that returned dict, and
+    ``ACCEPT_WITH_REVIEWER_FIX`` additionally carries ``reviewer_fix:
+    True`` so a reviewer-fix-eligible approval stays distinguishable
+    after normalization collapses it to ``approved``. Every read path
+    that only inspects the durable value (the first tuple element)
+    keeps working unchanged.
+    """
+
+    if value in VERDICTS:
+        durable = value
+    elif value in VERDICT_LABELS:
+        durable = VERDICT_LABELS[value]
+    else:
+        raise VerdictError(f"unknown verdict {value!r}")
+    marker: dict[str, Any] = {"label": value}
+    if value == "ACCEPT_WITH_REVIEWER_FIX":
+        marker["reviewer_fix"] = True
+    return durable, marker
+
+
 @dataclass(frozen=True, slots=True)
 class CorrectionPacket:
     """One structured Critical or Important finding returned to the lead."""
@@ -105,6 +158,17 @@ class ReviewVerdict:
     pr_number: int
     reviewed_sha: str
     packets: tuple[CorrectionPacket, ...]
+    #: INFRA-200: the exact JSON text of the parsed envelope with
+    #: ``verdict`` normalized to the durable value and
+    #: :func:`normalize_verdict`'s marker (``label``, and
+    #: ``reviewer_fix: true`` for ACCEPT_WITH_REVIEWER_FIX) merged in —
+    #: the payload a caller persists into
+    #: ``submitted_verdicts.verdict_json`` to retain the original
+    #: reviewer-facing label alongside the durable value. Empty for a
+    #: ``ReviewVerdict`` built outside :func:`parse_verdict` (no
+    #: schema change: this rides inside the existing JSON blob, not a
+    #: new column).
+    verdict_json: str = ""
 
     def with_pr_number(self, pr_number: int) -> ReviewVerdict:
         """Stamp the GitHub-derived pull request number, envelope and
@@ -120,6 +184,7 @@ class ReviewVerdict:
                 replace(packet, pr_number=pr_number)
                 for packet in self.packets
             ),
+            verdict_json=self.verdict_json,
         )
 
 
@@ -166,9 +231,12 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
     if set(value) != _ENVELOPE_KEYS:
         unexpected = sorted(set(value) ^ _ENVELOPE_KEYS)[0]
         raise VerdictError(f"verdict document field {unexpected} is invalid")
-    verdict = value["verdict"]
-    if verdict not in VERDICTS:
-        raise VerdictError(f"unknown verdict {verdict!r}")
+    # INFRA-200: normalize BEFORE the durable-value membership check, so
+    # the canonical reviewer-facing labels ACCEPT, ACCEPT_WITH_REVIEWER_FIX,
+    # and REWORK_REQUIRED are accepted here too, each collapsing to its
+    # durable value; the original label (and the reviewer_fix marker for
+    # ACCEPT_WITH_REVIEWER_FIX) is retained below in ``verdict_json``.
+    verdict, label_marker = normalize_verdict(value["verdict"])
     binding = _parse_binding(value)
     for field in ("repository", "branch", "reviewed_sha"):
         if getattr(binding, field) != getattr(expected, field):
@@ -197,6 +265,12 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
         raise VerdictError(
             "corrections_required requires at least one correction packet"
         )
+    # The parsed payload that ends up in submitted_verdicts.verdict_json:
+    # the exact envelope, with ``verdict`` normalized to the durable
+    # value and the original-label marker merged in. Existing durable
+    # inputs round-trip unchanged in substance — ``label`` merely
+    # restates ``verdict`` and no ``reviewer_fix`` key is added.
+    document = {**value, "verdict": verdict, **label_marker}
     return ReviewVerdict(
         verdict=verdict,
         repository=binding.repository,
@@ -204,6 +278,7 @@ def parse_verdict(text: str, *, expected: VerdictBinding) -> ReviewVerdict:
         pr_number=0,
         reviewed_sha=binding.reviewed_sha,
         packets=packets,
+        verdict_json=json.dumps(document, sort_keys=True),
     )
 
 

@@ -16,10 +16,12 @@ import pytest
 
 from hermes_orchestrator.verdicts import (
     IDLE_TERMINAL_REPORT,
+    VERDICT_LABELS,
     CorrectionPacket,
     ReviewVerdict,
     VerdictBinding,
     VerdictError,
+    normalize_verdict,
     parse_turn_report,
     parse_verdict,
 )
@@ -192,6 +194,125 @@ def test_verdict_carries_the_admitted_candidate_binding() -> None:
     assert parsed.branch == "feature/eng-9"
     assert parsed.pr_number == 0
     assert parsed.reviewed_sha == SHA
+
+
+def test_canonical_labels_normalize_to_durable_values() -> None:
+    # INFRA-200: ACCEPT, ACCEPT_WITH_REVIEWER_FIX, and REWORK_REQUIRED
+    # all normalize to the durable value already recorded in state.
+    assert normalize_verdict("ACCEPT") == ("approved", {"label": "ACCEPT"})
+    assert normalize_verdict("ACCEPT_WITH_REVIEWER_FIX") == (
+        "approved",
+        {"label": "ACCEPT_WITH_REVIEWER_FIX", "reviewer_fix": True},
+    )
+    assert normalize_verdict("REWORK_REQUIRED") == (
+        "corrections_required",
+        {"label": "REWORK_REQUIRED"},
+    )
+    assert VERDICT_LABELS == {
+        "ACCEPT": "approved",
+        "ACCEPT_WITH_REVIEWER_FIX": "approved",
+        "REWORK_REQUIRED": "corrections_required",
+    }
+
+    # The durable values already recorded in state normalize to
+    # themselves, unchanged, so every existing read path keeps working.
+    assert normalize_verdict("approved") == ("approved", {"label": "approved"})
+    assert normalize_verdict("corrections_required") == (
+        "corrections_required",
+        {"label": "corrections_required"},
+    )
+
+    with pytest.raises(VerdictError, match="unknown verdict"):
+        normalize_verdict("REJECTED")
+
+
+def test_parse_verdict_accepts_canonical_labels() -> None:
+    # INFRA-200: parse_verdict itself — the actual inbound entry point
+    # a submitted Sol verdict goes through — must accept the three
+    # canonical labels, not just normalize_verdict in isolation.
+    accept = parse_verdict(
+        json.dumps(verdict(verdict="ACCEPT", packets=[])),
+        expected=binding(),
+    )
+    assert accept.verdict == "approved"
+    accept_payload = json.loads(accept.verdict_json)
+    assert accept_payload["verdict"] == "approved"
+    assert accept_payload["label"] == "ACCEPT"
+    assert "reviewer_fix" not in accept_payload
+
+    fix = parse_verdict(
+        json.dumps(verdict(verdict="ACCEPT_WITH_REVIEWER_FIX", packets=[])),
+        expected=binding(),
+    )
+    assert fix.verdict == "approved"
+    fix_payload = json.loads(fix.verdict_json)
+    assert fix_payload["verdict"] == "approved"
+    assert fix_payload["label"] == "ACCEPT_WITH_REVIEWER_FIX"
+    assert fix_payload["reviewer_fix"] is True
+
+    rework = parse_verdict(
+        json.dumps(verdict(verdict="REWORK_REQUIRED")), expected=binding()
+    )
+    assert rework.verdict == "corrections_required"
+    rework_payload = json.loads(rework.verdict_json)
+    assert rework_payload["verdict"] == "corrections_required"
+    assert rework_payload["label"] == "REWORK_REQUIRED"
+    assert "reviewer_fix" not in rework_payload
+
+    # Every field the strict envelope requires survives the merge, and
+    # the packets themselves parse exactly as with a durable-value
+    # document.
+    assert rework.packets == parse_verdict(
+        json.dumps(verdict(verdict="corrections_required")),
+        expected=binding(),
+    ).packets
+    assert rework_payload["repository"] == "j-paterson/demo"
+    assert rework_payload["branch"] == "feature/eng-9"
+    assert rework_payload["reviewed_sha"] == SHA
+
+    # An unknown label still fails closed exactly as before.
+    with pytest.raises(VerdictError, match="unknown verdict"):
+        parse_verdict(
+            json.dumps(verdict(verdict="REJECTED", packets=[])),
+            expected=binding(),
+        )
+
+
+def test_reviewer_fix_label_is_retained_in_verdict_json() -> None:
+    # No schema change: parse_verdict merges normalize_verdict's marker
+    # into the SAME envelope dict it already parsed — no field is
+    # dropped or renamed — and exposes it as ReviewVerdict.verdict_json,
+    # the exact payload a caller persists into
+    # submitted_verdicts.verdict_json to retain the original label.
+    document = verdict(verdict="ACCEPT_WITH_REVIEWER_FIX", packets=[])
+    parsed = parse_verdict(json.dumps(document), expected=binding())
+
+    assert parsed.verdict == "approved"
+    stored = json.loads(parsed.verdict_json)
+    assert stored["verdict"] == "approved"
+    assert stored["label"] == "ACCEPT_WITH_REVIEWER_FIX"
+    assert stored["reviewer_fix"] is True
+    assert stored["repository"] == document["repository"]
+    assert stored["branch"] == document["branch"]
+    assert stored["reviewed_sha"] == document["reviewed_sha"]
+    assert stored["packets"] == document["packets"]
+
+    # REWORK_REQUIRED retains its label with no reviewer_fix marker.
+    rework = parse_verdict(
+        json.dumps(verdict(verdict="REWORK_REQUIRED")), expected=binding()
+    )
+    rework_stored = json.loads(rework.verdict_json)
+    assert rework_stored["label"] == "REWORK_REQUIRED"
+    assert "reviewer_fix" not in rework_stored
+
+    # Existing durable-value documents parse exactly as before: the
+    # marker's label merely restates the verdict, with no reviewer_fix
+    # key added — a no-op merge in substance.
+    plain = parse_verdict(json.dumps(verdict()), expected=binding())
+    plain_stored = json.loads(plain.verdict_json)
+    assert plain_stored["verdict"] == "corrections_required"
+    assert plain_stored["label"] == "corrections_required"
+    assert "reviewer_fix" not in plain_stored
 
 
 def test_idle_terminal_report_is_exact_and_leaves_no_continuation() -> None:

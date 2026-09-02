@@ -302,22 +302,24 @@ class TestStagedEligibility:
         assert git.pushes == []
         assert git.resets == [("reset",)]
 
-    def test_an_untracked_31_line_file_is_refused_before_commit(
+    def test_an_untracked_51_line_file_is_refused_before_commit(
         self, helper: ReviewerFixHelper, git: ScriptedGit
     ) -> None:
-        git.numstat_cached = "31\t0\tsrc/new_helper.py\n"
+        git.numstat_cached = "51\t0\tsrc/new_helper.py\n"
         self.refuse(helper, git, "changed lines exceed")
 
     def test_tracked_and_untracked_aggregate_over_budget_refuses(
         self, helper: ReviewerFixHelper, git: ScriptedGit
     ) -> None:
-        git.numstat_cached = "20\t0\tsrc/app.py\n15\t0\tsrc/new.py\n"
+        git.numstat_cached = "30\t0\tsrc/app.py\n21\t0\tsrc/new.py\n"
         self.refuse(helper, git, "changed lines exceed")
 
-    def test_more_than_two_files_refuses(
+    def test_more_than_three_files_refuses(
         self, helper: ReviewerFixHelper, git: ScriptedGit
     ) -> None:
-        git.numstat_cached = "1\t0\ta.py\n1\t0\tb.py\n1\t0\tc.py\n"
+        git.numstat_cached = (
+            "1\t0\ta.py\n1\t0\tb.py\n1\t0\tc.py\n1\t0\td.py\n"
+        )
         self.refuse(helper, git, "files exceed")
 
     def test_binary_content_refuses(
@@ -356,6 +358,43 @@ class TestStagedEligibility:
         git.numstat_cached = f"1\t1\t{path}\n"
         self.refuse(helper, git, "categorically excluded")
 
+    @pytest.mark.parametrize(
+        "path,category",
+        [
+            (
+                "src/hermes_orchestrator/migrations/0099_x.sql",
+                "schema/migration",
+            ),
+            ("schema/accounts.yml", "schema/migration"),
+            ("generated/client.py", "generated artifact"),
+            (
+                "src/hermes_orchestrator/hermes_tools.py",
+                "public API surface",
+            ),
+            ("schemas/review-verdict.json", "public API surface"),
+            (
+                "channels/hermes-control/manifest.json",
+                "public API surface",
+            ),
+            ("pyproject.toml", "public API surface"),
+            ("src/hermes_orchestrator/pricing.py", "pricing/economics"),
+            ("docs/billing_notes.md", "pricing/economics"),
+        ],
+    )
+    def test_excluded_categories_name_the_category(
+        self,
+        helper: ReviewerFixHelper,
+        git: ScriptedGit,
+        path: str,
+        category: str,
+    ) -> None:
+        git.numstat_cached = f"1\t1\t{path}\n"
+
+        with pytest.raises(ReviewerFixRefused, match="categorically") as info:
+            apply(helper)
+        assert category in str(info.value)
+        assert path in str(info.value)
+
     def test_untracked_full_line_count_lands_in_the_receipt(
         self, helper: ReviewerFixHelper, git: ScriptedGit
     ) -> None:
@@ -366,16 +405,47 @@ class TestStagedEligibility:
         assert receipt.changed_lines == 20
         assert receipt.files == ("src/new file.py", "src/gone.py")
 
-    def test_exactly_two_files_and_thirty_lines_stays_eligible(
+    def test_budget_allows_three_files_and_fifty_lines_and_consolidates_findings(
         self, helper: ReviewerFixHelper, git: ScriptedGit
     ) -> None:
-        git.numstat_cached = "10\t5\tsrc/app.py\n10\t5\tsrc/new.py\n"
+        # Exactly at the raised INFRA-200 budget (three files, fifty
+        # changed lines) still stays eligible.
+        git.numstat_cached = (
+            "20\t0\tsrc/app.py\n15\t0\tsrc/new.py\n10\t5\tsrc/other.py\n"
+        )
 
-        receipt = apply(helper)
+        receipt = apply(
+            helper,
+            findings=(
+                "align the retry constant with the contract",
+                "drop the stale TODO left over from the last pass",
+            ),
+        )
 
         assert receipt.state == "recorded"
-        assert receipt.changed_lines == 30
-        assert receipt.files == ("src/app.py", "src/new.py")
+        assert receipt.changed_lines == 50
+        assert receipt.files == (
+            "src/app.py",
+            "src/new.py",
+            "src/other.py",
+        )
+        # Multiple consolidated findings land as exactly ONE commit,
+        # labeled and listing each finding on its own line.
+        [commit] = git.commits
+        message = commit[2]
+        assert message.startswith("ACCEPT_WITH_REVIEWER_FIX: ")
+        assert (
+            "- align the retry constant with the contract" in message
+        )
+        assert (
+            "- drop the stale TODO left over from the last pass" in message
+        )
+
+    def test_fifty_one_changed_lines_refuses(
+        self, helper: ReviewerFixHelper, git: ScriptedGit
+    ) -> None:
+        git.numstat_cached = "26\t0\tsrc/app.py\n25\t0\tsrc/new.py\n"
+        self.refuse(helper, git, "changed lines exceed")
 
     def test_an_empty_new_file_counts_zero_but_is_receipted(
         self, helper: ReviewerFixHelper, git: ScriptedGit

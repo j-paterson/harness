@@ -1,8 +1,20 @@
-"""Admit exactly one validated immutable candidate per Merger wake."""
+"""Admit exactly one validated immutable candidate per Merger wake.
+
+INFRA-200: this module also attaches an OPTIONAL, purely advisory
+administrative-drift hint (see ``review_drift.py``) to the admitted
+candidate it returns. That hint exists so a caller MAY scope a replay
+narrowly when the only thing that changed since the last reviewed
+candidate is documentation, ``NOTICE``/``LICENSE``/``CHANGELOG`` text, or
+``.hermes/`` bookkeeping. It is never consulted by, and never weakens,
+any check in :meth:`CandidateAdmission._run_checks`: candidate/base/tree
+identity, durable packet integrity, generation freshness, and every other
+fail-closed gate below run exactly as they always have, whether the drift
+hint is "administrative", "semantic", "none", or absent entirely.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -15,6 +27,7 @@ from hermes_orchestrator.manifests import (
     WakeEvent,
     read_manifest_snapshot,
 )
+from hermes_orchestrator.review_drift import DriftVerdict, classify_drift
 
 #: ``(project_key, branch) -> sha``. Three outcomes, represented
 #: distinctly (INFRA-217, Sol correction c02dc0fe): the ref resolves, and
@@ -32,6 +45,14 @@ BranchHead = Callable[[str, str], str]
 #: targeting the integration branch (INFRA-217).
 MergedCandidateProof = Callable[[str, str, str], bool]
 BasePolicy = Callable[[str, str], bool]
+#: ``(candidate_sha) -> (tree_sha, changed_paths_vs_previous)``. Optional
+#: source for the administrative-drift hint (INFRA-200): given a
+#: candidate's SHA, returns its tree SHA and the paths that changed
+#: relative to whatever candidate this source considers "previous" for
+#: that project. Absent by default, in which case no drift hint is
+#: computed at all -- see ``review_drift.py`` and
+#: :meth:`CandidateAdmission._drift_verdict`.
+DescribeCandidate = Callable[[str], tuple[str, Sequence[str]]]
 
 
 class BranchHeadUnknown(RuntimeError):
@@ -105,12 +126,23 @@ class CompositeIntakeGate:
 
 @dataclass(frozen=True, slots=True)
 class AdmittedCandidate:
-    """One immutable candidate admitted for exactly one review turn."""
+    """One immutable candidate admitted for exactly one review turn.
+
+    ``drift`` (INFRA-200) is the administrative-drift hint attached to the
+    wake payload delivered to Sol: ``None`` when no ``describe_candidate``
+    source was configured (the default -- every prior caller sees this
+    field simply absent-by-value and nothing else changes), otherwise a
+    :class:`~hermes_orchestrator.review_drift.DriftVerdict` describing
+    whether this candidate differs from the last reviewed one only in
+    administrative paths, not at all, or semantically. It is advisory
+    only -- see the module docstring above.
+    """
 
     project_key: str
     manifest: CandidateManifest
     thread_id: str
     generation: int
+    drift: DriftVerdict | None = None
 
 
 class CandidateAdmission:
@@ -130,6 +162,7 @@ class CandidateAdmission:
         base_policy: BasePolicy,
         intake_gate: IntakeGate,
         merged_candidate_proof: MergedCandidateProof | None = None,
+        describe_candidate: DescribeCandidate | None = None,
     ) -> None:
         if branch_head is None:
             raise ValueError("candidate admission requires a branch head")
@@ -148,6 +181,10 @@ class CandidateAdmission:
         # is the only thing that may excuse an unresolvable remote
         # branch; when absent, behavior is exactly as before.
         self._merged_candidate_proof = merged_candidate_proof
+        # INFRA-200: optional administrative-drift hint source; absent by
+        # default, in which case ``_drift_verdict`` always returns None
+        # and every existing caller is byte-for-byte unaffected.
+        self._describe_candidate = describe_candidate
 
     def validate_only(
         self,
@@ -179,7 +216,7 @@ class CandidateAdmission:
         ``external_gates`` is documented on :meth:`_run_checks`.
         """
 
-        _snapshot, manifest, channel = self._run_checks(
+        _snapshot, manifest, channel, drift = self._run_checks(
             project_key,
             event,
             received_generation=received_generation,
@@ -190,6 +227,7 @@ class CandidateAdmission:
             manifest=manifest,
             thread_id=channel.thread_id,
             generation=channel.generation,
+            drift=drift,
         )
 
     def admit(
@@ -207,7 +245,7 @@ class CandidateAdmission:
         and identical either way.
         """
 
-        snapshot, manifest, channel = self._run_checks(
+        snapshot, manifest, channel, drift = self._run_checks(
             project_key,
             event,
             received_generation=received_generation,
@@ -229,6 +267,7 @@ class CandidateAdmission:
             manifest=manifest,
             thread_id=channel.thread_id,
             generation=channel.generation,
+            drift=drift,
         )
 
     def _run_checks(
@@ -238,9 +277,25 @@ class CandidateAdmission:
         *,
         received_generation: int,
         external_gates: bool = True,
-    ) -> tuple[ManifestSnapshot, CandidateManifest, ReviewerChannel]:
+    ) -> tuple[
+        ManifestSnapshot, CandidateManifest, ReviewerChannel, DriftVerdict | None
+    ]:
         """The complete read-only admission checks, shared by both entry
         points above; never performs a durable write.
+
+        INFRA-200: the administrative-drift hint computed below (the
+        fourth element of the returned tuple) is advisory ONLY. Every
+        check in this method -- the immutable manifest read, the wake
+        envelope's exact match against it, the ready reviewer channel at
+        the exact received generation, the remote branch head (or
+        proven-deleted-branch excuse), the base policy, and the intake
+        gate -- runs identically regardless of what the drift hint says.
+        Nothing below ever branches on ``drift``: an "administrative"
+        verdict cannot skip a check, shrink a comparison, or excuse a
+        mismatch. It exists purely so a caller downstream MAY choose a
+        narrower, scoped semantic replay instead of a wide one -- never
+        to bypass candidate/base/tree identity or durable packet
+        integrity, which fail closed exactly as before.
 
         INFRA-212: the checks split cleanly in two, and ``external_gates``
         selects between them.
@@ -302,8 +357,9 @@ class CandidateAdmission:
             raise CandidateRejected(
                 "wake generation is stale for the current reviewer channel"
             )
+        drift = self._drift_verdict(channel, manifest)
         if not external_gates:
-            return snapshot, manifest, channel
+            return snapshot, manifest, channel, drift
         try:
             head = self._branch_head(project_key, manifest.branch)
         except BranchHeadUnknown as error:
@@ -344,4 +400,43 @@ class CandidateAdmission:
                 "candidate base violates the active review policy"
             )
         self._intake_gate.validate(project_key, manifest)
-        return snapshot, manifest, channel
+        return snapshot, manifest, channel, drift
+
+    def _drift_verdict(
+        self, channel: ReviewerChannel, manifest: CandidateManifest
+    ) -> DriftVerdict | None:
+        """The administrative-drift hint for this candidate, or ``None``.
+
+        Returns ``None`` -- no hint attached at all -- whenever no
+        ``describe_candidate`` source was configured at construction; this
+        is the default, so every existing caller and test is unaffected
+        (INFRA-200).
+
+        When a source IS configured, the durable
+        ``reviewer_channels.last_delivered_candidate_sha`` column (read
+        via ``channel``, never re-queried here) is the record of the last
+        reviewed candidate for this project. When it is absent, there is
+        no prior candidate on durable record and this is treated as a
+        first review. Otherwise both the previous and current candidate's
+        tree SHAs are looked up through ``describe_candidate`` and handed
+        to the pure classifier in ``review_drift.py``. This method never
+        raises and never affects admission -- see the module docstring
+        and :meth:`_run_checks`.
+        """
+
+        if self._describe_candidate is None:
+            return None
+        previous_sha = channel.last_delivered_candidate_sha
+        if previous_sha is None:
+            return classify_drift(
+                previous_tree_sha=None, current_tree_sha="", changed_paths=()
+            )
+        previous_tree_sha, _ = self._describe_candidate(previous_sha)
+        current_tree_sha, changed_paths = self._describe_candidate(
+            manifest.candidate_sha
+        )
+        return classify_drift(
+            previous_tree_sha=previous_tree_sha,
+            current_tree_sha=current_tree_sha,
+            changed_paths=tuple(changed_paths),
+        )

@@ -22,6 +22,7 @@ from hermes_orchestrator.merge_flow import (
 from hermes_orchestrator.merger_turns import (
     CodexThreadReports,
     SubmissionRejected,
+    _settlement_ready_verdict_json,
 )
 from hermes_orchestrator.verdicts import IDLE_TERMINAL_REPORT
 from tests.integration.test_fable_ready_acceptance import (
@@ -307,12 +308,48 @@ def _submission(
     }
 
 
+class _StoredVerdictJson(str):
+    """A durable ``verdict_json`` string that compares JSON-semantically.
+
+    INFRA-200: ``submit_review`` now persists the NORMALIZED envelope --
+    ``ReviewVerdict.verdict_json``, the durable value plus the
+    ``label``/``reviewer_fix`` markers, key-sorted -- not the raw
+    ``flow.verdict(...)`` text every existing assertion in this module
+    was written to compare byte-for-byte. Stripping those two additive
+    marker keys (the identical transformation
+    ``merger_turns._settlement_ready_verdict_json`` applies before
+    re-parsing a durable row) and then comparing PARSED JSON, rather than
+    raw bytes, keeps every one of this module's ~30 existing
+    ``_submitted_rows(flow) == [...]`` assertions meaningful and
+    unchanged -- key order was never part of what they asserted, only
+    the document's content. The dedicated
+    ``test_submitted_verdict_persists_normalized_verdict_json`` reads the
+    raw column directly to prove the marker keys really are there.
+    """
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, str):
+            return NotImplemented
+        try:
+            mine = json.loads(_settlement_ready_verdict_json(str(self)))
+            theirs = json.loads(_settlement_ready_verdict_json(other))
+        except json.JSONDecodeError:
+            return str(self) == other
+        return bool(mine == theirs)
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+
 def _submitted_rows(flow: ProductionShapedFlow) -> list[tuple[str, str, str]]:
     rows = flow.database.execute(
         "SELECT event_id, state, verdict_json FROM submitted_verdicts "
         "ORDER BY created_at ASC, rowid ASC"
     ).fetchall()
-    return [(r["event_id"], r["state"], r["verdict_json"]) for r in rows]
+    return [
+        (r["event_id"], r["state"], _StoredVerdictJson(r["verdict_json"]))
+        for r in rows
+    ]
 
 
 def _review_count(flow: ProductionShapedFlow) -> int:
@@ -462,6 +499,61 @@ async def test_approved_submission_enters_the_guarded_merge_transition(
     assert _submitted_rows(flow) == [
         (emitted.event.event_id, "settled", flow.verdict(SHA_A, branch, 14))
     ]
+
+
+def _stored_verdict_json(flow: ProductionShapedFlow, event_id: str) -> dict[str, Any]:
+    row = flow.database.execute(
+        "SELECT verdict_json FROM submitted_verdicts WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    assert row is not None
+    return dict(json.loads(row["verdict_json"]))
+
+
+@pytest.mark.asyncio
+async def test_submitted_verdict_persists_normalized_verdict_json(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-200 follow-up A: submit_review persists ReviewVerdict.
+    # verdict_json (the normalized envelope -- durable value plus the
+    # label/reviewer_fix markers) into submitted_verdicts.verdict_json,
+    # not the raw pre-parse string, so the durable row retains the
+    # original reviewer-facing label alongside the value every existing
+    # read path uses.
+    await flow.merger.ensure_thread("demo")
+
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    document = json.loads(flow.verdict(SHA_A, branch, 14))
+    document["verdict"] = "ACCEPT_WITH_REVIEWER_FIX"
+    outcome = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted.event.event_id, "ENG-9", SHA_A, json.dumps(document)
+        ),
+    )
+    assert outcome.kind == "merged", outcome
+    stored = _stored_verdict_json(flow, emitted.event.event_id)
+    assert stored["verdict"] == "approved"
+    assert stored["label"] == "ACCEPT_WITH_REVIEWER_FIX"
+    assert stored["reviewer_fix"] is True
+
+    # A plain "approved" submission (no reviewer-fix label) stores
+    # label == "approved" and carries no reviewer_fix marker at all.
+    branch2 = flow.stage("ENG-10", SHA_B, pr_number=15)
+    emitted2 = await flow.emitter.emit("demo", "ENG-10", verification=(("t", "ok"),))
+    outcome2 = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            emitted2.event.event_id, "ENG-10", SHA_B,
+            flow.verdict(SHA_B, branch2, 15),
+        ),
+    )
+    assert outcome2.kind == "merged", outcome2
+    stored2 = _stored_verdict_json(flow, emitted2.event.event_id)
+    assert stored2["verdict"] == "approved"
+    assert stored2["label"] == "approved"
+    assert "reviewer_fix" not in stored2
 
 
 @pytest.mark.asyncio

@@ -3,11 +3,16 @@
 INFRA-194 (operator ruling, hardened by Sol corrections 2e1ddcce and
 48ac5268): Sol's write scope is the exact approved merge plus this
 helper. An eligible fix is mechanical, unambiguous, and auditable — at
-most two files and thirty changed lines, with every added, modified,
-deleted, and untracked file contributing its complete textual delta
-(the whole fix is staged before eligibility is decided) — and never
-touches migrations, schemas, generated artifacts, or the categorically
-excluded judgment surfaces, which return to the Fable lead.
+most three files, fifty changed lines, and (advisory, never wall-clock
+enforced) thirty minutes, with every added, modified, deleted, and
+untracked file contributing its complete textual delta (the whole fix
+is staged before eligibility is decided) — and never touches
+migrations, schemas, generated artifacts, the public API surface,
+pricing/economics, broad consumer changes, or any other categorically
+excluded judgment surface, all of which return to the Fable lead
+(INFRA-200). Multiple eligible small findings are consolidated into
+one transparent, labeled commit rather than one commit per finding;
+the budget is measured over the union diff of the whole staged fix.
 
 Publication is intent-journaled behind a single durable owner: every
 locally provable gate — the staged eligibility budget, the labeled
@@ -58,8 +63,14 @@ from hermes_orchestrator.manifests import (
 
 FIX_LABEL = "ACCEPT_WITH_REVIEWER_FIX"
 
-MAX_FILES = 2
-MAX_CHANGED_LINES = 30
+MAX_FILES = 3
+MAX_CHANGED_LINES = 50
+
+# Advisory only (INFRA-200): named in refusal and receipt text so the
+# bounded-fix budget is legible end to end, but never measured or
+# enforced against a wall clock — there is no reliable, tamper-proof
+# signal of elapsed wall-clock time to gate on here.
+MAX_MINUTES = 30
 
 # How long one recorded publication intent remains exclusively owned.
 # While the lease is live only the owner may cross or settle the
@@ -70,12 +81,46 @@ LEASE_SECONDS = 900
 _BLOCKING_STATES = "('intended', 'attempted', 'reconciliation_required')"
 
 # The mechanically enforceable subset of the categorical exclusions;
-# the judgment-bearing remainder (pricing, public APIs, ownership
-# architecture, broad consumer changes) is enforced by contract and
-# review, not by path matching.
-_EXCLUDED_PATH_PATTERN = re.compile(
-    r"(^|/)(migrations?|schemas?|generated)(/|$)|\.sql$"
+# the judgment-bearing remainder (ownership architecture, broad
+# consumer changes) is enforced by contract and review, not by path
+# matching. Order matters: each path is tested against these in turn
+# and the FIRST match names the category in the refusal, so the more
+# specific public-API and generated-artifact patterns are checked
+# before the broad, catch-all schema/migration pattern would otherwise
+# also claim them (e.g. the real ``schemas/*.json`` contract files are
+# public API surface, not a database schema/migration).
+_EXCLUDED_CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "generated artifact",
+        re.compile(r"(^|/)generated(/|$)"),
+    ),
+    (
+        "public API surface",
+        re.compile(
+            r"^src/hermes_orchestrator/hermes_tools\.py$"
+            r"|(^|/)schemas/"
+            r"|(^|/)channels/.*/manifest[^/]*$"
+            r"|^pyproject\.toml$"
+        ),
+    ),
+    (
+        "pricing/economics",
+        re.compile(r"(?i:pricing|economics|billing)"),
+    ),
+    (
+        "schema/migration",
+        re.compile(r"(^|/)(migrations?|schemas?)(/|$)|\.sql$"),
+    ),
 )
+
+
+def _excluded_category(path: str) -> str | None:
+    """The name of the first categorical exclusion ``path`` matches."""
+
+    for category, pattern in _EXCLUDED_CATEGORIES:
+        if pattern.search(path):
+            return category
+    return None
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -154,12 +199,29 @@ class ReviewerFixHelper:
         submitted_sha: str,
         message: str,
         verification: tuple[str, ...],
+        findings: tuple[str, ...] = (),
     ) -> ReviewerFixReceipt:
+        """Publish one bounded fix, optionally consolidating findings.
+
+        ``findings`` names each small eligible finding this fix
+        addresses (an id, or a short description) so that multiple
+        mechanical findings land as ONE transparent, labeled commit
+        instead of one commit per finding — the commit message lists
+        every consolidated finding on its own line, and the budget is
+        still measured over the union diff of the whole staged fix
+        (:meth:`_eligibility`), never per finding.
+        """
+
         project = self._projects.get(project_key)
         if project is None:
             raise ReviewerFixRefused(f"unknown project {project_key!r}")
         if not message.strip():
             raise ReviewerFixRefused("a reviewer fix requires a message")
+        if any(not finding.strip() for finding in findings):
+            raise ReviewerFixRefused(
+                "every consolidated finding requires a non-empty "
+                "description"
+            )
         if not verification:
             raise ReviewerFixRefused(
                 "a reviewer fix requires focused verification commands"
@@ -213,8 +275,10 @@ class ReviewerFixHelper:
             self._run(repo, "reset")
             raise
 
-        # One clearly labeled commit atop the submitted SHA.
-        self._run(repo, "commit", "-m", f"{FIX_LABEL}: {message.strip()}")
+        # One clearly labeled commit atop the submitted SHA, listing
+        # every consolidated finding on its own line.
+        commit_message = self._consolidated_message(message, findings)
+        self._run(repo, "commit", "-m", commit_message)
         final_sha = self._run(repo, "rev-parse", "HEAD").strip()
 
         # Focused verification proves the fix before it is published;
@@ -771,20 +835,49 @@ class ReviewerFixHelper:
         if len(files) > MAX_FILES:
             raise ReviewerFixRefused(
                 f"{len(files)} files exceed the bounded budget of "
-                f"{MAX_FILES}; return this to the Fable lead"
+                f"{MAX_FILES} files / {MAX_CHANGED_LINES} changed lines / "
+                f"~{MAX_MINUTES} minutes (advisory); return this to the "
+                "Fable lead"
             )
         if total > MAX_CHANGED_LINES:
             raise ReviewerFixRefused(
                 f"{total} changed lines exceed the bounded budget of "
-                f"{MAX_CHANGED_LINES}; return this to the Fable lead"
+                f"{MAX_CHANGED_LINES} changed lines / {MAX_FILES} files / "
+                f"~{MAX_MINUTES} minutes (advisory); return this to the "
+                "Fable lead"
             )
         for path in files:
-            if _EXCLUDED_PATH_PATTERN.search(path):
+            category = _excluded_category(path)
+            if category is not None:
                 raise ReviewerFixRefused(
                     f"{path} is categorically excluded from reviewer "
-                    "fixes; return this to the Fable lead"
+                    f"fixes ({category}); return this to the Fable lead"
                 )
         return tuple(files), total
+
+    def _consolidated_message(
+        self, message: str, findings: tuple[str, ...]
+    ) -> str:
+        """One transparent, labeled commit for one or many findings.
+
+        Multiple eligible small findings are consolidated into exactly
+        one ``FIX_LABEL``-prefixed commit: the summary heads it, every
+        consolidated finding is listed on its own line, and the
+        advisory (never wall-clock enforced) budget is named in the
+        trailer so the receipt stays legible end to end.
+        """
+
+        header = f"{FIX_LABEL}: {message.strip()}"
+        body = header
+        if findings:
+            lines = "\n".join(f"- {finding.strip()}" for finding in findings)
+            body = f"{header}\n\n{lines}"
+        return (
+            f"{body}\n\n"
+            f"Reviewer-fix budget (advisory): <= {MAX_FILES} files, "
+            f"<= {MAX_CHANGED_LINES} changed lines, ~{MAX_MINUTES} "
+            "minutes."
+        )
 
     def _run(self, repo: Path, *args: str) -> str:
         result = self._git.run(("git", *args), repo)

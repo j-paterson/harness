@@ -10,7 +10,7 @@ import pytest
 from hermes_orchestrator.config import load_settings
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.git import GitError
+from hermes_orchestrator.git import GitError, GitResult
 from hermes_orchestrator.merge_flow import (
     DatabaseDurableWakeReader,
     _branch_head,
@@ -500,3 +500,118 @@ def test_merged_candidate_proof_fails_closed_on_no_match_or_github_error(
         "nope", "feature/eng-9", "1" * 40
     ) is False
     assert unknown.calls == []
+
+
+# --- INFRA-200 follow-up B: describe_candidate wired from git --------------
+
+
+@dataclass
+class FakeDescribeGitRunner:
+    """Argv-keyed git fake for the tree/diff lookups behind
+    ``describe_candidate`` (INFRA-200); unknown invocations fail like a
+    broken clone."""
+
+    responses: dict[tuple[str, ...], str] = field(default_factory=dict)
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    def run(
+        self,
+        args: tuple[str, ...],
+        cwd: Path,
+        *,
+        input: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> GitResult:
+        self.calls.append(args)
+        if args not in self.responses:
+            return GitResult(128, "", "fatal: not found")
+        return GitResult(0, self.responses[args], "")
+
+
+def test_describe_candidate_is_wired_from_git(tmp_path: Path) -> None:
+    """INFRA-200: ``build_merge_flow`` wires a real ``describe_candidate``
+    into ``CandidateAdmission``, built from read-only git evidence --
+    ``git rev-parse <sha>^{tree}`` for the tree identity and ``git diff
+    --name-only <sha>^ <sha>`` for the changed paths -- via the same
+    argv-safe ``GitRunner`` idiom ``_branch_head``/``_base_policy`` use,
+    never a shell and never a new ``git.py`` helper."""
+
+    repo_root, state_dir = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    database = Database.open(settings.state_dir / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, settings.projects)
+
+    sha = "1" * 40
+    tree = "2" * 40
+    git = FakeDescribeGitRunner(
+        responses={
+            ("git", "rev-parse", "--verify", f"{sha}^{{tree}}"): tree + "\n",
+            (
+                "git",
+                "diff",
+                "--name-only",
+                f"{sha}^",
+                sha,
+            ): "docs/readme.md\nsrc/app.py\n",
+        }
+    )
+
+    flow = build_merge_flow(
+        settings,
+        database=database,
+        events=events,
+        queue=queue,
+        linear=_NullLinear(),
+        keychain=_FakeKeychain(),
+        base_env={},
+        git_runner=git,
+    )
+
+    describe = flow.admission._describe_candidate
+    assert describe is not None
+
+    tree_sha, changed = describe(sha)
+
+    assert tree_sha == tree
+    assert changed == ("docs/readme.md", "src/app.py")
+    assert ("git", "rev-parse", "--verify", f"{sha}^{{tree}}") in git.calls
+    assert ("git", "diff", "--name-only", f"{sha}^", sha) in git.calls
+
+
+def test_describe_candidate_never_raises_on_a_local_git_failure(
+    tmp_path: Path,
+) -> None:
+    """INFRA-200: ``CandidateAdmission._drift_verdict`` calls
+    ``describe_candidate`` unconditionally, for every admission, and
+    never defends against it raising -- the hint must stay purely
+    advisory and never break a real admission. A local git failure (an
+    unresolvable SHA here) must therefore degrade to a sentinel result,
+    never propagate."""
+
+    repo_root, state_dir = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    database = Database.open(settings.state_dir / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, settings.projects)
+
+    flow = build_merge_flow(
+        settings,
+        database=database,
+        events=events,
+        queue=queue,
+        linear=_NullLinear(),
+        keychain=_FakeKeychain(),
+        base_env={},
+        git_runner=FakeDescribeGitRunner(),
+    )
+
+    describe = flow.admission._describe_candidate
+    assert describe is not None
+
+    tree_sha, changed = describe("1" * 40)
+
+    assert changed == ("<drift-hint-lookup-failed>",)
+    assert tree_sha != ""

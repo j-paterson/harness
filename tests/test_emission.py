@@ -10,9 +10,14 @@ import pytest
 
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
 from hermes_orchestrator.config import ProjectConfig
-from hermes_orchestrator.emission import CandidateEmitter, EmissionBlocked
+from hermes_orchestrator.emission import (
+    CandidateEmitter,
+    EmissionBlocked,
+    wake_event_with_drift_hint,
+)
 from hermes_orchestrator.git import GitResult
 from hermes_orchestrator.manifests import WakeEvent, read_manifest
+from hermes_orchestrator.review_drift import DriftVerdict
 
 HEAD = "1" * 40
 BASE = "4" * 40
@@ -602,3 +607,60 @@ async def test_publication_refuses_a_lease_branch_or_head_that_disagrees(
         )
 
     assert deliverer.events == []
+
+
+# --- INFRA-200 follow-up B: administrative-drift hint --------------------
+
+
+@pytest.mark.asyncio
+async def test_administrative_drift_hint_is_appended_without_changing_identity(
+    emitter_parts: tuple[CandidateEmitter, FakeGitRunner, FakeDeliverer],
+) -> None:
+    emitter, _, _ = emitter_parts
+    result = await emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    event = result.event
+    drift = DriftVerdict(
+        kind="administrative",
+        reason="only administrative paths changed",
+        changed_paths=("README.md",),
+    )
+
+    hinted = wake_event_with_drift_hint(event, drift)
+
+    # Every field a delivery or admission path reads is byte-identical --
+    # the manifest hash and candidate identity stored in durable state
+    # are unchanged whether or not the hint is attached.
+    assert hinted.manifest_digest == event.manifest_digest
+    assert hinted.event_id == event.event_id
+    assert hinted.candidate_sha == event.candidate_sha
+    assert hinted.base_sha == event.base_sha
+    assert hinted.status == event.status
+    assert hinted.issue_id == event.issue_id
+    assert hinted.manifest_path == event.manifest_path
+    # Only the rendered text differs: the plain render, plus one
+    # trailing advisory line.
+    plain = event.render(1)
+    rendered = hinted.render(1)
+    assert rendered.startswith(plain)
+    assert rendered != plain
+    assert "drift: administrative" in rendered
+    assert "only administrative paths changed" in rendered
+
+
+@pytest.mark.asyncio
+async def test_semantic_drift_delivers_the_plain_event(
+    emitter_parts: tuple[CandidateEmitter, FakeGitRunner, FakeDeliverer],
+) -> None:
+    emitter, _, _ = emitter_parts
+    result = await emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    event = result.event
+
+    # No drift source configured (None) and a "semantic" verdict both
+    # deliver the exact, unwrapped event -- Sol gets no scoping hint.
+    assert wake_event_with_drift_hint(event, None) is event
+    semantic = DriftVerdict(
+        kind="semantic",
+        reason="semantic paths changed",
+        changed_paths=("src/app.py",),
+    )
+    assert wake_event_with_drift_hint(event, semantic) is event
