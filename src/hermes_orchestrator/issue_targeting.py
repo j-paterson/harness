@@ -85,6 +85,7 @@ from dataclasses import dataclass
 
 from hermes_orchestrator.cells import (
     DEVELOPMENT_LANE,
+    HARNESS_LANE,
     MAX_DEVELOPMENT_ISSUE_LANES,
     LinearProjector,
     activate_admitted_issue,
@@ -273,6 +274,240 @@ def target_issue(
             f"targeting {issue_id!r} could not be published or reconciled"
         )
     return TargetIssueResult(assignment=pending[0], idempotent=True)
+
+
+def target_harness_followup(
+    database: Database,
+    *,
+    events: EventStore,
+    assignments: LeadAssignments,
+    issue_id: str,
+    project_key: str,
+    cell_id: str,
+    session_id: str,
+    instruction: str,
+    known_projects: Collection[str],
+) -> TargetIssueResult:
+    """Attach one explicitly admitted, dependency-ready project issue to
+    a lead already durably bound to a HARNESS-lane primary assignment
+    (INFRA-215), as a second, lane-preserving work item — never a
+    second seat, and never a new protocol.
+
+    Why this is a single-shot transition, unlike :func:`target_issue`:
+    the DEVELOPMENT lane's ``target_issue``/``acknowledge_target`` pair
+    exists because that lane's canonical activation
+    (``cells._activate_issue_transaction``) is an exact-session-ACK
+    protocol — publication and activation are deliberately two
+    transactions so the exact confirming session can be proven before
+    the queue transitions. The HARNESS lane has no such protocol for
+    its own primary activation: ``cells._activate_issue_body`` with
+    ``harness=True`` activates only the cell's lease and returns —  it
+    never CASes ``admitted_issues``, never journals ``issue.started``,
+    and (see below) never calls ``assignments.publish_in`` for the
+    issue it was launched against. INFRA-215 is explicit that no new
+    protocol is to be introduced for the harness lane, so this function
+    does not invent an ACK step either: it re-proves every mutable
+    predicate, publishes the assignment through the EXISTING
+    ``LeadAssignments.publish_in``, CASes the admitted issue
+    ``queued``/``blocked`` -> ``in_development``, and journals
+    ``issue.targeted`` — all inside the one ``BEGIN IMMEDIATE``
+    transaction ``Database.transaction()`` opens. A single failed
+    predicate raises :class:`IssueTargetingRefused` and the whole
+    transaction rolls back — zero durable writes.
+
+    How the harness PRIMARY assignment is represented (and therefore
+    how "at most zero live follow-ups" is counted): it is represented
+    by NOTHING in ``lead_assignments``. ``_activate_issue_body``'s
+    publish step is gated ``if not harness and assignments is not
+    None`` — the harness path never reaches it. A harness cell's
+    primary issue lives only in ``project_cells`` (the cell's own
+    ``session_id``/``profile_alias`` binding) and in the launch prompt
+    text; it never gets a durable assignment packet of its own. So
+    "the harness cell currently has at most ZERO live follow-up
+    assignments" reduces to a plain count: zero ``lead_assignments``
+    rows in a state other than ``superseded`` exist for this exact
+    ``cell_id``/``session_id`` pair — there is no primary row to
+    exclude from that count, because one is never written. Exactly one
+    follow-up may be live at a time; calling this again while the
+    first follow-up is still ``published`` or ``acknowledged`` refuses
+    closed with zero writes.
+
+    Capacity: the project's canonical development-lane bound
+    (:func:`cells.development_lane_saturated`) is re-proven here too —
+    once this follow-up transitions to ``in_development`` it occupies
+    that same project-wide, lane-agnostic count
+    (``_OCCUPYING_ISSUE_STATES`` is keyed on ``admitted_issues.state``
+    alone, not on which cell/lane owns the issue), so admitting it must
+    not itself push the project over the bound the development lane's
+    own dispatch relies on.
+
+    Never inserts a ``project_cells`` row, and never opens the Linear
+    "In Development" projection effect that the canonical development
+    activation opens — the harness lane's product-issue work stays as
+    invisible to Linear as the harness lane's own primary work always
+    has been. The issue's normal Sol/candidate path is driven off
+    ``admitted_issues`` state independent of that projection and is
+    unaffected; it may still run to completion the ordinary way once
+    Fable produces a change for it.
+    """
+
+    if not instruction.strip():
+        raise IssueTargetingRefused("an operator instruction is required")
+    if project_key not in known_projects:
+        raise IssueTargetingRefused(f"unknown project {project_key!r}")
+
+    with database.transaction() as connection:
+        issue_row = connection.execute(
+            "SELECT state, instruction_id, dependency_ready "
+            "FROM admitted_issues WHERE issue_id = ? AND project_key = ?",
+            (issue_id, project_key),
+        ).fetchone()
+        if issue_row is None or str(issue_row["state"]) not in _ADMITTED_STATES:
+            raise IssueTargetingRefused(
+                f"issue {issue_id!r} is not admitted for project {project_key!r}"
+            )
+        issue_state = str(issue_row["state"])
+        durable_instruction_id = str(issue_row["instruction_id"])
+
+        if not int(issue_row["dependency_ready"]):
+            raise IssueTargetingRefused(
+                f"issue {issue_id!r} is not dependency-ready"
+            )
+
+        if development_lane_saturated(
+            connection, project_key=project_key, issue_id=issue_id
+        ):
+            raise IssueTargetingRefused(
+                f"project {project_key!r}'s development lane already holds "
+                f"{MAX_DEVELOPMENT_ISSUE_LANES} other occupying issues"
+            )
+
+        pending_decision = connection.execute(
+            "SELECT 1 FROM operator_decisions WHERE issue_id = ? "
+            "AND status = 'pending' LIMIT 1",
+            (issue_id,),
+        ).fetchone()
+        if pending_decision is not None:
+            raise IssueTargetingRefused(
+                f"issue {issue_id!r} has a pending operator decision"
+            )
+
+        # The exact named cell, its required HARNESS lane_role, and its
+        # liveness are all predicates of this one query — the same
+        # shape as ``target_issue``'s development-lane lookup, just
+        # bound to the other lane.
+        cell_row = connection.execute(
+            "SELECT profile_alias, session_id, state FROM project_cells "
+            "WHERE cell_id = ? AND project_key = ? AND lane_role = ? "
+            f"AND state IN ({','.join('?' for _ in _ACTIVE_CELL_STATES)})",
+            (cell_id, project_key, HARNESS_LANE, *_ACTIVE_CELL_STATES),
+        ).fetchone()
+        if cell_row is None:
+            raise IssueTargetingRefused(
+                f"cell {cell_id!r} is not a live harness cell for "
+                f"project {project_key!r}"
+            )
+        profile_alias = str(cell_row["profile_alias"])
+
+        current_session_id = (
+            None
+            if cell_row["session_id"] is None
+            or str(cell_row["state"]) not in _CURRENT_SESSION_STATES
+            else str(cell_row["session_id"])
+        )
+        if current_session_id is None or current_session_id != str(session_id):
+            raise IssueTargetingRefused(
+                f"session {session_id!r} is not harness cell {cell_id!r}'s "
+                "current session"
+            )
+
+        lease_row = connection.execute(
+            "SELECT 1 FROM profile_leases WHERE project_key = ? "
+            "AND profile_alias = ? AND state = 'active'",
+            (project_key, profile_alias),
+        ).fetchone()
+        if lease_row is None:
+            raise IssueTargetingRefused(
+                f"harness cell {cell_id!r}'s profile lease is not active"
+            )
+
+        # Exactly one follow-up at a time. There is no primary row to
+        # exclude from this count -- see the docstring above -- so any
+        # live (non-superseded) packet at all for this cell/session is
+        # a live follow-up already occupying the one seat.
+        live_followup = connection.execute(
+            "SELECT 1 FROM lead_assignments WHERE cell_id = ? "
+            "AND session_id = ? AND state != 'superseded' LIMIT 1",
+            (cell_id, str(session_id)),
+        ).fetchone()
+        if live_followup is not None:
+            raise IssueTargetingRefused(
+                f"harness cell {cell_id!r} already has a live follow-up "
+                "assignment"
+            )
+
+        queue_transition = f"{issue_state}->{IssueState.IN_DEVELOPMENT.value}"
+        published = assignments.publish_in(
+            connection,
+            project_key=project_key,
+            issue_id=issue_id,
+            cell_id=cell_id,
+            session_id=str(session_id),
+            profile_alias=profile_alias,
+            instruction_id=durable_instruction_id,
+            queue_transition=queue_transition,
+        )
+        if published is None:
+            raise IssueTargetingRefused(
+                f"targeting {issue_id!r} could not be published as a "
+                "harness follow-up"
+            )
+
+        updated = connection.execute(
+            "UPDATE admitted_issues SET state = ?, updated_at = ? "
+            "WHERE issue_id = ? AND state = ?",
+            (
+                IssueState.IN_DEVELOPMENT.value,
+                published.updated_at,
+                issue_id,
+                issue_state,
+            ),
+        )
+        if updated.rowcount == 0:
+            raise IssueTargetingRefused(
+                f"issue {issue_id!r} changed state before it could be "
+                "activated as a harness follow-up"
+            )
+
+        events.append(
+            connection,
+            EventInput(
+                event_type="issue.targeted",
+                aggregate_type="issue",
+                aggregate_id=issue_id,
+                payload={
+                    "cell_id": cell_id,
+                    "session_id": str(session_id),
+                    "profile_alias": profile_alias,
+                    "lane_role": HARNESS_LANE,
+                    "assignment_id": published.assignment_id,
+                },
+            ),
+        )
+        events.append(
+            connection,
+            EventInput(
+                event_type="issue_targeting.instruction",
+                aggregate_type="lead_assignment",
+                aggregate_id=published.assignment_id,
+                payload={
+                    "issue_id": issue_id,
+                    "operator_instruction": instruction,
+                },
+            ),
+        )
+
+    return TargetIssueResult(assignment=published, idempotent=False)
 
 
 async def acknowledge_target(

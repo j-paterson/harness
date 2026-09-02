@@ -20,6 +20,7 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.issue_targeting import (
     IssueTargetingRefused,
     acknowledge_target,
+    target_harness_followup,
     target_issue,
 )
 from hermes_orchestrator.lead_assignments import LeadAssignments
@@ -70,19 +71,21 @@ def _seed_admitted(
     priority: int = 2,
     state: str = "queued",
     admitted_at: str = "2026-08-01T00:00:00+00:00",
+    dependency_ready: bool = True,
 ) -> None:
     with database.transaction() as connection:
         connection.execute(
             "INSERT INTO admitted_issues("
             "issue_id, project_key, priority, state, instruction_id, "
             "dependency_ready, overlap_risk, admitted_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             (
                 issue_id,
                 project_key,
                 priority,
                 state,
                 f"instr-{issue_id}",
+                1 if dependency_ready else 0,
                 admitted_at,
                 admitted_at,
             ),
@@ -218,6 +221,36 @@ def _admitted_snapshot(database: Database) -> list[tuple[object, ...]]:
 def _assignment_count(database: Database) -> int:
     row = database.execute("SELECT COUNT(*) AS n FROM lead_assignments").fetchone()
     return int(row["n"])
+
+
+def _project_cells_count(database: Database) -> int:
+    row = database.execute("SELECT COUNT(*) AS n FROM project_cells").fetchone()
+    return int(row["n"])
+
+
+def _seed_pending_decision(
+    database: Database,
+    *,
+    issue_id: str,
+    project_key: str = "demo",
+    cell_id: str = CELL_ID,
+    session_id: str = SESSION_ID,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO operator_decisions("
+            "decision_id, issue_id, project_key, cell_id, session_id, "
+            "actor, choice, status, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, 'operator', 'hold', 'pending', ?)",
+            (
+                f"decision-{issue_id}",
+                issue_id,
+                project_key,
+                cell_id,
+                session_id,
+                "2026-08-01T00:00:00+00:00",
+            ),
+        )
 
 
 def _effect_count(database: Database, issue_id: str) -> int:
@@ -1209,3 +1242,242 @@ async def test_retry_across_the_crash_boundary_activates_exactly_once(
     assert _assignment_count(database) == 1
     assert _event_count(database, "assignment.acknowledged", assignment_id) == 1
     assert linear.projected == ["INFRA-9"]
+
+
+# ---------------------------------------------------------------------------
+# INFRA-215 -- a harness-bound lead receiving one admitted, dependency-ready
+# project follow-up through a durable, lane-preserving transition.
+# ---------------------------------------------------------------------------
+
+HARNESS_CELL_ID = "cell-harness-bound"
+
+
+def _seed_harness_cell(
+    database: Database,
+    *,
+    cell_id: str = HARNESS_CELL_ID,
+    project_key: str = "demo",
+    session_id: str = SESSION_ID,
+    profile_alias: str = "max-harness",
+    state: str = "active",
+    lease: bool = True,
+) -> None:
+    _seed_cell(
+        database,
+        cell_id=cell_id,
+        project_key=project_key,
+        session_id=session_id,
+        profile_alias=profile_alias,
+        state=state,
+        lane_role=HARNESS_LANE,
+        lease=lease,
+    )
+
+
+def test_harness_lead_receives_one_admitted_followup_lane_preserving(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """A harness cell durably bound to its primary (INFRA-198-shaped)
+    assignment can receive exactly one admitted, dependency-ready
+    project issue as a follow-up -- without a second seat, without
+    touching ``project_cells``, and without disturbing the cell's
+    session/profile binding."""
+
+    _seed_harness_cell(database)
+    _seed_admitted(database, issue_id="INFRA-205")
+    cells_before = _project_cells_count(database)
+
+    result = target_harness_followup(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id="INFRA-205",
+        project_key="demo",
+        cell_id=HARNESS_CELL_ID,
+        session_id=SESSION_ID,
+        instruction="pick up INFRA-205 as a harness follow-up",
+        known_projects={"demo"},
+    )
+
+    assert result.idempotent is False
+    assert result.assignment.issue_id == "INFRA-205"
+    assert result.assignment.cell_id == HARNESS_CELL_ID
+    assert result.assignment.session_id == SESSION_ID
+    assert result.assignment.profile_alias == "max-harness"
+    assert result.assignment.state == "published"
+    assert _assignment_count(database) == 1
+    assert _project_cells_count(database) == cells_before
+    assert _issue_state(database, "INFRA-205") == "in_development"
+    assert _event_count(database, "issue.targeted", "INFRA-205") == 1
+    # The harness cell's own binding is untouched -- same session, same
+    # profile, still the lane it was.
+    row = database.execute(
+        "SELECT session_id, profile_alias, lane_role FROM project_cells "
+        "WHERE cell_id = ?",
+        (HARNESS_CELL_ID,),
+    ).fetchone()
+    assert str(row["session_id"]) == SESSION_ID
+    assert str(row["profile_alias"]) == "max-harness"
+    assert str(row["lane_role"]) == HARNESS_LANE
+
+
+def test_second_followup_refused_while_one_is_live(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Exactly one follow-up at a time: a second explicit target while
+    the first is still live (published/acknowledged) refuses closed."""
+
+    _seed_harness_cell(database)
+    _seed_admitted(database, issue_id="INFRA-205")
+    _seed_admitted(database, issue_id="INFRA-206")
+
+    first = target_harness_followup(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id="INFRA-205",
+        project_key="demo",
+        cell_id=HARNESS_CELL_ID,
+        session_id=SESSION_ID,
+        instruction="pick up INFRA-205",
+        known_projects={"demo"},
+    )
+    assert first.assignment.issue_id == "INFRA-205"
+
+    with pytest.raises(IssueTargetingRefused):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-206",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="pick up INFRA-206 too",
+            known_projects={"demo"},
+        )
+
+    assert _assignment_count(database) == 1
+    assert _issue_state(database, "INFRA-206") == "queued"
+    assert _issue_state(database, "INFRA-205") == "in_development"
+
+
+def test_followup_refuses_not_ready_or_cross_project_or_pending_decision(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Three independent predicate misses, each a fail-closed refusal
+    with zero durable writes: dependency not ready, the issue admitted
+    for a different project, and a pending operator decision."""
+
+    _seed_harness_cell(database)
+
+    # Not dependency-ready.
+    _seed_admitted(database, issue_id="INFRA-300", dependency_ready=False)
+    with pytest.raises(IssueTargetingRefused):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-300",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="not ready",
+            known_projects={"demo"},
+        )
+    assert _issue_state(database, "INFRA-300") == "queued"
+    assert _assignment_count(database) == 0
+
+    # Admitted for a different project than the harness cell's own.
+    _seed_admitted(database, issue_id="INFRA-301", project_key="other")
+    with pytest.raises(IssueTargetingRefused):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-301",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="cross project",
+            known_projects={"demo", "other"},
+        )
+    assert _issue_state(database, "INFRA-301") == "queued"
+    assert _assignment_count(database) == 0
+
+    # A pending operator decision blocks the follow-up exactly as it
+    # blocks development-lane targeting.
+    _seed_admitted(database, issue_id="INFRA-302")
+    _seed_pending_decision(database, issue_id="INFRA-302")
+    with pytest.raises(IssueTargetingRefused):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-302",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="pending decision",
+            known_projects={"demo"},
+        )
+    assert _issue_state(database, "INFRA-302") == "queued"
+    assert _assignment_count(database) == 0
+
+
+def test_followup_refuses_dead_or_development_cell_through_harness_path(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """The harness follow-up path requires the exact named cell to be a
+    LIVE HARNESS-lane cell -- a development-lane cell of the same id
+    (impossible in practice, but the predicate must still be a query
+    filter) or a dead harness cell must both refuse."""
+
+    _seed_admitted(database, issue_id="INFRA-205")
+
+    # A development-lane cell is never an eligible harness target, even
+    # by the same cell_id/session_id.
+    _seed_cell(
+        database,
+        cell_id=HARNESS_CELL_ID,
+        session_id=SESSION_ID,
+        profile_alias="max-c",
+        state="active",
+        lane_role=DEVELOPMENT_LANE,
+    )
+    with pytest.raises(IssueTargetingRefused):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-205",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="wrong lane",
+            known_projects={"demo"},
+        )
+    assert _assignment_count(database) == 0
+    assert _issue_state(database, "INFRA-205") == "queued"
+
+    # A dead (failed) harness cell is not live either.
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET lane_role = ?, state = 'failed' "
+            "WHERE cell_id = ?",
+            (HARNESS_LANE, HARNESS_CELL_ID),
+        )
+    with pytest.raises(IssueTargetingRefused):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-205",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="dead cell",
+            known_projects={"demo"},
+        )
+    assert _assignment_count(database) == 0
+    assert _issue_state(database, "INFRA-205") == "queued"
