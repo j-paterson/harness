@@ -1,10 +1,16 @@
 """Tests for model tier configuration and characterization."""
 
+import json
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
+from hermes_orchestrator import claude as claude_module
+from hermes_orchestrator.claude import ClaudeRunner, LeadTurnRequest
+from hermes_orchestrator.cli import subagent_gate
 from hermes_orchestrator.model_tiers import ModelTier, load_model_tiers
+from hermes_orchestrator.profiles import ProfileRegistry
 
 
 def test_load_real_config():
@@ -37,7 +43,8 @@ def test_sonnet_tier_properties():
     sonnet = tiers["sonnet"]
     assert sonnet.name == "sonnet"
     assert sonnet.model == "sonnet"
-    assert sonnet.default_effort == "high"
+    # INFRA-211: ordinary bounded implementation work is medium.
+    assert sonnet.default_effort == "medium"
     assert sonnet.policy
     assert len(sonnet.policy) > 0
 
@@ -50,7 +57,8 @@ def test_fable_tier_properties():
     fable = tiers["fable"]
     assert fable.name == "fable"
     assert fable.model == "fable"
-    assert fable.default_effort == "high"
+    # INFRA-211: the managed lead plans at medium unless justified higher.
+    assert fable.default_effort == "medium"
     assert fable.policy
     assert len(fable.policy) > 0
 
@@ -275,3 +283,108 @@ def test_policies_are_non_empty():
         assert tier.policy, f"Policy for {tier_name} is empty"
         assert isinstance(tier.policy, str)
         assert len(tier.policy) > 0
+
+
+# INFRA-211: the effort a managed launch records must come from the tier
+# config above, not from a literal at the launch site.
+
+REAL_CONFIG = Path(__file__).parent.parent / "config" / "model-tiers.yaml"
+
+
+def _runner(tmp_path: Path) -> ClaudeRunner:
+    config = tmp_path / "profiles.yaml"
+    config.write_text(
+        "profiles:\n"
+        + "".join(
+            f"  - alias: max-{alias}\n    config_dir: {tmp_path / alias}\n"
+            for alias in ("a", "b", "c", "d")
+        ),
+        encoding="utf-8",
+    )
+    return ClaudeRunner(
+        ProfileRegistry.load(config),
+        prompt_file=tmp_path / "claude-lead.md",
+        base_env={"PATH": "/usr/bin"},
+    )
+
+
+def _lead_effort(runner: ClaudeRunner, tmp_path: Path) -> str:
+    command, _env = runner.build_command(
+        LeadTurnRequest(
+            session_id=UUID("11111111-1111-4111-8111-111111111111"),
+            cwd=tmp_path,
+            prompt="Plan ENG-9",
+            profile_alias="max-a",
+        )
+    )
+    return command[command.index("--effort") + 1]
+
+
+def test_lead_turn_effort_is_the_configured_fable_default(tmp_path):
+    """The managed lead turn records the fable tier's configured effort."""
+    claude_module.configured_model_tiers.cache_clear()
+    assert _lead_effort(_runner(tmp_path), tmp_path) == "medium"
+    assert (
+        _lead_effort(_runner(tmp_path), tmp_path)
+        == load_model_tiers(REAL_CONFIG)["fable"].default_effort
+    )
+
+
+def test_lead_turn_effort_follows_the_tier_config(tmp_path, monkeypatch):
+    """Reconfiguring the fable tier moves the lead turn -- no literal survives."""
+    config = tmp_path / "model-tiers.yaml"
+    config.write_text(
+        REAL_CONFIG.read_text(encoding="utf-8").replace(
+            'model: "fable"\n    default_effort: "medium"',
+            'model: "fable"\n    default_effort: "low"',
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(claude_module, "_MODEL_TIERS_PATH", config)
+    claude_module.configured_model_tiers.cache_clear()
+    try:
+        assert _lead_effort(_runner(tmp_path), tmp_path) == "low"
+    finally:
+        claude_module.configured_model_tiers.cache_clear()
+
+
+class _RecordingAdmission:
+    """Records the effort the gate hands admission; always allows."""
+
+    def __init__(self) -> None:
+        self.effort: str | None = None
+
+    def admit(self, *, session_id, packet_id, model, effort, tool_use_id):
+        self.effort = effort
+        return type("Decision", (), {"allowed": True, "reason": "reserved"})()
+
+
+def _gate_effort(tmp_path: Path, tool_input: dict) -> str | None:
+    admission = _RecordingAdmission()
+    payload = json.dumps(
+        {"session_id": "s-1", "tool_input": tool_input, "tool_use_id": "t-1"}
+    )
+    code, _message = subagent_gate(tmp_path, payload, admission=admission)
+    assert code == 0
+    return admission.effort
+
+
+def test_gate_defaults_an_unspecified_effort_to_the_tier_default(tmp_path):
+    """A sonnet launch that names no effort takes sonnet's configured default."""
+    claude_module.configured_model_tiers.cache_clear()
+    effort = _gate_effort(
+        tmp_path,
+        {"description": f"packet:{'a' * 32}", "model": "sonnet"},
+    )
+    assert effort == load_model_tiers(REAL_CONFIG)["sonnet"].default_effort
+    assert effort == "medium"
+
+
+def test_gate_preserves_an_explicitly_requested_high_effort(tmp_path):
+    """An explicitly justified high effort still reaches admission unchanged."""
+    claude_module.configured_model_tiers.cache_clear()
+    effort = _gate_effort(
+        tmp_path,
+        {"description": f"packet:{'a' * 32}", "model": "sonnet", "effort": "high"},
+    )
+    assert effort == "high"

@@ -5,9 +5,9 @@ tiers:
     policy: "mechanical inspection and one-file edits"
   sonnet:
     model: "sonnet"
-    default_effort: "high"
+    default_effort: "medium"
     policy: "bounded multi-file implementation"
   fable:
     model: "fable"
-    default_effort: "high"
+    default_effort: "medium"
     policy: "orchestration, integration, ambiguity, security-sensitive work; the lead itself"

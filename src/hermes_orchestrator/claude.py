@@ -12,15 +12,46 @@ import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from hermes_orchestrator.model_tiers import ModelTier, load_model_tiers
 from hermes_orchestrator.processes import ProcessRegistry, register_spawned
 from hermes_orchestrator.profiles import ProfileRegistry
 
 if TYPE_CHECKING:
     from hermes_orchestrator.control_operations import ControlOperations
+
+# INFRA-211: effort is a tier property, so every managed launch reads it
+# from the one tier config instead of carrying its own literal. The path
+# is the repository's own config/ (src/hermes_orchestrator/claude.py ->
+# repo root); no new config key, and no new collaborator threaded
+# through ClaudeRunner's callers.
+_MODEL_TIERS_PATH = Path(__file__).resolve().parents[2] / "config" / "model-tiers.yaml"
+# Only used when the tier config is unreadable: the launch still has to
+# name an effort, and the conservative choice is the new default, never
+# the amplified "high" this issue removes.
+_UNCONFIGURED_EFFORT = "medium"
+
+
+@lru_cache(maxsize=1)
+def configured_model_tiers() -> dict[str, ModelTier]:
+    """The repository's tier config; empty when it cannot be read."""
+
+    try:
+        return load_model_tiers(_MODEL_TIERS_PATH)
+    except (OSError, ValueError):
+        return {}
+
+
+def tier_default_effort(tier_name: str) -> str:
+    """Configured default effort for one tier."""
+
+    tier = configured_model_tiers().get(tier_name)
+    return tier.default_effort if tier is not None else _UNCONFIGURED_EFFORT
+
 
 _SYNTHETIC_MODEL = "<synthetic>"
 _MAX_STREAM_LINE_BYTES = 1024 * 1024
@@ -494,7 +525,8 @@ class ClaudeRunner:
             "--model",
             "fable",
             "--effort",
-            "high",
+            # INFRA-211: the fable tier's configured default, not a literal.
+            tier_default_effort("fable"),
         ]
         if self._freeze_dir is not None:
             command.extend(["--settings", self.hook_settings()])
