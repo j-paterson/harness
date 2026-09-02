@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -136,6 +137,60 @@ class DiskUsageLike(Protocol):
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def bound_process_rss(
+    database: SampleExecutor,
+    *,
+    process_iter: Callable[[], Iterable[Any]] = psutil.process_iter,
+    daemon_pid: int | None = None,
+) -> int:
+    """Measure the daemon and Claude trees bound to current project cells."""
+
+    active_states = ("starting", "active", "handoff_required", "paused")
+    placeholders = ",".join("?" for _ in active_states)
+    rows = database.execute(
+        f"SELECT session_id FROM project_cells WHERE state IN ({placeholders}) "
+        "AND session_id IS NOT NULL",
+        active_states,
+    ).fetchall()
+    sessions = {str(row["session_id"]) for row in rows}
+    daemon_pid = os.getpid() if daemon_pid is None else daemon_pid
+    try:
+        processes = tuple(process_iter())
+    except (OSError, psutil.Error):
+        return 0
+
+    roots: list[Any] = []
+    for process in processes:
+        try:
+            command = tuple(str(part) for part in process.cmdline())
+            is_bound_lead = any(
+                command[index] in {"--resume", "--session-id"}
+                and command[index + 1] in sessions
+                for index in range(len(command) - 1)
+            )
+            if int(process.pid) == daemon_pid or is_bound_lead:
+                roots.append(process)
+        except (OSError, psutil.Error):
+            continue
+
+    total = 0
+    seen: set[int] = set()
+    for root in roots:
+        try:
+            members = (root, *root.children(recursive=True))
+        except (OSError, psutil.Error):
+            members = (root,)
+        for member in members:
+            try:
+                pid = int(member.pid)
+                if pid not in seen:
+                    total += int(member.memory_info().rss)
+                    seen.add(pid)
+            except (OSError, psutil.Error):
+                continue
+    return total
 
 
 class ResourceSampler:
