@@ -4098,6 +4098,24 @@ def test_intake_poll_dispatches_ready_work_at_the_idle_boundary(
     assert linear.targets == [("INFRA-9", "In Development", "operator")]
 
 
+def test_intake_poll_dispatches_despite_an_outstanding_child(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-211: Fable owns child supervision and leads work several
+    issues at once, so an outstanding child must not gate dispatch.
+    The all-or-nothing continuation gate froze the whole seat behind
+    one unsettled child; capacity alone bounds this now."""
+
+    _repo_root, state_dir = configured_repo
+    _seed_idle_dispatch(state_dir, outstanding_child=True)
+    _patch_idle_linear(monkeypatch, _IdleLinear())
+
+    result = _poll_at_idle_boundary(configured_repo, monkeypatch)
+
+    assert result.exit_code == 0
+    assert _idle_dispatch_counts(state_dir) == (1, 1, "in_development")
+
+
 def test_intake_poll_idle_dispatch_commits_locally_before_projecting(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4150,7 +4168,6 @@ def test_intake_poll_idle_dispatch_commits_locally_before_projecting(
         ),
         pytest.param({"pressure": "red"}, False, id="red-sample"),
         pytest.param({"pressure": None}, False, id="no-sample"),
-        pytest.param({"outstanding_child": True}, False, id="outstanding-children"),
         pytest.param({"with_cell": False}, True, id="no-live-cell"),
         pytest.param(
             {"sampled_at": "not-a-timestamp"}, False, id="malformed-sampled-at"

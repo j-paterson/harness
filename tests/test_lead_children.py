@@ -557,3 +557,113 @@ def test_same_cwd_with_the_wrong_cmux_surface_stays_foreign(
     assert _canonical_session(database, CLEARED_SESSION, str(tmp_path)) == (
         CLEARED_SESSION
     )
+
+
+def test_a_deliberately_stopped_child_settles_from_the_cli(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-198: a child the lead stops on purpose never gets a
+    SubagentStop, so its row pins the seat forever. The lead knows the
+    child's agent_id but not the seat's durable session id, so
+    ``child-stop --child <agent_id>`` must resolve the seat from the
+    SAME cwd evidence every hook entry already uses and settle the
+    child through the normal lifecycle. Running it twice is a durable
+    no-op."""
+
+    import argparse
+    import os
+
+    from hermes_orchestrator.cli import _child_event
+    from tests.test_cmux_surfaces import LEAD
+
+    monkeypatch.chdir(tmp_path)
+    seed_active_cell(database)
+    seed_live_channel(database, os.getcwd())
+    seed_live_anchor(database, tmp_path)
+    monkeypatch.setenv("CMUX_WORKSPACE_ID", LEAD.workspace_uuid)
+    monkeypatch.setenv("CMUX_SURFACE_ID", LEAD.surface_uuid)
+    tracker = LeadChildTracker(
+        database,
+        control=ControlOperations(
+            database, events=EventStore(database), now=lambda: NOW
+        ),
+        now=lambda: NOW,
+    )
+    assert tracker.child_started(SESSION, "a1b2c3d4e5f60718") is True
+    assert tracker.record_turn_stop(SESSION) is not None
+    # No hook payload at all: the deliberate CLI invocation names only
+    # the child, and a terminal stdin must never be read.
+    monkeypatch.setattr(
+        "sys.stdin", type("Tty", (), {"isatty": lambda self: True})()
+    )
+    args = argparse.Namespace(
+        state_dir=tmp_path, session=None, child="a1b2c3d4e5f60718"
+    )
+
+    assert _child_event(args, completed=True) == 0
+
+    assert (
+        database.scalar(
+            "SELECT state FROM lead_children WHERE child_id = ?",
+            ("a1b2c3d4e5f60718",),
+        )
+        == "completed"
+    )
+    assert (
+        database.scalar(
+            "SELECT state FROM lead_continuations WHERE session_id = ?",
+            (SESSION,),
+        )
+        == "reactivated"
+    )
+    assert reactivations(database) == 1
+    # The next genuine Stop now owes nothing, so dispatch is free.
+    assert tracker.record_turn_stop(SESSION) is None
+    settled = durable_snapshot(database)
+
+    assert _child_event(args, completed=True) == 0
+
+    assert durable_snapshot(database) == settled
+
+
+def test_an_outstanding_child_no_longer_freezes_dispatch(
+    database: Database,
+) -> None:
+    """INFRA-211: Fable owns child supervision and works several issues
+    at once, so an outstanding child must NOT gate new dispatch. The
+    Stop still records the continuation that drives reactivation; it
+    simply stops being an all-or-nothing gate, and capacity alone
+    (lane cap + resource ceiling) bounds what dispatches."""
+
+    from hermes_orchestrator.control_operations import ControlOperations
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_children import LeadChildTracker
+
+    seed_active_cell(database)
+    tracker = LeadChildTracker(
+        database,
+        control=ControlOperations(database, events=EventStore(database)),
+    )
+    tracker.child_started(SESSION, "child-live")
+
+    continuation = tracker.record_turn_stop(SESSION)
+
+    # The promise is still recorded -- reactivation depends on it --
+    # but the caller no longer treats it as a dispatch veto.
+    assert continuation is not None
+    assert (
+        database.scalar(
+            "SELECT state FROM lead_continuations WHERE session_id = ?",
+            (SESSION,),
+        )
+        == "waiting"
+    )
+    # The child stays outstanding: this must not settle it silently.
+    assert (
+        database.scalar(
+            "SELECT state FROM lead_children WHERE session_id = ? "
+            "AND child_id = 'child-live'",
+            (SESSION,),
+        )
+        == "started"
+    )
