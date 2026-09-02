@@ -80,10 +80,13 @@ from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.git import GitError, GitRunner, WorktreeGit
 from hermes_orchestrator.handoffs import (
+    DerivedFacts,
     HandoffRecord,
     HandoffRejected,
     HandoffService,
+    LiveCell,
     derived_handoff_document,
+    validate_handoff_identity,
 )
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.issue_targeting import (
@@ -4648,6 +4651,129 @@ def _compose_lead_rotation(
     )
 
 
+def _modified_files(path: Path, base_branch: str) -> list[str]:
+    """Paths changed on this worktree's branch relative to the fetched
+    integration branch (INFRA-184), read-only.
+
+    Follows the exact fail-closed idiom ``_worktree_state`` already
+    uses for its own git probes: any failure (missing worktree, no
+    fetched ``origin/<base_branch>``, git itself absent) maps to an
+    empty list rather than raising, so a handoff submission is never
+    blocked by an unreadable probe -- ``derived_handoff_document``
+    renders an honest "no files changed" fallback instead.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "diff",
+                "--name-only",
+                f"origin/{base_branch}...HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _derived_pull_request(
+    database: Database, *, project_key: str, issue_id: str
+) -> str:
+    """The most recent durably recorded pull request for this issue.
+
+    Sourced from ``reviews`` (INFRA-166), the one table that binds a
+    ``pr_number`` directly to an ``issue_id``: ``ci_merge_ledger`` and
+    ``github_merge_effects`` record merges but not issue identity, so
+    they cannot be scoped to a single issue's handoff without guessing.
+    The GitHub API is never called -- an issue with no recorded review
+    reports "none recorded in durable state" rather than reaching out.
+    """
+
+    row = database.execute(
+        "SELECT repository, pr_number, state FROM reviews "
+        "WHERE project_key = ? AND issue_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (project_key, issue_id),
+    ).fetchone()
+    if row is None:
+        return "none recorded in durable state"
+    repository = str(row["repository"])
+    pr_number = int(row["pr_number"])
+    state = str(row["state"])
+    return f"#{pr_number} {state} https://github.com/{repository}/pull/{pr_number}"
+
+
+def _derived_test_results(database: Database, issue_id: str) -> list[str]:
+    """Observed test/acceptance evidence durably recorded for this issue.
+
+    Two sources, both scoped by ``issue_id`` (INFRA-184):
+    ``subagent_packets.evidence_json`` for each accepted packet (diff
+    scope, red/green proof references reviewed at acceptance), and
+    ``acceptance_gates.evidence_json`` for a satisfied acceptance gate.
+    ``verification_receipts`` is deliberately NOT read here -- it keys
+    on ``gate_id``/``tree_hash`` with no ``issue_id`` or ``cell_id``
+    column, so there is no durable way to scope a receipt to one
+    issue's handoff without guessing at a tree match.
+    """
+
+    results: list[str] = []
+    for row in database.execute(
+        "SELECT packet_id, evidence_json FROM subagent_packets "
+        "WHERE issue_id = ? AND state = 'accepted' "
+        "ORDER BY updated_at ASC, rowid ASC",
+        (issue_id,),
+    ).fetchall():
+        packet_id = str(row["packet_id"])
+        evidence_json = row["evidence_json"]
+        evidence = json.loads(str(evidence_json)) if evidence_json else {}
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(evidence.items()))
+        outcome = f"accepted{': ' + summary if summary else ''}"
+        results.append(f"subagent packet {packet_id} — {outcome}")
+    for row in database.execute(
+        "SELECT instruction_id, evidence_json FROM acceptance_gates "
+        "WHERE issue_id = ? AND state = 'satisfied'",
+        (issue_id,),
+    ).fetchall():
+        instruction_id = str(row["instruction_id"])
+        evidence_json = row["evidence_json"]
+        pairs = json.loads(str(evidence_json)) if evidence_json else []
+        summary = ", ".join(f"{k}={v}" for k, v in pairs)
+        outcome = f"satisfied{': ' + summary if summary else ''}"
+        results.append(f"acceptance gate {instruction_id} — {outcome}")
+    return results
+
+
+def _derived_pending_corrections(
+    database: Database, *, project_key: str, issue_id: str
+) -> list[str]:
+    """Merger correction packets still awaiting the lead's
+    acknowledgement for this issue (INFRA-184), read from the
+    ``lead_corrections`` outbox via the existing
+    :class:`LeadCorrectionOutbox` port -- never queried as raw SQL, and
+    never delivered as a Linear comment.
+    """
+
+    outbox = LeadCorrectionOutbox(
+        database=database,
+        events=EventStore(database),
+        # Only ``pending()`` is used below, which never resolves this
+        # callback: it exists solely to satisfy the port's constructor.
+        project_for_issue=lambda _issue_id: project_key,
+    )
+    return [
+        f"{correction.correction_id} ({correction.source}, pr #{correction.pr_number})"
+        for correction in outbox.pending(project_key)
+        if correction.issue_id == issue_id
+    ]
+
+
 def _submit_handoff(
     args: argparse.Namespace, settings: Any, runtime: Any, database: Database
 ) -> int:
@@ -4714,7 +4840,8 @@ def _submit_handoff(
         return 1
     if lane is not None:
         issue_id = lane.issue_id
-        worktree = _worktree_state(lane.path)
+        probe_path = lane.path
+        worktree = _worktree_state(probe_path)
         issue_state = next(
             (
                 str(row["state"])
@@ -4745,12 +4872,30 @@ def _submit_handoff(
         # Preserved fallback: an unassigned cell in a project with at
         # most one active issue behaves exactly as it did before, down
         # to the coordinator worktree probe.
-        worktree = _worktree_state(project.lead_cwd)
+        probe_path = project.lead_cwd
+        worktree = _worktree_state(probe_path)
         issue_id, issue_state = (
             (str(issue_rows[0]["issue_id"]), str(issue_rows[0]["state"]))
             if len(issue_rows) == 1
             else ("none", "unknown")
         )
+    # INFRA-184: every remaining mechanical fact -- the pull request,
+    # the files actually changed, observed test/acceptance evidence,
+    # and pending Merger corrections -- is derived from durable rows
+    # and a read-only git probe, never supplied by the incumbent or
+    # fetched from the GitHub API.
+    facts = DerivedFacts(
+        pull_request=_derived_pull_request(
+            database, project_key=project_key, issue_id=issue_id
+        ),
+        modified_files=tuple(_modified_files(probe_path, project.integration_branch)),
+        test_results=tuple(_derived_test_results(database, issue_id)),
+        pending_corrections=tuple(
+            _derived_pending_corrections(
+                database, project_key=project_key, issue_id=issue_id
+            )
+        ),
+    )
     document = derived_handoff_document(
         cell_id=args.cell,
         project_key=project_key,
@@ -4764,7 +4909,39 @@ def _submit_handoff(
         caveats=list(args.caveats),
         risks=list(args.risks),
         next_action=args.next_action,
+        facts=facts,
     )
+    # INFRA-184: mechanical identity validation, fail-closed, BEFORE
+    # any durable write. The document is built from the cell row read
+    # above; this re-reads the live row right before submission and
+    # refuses on any drift (the cell reassigned, or its session
+    # rotated) rather than writing a handoff for a seat that has since
+    # moved.
+    live_cell_row = database.execute(
+        "SELECT cell_id, session_id FROM project_cells WHERE cell_id = ?",
+        (args.cell,),
+    ).fetchone()
+    if live_cell_row is None:
+        message = f"handoff refused: cell {args.cell!r} no longer exists"
+        _print({"error": message}, json_output=args.json, human=f"{message}.")
+        return 1
+    live_session = live_cell_row["session_id"]
+    try:
+        validate_handoff_identity(
+            document,
+            LiveCell(
+                cell_id=str(live_cell_row["cell_id"]),
+                session_id=(str(live_session) if live_session is not None else None),
+            ),
+            requesting_session_id=str(cell["session_id"]),
+        )
+    except HandoffRejected as error:
+        _print(
+            {"error": str(error)},
+            json_output=args.json,
+            human=f"handoff refused: {error}",
+        )
+        return 1
     handoffs = HandoffService(database)
     submitted: list[HandoffRecord] = []
     # The existing post-commit listener idiom: the durable submission

@@ -14,6 +14,7 @@ from hermes_orchestrator.context import (
     ActiveTimeTracker,
     ContextMonitor,
     ContextSignal,
+    derive_context_occupancy,
 )
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
@@ -138,3 +139,131 @@ def test_decision_is_sticky_and_durable(
 def test_naive_clock_is_rejected(active_time: ActiveTimeTracker) -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         active_time.open("worker-1", datetime(2026, 8, 28, 8))
+
+
+# -- derive_context_occupancy (INFRA-184) --------------------------------
+
+
+def test_derive_context_occupancy_authoritative_percent_wins() -> None:
+    # A cumulative-shaped usage dict is supplied alongside an
+    # authoritative reading; the authoritative figure always wins and the
+    # cumulative fields are never touched.
+    measurement = derive_context_occupancy(
+        {"input_tokens": 900_000, "cache_read_input_tokens": 5_000_000},
+        window_tokens=200_000,
+        authoritative_percent=42.5,
+    )
+    assert measurement.percent == 42.5
+    assert measurement.source == "authoritative"
+    assert measurement.uncertainty is None
+    assert measurement.occupied_tokens == 85_000
+
+
+def test_derive_context_occupancy_out_of_range_authoritative_percent_falls_back() -> (
+    None
+):
+    measurement = derive_context_occupancy(
+        {"input_tokens": 20_000},
+        window_tokens=100_000,
+        authoritative_percent=142.0,
+    )
+    assert measurement.source == "lead_estimate"
+    assert measurement.percent == 20.0
+
+
+def test_derive_context_occupancy_single_call_estimate() -> None:
+    # input + cache_creation + cache_read for ONE call is legitimately
+    # that call's own prompt size.
+    measurement = derive_context_occupancy(
+        {"input_tokens": 40_000, "cache_creation_input_tokens": 10_000},
+        window_tokens=100_000,
+    )
+    assert measurement.percent == 50.0
+    assert measurement.occupied_tokens == 50_000
+    assert measurement.source == "lead_estimate"
+    assert measurement.uncertainty is None
+
+
+def test_derive_context_occupancy_clamps_impossible_percent() -> None:
+    # The observed shape: a monotonically-growing cache_read_input_tokens
+    # counter read back as though it were this call's own live window
+    # occupancy -- exactly what produced the false "1704% full" rotation.
+    measurement = derive_context_occupancy(
+        {"cache_read_input_tokens": 3_408_000},
+        window_tokens=200_000,
+    )
+    assert measurement.percent == 100.0
+    assert measurement.source == "lead_estimate"
+    assert measurement.uncertainty == "impossible_percent:1704.0"
+
+
+def test_derive_context_occupancy_negative_field_is_dropped_and_flagged() -> None:
+    measurement = derive_context_occupancy(
+        {"input_tokens": -5, "cache_read_input_tokens": 30_000},
+        window_tokens=100_000,
+    )
+    assert measurement.percent == 30.0
+    assert measurement.occupied_tokens == 30_000
+    assert measurement.source == "lead_estimate"
+    assert measurement.uncertainty == "negative_field:input_tokens:-5"
+
+
+# -- uncertain signals never rotate alone (INFRA-184) --------------------
+
+
+def test_uncertain_signal_never_satisfies_rotation_threshold_alone(
+    context_monitor: ContextMonitor,
+) -> None:
+    decision = context_monitor.record(
+        signal(percent=100.0, uncertainty="impossible_percent:1704.0")
+    )
+    assert decision.state == "healthy"
+    assert any("uncertain" in reason for reason in decision.reasons)
+    assert decision.evidence["uncertainty"] == "impossible_percent:1704.0"
+
+
+def test_uncertain_signal_does_not_become_durable_fallback_percent(
+    context_monitor: ContextMonitor,
+) -> None:
+    context_monitor.record(signal(percent=50.0))
+    decision = context_monitor.record(
+        signal(percent=100.0, uncertainty="impossible_percent:1704.0")
+    )
+    assert decision.evidence["percent"] == 50.0
+    # A later signal-less turn (no fresh percent reported at all) must
+    # inherit the last TRUSTED percent, never the discarded uncertain one.
+    decision = context_monitor.record(signal(percent=None))
+    assert decision.evidence["percent"] == 50.0
+    assert decision.state == "healthy"
+
+
+def test_six_active_hours_still_fires_alongside_uncertain_measurement(
+    context_monitor: ContextMonitor,
+) -> None:
+    context_monitor.record(
+        signal(percent=100.0, uncertainty="impossible_percent:1704.0")
+    )
+    decision = context_monitor.record(signal(active_hours=6.2, safe_boundary=True))
+    assert decision.state == "rotate_now"
+
+
+def test_context_error_still_fires_alongside_uncertain_measurement(
+    context_monitor: ContextMonitor,
+) -> None:
+    context_monitor.record(
+        signal(percent=100.0, uncertainty="impossible_percent:1704.0")
+    )
+    decision = context_monitor.record(signal(context_error=True, safe_boundary=False))
+    assert decision.state == "rotate_now"
+    assert "emergency" in decision.reasons[0]
+
+
+def test_compaction_and_rapid_refill_still_fire_alongside_uncertain_measurement(
+    context_monitor: ContextMonitor,
+) -> None:
+    context_monitor.record(
+        signal(percent=100.0, uncertainty="impossible_percent:1704.0")
+    )
+    assert context_monitor.record(signal(compaction=True)).state == "prepare"
+    decision = context_monitor.record(signal(compaction=True, rapid_refill=True))
+    assert decision.state == "rotation_pending"

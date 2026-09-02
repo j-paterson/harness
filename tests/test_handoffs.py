@@ -282,3 +282,131 @@ def test_derived_document_from_an_unreadable_worktree_fails_submission(
 
     with pytest.raises(HandoffRejected, match=r"branch|commits"):
         handoffs.submit(document)
+
+
+def test_derived_handoff_document_reports_real_pr_files_tests_and_corrections() -> None:
+    """INFRA-184: the pull request, the files actually changed, observed
+    test/acceptance evidence, and pending Merger corrections all come
+    from the caller's ``DerivedFacts`` -- not a synthetic one-line
+    placeholder -- and land in the document's existing sections."""
+
+    from hermes_orchestrator.handoffs import DerivedFacts, derived_handoff_document
+
+    document = derived_handoff_document(
+        cell_id="cell-demo",
+        project_key="demo",
+        session_id="11111111-1111-4111-8111-111111111111",
+        profile_alias="max-b",
+        issue_id="ENG-9",
+        issue_state="in_development",
+        branch="feature/eng-9",
+        head="abc123",
+        decisions=["Keep the existing public interface."],
+        caveats=["CI flake on the network suite."],
+        risks=["Schema migration is irreversible."],
+        next_action="Run the failing test and correct ENG-9.",
+        facts=DerivedFacts(
+            pull_request="#91 open https://github.com/owner/demo/pull/91",
+            modified_files=("src/example.py", "tests/test_example.py"),
+            test_results=(
+                "subagent packet packet-1 — accepted: diff=scoped",
+                "acceptance gate instr-1 — satisfied: predicate=covered",
+            ),
+            pending_corrections=("correction-1 (codex, pr #91)",),
+        ),
+    )
+
+    assert document.pull_request == "#91 open https://github.com/owner/demo/pull/91"
+    assert document.modified_files == ["src/example.py", "tests/test_example.py"]
+    assert [test.command for test in document.tests] == [
+        "subagent packet packet-1",
+        "acceptance gate instr-1",
+    ]
+    assert [test.outcome for test in document.tests] == [
+        "accepted: diff=scoped",
+        "satisfied: predicate=covered",
+    ]
+    assert any(
+        "correction-1 (codex, pr #91)" in note for note in document.environment_notes
+    )
+    # The incumbent's own inputs are untouched by the derived facts.
+    assert document.decisions == ["Keep the existing public interface."]
+    assert document.blockers == ["CI flake on the network suite."]
+    assert document.risks == ["Schema migration is irreversible."]
+
+
+def test_derived_handoff_document_falls_back_when_no_facts_are_recorded(
+    handoffs: HandoffService,
+) -> None:
+    """No durable PR/test/correction evidence exists yet: the document
+    still satisfies every non-empty field with an honest placeholder,
+    not silence, and submits cleanly."""
+
+    from hermes_orchestrator.handoffs import derived_handoff_document
+
+    document = derived_handoff_document(
+        cell_id="cell-demo",
+        project_key="demo",
+        session_id="11111111-1111-4111-8111-111111111111",
+        profile_alias="max-b",
+        issue_id="ENG-9",
+        issue_state="in_development",
+        branch="feature/eng-9",
+        head="abc123",
+        decisions=["Keep the existing public interface."],
+        caveats=[],
+        risks=[],
+        next_action="Run the failing test and correct ENG-9.",
+    )
+
+    assert document.pull_request == "none recorded in durable state"
+    assert document.modified_files
+    assert document.tests[0].outcome == "none recorded in durable state"
+    assert any(
+        "no pending Merger corrections" in note for note in document.environment_notes
+    )
+    handoffs.submit(document)
+
+
+def test_validate_handoff_identity_refuses_mismatched_cell_or_session() -> None:
+    """INFRA-184: identity is validated mechanically before submission.
+    A document naming a different cell than the live submitting seat,
+    and a live cell whose session no longer matches who is submitting,
+    both refuse -- fail closed, no write."""
+
+    from hermes_orchestrator.handoffs import LiveCell, validate_handoff_identity
+
+    document = valid_handoff().model_copy(update={"cell_id": "cell-demo"})
+
+    # cell_id mismatch: the document names a cell other than the live
+    # submitting seat.
+    with pytest.raises(HandoffRejected, match="cell"):
+        validate_handoff_identity(
+            document,
+            LiveCell(cell_id="cell-other", session_id="session-1"),
+            requesting_session_id="session-1",
+        )
+
+    # session mismatch: the live cell has been reassigned to a
+    # different session since the document was derived.
+    with pytest.raises(HandoffRejected, match="session"):
+        validate_handoff_identity(
+            document,
+            LiveCell(cell_id="cell-demo", session_id="session-2"),
+            requesting_session_id="session-1",
+        )
+
+    # a live cell with no session at all (never seated) also refuses.
+    with pytest.raises(HandoffRejected, match="session"):
+        validate_handoff_identity(
+            document,
+            LiveCell(cell_id="cell-demo", session_id=None),
+            requesting_session_id="session-1",
+        )
+
+    # matching identity does not raise.
+    validate_handoff_identity(
+        document,
+        LiveCell(cell_id="cell-demo", session_id="session-1"),
+        requesting_session_id="session-1",
+    )
