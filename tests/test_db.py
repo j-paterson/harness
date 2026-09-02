@@ -9,18 +9,74 @@ def test_database_applies_migration_once(tmp_path: Path) -> None:
     database_path = tmp_path / "state.db"
 
     database = Database.open(database_path)
-    assert database.schema_version() == 56
+    assert database.schema_version() == 57
     database.close()
 
     reopened = Database.open(database_path)
     try:
-        assert reopened.schema_version() == 56
+        assert reopened.schema_version() == 57
         assert reopened.scalar("PRAGMA integrity_check") == "ok"
         assert reopened.scalar("PRAGMA foreign_keys") == 1
         assert reopened.scalar("PRAGMA journal_mode") == "wal"
         assert reopened.scalar("PRAGMA busy_timeout") == 5000
     finally:
         reopened.close()
+
+
+def test_migration_0057_backfills_legacy_harness_bindings(tmp_path: Path) -> None:
+    database_path = tmp_path / "state.db"
+    migrations = Path(hermes_orchestrator.db.__file__).with_name("migrations")
+    connection = sqlite3.connect(database_path)
+    try:
+        for migration_path in sorted(migrations.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+            version = int(migration_path.name.split("_", maxsplit=1)[0])
+            if version > 56:
+                continue
+            connection.executescript(migration_path.read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO project_cells(cell_id, project_key, state, profile_alias, "
+            "session_id, created_at, updated_at, lane_role) VALUES "
+            "('harness-cell', 'demo', 'active', 'max-d', 'session-live', "
+            "'2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00', 'harness')"
+        )
+        for binding_id, state, session_id in (
+            ("incumbent", "stale", "session-live"),
+            ("failed-successor", "lost", "session-live"),
+            ("old-session", "closed", "session-old"),
+        ):
+            connection.execute(
+                "INSERT INTO cmux_surface_bindings("
+                "binding_id, role, project_key, cell_id, session_id, profile_alias, "
+                "workspace_uuid, surface_uuid, generation, state, created_at, "
+                "updated_at, lane_role) VALUES (?, 'lead', 'demo', 'harness-cell', "
+                "?, 'max-d', ?, ?, 1, ?, '2026-09-01T00:00:00+00:00', "
+                "'2026-09-01T00:00:00+00:00', 'development')",
+                (
+                    binding_id,
+                    session_id,
+                    f"workspace-{binding_id}",
+                    f"surface-{binding_id}",
+                    state,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database.open(database_path)
+    try:
+        assert database.schema_version() == 57
+        rows = database.execute(
+            "SELECT binding_id, lane_role FROM cmux_surface_bindings "
+            "ORDER BY binding_id"
+        ).fetchall()
+        assert [(str(row["binding_id"]), str(row["lane_role"])) for row in rows] == [
+            ("failed-successor", "harness"),
+            ("incumbent", "harness"),
+            ("old-session", "development"),
+        ]
+    finally:
+        database.close()
 
 
 def test_migration_0050_pins_the_capacity_observation_table(
@@ -82,7 +138,7 @@ def test_migration_0050_applies_on_a_schema_49_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 56
+        assert database.schema_version() == 57
         assert database.scalar("PRAGMA integrity_check") == "ok"
         assert (
             database.scalar(
@@ -146,7 +202,7 @@ def test_migration_0051_applies_on_a_schema_50_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 56
+        assert database.schema_version() == 57
         assert database.scalar("PRAGMA integrity_check") == "ok"
         row = database.execute(
             "SELECT state, replacement_session_id, replacement_profile_alias "
@@ -229,7 +285,7 @@ def test_migration_0052_applies_on_a_schema_51_database(tmp_path: Path) -> None:
 
     database = Database.open(database_path)
     try:
-        assert database.schema_version() == 56
+        assert database.schema_version() == 57
         assert database.scalar("PRAGMA integrity_check") == "ok"
         assert (
             database.scalar(
