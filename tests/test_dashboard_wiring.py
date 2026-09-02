@@ -535,7 +535,10 @@ async def test_upper_pane_stays_live_across_maintenance_intervals(
 import os  # noqa: E402
 import stat  # noqa: E402
 
-from hermes_orchestrator.cli import _ReadOnlyDashboardDatabase  # noqa: E402
+from hermes_orchestrator.cli import (  # noqa: E402
+    _dashboard_replacement_launcher,
+    _ReadOnlyDashboardDatabase,
+)
 
 
 def _recording_connect(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -550,6 +553,38 @@ def _recording_connect(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr(sqlite3, "connect", recorder)
     return recorded
+
+
+def test_dashboard_detects_a_new_active_runtime_through_the_stable_launcher(
+    tmp_path: Path,
+) -> None:
+    old_runtime = tmp_path / "runtimes" / "old"
+    new_runtime = tmp_path / "runtimes" / "new"
+    old_runtime.mkdir(parents=True)
+    new_runtime.mkdir()
+    (new_runtime / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    active = tmp_path / "runtimes" / "ACTIVE"
+    active.write_text(f"{new_runtime}\n", encoding="utf-8")
+    launcher = tmp_path / "bin" / "hermes-orchestrator"
+    launcher.parent.mkdir()
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    assert _dashboard_replacement_launcher(tmp_path, old_runtime) == launcher
+    assert _dashboard_replacement_launcher(tmp_path, new_runtime) is None
+
+
+def test_dashboard_stays_put_without_a_complete_deployed_replacement(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtimes" / "current"
+    runtime.mkdir(parents=True)
+
+    assert _dashboard_replacement_launcher(tmp_path, runtime) is None
+
+    (tmp_path / "runtimes" / "ACTIVE").write_text(
+        f"{tmp_path / 'runtimes' / 'new'}\n", encoding="utf-8"
+    )
+    assert _dashboard_replacement_launcher(tmp_path, runtime) is None
 
 
 def test_write_forbidden_filesystem_fails_closed_no_immutable_retry(

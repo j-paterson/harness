@@ -3968,6 +3968,26 @@ class _ReadOnlyDashboardDatabase:
         return self._connection.execute(sql, parameters)
 
 
+def _dashboard_replacement_launcher(
+    state_dir: Path, current_runtime: Path
+) -> Path | None:
+    """Return the stable launcher when ACTIVE moved to a complete runtime."""
+
+    pointer = state_dir / "runtimes" / "ACTIVE"
+    launcher = state_dir / "bin" / "hermes-orchestrator"
+    try:
+        active = Path(pointer.read_text(encoding="utf-8").strip()).resolve()
+    except OSError:
+        return None
+    if (
+        active == current_runtime.resolve()
+        or not (active / "pyproject.toml").is_file()
+        or not launcher.is_file()
+    ):
+        return None
+    return launcher
+
+
 def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
     """Run the lock-free read-only dashboard loop (the upper pane).
 
@@ -4077,6 +4097,7 @@ def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
             await action.tick()
             if args.once:
                 return 1
+            current_runtime = _code_checkout_root()
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
             for signum in (signal.SIGINT, signal.SIGTERM):
@@ -4089,6 +4110,14 @@ def _dashboard(args: argparse.Namespace, settings: Settings) -> int:
                         stop.wait(), timeout=args.interval
                     )
                     break
+                replacement = _dashboard_replacement_launcher(
+                    settings.state_dir, current_runtime
+                )
+                if replacement is not None:
+                    os.execv(
+                        str(replacement),
+                        [str(replacement), *sys.argv[1:]],
+                    )
                 await action.tick()
                 ticks += 1
             return ticks
