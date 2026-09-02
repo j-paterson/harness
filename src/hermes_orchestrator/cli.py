@@ -531,6 +531,39 @@ def _parser() -> argparse.ArgumentParser:
     )
     hooks_install.add_argument("--json", action="store_true")
 
+    claude_launch = commands.add_parser(
+        "claude-launch",
+        help=(
+            "INFRA-192: launch Claude on one named provider route "
+            "(first-party Max by default, bedrock only by explicit route) "
+            "with the child environment sanitized independent of cwd; "
+            "probes auth status first and refuses a route whose live "
+            "provider disagrees with its kind"
+        ),
+    )
+    claude_launch.add_argument("--route", required=True)
+    claude_launch.add_argument("claude_args", nargs=argparse.REMAINDER)
+
+    provider_probe = commands.add_parser(
+        "provider-probe",
+        help=(
+            "INFRA-192: run the live non-inference auth/status probe for "
+            "every configured route (or --route) and report identity-free "
+            "provider facts; exits 1 when any route fails closed"
+        ),
+    )
+    provider_probe.add_argument("--route", default=None)
+    provider_probe.add_argument("--json", action="store_true")
+
+    commands.add_parser(
+        "claude-shell-init",
+        help=(
+            "INFRA-192: print the zsh/bash functions (claude, claude-max-*, "
+            "claude-bedrock) that forward every launch to claude-launch "
+            "through the stable launcher; contains no secrets"
+        ),
+    )
+
     intake_poll = commands.add_parser(
         "intake-poll",
         help=(
@@ -3160,6 +3193,130 @@ def _runtime_apply(args: argparse.Namespace, settings: Settings) -> int:
     return 0 if report.state == "verified" else 1
 
 
+def _provider_routes(settings: Settings) -> Any:
+    """Load the closed route set: four Max profiles plus optional Bedrock.
+
+    INFRA-192: both files are local, gitignored selection metadata.
+    A missing file is a refusal with a pointer, never a silent
+    fallback to whatever the inherited environment would pick.
+    """
+
+    from hermes_orchestrator.profiles import ProfileRegistry
+    from hermes_orchestrator.provider_routes import ProviderRoutes
+
+    profile_path = settings.repo_root / "config" / "profiles.yaml"
+    providers_path = settings.repo_root / "config" / "providers.yaml"
+    if not profile_path.exists():
+        raise ValueError("config/profiles.yaml is required")
+    if not providers_path.exists():
+        raise ValueError(
+            "config/providers.yaml is required "
+            "(start from config/providers.example.yaml)"
+        )
+    registry = ProfileRegistry.load(profile_path)
+    return ProviderRoutes.load(providers_path, registry)
+
+
+def _claude_launch(args: argparse.Namespace, settings: Settings) -> int:
+    from hermes_orchestrator.provider_routes import (
+        ProviderProbe,
+        launch,
+        resolve_executable,
+    )
+
+    try:
+        routes = _provider_routes(settings)
+        executable = resolve_executable(routes)
+    except ValueError as error:
+        print(f"claude-launch refused: {error}", file=sys.stderr)
+        return 2
+    arguments = list(args.claude_args)
+    if arguments and arguments[0] == "--":
+        arguments = arguments[1:]
+    base_env = dict(os.environ)
+    probe = ProviderProbe(routes, base_env=base_env, executable=executable)
+    code, message = launch(
+        routes,
+        args.route,
+        arguments,
+        base_env=base_env,
+        executable=executable,
+        probe=probe,
+    )
+    if message:
+        print(message, file=sys.stderr)
+    return code
+
+
+def _provider_probe(args: argparse.Namespace, settings: Settings) -> int:
+    from hermes_orchestrator.provider_routes import (
+        ProviderProbe,
+        resolve_executable,
+    )
+
+    try:
+        routes = _provider_routes(settings)
+        executable = resolve_executable(routes)
+        names = tuple(routes.names) if args.route is None else (args.route,)
+        for name in names:
+            routes.route(name)
+    except ValueError as error:
+        print(f"provider-probe refused: {error}", file=sys.stderr)
+        return 2
+    probe = ProviderProbe(routes, base_env=dict(os.environ), executable=executable)
+    results = [probe.check(name) for name in names]
+    ok = all(result.ok for result in results)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": ok,
+                    "routes": [result.as_record() for result in results],
+                    "metadata": list(routes.metadata()),
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        for result in results:
+            print(
+                f"{result.route}\t{result.kind}\t"
+                f"{'ok' if result.ok else 'REFUSED'}\t{result.reason}\t"
+                f"{result.reported_provider or '-'}"
+            )
+    return 0 if ok else 1
+
+
+def _claude_shell_init(args: argparse.Namespace, settings: Settings) -> int:
+    from hermes_orchestrator.provider_routes import shell_init
+
+    try:
+        routes = _provider_routes(settings)
+    except ValueError as error:
+        print(f"claude-shell-init refused: {error}", file=sys.stderr)
+        return 2
+    launcher = settings.state_dir / "bin" / "hermes-orchestrator"
+    if not launcher.exists():
+        print(
+            "claude-shell-init refused: the stable launcher "
+            f"{launcher} does not exist. Deploy the runtime "
+            "(`hermes-orchestrator deploy-install`) so the launcher is "
+            "rendered, then re-run claude-shell-init; shell functions are "
+            "never bound to a mutable checkout.",
+            file=sys.stderr,
+        )
+        return 1
+    command = [
+        str(launcher),
+        "--repo-root",
+        str(settings.repo_root),
+        "--state-dir",
+        str(settings.state_dir),
+    ]
+    print(shell_init(routes, command), end="")
+    return 0
+
+
 def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
     """Install the Hermes hooks into every classic profile, idempotently.
 
@@ -4614,6 +4771,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _serve_console(args, settings)
     if args.command == "hooks-install":
         return _hooks_install(args, settings)
+    if args.command == "claude-launch":
+        return _claude_launch(args, settings)
+    if args.command == "provider-probe":
+        return _provider_probe(args, settings)
+    if args.command == "claude-shell-init":
+        return _claude_shell_init(args, settings)
     if args.command == "runtime-activate":
         return _runtime_activate(args, settings)
     if args.command == "verify":

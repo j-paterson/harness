@@ -1,0 +1,14 @@
+# INFRA-192: provider routes. Selection metadata only — never credentials.
+#
+# Ordinary `claude` (the "default" route) and every max-* route launch
+# first-party Claude Max with all Bedrock/AWS/other-provider selection
+# variables removed from the child environment, regardless of the
+# current working directory. Bedrock exists only when this optional
+# `bedrock` section is present, and only through the `bedrock` route
+# (`claude-bedrock` after `hermes-orchestrator claude-shell-init`).
+default_max_alias: max-d
+# claude_executable: /Users/OPERATOR/.local/bin/claude   # default: `claude` on PATH
+bedrock:
+  config_dir: /Users/OPERATOR/.claude-bedrock   # must not be a max-* config_dir
+  # aws_profile: dev        # plain AWS profile name; credentials come from ~/.aws / SSO
+  # aws_region: us-east-1

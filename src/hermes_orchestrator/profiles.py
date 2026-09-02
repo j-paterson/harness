@@ -15,25 +15,13 @@ from typing import Any, Protocol
 
 import yaml
 
+from hermes_orchestrator.provider_routes import MAX_ROUTE_SCRUBBED_KEYS
+
 _PROFILE_COUNT = 4
 _ALIAS_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_SCRUBBED_ENVIRONMENT_KEYS = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "AWS_PROFILE",
-        "AWS_REGION",
-        "AWS_DEFAULT_REGION",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "AZURE_CLIENT_SECRET",
-    }
-)
+# INFRA-192: the single source of truth for what a first-party Max child
+# environment must never inherit lives in provider_routes.
+_SCRUBBED_ENVIRONMENT_KEYS = MAX_ROUTE_SCRUBBED_KEYS
 
 
 @dataclass(frozen=True, slots=True)
