@@ -392,6 +392,39 @@ def test_capacity_row_capped_from_cache_used_at_100_percent() -> None:
     assert "capped" in max_a
 
 
+def test_capped_provider_observation_owns_its_reset_horizon() -> None:
+    windows = UsageWindows(
+        fetched_at="2026-08-31T11:59:00+00:00",
+        five_hour_used=100,
+        five_hour_resets_at="2026-08-31T20:00:00+00:00",
+        seven_day_used=50,
+        seven_day_resets_at="2026-09-01T20:00:00+00:00",
+        fable_used=100,
+        fable_resets_at="2026-09-01T20:00:00+00:00",
+        fable_severity="critical",
+        fable_active=True,
+    )
+    capacity = (
+        _capacity_fact(
+            "max-a",
+            state="capped",
+            source="provider_limit",
+            observed_at="2026-08-31T11:47:00+00:00",
+            resets_at="2026-08-31T12:47:00+00:00",
+            windows=windows,
+        ),
+        *(_capacity_fact(alias) for alias in _ALIASES[1:]),
+    )
+
+    lines = render_frame(
+        _frame_snapshot(capacity=capacity), width=100, height=20, now=_NOW
+    )
+    max_a = next(line for line in lines if line.strip().startswith("max-a"))
+
+    assert "resets in 47m" in max_a
+    assert "20:00Z" not in max_a
+
+
 def test_codex_row_shows_remaining_percent_or_unavailable() -> None:
     codex = CodexFact(
         available=True, primary_used_percent=12, secondary_used_percent=40
@@ -453,6 +486,23 @@ def test_attention_reports_nothing_needs_attention_when_all_clear() -> None:
     lines = render_frame(snapshot, width=60, height=20, now=_NOW)
     joined = "\n".join(lines)
     assert "nothing needs attention" in joined
+
+
+def test_channel_blocked_attention_does_not_claim_there_is_a_dialog() -> None:
+    snapshot = _frame_snapshot(
+        tasks=(_task(issue_id="INFRA-192", project_key="agent-orchestration"),),
+        attention_control=ControlAttentionFact(
+            kind="channel.blocked",
+            project_key="agent-orchestration",
+            created_at="2026-08-31T11:59:00+00:00",
+        ),
+    )
+
+    lines = render_frame(snapshot, width=80, height=20, now=_NOW)
+    joined = "\n".join(lines)
+
+    assert "channel blocked: agent-orchestration" in joined
+    assert "confirm channel dialog" not in joined
 
 
 def test_last_tick_failure_and_ok_are_shown() -> None:

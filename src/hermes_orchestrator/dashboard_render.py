@@ -715,7 +715,18 @@ def _later_of(left: datetime | None, right: datetime | None) -> datetime:
 
 
 def _capacity_reset_text(capacity: CapacityFact, now: datetime) -> str:
-    resets_at = capacity.windows.fable_resets_at or capacity.windows.seven_day_resets_at
+    provider_cap_reset = (
+        capacity.resets_at
+        if capacity.state == "capped"
+        and capacity.resets_at is not None
+        and _parse(capacity.resets_at) > now
+        else None
+    )
+    resets_at = (
+        provider_cap_reset
+        or capacity.windows.fable_resets_at
+        or capacity.windows.seven_day_resets_at
+    )
     if not resets_at:
         return ""
     resets = _parse(resets_at)
@@ -1103,6 +1114,20 @@ def _attention_text(snapshot: DashboardSnapshot, now: datetime) -> str:
             )
 
     if snapshot.attention_control is not None:
+        kind = snapshot.attention_control.kind
+        if kind != "channel.approval_required":
+            labels = {
+                "channel.blocked": "channel blocked",
+                "channel.rebind_refused": "channel rebind refused",
+                "channel.adopt_refused": "channel adoption refused",
+                "lead.launch_failed": "lead launch failed",
+                "lead.dead_worker_retired": "lead stopped",
+                "signal.failed": "wake failed",
+            }
+            return (
+                f"{labels.get(kind, kind)}: "
+                f"{snapshot.attention_control.project_key}"
+            )
         issue = next(
             (
                 task.issue_id
