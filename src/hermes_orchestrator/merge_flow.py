@@ -24,7 +24,7 @@ from hermes_orchestrator.circleci import (
     CircleCiStatusAdapter,
     HttpxCircleCiTransport,
 )
-from hermes_orchestrator.codex_merger import CodexMerger
+from hermes_orchestrator.codex_merger import CodexMerger, ContractAwareDelivery
 from hermes_orchestrator.codex_queue import CodexQueueDelivery
 from hermes_orchestrator.codex_rpc import CodexRpcClient, app_server_command
 from hermes_orchestrator.config import Settings
@@ -32,6 +32,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import CandidateEmitter
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import (
+    GitError,
     GitRunner,
     GitVerifier,
     SubprocessGitRunner,
@@ -52,6 +53,7 @@ from hermes_orchestrator.review_intake import (
     BranchHeadUnknown,
     CandidateAdmission,
     CompositeIntakeGate,
+    DescribeCandidate,
 )
 from hermes_orchestrator.reviews import LinearProjector, ReviewService
 from hermes_orchestrator.settlement import MergeSettlements
@@ -311,6 +313,14 @@ def build_merge_flow(
     delivery = CodexQueueDelivery(
         channels=merger, manifest_root=manifest_root, **delivery_kwargs
     )
+    # INFRA-200: both real candidate delivery paths below -- a brand-new
+    # admission and a queued release -- share this ONE wrapped adapter, so
+    # an existing thread that has not yet adopted the versioned contract
+    # gets it prepended to whichever one delivers next, exactly once, with
+    # no separate turn and no new wake. ``flow.delivery`` stays the raw
+    # queue adapter (its own tests reach into it directly); only the two
+    # composed collaborators below see the wrapped one.
+    contract_delivery = ContractAwareDelivery(merger=merger, inner=delivery)
     window = CiWindow(
         database=database,
         status=circleci,
@@ -335,6 +345,16 @@ def build_merge_flow(
         base_policy=_base_policy(settings, GitVerifier(runner=runner)),
         intake_gate=intake_gate,
         merged_candidate_proof=_merged_candidate_proof(settings, github),
+        # INFRA-200: the administrative-drift hint source. Purely local,
+        # read-only git evidence -- no credential, no network call -- so
+        # wiring it costs composition nothing; when it cannot resolve a
+        # SHA it raises exactly like every other local git failure and
+        # ``CandidateAdmission._drift_verdict`` is not itself defended
+        # against that (see ``_describe_candidate`` below), matching the
+        # advisory-only contract documented on ``AdmittedCandidate.drift``.
+        describe_candidate=_describe_candidate(
+            settings, GitVerifier(runner=runner), runner
+        ),
     )
     qa = QaRouter(database=database, events=events)
     settlements = MergeSettlements(database, events)
@@ -363,7 +383,7 @@ def build_merge_flow(
         projects=settings.projects,
         git=runner,
         manifest_root=manifest_root,
-        delivery=delivery,
+        delivery=contract_delivery,
         intake_gate=intake_gate,
         lead=outbox,
         issue_for_failure=reviews.issue_for_candidate,
@@ -392,7 +412,10 @@ def build_merge_flow(
         # INFRA-221: the same queue delivery adapter the emitter uses, so
         # the candidate held behind an unsettled verdict is released and
         # woken through the existing wake path once that verdict settles.
-        delivery=delivery,
+        # INFRA-200: wrapped identically to the emitter's, so a release
+        # also adopts the versioned contract on an existing thread that
+        # has not yet received it.
+        delivery=contract_delivery,
     )
     return MergeFlow(
         rpc=rpc,
@@ -512,3 +535,80 @@ def _base_policy(settings: Settings, git: GitVerifier) -> Callable[[str, str], b
             return False
 
     return policy
+
+
+#: INFRA-200: sentinel changed-path a lookup failure returns from
+#: ``_describe_candidate`` below. Deliberately not a real path
+#: ``review_drift.is_administrative_path`` would ever match, so a local
+#: git failure can never be misread as evidence of administrative-only
+#: drift.
+_DRIFT_LOOKUP_FAILED_PATH = "<drift-hint-lookup-failed>"
+
+
+def _describe_candidate(
+    settings: Settings, git: GitVerifier, runner: GitRunner
+) -> DescribeCandidate:
+    """Build the administrative-drift hint source (INFRA-200).
+
+    ``DescribeCandidate`` (``review_intake.py``) takes only a candidate
+    SHA -- no project key -- so, for a deployment with more than one
+    configured project, each configured project's ``repo_path`` is tried
+    in turn until one resolves the SHA locally; the first project whose
+    object database contains it wins. A single-project deployment (the
+    common case, and every test fixture in this module) always resolves
+    on the first try.
+
+    Tree identity reuses :meth:`GitVerifier.tree_of` (``git rev-parse
+    <sha>^{tree}``) -- exactly what's needed. ``GitVerifier.
+    changed_paths`` is NOT reused for the changed-paths half: it returns
+    ``git diff --name-status`` lines (status-prefixed, built for the
+    merge-ancestry proofs in ``git.py``), not the bare paths
+    ``review_drift.is_administrative_path`` matches against, so ``git
+    diff --name-only <sha>^ <sha>`` -- the candidate's own commit against
+    its first parent -- is invoked directly here via the same argv-safe
+    ``GitRunner`` idiom ``_branch_head``/``_base_policy`` already use; no
+    new ``git.py`` helper.
+
+    ``CandidateAdmission._drift_verdict`` calls this source unconditionally
+    once wired, for EVERY admission (settlement-time and any read-only
+    dry run alike), and never defends against it raising -- see its own
+    docstring: the hint must be purely advisory and never break a real
+    admission. So this never raises: any local git failure (an
+    unreachable commit -- most plausible for a long-deleted candidate
+    branch whose objects were eventually pruned -- a corrupt repository,
+    an unexpected git error) degrades to a sentinel tree identity paired
+    with :data:`_DRIFT_LOOKUP_FAILED_PATH`, which ``review_drift.
+    classify_drift`` can only ever read as ``"semantic"`` -- it matches
+    no administrative pattern and, keyed by the requested SHA, can never
+    coincidentally equal another failed lookup's sentinel for a
+    genuinely different candidate. Fail-toward-semantic, exactly like
+    ``classify_drift``'s own "first review" default: an unresolvable
+    prior state is never treated as administrative-only.
+    """
+
+    def describe(candidate_sha: str) -> tuple[str, tuple[str, ...]]:
+        for project in settings.projects.values():
+            try:
+                tree_sha = git.tree_of(project.repo_path, candidate_sha)
+            except GitError:
+                continue
+            try:
+                result = runner.run(
+                    (
+                        "git",
+                        "diff",
+                        "--name-only",
+                        f"{candidate_sha}^",
+                        candidate_sha,
+                    ),
+                    project.repo_path,
+                )
+            except Exception:
+                return tree_sha, (_DRIFT_LOOKUP_FAILED_PATH,)
+            if result.returncode != 0:
+                return tree_sha, (_DRIFT_LOOKUP_FAILED_PATH,)
+            paths = tuple(line for line in result.stdout.splitlines() if line)
+            return tree_sha, paths
+        return f"drift-hint-unavailable:{candidate_sha}", (_DRIFT_LOOKUP_FAILED_PATH,)
+
+    return describe

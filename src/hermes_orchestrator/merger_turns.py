@@ -32,6 +32,7 @@ from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
 from hermes_orchestrator.codex_rpc import RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.emission import wake_event_with_drift_hint
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.github import DiscoveredPull, GitHubError
 from hermes_orchestrator.manifests import (
@@ -51,11 +52,79 @@ from hermes_orchestrator.verdicts import (
     CorrectionPacket,
     VerdictBinding,
     VerdictError,
+    normalize_verdict,
     parse_turn_report,
     parse_verdict,
 )
 
 TURN_COMPLETED_METHODS = frozenset({"turn/completed", "thread/turn/completed"})
+
+#: INFRA-200: the two additive keys :func:`~hermes_orchestrator.verdicts.
+#: normalize_verdict` merges into a parsed verdict's ``verdict_json`` --
+#: never part of the base envelope :func:`~hermes_orchestrator.verdicts.
+#: parse_verdict` itself accepts on input.
+_VERDICT_MARKER_KEYS = ("label", "reviewer_fix")
+
+
+def _settlement_ready_verdict_json(verdict_json: str) -> str:
+    """Strip INFRA-200's persisted ``label``/``reviewer_fix`` markers so a
+    durably stored, already-normalized verdict can be re-parsed.
+
+    ``submitted_verdicts.verdict_json`` now stores ``ReviewVerdict.
+    verdict_json`` -- ``parse_verdict``'s own envelope, normalized to its
+    durable value with the original reviewer-facing label (and, for
+    ``ACCEPT_WITH_REVIEWER_FIX``, ``reviewer_fix: true``) merged in (see
+    ``submit_review``) -- but ``parse_verdict``'s own envelope-key check
+    is exact against the five base fields and rejects those two
+    additive keys outright. Every settlement re-parse of a durable row
+    (direct, recovered, or duplicate-resumed) must therefore strip them
+    back out first, here, before calling ``parse_turn_report``. Anything
+    that is not a JSON object -- the idle terminal report, or malformed
+    text ``parse_verdict`` itself must reject -- passes through
+    completely unchanged.
+    """
+
+    try:
+        value = json.loads(verdict_json)
+    except json.JSONDecodeError:
+        return verdict_json
+    if not isinstance(value, dict):
+        return verdict_json
+    if not any(key in value for key in _VERDICT_MARKER_KEYS):
+        return verdict_json
+    filtered = {k: v for k, v in value.items() if k not in _VERDICT_MARKER_KEYS}
+    return json.dumps(filtered, sort_keys=True)
+
+
+def _normalize_verdict_json_best_effort(verdict_json: str) -> str:
+    """Best-effort INFRA-200 normalization of a RAW incoming verdict
+    document, for duplicate-identity comparison only.
+
+    Mirrors exactly what ``parse_verdict`` computes for its own
+    ``verdict_json`` output -- ``{**value, "verdict": durable, **marker}``
+    -- so for any genuinely valid envelope this produces the
+    byte-identical string ``parse_verdict`` (and therefore
+    ``submit_review``'s persistence) will. Unlike ``parse_verdict`` it
+    never raises: anything that is not a JSON object with a recognized
+    string ``verdict`` field is returned unchanged, and the authoritative
+    parse still owns rejecting it. Used only to compare a fresh,
+    not-yet-parsed resubmission against an already-persisted
+    (already-normalized) row, before the outstanding wake and immutable
+    manifest are even read.
+    """
+
+    try:
+        value = json.loads(verdict_json)
+    except json.JSONDecodeError:
+        return verdict_json
+    if not isinstance(value, dict) or not isinstance(value.get("verdict"), str):
+        return verdict_json
+    try:
+        durable, marker = normalize_verdict(value["verdict"])
+    except VerdictError:
+        return verdict_json
+    document = {**value, "verdict": durable, **marker}
+    return json.dumps(document, sort_keys=True)
 
 # INFRA-223: the exact terminal vocabularies the orphaned-submission
 # reconciliation joins against. Neither is invented here.
@@ -860,6 +929,32 @@ class MergerTurnService:
         event = self._merger.next_releasable_candidate(project_key)
         if event is None:
             return None
+        # INFRA-200: a purely advisory, read-only dry run of admission's
+        # LOCAL checks only (``external_gates=False`` -- no remote head,
+        # base policy, or intake gate; no credential, no durable write)
+        # against the reviewer channel's OWN current generation, which
+        # this call can only ever match -- so this can reject only on a
+        # genuine manifest/envelope mismatch, never on staleness. Its
+        # sole purpose here is the administrative-drift hint
+        # (``AdmittedCandidate.drift``) this release's wake carries into
+        # Sol's intake message; any rejection is swallowed and the
+        # candidate is still released, unhinted, exactly as before this
+        # existed -- the hint never gates or delays a release, and the
+        # settlement-time admission this release is eventually reviewed
+        # under is completely unaffected.
+        channel = self._merger.read_channel(project_key)
+        if channel is not None and channel.state == "ready":
+            try:
+                admitted = self._admission.validate_only(
+                    project_key,
+                    event,
+                    received_generation=channel.generation,
+                    external_gates=False,
+                )
+            except CandidateRejected:
+                pass
+            else:
+                event = wake_event_with_drift_hint(event, admitted.drift)
         return await self._delivery.deliver(project_key, event)
 
     async def handle_turn(self, project_key: str) -> TurnOutcome:
@@ -987,7 +1082,10 @@ class MergerTurnService:
             reviewed_sha=snapshot.manifest.candidate_sha,
         )
         try:
-            verdict = parse_turn_report(submitted.verdict_json, expected=binding)
+            verdict = parse_turn_report(
+                _settlement_ready_verdict_json(submitted.verdict_json),
+                expected=binding,
+            )
         except VerdictError as error:
             return TurnOutcome(
                 project_key, "verdict_invalid", event.event_id, event.issue_id,
@@ -1203,6 +1301,12 @@ class MergerTurnService:
             )
         )
         if existing is not None and not stale_existing:
+            # INFRA-200: ``existing.verdict_json`` is already durably
+            # stored in its normalized form (see ``_persist_submission``/
+            # ``_supersede_submission`` below), so this RAW, not-yet-
+            # parsed resubmission is normalized the same way, purely for
+            # this identity comparison, before any wake or manifest is
+            # even read.
             return await self._resolve_duplicate(
                 existing,
                 project_key=project_key,
@@ -1211,7 +1315,7 @@ class MergerTurnService:
                 candidate_sha=candidate_sha,
                 reviewed_thread_id=reviewed_thread_id,
                 reviewed_generation=reviewed_generation,
-                verdict_json=verdict_json,
+                verdict_json=_normalize_verdict_json_best_effort(verdict_json),
             )
         await self._reviews.resume_settlements(project_key)
         outstanding = self.outstanding_wake(project_key)
@@ -1259,6 +1363,15 @@ class MergerTurnService:
             raise SubmissionRejected(
                 f"verdict document is invalid: {error}"
             ) from error
+        # INFRA-200: persist the NORMALIZED envelope -- durable value plus
+        # the ``label``/``reviewer_fix`` markers ``parse_verdict`` merged
+        # in -- rather than the raw pre-parse string, so a stored
+        # ``submitted_verdicts.verdict_json`` row retains the original
+        # reviewer-facing label. ``document.verdict_json`` is only empty
+        # for a ``ReviewVerdict`` built outside ``parse_verdict`` (never
+        # the case here, since ``document`` came from ``parse_verdict``
+        # above), so the raw fallback is defensive, not a normal path.
+        persisted_verdict_json = document.verdict_json or verdict_json
         # INFRA-212: everything above is proven from durable local state
         # alone -- the outstanding wake, the immutable manifest, the
         # ready reviewer-channel binding, and the submitted document.
@@ -1351,7 +1464,7 @@ class MergerTurnService:
                 existing,
                 reviewed_thread_id=reviewed_thread_id,
                 reviewed_generation=reviewed_generation,
-                verdict_json=verdict_json,
+                verdict_json=persisted_verdict_json,
             )
         else:
             submission = self._persist_submission(
@@ -1361,7 +1474,7 @@ class MergerTurnService:
                 candidate_sha=candidate_sha,
                 reviewed_thread_id=reviewed_thread_id,
                 reviewed_generation=reviewed_generation,
-                verdict_json=verdict_json,
+                verdict_json=persisted_verdict_json,
             )
         if submission is None:
             # Lost the exactly-once CAS to a concurrent submission, or the
@@ -1373,6 +1486,10 @@ class MergerTurnService:
                     "the reviewer channel was replaced while persisting the "
                     "submission; submit again from the new binding"
                 )
+            # INFRA-200: ``persisted_verdict_json`` is already the exact
+            # normalized form a winning racer's row would hold, so this
+            # comparison needs no further normalization (unlike the
+            # early, pre-parse duplicate check above).
             return await self._resolve_duplicate(
                 raced,
                 project_key=project_key,
@@ -1381,7 +1498,7 @@ class MergerTurnService:
                 candidate_sha=candidate_sha,
                 reviewed_thread_id=reviewed_thread_id,
                 reviewed_generation=reviewed_generation,
-                verdict_json=verdict_json,
+                verdict_json=persisted_verdict_json,
             )
         outcome = await self._settle_wake(
             project, project_key, channel, event, state, submitted=submission

@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from hermes_orchestrator.ci_window import MergeWindowExhausted, PriorMergeFailed
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
@@ -33,8 +33,65 @@ from hermes_orchestrator.manifests import (
     wake_event_for,
     write_manifest,
 )
+from hermes_orchestrator.review_drift import DriftVerdict
 from hermes_orchestrator.review_intake import CandidateRejected
 from hermes_orchestrator.verdicts import CorrectionPacket
+
+
+class _DriftHintedWakeEvent:
+    """A ``WakeEvent`` view whose rendered text also carries an
+    administrative-drift hint (INFRA-200).
+
+    Mirrors ``codex_merger._PrefixedWakeEvent`` exactly: every field the
+    delivery path reads (status, issue_id, candidate_sha, base_sha,
+    manifest_path, event_id, manifest_digest) is forwarded unchanged to
+    the wrapped event via ``__getattr__``, so this is transparent to
+    ``codex_queue.CodexQueueDelivery.deliver``, ``register_wake``,
+    manifest verification, and every other consumer -- the wake's
+    content-addressed identity is never touched. Only :meth:`render`
+    differs, appending one trailing advisory line to whatever the
+    wrapped event already renders; nothing sends a second turn for it.
+    """
+
+    __slots__ = ("_hint", "_inner")
+
+    def __init__(self, inner: WakeEvent, hint: str) -> None:
+        self._inner = inner
+        self._hint = hint
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def render(self, generation: int) -> str:
+        return f"{self._inner.render(generation)}\n{self._hint}"
+
+
+def wake_event_with_drift_hint(
+    event: WakeEvent, drift: DriftVerdict | None
+) -> WakeEvent:
+    """Append the administrative-drift hint to ``event``'s rendered text.
+
+    INFRA-200: ``drift`` -- ``review_intake.AdmittedCandidate.drift`` --
+    is purely advisory (see ``review_drift.py``). ``None`` (no drift
+    source configured, or nothing to compare against) and a
+    ``"semantic"`` verdict both deliver ``event`` completely unwrapped:
+    Sol gets no scoping hint and reviews the full diff exactly as before
+    this hint existed. Only an ``"administrative"`` verdict wraps the
+    event, appending one trailing line; every field a delivery or
+    admission path reads -- manifest digest, candidate SHA, event id,
+    status, issue id, base SHA -- is forwarded unchanged (see
+    :class:`_DriftHintedWakeEvent`), so the wake's content-addressed
+    identity and everything durably recorded from it are byte-identical
+    with and without the hint.
+    """
+
+    if drift is None or drift.kind == "semantic":
+        return event
+    hint = (
+        f"drift: administrative — {drift.reason}; scope replay to the "
+        "changed paths, identity checks unchanged"
+    )
+    return _DriftHintedWakeEvent(event, hint)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True, slots=True)
