@@ -326,6 +326,12 @@ class ChannelHub:
         ).fetchone()
         if row is None or str(row["state"]) in ("acked", "superseded"):
             return "deduplicated"
+        # One successful write is one visible channel entry. The event
+        # remains durable until confirmation and a restarted sidecar gets
+        # it through registration replay; a routine publish pass must not
+        # surface the same event again every daemon tick.
+        if str(row["state"]) == "published":
+            return "deduplicated"
         writer = self._connections.get(session_id)
         if writer is None:
             return "pending"
@@ -667,6 +673,30 @@ class ChannelHub:
         session_id = str(message.get("session_id") or "")
         if not (project and cell_id and session_id):
             return
+        prior = self._database.execute(
+            "SELECT result_json, created_at FROM control_operations "
+            "WHERE session_id = ? AND kind = 'channel.blocked' "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        latest_registration = self._database.scalar(
+            "SELECT MAX(connected_at) FROM channel_registrations "
+            "WHERE session_id = ?",
+            (session_id,),
+        )
+        if prior is not None:
+            with suppress(json.JSONDecodeError):
+                prior_result = json.loads(str(prior["result_json"]))
+                same_incident = (
+                    isinstance(prior_result, dict)
+                    and prior_result.get("refusal") == reason
+                    and (
+                        latest_registration is None
+                        or str(latest_registration) <= str(prior["created_at"])
+                    )
+                )
+                if same_incident:
+                    return
         with suppress(Exception):
             self._control.record(
                 kind="channel.blocked",

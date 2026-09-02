@@ -434,6 +434,42 @@ class TestDelivery:
         assert event["packet_id"] == CORRECTION_ID
         await sidecar.close()
 
+    async def test_repeated_publish_pass_does_not_repeat_visible_event(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        seed_packets(database)
+        sidecar = await registered_sidecar(hub, capabilities)
+
+        first = await hub.publish(
+            kind="HERMES_CORRECTION_READY",
+            packet_id=CORRECTION_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+        event = await sidecar.receive()
+        second = await hub.publish(
+            kind="HERMES_CORRECTION_READY",
+            packet_id=CORRECTION_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+
+        assert first == "published"
+        assert second == "deduplicated"
+        assert event["packet_id"] == CORRECTION_ID
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(sidecar.reader.readline(), timeout=0.3)
+        assert database.scalar(
+            "SELECT attempts FROM channel_events WHERE event_id = ?",
+            (event["event_id"],),
+        ) == 1
+        await sidecar.close()
+
     async def test_duplicate_and_foreign_acks_change_nothing(
         self,
         database: Database,
@@ -1174,6 +1210,24 @@ class TestControlOperationEvents:
             await second.receive()
             await second.close()
             assert len(operations.pending_for_session(SESSION)) == 1
+
+            # Confirmation does not make the same unresolved incident
+            # newly actionable on the sidecar's next bounded retry.
+            assert operations.acknowledge(
+                receipt.operation_id, session_id=SESSION
+            )
+            third = await Sidecar.connect(hub.socket_path)
+            await third.send(
+                register_message(issued_capability(capabilities))
+            )
+            await third.receive()
+            await third.close()
+            blocked_count = database.scalar(
+                "SELECT COUNT(*) FROM control_operations "
+                "WHERE session_id = ? AND kind = 'channel.blocked'",
+                (SESSION,),
+            )
+            assert blocked_count == 1
 
             # The seat lands and registration succeeds: the blocked
             # receipt is healed by the recovery it was blocking on.

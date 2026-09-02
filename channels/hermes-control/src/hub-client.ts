@@ -22,12 +22,6 @@ export interface HubClientOptions {
    * have to wait a full minute.
    */
   parkedRetryMs?: number;
-  /**
-   * Width of the process-scoped coalescing window applied to
-   * repeated event_ids (see `forwardedAt` below). Defaults to 15
-   * minutes; overridable so tests don't have to wait that long.
-   */
-  coalesceMs?: number;
   onEvent: (kind: string, packetId: string, eventId: string) => void;
   onLog: (message: string) => void;
 }
@@ -42,7 +36,6 @@ const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
 const ACK_TIMEOUT_MS = 10000;
 const DEFAULT_PARKED_RETRY_MS = 60000;
-const DEFAULT_COALESCE_MS = 900000;
 
 // Refusals no single retry can cure from inside this process: the
 // wire protocol itself is wrong, or this process belongs to a
@@ -79,15 +72,12 @@ export class HubClient {
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   /**
-   * event_id -> Date.now() of the last forward, scoped to the whole
-   * process lifetime — it is NOT cleared on registration or
-   * re-registration (see the "registered" case below). Bounds the
-   * visible burst from the hub's per-publish-pass resend, and from
-   * every replay following a reconnect, to at most one forward per
-   * event_id per window, without ever suppressing a genuinely new
-   * event: see the "event" case for the coalescing rule itself.
+   * Event IDs already forwarded by this sidecar process. The MCP layer
+   * queues pre-initialize notifications, so a repeat cannot heal a loss;
+   * it only creates another visible chat entry. A replacement sidecar
+   * starts with an empty set and receives pending events from hub replay.
    */
-  private forwardedAt = new Map<string, number>();
+  private forwarded = new Set<string>();
 
   constructor(opts: HubClientOptions) {
     this.opts = opts;
@@ -217,13 +207,13 @@ export class HubClient {
       case "registered":
         this.state = "registered";
         this.backoff = INITIAL_BACKOFF_MS;
-        // forwardedAt is process-scoped and is deliberately NOT
+        // forwarded is process-scoped and is deliberately NOT
         // cleared here: the hub's replay follows every registration,
         // and a still-unacknowledged event_id must stay coalesced
         // across that replay (and across any number of reconnects)
-        // until its window lapses — otherwise every reconnect would
+        // for this process — otherwise every reconnect would
         // re-surface it to Claude regardless of how recently it last
-        // forwarded (see `forwardedAt` above and the "event" case
+        // forwarded (see `forwarded` above and the "event" case
         // below). A brand-new event_id is unaffected and still
         // forwards immediately.
         return true;
@@ -274,26 +264,13 @@ export class HubClient {
         // answered and flushes them in order; a hub resend is no
         // longer needed to recover that case.
         //
-        // What coalescing here still guards against is a still-
-        // unacknowledged event being re-shown to Claude on every one
-        // of those resends. `forwardedAt` (process-scoped, NOT cleared
-        // on registration/re-registration — see the "registered" case
-        // above) coalesces repeats of the same event_id inside a
-        // bounded window (`coalesceMs`, default 15 minutes): a hub
-        // republish burst, and any replay following a reconnect,
-        // renders as at most one visible entry per window, while a
-        // still-unacknowledged event still re-surfaces once the window
-        // lapses — a safety net against any other loss mode — and a
-        // brand-new event_id always forwards immediately. Exactly-once
-        // effect remains enforced downstream, by the durable drain's
-        // dedup and the hub's ack compare-and-set — not here.
-        const now = Date.now();
-        const last = this.forwardedAt.get(validated.event_id);
-        const coalesceMs = this.opts.coalesceMs ?? DEFAULT_COALESCE_MS;
-        if (last !== undefined && now - last < coalesceMs) {
+        // A still-unconfirmed event is shown once for this sidecar
+        // lifetime. The hub remains the durable source; replacement
+        // sidecars replay it, while new event IDs forward immediately.
+        if (this.forwarded.has(validated.event_id)) {
           return true;
         }
-        this.forwardedAt.set(validated.event_id, now);
+        this.forwarded.add(validated.event_id);
 
         // onEvent ultimately drives sending a notification to the
         // host over MCP stdio: it must never be allowed to take the
