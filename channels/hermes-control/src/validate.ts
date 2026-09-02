@@ -65,8 +65,9 @@ export function validateHubEvent(
 /**
  * Compose concise operator- and agent-readable content for the client's
  * `notifications/claude/channel` contract. The durable identifiers remain
- * in metadata and the packet id stays in the action sentence so a lead can
- * retrieve the exact item without inspecting raw protocol vocabulary. The
+ * in metadata; the visible action sentence stays short enough for Claude's
+ * collapsed cmux row. The lead reads the exact packet id from channel
+ * metadata, not from display text. The
  * client treats a malformed `content` as a ProtocolError that kills
  * the whole stdio connection (observed live), so the sidecar must
  * never hand it one. Returns null when either input would violate the
@@ -81,13 +82,13 @@ export function composeNotificationContent(
   if (!PACKET_ID_RE.test(packetId)) return null;
   switch (kind) {
     case "HERMES_ASSIGNMENT_READY":
-      return `Hermes: a new assignment is ready. Retrieve and confirm packet ${packetId}, then begin it.`;
+      return "Assignment ready · confirm and begin.";
     case "HERMES_CORRECTION_READY":
-      return `Hermes: Sol returned corrections. Retrieve and confirm packet ${packetId}, then resume work.`;
+      return "Sol corrections ready · confirm and resume.";
     case "HERMES_WORK_READY":
-      return `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`;
+      return "Work ready · confirm and continue.";
     case "HERMES_CONTROL_READY":
-      return `Hermes: a control update needs attention. Retrieve and confirm packet ${packetId}.`;
+      return "Control update · confirm and continue.";
     default:
       return null;
   }

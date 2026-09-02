@@ -34,7 +34,7 @@ test("valid event produces a notification with the correct envelope shape", asyn
     // is a live-proven ProtocolError that drops the whole connection.
     assert.equal(
       notif1.params.content,
-      `Hermes: work is ready to continue. Retrieve and confirm packet ${"a".repeat(32)}, then proceed.`
+      "Work ready · confirm and continue."
     );
     assert.deepEqual(notif1.params.meta, {
       kind: "HERMES_WORK_READY",
@@ -57,20 +57,28 @@ test("every visible event kind uses concise action-oriented text", () => {
   const packet = "a".repeat(32);
   assert.equal(
     composeNotificationContent("HERMES_ASSIGNMENT_READY", packet),
-    `Hermes: a new assignment is ready. Retrieve and confirm packet ${packet}, then begin it.`
+    "Assignment ready · confirm and begin."
   );
   assert.equal(
     composeNotificationContent("HERMES_CORRECTION_READY", packet),
-    `Hermes: Sol returned corrections. Retrieve and confirm packet ${packet}, then resume work.`
+    "Sol corrections ready · confirm and resume."
   );
   assert.equal(
     composeNotificationContent("HERMES_WORK_READY", packet),
-    `Hermes: work is ready to continue. Retrieve and confirm packet ${packet}, then proceed.`
+    "Work ready · confirm and continue."
   );
   assert.equal(
     composeNotificationContent("HERMES_CONTROL_READY", packet),
-    `Hermes: a control update needs attention. Retrieve and confirm packet ${packet}.`
+    "Control update · confirm and continue."
   );
+  for (const kind of [
+    "HERMES_ASSIGNMENT_READY",
+    "HERMES_CORRECTION_READY",
+    "HERMES_WORK_READY",
+    "HERMES_CONTROL_READY",
+  ]) {
+    assert.ok(composeNotificationContent(kind, packet)!.length <= 48);
+  }
 });
 
 test("distinct event ids always forward independently", async () => {
@@ -139,7 +147,7 @@ test("an event delivered before initialize is queued and flushed exactly once af
     );
     assert.equal(
       notif1.params.content,
-      `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`
+      "Work ready · confirm and continue."
     );
     assert.deepEqual(notif1.params.meta, {
       kind: "HERMES_WORK_READY",

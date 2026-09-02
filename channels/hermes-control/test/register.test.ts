@@ -149,7 +149,7 @@ test("after parking, a subsequent successful registration restores normal event 
     );
     assert.equal(
       notif.params.content,
-      `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`
+      "Work ready · confirm and continue."
     );
 
     fx.sidecar.send({

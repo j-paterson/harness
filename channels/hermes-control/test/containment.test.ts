@@ -122,7 +122,7 @@ test("McpServer.notifyChannelEvent contains a throwing writer and keeps working 
   assert.equal(parsed.method, "notifications/claude/channel");
   assert.equal(
     parsed.params.content,
-    `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`
+    "Work ready · confirm and continue."
   );
   assert.equal(parsed.params.meta.event_id, "evt-2");
 });
@@ -159,7 +159,7 @@ test("McpServer.notifyChannelEvent refuses malformed content: not sent, logged, 
   const parsed = JSON.parse(written[0]);
   assert.equal(
     parsed.params.content,
-    `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`
+    "Work ready · confirm and continue."
   );
   assert.equal(parsed.params.meta.event_id, "evt-good");
 });
