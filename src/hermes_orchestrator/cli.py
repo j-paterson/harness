@@ -477,7 +477,9 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "durably count one background child completion and "
             "reactivate a waiting lead exactly once "
-            "(Claude Code SubagentStop hook)"
+            "(Claude Code SubagentStop hook; also the lead's own "
+            "--child <agent_id> settlement for a child it stopped "
+            "on purpose, whose SubagentStop never fires)"
         ),
     )
     child_stop.add_argument("--session", default=None)
@@ -3194,7 +3196,11 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
     cwd = None
     if session is None or child is None:
         with suppress(Exception):
-            payload = json.loads(sys.stdin.read() or "{}")
+            # A deliberate CLI invocation carries no hook payload; a
+            # blocking read on a terminal would hang the lead, so the
+            # payload is only consulted when one is actually piped in.
+            piped = "" if sys.stdin.isatty() else sys.stdin.read()
+            payload = json.loads(piped or "{}")
             session = session or payload.get("session_id")
             cwd = payload.get("cwd")
             # Strictly the shared lifecycle identity: SubagentStart
@@ -3203,7 +3209,7 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
             # can never satisfy it; an event without agent_id fails
             # closed and never advances progress.
             child = child or payload.get("agent_id")
-    if not session or not child:
+    if not child:
         return 0
     with suppress(Exception):
         from hermes_orchestrator.events import EventStore
@@ -3214,7 +3220,15 @@ def _child_event(args: argparse.Namespace, *, completed: bool) -> int:
             # INFRA-198: the same one-shot canonicalization the Stop
             # entry does -- a child recorded under a /clear-ed logical
             # id would leave the seat's outstanding set silently empty.
-            session = _canonical_session(database, str(session), cwd)
+            # A deliberate `child-stop --child <agent_id>` names no
+            # session at all: the seat is resolved from the SAME
+            # durable evidence (this cwd's one active cell and its one
+            # live channel registration), so the lead can settle a
+            # child it stopped on purpose without knowing the durable
+            # id. An unresolvable seat stays inert exactly as before.
+            session = _canonical_session(database, str(session or ""), cwd)
+            if not session:
+                return 0
             tracker = LeadChildTracker(
                 database,
                 control=ControlOperations(
@@ -3438,30 +3452,36 @@ def _intake_poll(args: argparse.Namespace) -> int:
                         )
             # A Stop with live background children records the durable
             # continuation the last child completion will reactivate;
-            # a Stop with none supersedes any stale promise and is
-            # this session's genuine idle boundary. An exception here
-            # leaves ``continuation`` truthy, so a hook error never
-            # risks treating an uncertain state as idle.
-            continuation: object = "unknown"
+            # a Stop with none supersedes any stale promise.
             with suppress(Exception):
                 from hermes_orchestrator.events import EventStore
                 from hermes_orchestrator.lead_children import (
                     LeadChildTracker,
                 )
 
-                continuation = LeadChildTracker(
+                LeadChildTracker(
                     database,
                     control=ControlOperations(
                         database, events=EventStore(database)
                     ),
                 ).record_turn_stop(str(session))
-            if continuation is None:
-                # INFRA-199: at the genuine idle boundary, offer the
-                # existing admitted queue one normal durable
-                # assignment before anything else, so a freshly
-                # published packet rides this same poll response.
-                with suppress(Exception):
-                    _dispatch_idle_lead(database, str(session), args)
+            # INFRA-199: at the Stop boundary, offer the existing
+            # admitted queue one normal durable assignment before
+            # anything else, so a freshly published packet rides this
+            # same poll response.
+            #
+            # INFRA-211: outstanding children do NOT gate this. Fable
+            # owns child supervision and leads work several issues at
+            # once, so an all-or-nothing continuation gate froze the
+            # whole seat behind one unsettled child. Capacity alone
+            # bounds dispatch, through the caps ``_dispatch_idle_lead``
+            # already applies and re-proves in its activation
+            # transaction: ``development_lane_saturated``
+            # (MAX_DEVELOPMENT_ISSUE_LANES) and the resource-backed
+            # ``admission_priority_ceiling``. A stale child can consume
+            # a capacity slot; it can no longer freeze the seat.
+            with suppress(Exception):
+                _dispatch_idle_lead(database, str(session), args)
         # INFRA-201: settle this session's maintenance receipts
         # silently before offering anything — no output either way,
         # for any hook event, so a wake never reaches the primary view
