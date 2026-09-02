@@ -419,16 +419,10 @@ class LeadIntakePoll:
                     str(row["assignment_id"]),
                 )
             )
-        # INFRA-201: pure transport/dedup churn is settled silently
-        # by the lead's own Stop hook
-        # (``settle_maintenance_for_session``) and never offered
-        # here. INFRA-219 (Sol correction 14bd0c17) narrows that
-        # exclusion to SILENT_MAINTENANCE_CONTROL_KINDS: the
-        # runtime-lifecycle kinds (daemon.restarted,
-        # channel.reregistered, channel.replayed) ARE offered, so a
-        # merged-runtime activation wakes the exact bound lead
-        # through this existing offer/ACK path instead of leaving it
-        # idle until manual cmux intervention.
+        # Pure transport/lifecycle churn is settled silently by the
+        # lead's own Stop hook and never offered here. A restart,
+        # re-registration, or replay changes Hermes' bookkeeping, not
+        # the lead's next action, so it must not spend a model turn.
         maintenance_placeholders = ",".join(
             "?" * len(SILENT_MAINTENANCE_CONTROL_KINDS)
         )

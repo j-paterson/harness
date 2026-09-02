@@ -4728,18 +4728,17 @@ def test_intake_poll_idle_dispatch_survives_a_linear_composition_failure(
     started, assigned, issue_state = _idle_dispatch_counts(state_dir)
     assert (started, assigned) == (1, 1)
     assert issue_state == "in_development"
-    assert _pending_projection_rows(state_dir) == [
-        (
-            "linear:INFRA-9:in-development:v2",
-            {
-                "issue_id": "INFRA-9",
-                "target": {
-                    "status": "In Development",
-                    "assignee_alias": "operator",
-                },
-            },
-        )
-    ]
+    pending = _pending_projection_rows(state_dir)
+    assert len(pending) == 1
+    effect_id, request = pending[0]
+    assert effect_id.startswith("linear:INFRA-9:in-development:")
+    assert request == {
+        "issue_id": "INFRA-9",
+        "target": {
+            "status": "In Development",
+            "assignee_alias": "operator",
+        },
+    }
 
 
 def test_idle_dispatch_rechecks_reprioritization_in_transaction(

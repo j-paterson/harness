@@ -92,7 +92,7 @@ def _profile_line(usage: ProfileUsage, lease: ProfileLeaseFact | None) -> str:
 
 def _codex_line(codex: CodexFact) -> str:
     if not codex.available:
-        return f"codex    unavailable since {codex.unavailable_since}"
+        return f"codex    usage unknown since {codex.unavailable_since}"
     primary = _percent(codex.primary_used_percent)
     secondary = _percent(codex.secondary_used_percent)
     reached = " limit reached" if codex.reached else ""
@@ -900,8 +900,8 @@ def _codex_capacity_row(codex: CodexFact, now: datetime) -> str:
             else None
         )
         if seconds is not None and seconds < 60:
-            return "codex unavailable"
-        return f"codex unavailable {_age(codex.unavailable_since, now)}"
+            return "codex usage unknown"
+        return f"codex usage unknown {_age(codex.unavailable_since, now)}"
     if codex.primary_used_percent is None or codex.secondary_used_percent is None:
         return "codex unknown"
     primary_left = max(0, min(100, 100 - codex.primary_used_percent))

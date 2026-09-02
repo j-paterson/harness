@@ -1041,21 +1041,13 @@ async def test_the_router_fails_closed_residual_deliveries(
     assert LeadIntakePoll(database=database).next_offer(SESSION) is None
 
 
-def test_a_runtime_lifecycle_receipt_is_offered_to_its_exact_bound_lead(
+def test_runtime_lifecycle_receipts_are_silent_maintenance(
     database: Database,
 ) -> None:
-    """INFRA-219 (Sol correction 14bd0c17): the live acceptance failure.
-
-    After a merged-runtime activation the daemon durably recorded
-    ``daemon.restarted`` bound to the exact ACTIVE lead session, but the
-    kind was excluded from offers as maintenance churn, so the lead sat
-    idle until it was woken MANUALLY through cmux. Runtime-lifecycle
-    receipts are now offered through this same existing offer/ACK path
-    -- no new transport -- so the bound lead is woken without any cmux
-    or operator action, and a foreign session is still never offered it.
-    """
+    """Restart/re-register/replay never changes Fable's next action."""
 
     seed_active_cell(database)
+    operations = ControlOperations(database, events=EventStore(database))
     lifecycle = (
         ("daemon.restarted", "a" * 32),
         ("channel.reregistered", "b" * 32),
@@ -1081,18 +1073,9 @@ def test_a_runtime_lifecycle_receipt_is_offered_to_its_exact_bound_lead(
                     NOW.isoformat(),
                 ),
             )
-        poll = LeadIntakePoll(database=database)
-
-        offer = poll.next_offer(SESSION)
-
-        assert offer is not None, kind
-        assert offer.kind == "HERMES_CONTROL_READY"
-        assert offer.packet_id == operation_id
-        # A foreign session is never offered this lead's receipt.
-        assert poll.next_offer(OTHER_SESSION) is None
-        # Settle it so the next kind is the only outstanding one.
-        database.execute(
-            "UPDATE control_operations SET state = 'acknowledged' "
-            "WHERE operation_id = ?",
-            (operation_id,),
-        )
+    poll = LeadIntakePoll(database=database)
+    assert poll.next_offer(SESSION) is None
+    assert poll.next_offer(OTHER_SESSION) is None
+    assert set(operations.settle_maintenance_for_session(SESSION)) == {
+        operation_id for _, operation_id in lifecycle
+    }

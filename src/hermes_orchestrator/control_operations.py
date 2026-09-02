@@ -80,25 +80,15 @@ MAINTENANCE_CONTROL_KINDS = frozenset(
         "channel.confirm_claimed",
     }
 )
-#: INFRA-219 (Sol correction 14bd0c17): the runtime-lifecycle subset of
-#: the maintenance kinds. INFRA-201 correctly classified transport churn
-#: as silent, but a MERGED-RUNTIME activation is not churn: it is the one
-#: moment an ACTIVE lead must be told its runtime changed. Observed live
-#: — after PR #52 activated runtime 8ac98e2757ba these three sat
-#: ``published``, bound to the exact idle lead, and the lead had to be
-#: woken manually through cmux. They are therefore OFFERED through the
-#: existing offer/ACK path (no new transport), while the genuinely churny
-#: remainder stays silent exactly as INFRA-201 intended.
-LIFECYCLE_CONTROL_KINDS = frozenset(
-    {
-        "daemon.restarted",
-        "channel.reregistered",
-        "channel.replayed",
-    }
-)
+# Runtime activation and channel recovery change Hermes' state, not the
+# lead's next action.  Waking Fable for these three receipts caused one
+# model turn per restart plus two more per re-registration/replay.  Keep
+# them durable for the dashboard and audit log, but settle them through
+# the maintenance path without model intake.
+LIFECYCLE_CONTROL_KINDS: frozenset[str] = frozenset()
 
-#: The maintenance kinds still settled silently by the lead's own Stop
-#: hook: pure transport/dedup churn with nothing for a lead to act on.
+#: Maintenance kinds settled silently by the lead's Stop hook.  None can
+#: change the lead's next action, including routine runtime lifecycle.
 SILENT_MAINTENANCE_CONTROL_KINDS = (
     MAINTENANCE_CONTROL_KINDS - LIFECYCLE_CONTROL_KINDS
 )

@@ -278,10 +278,6 @@ def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
     churn; everything else — including any future kind — is
     lead-actionable by default."""
 
-    # INFRA-219 (Sol correction 14bd0c17) narrows INFRA-201's silent set:
-    # the runtime-LIFECYCLE kinds are lead-actionable now, because a
-    # merged-runtime activation must wake the exact bound idle lead. The
-    # partition is therefore against SILENT_MAINTENANCE_CONTROL_KINDS.
     assert MAINTENANCE_CONTROL_KINDS <= CONTROL_KINDS
     assert LIFECYCLE_CONTROL_KINDS <= MAINTENANCE_CONTROL_KINDS
     assert SILENT_MAINTENANCE_CONTROL_KINDS == (
@@ -293,13 +289,7 @@ def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
     assert set() == (
         LEAD_ACTIONABLE_CONTROL_KINDS & SILENT_MAINTENANCE_CONTROL_KINDS
     )
-    # The three runtime-lifecycle kinds are offered, never silent.
-    assert LIFECYCLE_CONTROL_KINDS <= LEAD_ACTIONABLE_CONTROL_KINDS
-    assert {
-        "daemon.restarted",
-        "channel.reregistered",
-        "channel.replayed",
-    } == LIFECYCLE_CONTROL_KINDS
+    assert not LIFECYCLE_CONTROL_KINDS
     assert {
         "daemon.restarted",
         "channel.reregistered",
@@ -309,11 +299,13 @@ def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
         "channel.confirm_claimed",
     } == MAINTENANCE_CONTROL_KINDS
     assert {
+        "daemon.restarted",
+        "channel.reregistered",
+        "channel.replayed",
         "intake.dedup_repaired",
         "channel.auto_confirmed",
         "channel.confirm_claimed",
     } == SILENT_MAINTENANCE_CONTROL_KINDS
-    # The lead-actionable set now also carries the three lifecycle kinds.
     assert {
         "channel.blocked",
         "children.completed",
@@ -330,20 +322,13 @@ def test_maintenance_and_actionable_kinds_partition_the_vocabulary() -> None:
         # lead-actionable -- it is the operator's evidence that a seat
         # and its cell were released and need a deliberate start-lane.
         "lead.dead_worker_retired",
-        "daemon.restarted",
-        "channel.reregistered",
-        "channel.replayed",
     } == LEAD_ACTIONABLE_CONTROL_KINDS
 
 
 def test_settle_maintenance_for_session_acks_only_that_sessions_maintenance(
     operations: ControlOperations, database: Database
 ) -> None:
-    # INFRA-219 Sol correction 14bd0c17: the lifecycle kinds are OFFERED
-    # now, so the silent settler no longer touches them. This test is
-    # about the settler's session scoping, which is unchanged — it just
-    # needs kinds that are still silent.
-    maintenance = record(operations, kind="intake.dedup_repaired")
+    maintenance = record(operations, kind="daemon.restarted")
     other_session_maintenance = record(
         operations, kind="channel.auto_confirmed", session_id=OTHER_SESSION
     )

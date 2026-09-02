@@ -85,7 +85,7 @@ def test_rendering_is_deterministic_for_equal_input() -> None:
 def test_unavailable_codex_renders_the_recorded_fact() -> None:
     lines = render_dashboard(_snapshot(), width=80)
     codex_line = next(line for line in lines if "codex" in line)
-    assert "unavailable since 2026-08-30T11:00:00+00:00" in codex_line
+    assert "usage unknown since 2026-08-30T11:00:00+00:00" in codex_line
 
 
 def test_available_codex_renders_percentages() -> None:
@@ -441,7 +441,7 @@ def test_codex_row_shows_remaining_percent_or_unavailable() -> None:
     snapshot2 = _frame_snapshot(codex=unavailable)
     lines2 = render_frame(snapshot2, width=60, height=20, now=_NOW)
     codex_line2 = next(line for line in lines2 if line.strip().startswith("codex"))
-    assert "unavailable" in codex_line2
+    assert "usage unknown" in codex_line2
 
 
 def test_system_shows_pressure_meter_mem_disk_swap_load_and_workers() -> None:
