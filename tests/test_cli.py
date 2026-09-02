@@ -3053,7 +3053,15 @@ def test_start_lane_retires_a_dead_worker_and_seats_its_replacement(
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["status"] == "seated"
+    # The retire-then-reseat path prints TWO JSON documents, one per
+    # line: the retirement receipt, then the seating result.
+    documents = [
+        json.loads(line) for line in result.stdout.splitlines() if line.strip()
+    ]
+    assert [entry["status"] for entry in documents] == [
+        "dead_worker_retired",
+        "seated",
+    ]
     assert retired == ["cell-harness"]
     assert calls == [
         {"issue_id": "ENG-1", "lane_role": "harness", "harness_run": "run-1"}

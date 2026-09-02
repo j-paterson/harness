@@ -10,7 +10,10 @@ from uuid import UUID
 import pytest
 
 from hermes_orchestrator.cells import (
+    DEVELOPMENT_LANE,
     MAX_DEVELOPMENT_ISSUE_LANES,
+    DevSeatRecovery,
+    DispatchResult,
     HarnessCheckoutRefused,
     ProfileCapacityEvidence,
     ProjectCell,
@@ -6191,3 +6194,97 @@ def test_pre_confirmation_fable_cap_is_persisted_before_release(
     assert str(row["source"]) == "provider_limit"
     # A session cap says nothing about weekly Fable capacity.
     assert service._record_start_cap(cell, limit_kind="session") is None
+
+
+# -- DevSeatRecovery (INFRA-198) -----------------------------------------
+
+
+class _RecoveryCells:
+    """The two ProjectCellService seams DevSeatRecovery reads: live
+    development projects, and the exact dispatch call start-lane makes."""
+
+    def __init__(self, active: frozenset[str] = frozenset()) -> None:
+        self.active = active
+        self.dispatched: list[tuple[str, str]] = []
+        self.dispatch_error: Exception | None = None
+
+    def active_projects(self, lane_role: str) -> frozenset[str]:
+        assert lane_role == DEVELOPMENT_LANE
+        return self.active
+
+    async def dispatch(
+        self, issue_id: str, *, lane_role: str
+    ) -> DispatchResult:
+        self.dispatched.append((issue_id, lane_role))
+        if self.dispatch_error is not None:
+            raise self.dispatch_error
+        return DispatchResult(status="started", issue_id=issue_id)
+
+
+def _publish_assignment(
+    database: Database, issue_id: str, state: str = "published"
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO lead_assignments("
+            "assignment_id, schema_version, project_key, issue_id, cell_id, "
+            "session_id, profile_alias, instruction_id, queue_transition, "
+            "state, created_at, updated_at) "
+            "VALUES (?, 1, 'demo', ?, 'cell-recovery', "
+            "'99999999-9999-4999-8999-999999999999', 'max-a', ?, 'working', "
+            "?, ?, ?)",
+            (f"assign-{issue_id}", issue_id, f"instr-{issue_id}", state, now, now),
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_dispatches_the_assigned_issue_for_a_dead_dev_lane(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "REC-1")
+    _publish_assignment(database, "REC-1")
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == [("REC-1", DEVELOPMENT_LANE)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_falls_back_to_the_ranked_queue_head(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "REC-2")
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == [("REC-2", DEVELOPMENT_LANE)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_leaves_a_live_development_lane_alone(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "REC-3")
+    _publish_assignment(database, "REC-3")
+    cells = _RecoveryCells(active=frozenset({"demo"}))
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_nothing_without_remaining_work(
+    database: Database, queue: QueueService
+) -> None:
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_contains_a_dispatch_failure(
+    database: Database, queue: QueueService
+) -> None:
+    admit(queue, "REC-4")
+    cells = _RecoveryCells(active=frozenset())
+    cells.dispatch_error = RuntimeError("dispatch exploded")
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == [("REC-4", DEVELOPMENT_LANE)]

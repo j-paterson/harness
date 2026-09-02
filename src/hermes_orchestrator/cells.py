@@ -3125,3 +3125,83 @@ class ProjectCellService:
             session_id=UUID(str(row["session_id"])),
             lane_role=str(row["lane_role"]),
         )
+
+
+class DevSeatRecovery:
+    """INFRA-198: re-dispatch a development lane whose only cell was
+    retired (e.g. by the dead-lead sweep) while the project still has
+    work.
+
+    Observed live: ``project_cells`` can hold a project whose only
+    ``lane_role='development'`` row is ``failed``/retired while
+    admitted work remains -- either an already-in-development issue
+    with a live ``lead_assignments`` row, or ready work still sitting
+    in the ranked queue. Nothing in the daemon re-dispatches that
+    lane on its own; only a human running ``start-lane`` could. This
+    reuses the EXISTING lifecycle end to end: :meth:`ProjectCellService
+    .active_projects` (the same ``_ACTIVE_CELL_STATES`` live-state
+    tuple every other live-cell check uses) to detect "no live dev
+    cell", and :meth:`ProjectCellService.dispatch` -- the same call
+    ``start-lane`` makes -- to recover it, so every existing gate
+    (operator decisions, occupancy, resource ceiling, profile caps)
+    still applies unmodified.
+    """
+
+    def __init__(
+        self,
+        cells: ProjectCellService,
+        queue: QueueService,
+        database: Database,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._cells = cells
+        self._queue = queue
+        self._database = database
+        self._now = now
+
+    async def tick(self, project_keys: Sequence[str]) -> None:
+        """Recover at most one development lane per project, per tick.
+
+        Fails closed per project: an exception recovering one project
+        never blocks the others, and never breaks the maintenance
+        tick (mirrors every sibling step in ``cli.py``'s
+        ``_maintenance``).
+        """
+
+        for project_key in project_keys:
+            with suppress(Exception):
+                await self._recover_one(project_key)
+
+    async def _recover_one(self, project_key: str) -> None:
+        if project_key in self._cells.active_projects(DEVELOPMENT_LANE):
+            return
+        issue_id = self._pick_issue(project_key)
+        if issue_id is None:
+            return
+        # DispatchResult refusals (occupancy, gates, capacity) are left
+        # for the next tick, exactly like any other dispatch refusal --
+        # this step never inspects or acts on the status beyond that.
+        await self._cells.dispatch(issue_id, lane_role=DEVELOPMENT_LANE)
+
+    def _pick_issue(self, project_key: str) -> str | None:
+        # (a) an already-in-development issue with a live (non-superseded)
+        # lead_assignments row -- the exact predicate ``lane_cells``
+        # (dashboard_sources.py) uses to attribute live work to a lane.
+        row = self._database.execute(
+            "SELECT la.issue_id AS issue_id FROM lead_assignments AS la "
+            "JOIN admitted_issues AS ai ON ai.issue_id = la.issue_id "
+            "WHERE la.project_key = ? AND la.state != 'superseded' "
+            "AND ai.state != ? "
+            "ORDER BY la.updated_at DESC LIMIT 1",
+            (project_key, IssueState.DONE.value),
+        ).fetchone()
+        if row is not None:
+            return str(row["issue_id"])
+        # (b) otherwise, the same ranked-queue head the scheduler itself
+        # would pick for this project (``Scheduler.plan`` /
+        # ``QueueService.list_ranked``) -- no second definition of
+        # "runnable".
+        for issue in self._queue.list_ranked(self._now()):
+            if issue.project_key == project_key:
+                return issue.issue_id
+        return None
