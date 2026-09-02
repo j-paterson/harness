@@ -222,6 +222,21 @@ class SatisfyAcceptanceCommand(_Command):
     evidence: dict[NonEmptyText, NonEmptyText] = Field(min_length=1)
 
 
+class ContinueWorkCommand(_Command):
+    """Continue a bound seat's already-assigned issue, never assign one.
+
+    ``request_id`` scopes idempotency to THIS request: retrying the same
+    ``request_id`` for the same issue deduplicates through the wake
+    store's existing turn-identity index, while a later, distinct
+    ``request_id`` for the same issue is a new, legitimate continuation
+    and may commit another wake.
+    """
+
+    intent: Literal["continue_work"]
+    issue_id: NonEmptyText
+    request_id: NonEmptyText
+
+
 class ApplyOperatorDecisionCommand(_Command):
     """The only event shape that may resolve a pending decision.
 
@@ -263,7 +278,8 @@ HermesCommand = Annotated[
     | RejectPacketCommand
     | RecordDirectExceptionCommand
     | RequireAcceptanceCommand
-    | SatisfyAcceptanceCommand,
+    | SatisfyAcceptanceCommand
+    | ContinueWorkCommand,
     Field(discriminator="intent"),
 ]
 
@@ -299,6 +315,7 @@ _ALLOWED_INTENTS = frozenset(
         "record_direct_exception",
         "require_acceptance",
         "satisfy_acceptance",
+        "continue_work",
     }
 )
 

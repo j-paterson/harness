@@ -20,6 +20,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from uuid import UUID
 
 from hermes_orchestrator import migration_env as migration_env_module
 from hermes_orchestrator.acceptance import AcceptanceGates
@@ -28,7 +29,9 @@ from hermes_orchestrator.cells import (
     HARNESS_LANE,
     ProfileCapacityEvidence,
     ProjectCellService,
+    admission_priority_ceiling,
     bind_admitted_issue_worktree,
+    development_lane_saturated,
     ensure_harness_checkout,
 )
 from hermes_orchestrator.channel_hub import (
@@ -96,6 +99,7 @@ from hermes_orchestrator.lead_wakes import (
     LeadTerminalWakes,
     LeadWakeDelivery,
     LeadWakeReconciler,
+    TerminalWakeInput,
 )
 from hermes_orchestrator.linear import LinearProjection, ProjectLinearRouter
 from hermes_orchestrator.merge_flow import (
@@ -2394,8 +2398,92 @@ def _hermes_handlers(
         )
         return _packet_payload(packet)
 
+    def continue_work(command: Any) -> dict[str, Any]:
+        # INFRA-198: continue an already-bound seat's already-assigned
+        # issue; the caller never names a seat, and this path never
+        # assigns, admits, or queues anything. Every refusal below is
+        # fail-closed with zero durable writes.
+        if runtime.lead_wakes is None:
+            raise ValueError("lead terminal wakes are unavailable")
+        issue_row = runtime.database.execute(
+            "SELECT project_key, priority FROM admitted_issues "
+            "WHERE issue_id = ?",
+            (command.issue_id,),
+        ).fetchone()
+        if issue_row is None:
+            raise ValueError(
+                f"issue {command.issue_id!r} is not admitted; continue_work "
+                "never assigns or admits work"
+            )
+        project_key = str(issue_row["project_key"])
+        issue_priority = int(issue_row["priority"])
+        cell_rows = runtime.database.execute(
+            "SELECT cell_id, session_id, profile_alias FROM project_cells "
+            "WHERE project_key = ? AND lane_role = 'development' "
+            "AND state = 'active'",
+            (project_key,),
+        ).fetchall()
+        if len(cell_rows) != 1:
+            raise ValueError(
+                f"project {project_key!r} has {len(cell_rows)} active "
+                "development cells; continue_work requires exactly one "
+                "unambiguous seat"
+            )
+        cell = cell_rows[0]
+        cell_id = str(cell["cell_id"])
+        session_id = str(cell["session_id"])
+        profile_alias = str(cell["profile_alias"])
+        assigned = runtime.database.execute(
+            "SELECT 1 FROM lead_assignments WHERE issue_id = ? "
+            "AND session_id = ? AND state != 'superseded' LIMIT 1",
+            (command.issue_id, session_id),
+        ).fetchone()
+        if assigned is None:
+            raise ValueError(
+                f"issue {command.issue_id!r} is not assigned to the bound "
+                "development seat; continue_work never assigns, admits, "
+                "or queues work"
+            )
+        ceiling = admission_priority_ceiling(
+            runtime.database,
+            now=datetime.now(UTC),
+            freshness_minutes=settings.policy.resource_sample_freshness_minutes,
+        )
+        if ceiling is None:
+            raise ValueError(
+                "no resource sample fresh enough authorizes continue_work "
+                "right now"
+            )
+        if issue_priority > ceiling:
+            raise ValueError(
+                f"issue {command.issue_id!r} priority {issue_priority} "
+                f"exceeds the resource-authorized ceiling {ceiling}; "
+                "continue_work refuses"
+            )
+        if development_lane_saturated(
+            runtime.database, project_key=project_key, issue_id=command.issue_id
+        ):
+            raise ValueError(
+                f"development lane for {project_key!r} is saturated; "
+                "continue_work refuses"
+            )
+        wake = runtime.lead_wakes.commit(
+            TerminalWakeInput(
+                project_key=project_key,
+                issue_id=command.issue_id,
+                cell_id=cell_id,
+                session_id=UUID(session_id),
+                profile_alias=profile_alias,
+                turn_key=f"continue-work:{command.issue_id}:{command.request_id}",
+                kind="work_ready",
+                reason="operator-issued continue_work",
+            )
+        )
+        return wake.as_dict()
+
     return {
         "retry": _retry_handler(runtime.queue),
+        "continue_work": continue_work,
         "pending_corrections": pending_corrections,
         "fetch_correction": fetch_correction,
         "ack_correction": ack_correction,
