@@ -1601,15 +1601,16 @@ def pending_effect_state(database: Database) -> str:
     )
 
 
-def test_pending_linear_effect_keeps_admission_closed(
+def test_pending_linear_effect_without_reads_does_not_close_global_admission(
     database: Database, events: EventStore
 ) -> None:
     linear_effect(database)
     report = build(database, events).run()
     finding = by_kind(report, "linear_effect_ambiguous")[0]
-    assert finding.blocking is True
+    assert finding.blocking is False
+    assert finding.severity == "warning"
     assert finding.subsystem == "linear"
-    assert report.safe_to_open_admission is False
+    assert report.safe_to_open_admission is True
 
 
 def linear_build(
@@ -1666,7 +1667,7 @@ def test_pending_linear_effect_provably_not_applied_is_reported(
     assert pending_effect_state(database) == "pending"
 
 
-def test_pending_linear_effect_state_mismatch_keeps_admission_closed(
+def test_pending_linear_effect_state_mismatch_does_not_close_global_admission(
     database: Database, events: EventStore
 ) -> None:
     linear_effect(database)
@@ -1683,12 +1684,13 @@ def test_pending_linear_effect_state_mismatch_keeps_admission_closed(
     )
     report = linear_build(database, events, reads).run()
     finding = by_kind(report, "linear_state_mismatch")[0]
-    assert finding.blocking is True
-    assert report.safe_to_open_admission is False
+    assert finding.blocking is False
+    assert finding.severity == "warning"
+    assert report.safe_to_open_admission is True
     assert pending_effect_state(database) == "pending"
 
 
-def test_pending_linear_effect_team_mismatch_keeps_admission_closed(
+def test_pending_linear_effect_team_mismatch_does_not_close_global_admission(
     database: Database, events: EventStore
 ) -> None:
     linear_effect(database)
@@ -1696,12 +1698,27 @@ def test_pending_linear_effect_team_mismatch_keeps_admission_closed(
     reads = FakeLinearReads(issue=linear_issue(team_id="team-other"))
     report = linear_build(database, events, reads).run()
     finding = by_kind(report, "linear_team_mismatch")[0]
-    assert finding.blocking is True
-    assert report.safe_to_open_admission is False
+    assert finding.blocking is False
+    assert finding.severity == "warning"
+    assert report.safe_to_open_admission is True
     assert pending_effect_state(database) == "pending"
 
 
-def test_pending_linear_effect_unavailable_read_keeps_admission_closed(
+def test_pending_linear_effect_identity_mismatch_does_not_close_global_admission(
+    database: Database, events: EventStore
+) -> None:
+    linear_effect(database)
+    admitted_issue(database)
+    reads = FakeLinearReads(issue=linear_issue(issue_id="ENG-other"))
+    report = linear_build(database, events, reads).run()
+    finding = by_kind(report, "linear_identity_mismatch")[0]
+    assert finding.blocking is False
+    assert finding.severity == "warning"
+    assert report.safe_to_open_admission is True
+    assert pending_effect_state(database) == "pending"
+
+
+def test_pending_linear_effect_unavailable_read_does_not_close_global_admission(
     database: Database, events: EventStore
 ) -> None:
     linear_effect(database)
@@ -1709,12 +1726,13 @@ def test_pending_linear_effect_unavailable_read_keeps_admission_closed(
     reads = FakeLinearReads(error=RuntimeError("linear unreachable"))
     report = linear_build(database, events, reads).run()
     finding = by_kind(report, "linear_state_unavailable")[0]
-    assert finding.blocking is True
-    assert report.safe_to_open_admission is False
+    assert finding.blocking is False
+    assert finding.severity == "warning"
+    assert report.safe_to_open_admission is True
     assert pending_effect_state(database) == "pending"
 
 
-def test_pending_linear_effect_without_exact_identities_keeps_admission_closed(
+def test_pending_linear_effect_without_exact_identities_does_not_close_admission(
     database: Database, events: EventStore
 ) -> None:
     # No admitted issue maps the journaled target onto a configured
@@ -1723,8 +1741,9 @@ def test_pending_linear_effect_without_exact_identities_keeps_admission_closed(
     reads = FakeLinearReads(issue=linear_issue())
     report = linear_build(database, events, reads).run()
     finding = by_kind(report, "linear_projection_unresolvable")[0]
-    assert finding.blocking is True
-    assert report.safe_to_open_admission is False
+    assert finding.blocking is False
+    assert finding.severity == "warning"
+    assert report.safe_to_open_admission is True
     assert reads.calls == []
 
 

@@ -1217,7 +1217,7 @@ class Reconciler:
                     Finding(
                         kind="linear_effect_ambiguous",
                         subsystem="linear",
-                        severity="blocking",
+                        severity="warning",
                         aggregate_id=str(row["effect_id"]),
                         recommended_action=(
                             "re-read the issue read-only and compare it "
@@ -1260,7 +1260,8 @@ class Reconciler:
         The journal row is never completed or mutated here and no Linear
         mutation is ever issued; only the finding changes. Resolution
         requires every configured identity — project, team, state, and
-        assignee ids — to be exact; anything unprovable fails closed.
+        assignee ids — to be exact. Unprovable effects remain pending and
+        visible, but Linear is a projection and cannot close global admission.
         """
 
         effect_id = str(row["effect_id"])
@@ -1312,12 +1313,11 @@ class Reconciler:
             return Finding(
                 kind="linear_projection_unresolvable",
                 subsystem="linear",
-                severity="blocking",
+                severity="warning",
                 aggregate_id=effect_id,
                 recommended_action=(
                     "the journaled target cannot be bound to exact "
-                    "configured identities; audit the effect before "
-                    "reopening admission"
+                    "configured identities; audit the effect before retrying it"
                 ),
                 evidence={"issue_id": issue_id},
             )
@@ -1327,11 +1327,11 @@ class Reconciler:
             return Finding(
                 kind="linear_state_unavailable",
                 subsystem="linear",
-                severity="blocking",
+                severity="warning",
                 aggregate_id=effect_id,
                 recommended_action=(
                     "the issue could not be read, so the pending effect "
-                    "outcome stays unknown; admission stays closed"
+                    "outcome stays unknown; unrelated work may continue"
                 ),
                 evidence={
                     "issue_id": issue_id,
@@ -1343,7 +1343,7 @@ class Reconciler:
             return Finding(
                 kind="linear_identity_mismatch",
                 subsystem="linear",
-                severity="blocking",
+                severity="warning",
                 aggregate_id=effect_id,
                 recommended_action=(
                     "the read returned a different issue identity; "
@@ -1355,11 +1355,11 @@ class Reconciler:
             return Finding(
                 kind="linear_team_mismatch",
                 subsystem="linear",
-                severity="blocking",
+                severity="warning",
                 aggregate_id=effect_id,
                 recommended_action=(
                     "the issue is not in the configured Linear team; "
-                    "audit the routing before reopening admission"
+                    "audit the routing before retrying this projection"
                 ),
                 evidence={**evidence, "observed_team": str(issue.team_id)},
             )
@@ -1402,7 +1402,7 @@ class Reconciler:
         return Finding(
             kind="linear_state_mismatch",
             subsystem="linear",
-            severity="blocking",
+            severity="warning",
             aggregate_id=effect_id,
             recommended_action=(
                 "the issue changed after the journaled read without "
