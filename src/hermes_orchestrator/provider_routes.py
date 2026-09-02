@@ -32,8 +32,10 @@ import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -115,6 +117,11 @@ _MAX_EXPECTED = {
     "apiProvider": "firstParty",
     "subscriptionType": "max",
 }
+_CAPACITY_RESET_PATTERN = re.compile(
+    r"resets?\s+(?P<clock>\d{1,2}:\d{2}\s*(?:am|pm))\s*"
+    r"\((?P<zone>[^)]+)\)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +430,48 @@ class RouteHealth:
             "reported_provider": self.reported_provider,
             "reported_auth_method": self.reported_auth_method,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class FableCapacity:
+    """Identity-free result of one bounded Fable inference probe."""
+
+    state: str
+    resets_at: datetime | None
+    detail: str
+
+
+def parse_fable_capacity(output: str, *, now: datetime) -> FableCapacity:
+    """Classify a bounded probe without inventing a reset horizon."""
+
+    text = output.strip()
+    if text == "CAPACITY_OK":
+        return FableCapacity(
+            state="available",
+            resets_at=None,
+            detail="bounded provider Fable probe returned CAPACITY_OK",
+        )
+    if "limit" not in text.lower():
+        raise ValueError("Fable capacity probe returned an unrecognized response")
+    match = _CAPACITY_RESET_PATTERN.search(text)
+    if match is None:
+        raise ValueError("Fable limit response did not include an exact reset time")
+    try:
+        zone = ZoneInfo(match.group("zone"))
+    except ZoneInfoNotFoundError as error:
+        raise ValueError("Fable limit response named an unknown timezone") from error
+    clock = datetime.strptime(
+        match.group("clock").replace(" ", "").lower(), "%I:%M%p"
+    ).time()
+    local_now = now.astimezone(zone)
+    reset = datetime.combine(local_now.date(), clock, tzinfo=zone)
+    if reset <= local_now:
+        reset += timedelta(days=1)
+    return FableCapacity(
+        state="capped",
+        resets_at=reset.astimezone(UTC),
+        detail="bounded provider Fable probe reported a limit with exact reset",
+    )
 
 
 def resolve_executable(

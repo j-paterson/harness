@@ -554,6 +554,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     provider_probe.add_argument("--route", default=None)
     provider_probe.add_argument("--json", action="store_true")
+    provider_probe.add_argument(
+        "--fable-capacity",
+        action="store_true",
+        help=(
+            "run one bounded Fable inference on exactly one Max route and "
+            "atomically persist its available/capped result"
+        ),
+    )
 
     commands.add_parser(
         "claude-shell-init",
@@ -3250,7 +3258,9 @@ def _claude_launch(args: argparse.Namespace, settings: Settings) -> int:
 
 def _provider_probe(args: argparse.Namespace, settings: Settings) -> int:
     from hermes_orchestrator.provider_routes import (
+        FIRST_PARTY_MAX,
         ProviderProbe,
+        parse_fable_capacity,
         resolve_executable,
     )
 
@@ -3260,12 +3270,83 @@ def _provider_probe(args: argparse.Namespace, settings: Settings) -> int:
         names = tuple(routes.names) if args.route is None else (args.route,)
         for name in names:
             routes.route(name)
+        if args.fable_capacity and (
+            len(names) != 1
+            or names[0] == "default"
+            or routes.route(names[0]).kind != FIRST_PARTY_MAX
+        ):
+            raise ValueError(
+                "--fable-capacity requires exactly one named Max route"
+            )
     except ValueError as error:
         print(f"provider-probe refused: {error}", file=sys.stderr)
         return 2
     probe = ProviderProbe(routes, base_env=dict(os.environ), executable=executable)
     results = [probe.check(name) for name in names]
     ok = all(result.ok for result in results)
+    capacity: dict[str, object] | None = None
+    if args.fable_capacity and ok:
+        observed_at = datetime.now(UTC)
+        route_name = names[0]
+        environment = routes.launch_env(route_name, dict(os.environ))
+        try:
+            completed = subprocess.run(
+                (
+                    executable,
+                    "-p",
+                    "Reply with exactly CAPACITY_OK and nothing else.",
+                    "--model",
+                    "fable",
+                    "--max-turns",
+                    "1",
+                    "--output-format",
+                    "text",
+                    "--no-session-persistence",
+                    "--dangerously-skip-permissions",
+                ),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            evidence = parse_fable_capacity(
+                completed.stdout + completed.stderr, now=observed_at
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            print(f"provider-probe refused: {error}", file=sys.stderr)
+            return 2
+        database = Database.open(settings.state_dir / "state.db")
+        try:
+            with database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO profile_capacity_observations("
+                    "profile_alias, model, state, source, observed_at, "
+                    "resets_at, detail) VALUES (?, 'fable', ?, "
+                    "'provider_limit', ?, ?, ?)",
+                    (
+                        route_name,
+                        evidence.state,
+                        observed_at.isoformat(),
+                        (
+                            None
+                            if evidence.resets_at is None
+                            else evidence.resets_at.isoformat()
+                        ),
+                        evidence.detail,
+                    ),
+                )
+        finally:
+            database.close()
+        capacity = {
+            "route": route_name,
+            "state": evidence.state,
+            "resets_at": (
+                None
+                if evidence.resets_at is None
+                else evidence.resets_at.isoformat()
+            ),
+        }
+        ok = evidence.state == "available"
     if args.json:
         print(
             json.dumps(
@@ -3273,6 +3354,7 @@ def _provider_probe(args: argparse.Namespace, settings: Settings) -> int:
                     "ok": ok,
                     "routes": [result.as_record() for result in results],
                     "metadata": list(routes.metadata()),
+                    "capacity": capacity,
                 },
                 sort_keys=True,
             )
@@ -3283,6 +3365,11 @@ def _provider_probe(args: argparse.Namespace, settings: Settings) -> int:
                 f"{result.route}\t{result.kind}\t"
                 f"{'ok' if result.ok else 'REFUSED'}\t{result.reason}\t"
                 f"{result.reported_provider or '-'}"
+            )
+        if capacity is not None:
+            print(
+                f"{capacity['route']}\tfable\t{capacity['state']}\t"
+                f"{capacity['resets_at'] or '-'}"
             )
     return 0 if ok else 1
 
