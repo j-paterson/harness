@@ -4229,7 +4229,17 @@ class _ReadOnlyDashboardDatabase:
 def _dashboard_replacement_launcher(
     state_dir: Path, current_runtime: Path
 ) -> Path | None:
-    """Return the stable launcher when ACTIVE moved to a complete runtime."""
+    """Return the exec target when ACTIVE moved to a complete runtime.
+
+    INFRA-225: prefer the activated runtime's own console script
+    (``<active>/.venv/bin/hermes-orchestrator``) when it exists —
+    exec'ing it replaces this process in place, since its shebang is
+    the runtime's own venv python. The ``bin/hermes-orchestrator``
+    shim instead runs ``uv run``, which spawns a child and waits
+    rather than exec'ing, leaving the prior wrapper alive as a stacked
+    parent; it remains the fallback for a runtime not yet carrying its
+    own console script.
+    """
 
     pointer = state_dir / "runtimes" / "ACTIVE"
     launcher = state_dir / "bin" / "hermes-orchestrator"
@@ -4237,11 +4247,12 @@ def _dashboard_replacement_launcher(
         active = Path(pointer.read_text(encoding="utf-8").strip()).resolve()
     except OSError:
         return None
-    if (
-        active == current_runtime.resolve()
-        or not (active / "pyproject.toml").is_file()
-        or not launcher.is_file()
-    ):
+    if active == current_runtime.resolve() or not (active / "pyproject.toml").is_file():
+        return None
+    console_script = active / ".venv" / "bin" / "hermes-orchestrator"
+    if console_script.is_file():
+        return console_script
+    if not launcher.is_file():
         return None
     return launcher
 
