@@ -465,6 +465,92 @@ def test_observation_runtime_still_exposes_lead_wakes(tmp_path: Path) -> None:
         runtime.close()
 
 
+def seed_idle_runnable_seat(
+    state_dir: Path,
+    *,
+    project_key: str = "demo",
+    issue_id: str = "INFRA-1",
+    session_id: str = "22222222-2222-4222-8222-222222222222",
+) -> None:
+    """Seed a durable ACTIVE development cell that is genuinely idle
+    (its session recorded a Stop and never started a turn since), one
+    queued dependency-ready admitted issue, and a fresh green resource
+    sample -- every predicate ``commit_work_ready`` requires -- before
+    the daemon opens its own persistent connection over the same file.
+    """
+
+    now = datetime.now(UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells(cell_id, project_key, state, "
+                "profile_alias, session_id, created_at, updated_at, "
+                "lane_role) VALUES ('cell-idle', ?, 'active', 'max-c', "
+                "?, ?, ?, 'development')",
+                (project_key, session_id, now, now),
+            )
+            connection.execute(
+                "INSERT INTO admitted_issues(issue_id, project_key, "
+                "priority, state, instruction_id, dependency_ready, "
+                "overlap_risk, admitted_at, updated_at) VALUES "
+                "(?, ?, 1, 'queued', 'chat-1', 1, 0, ?, ?)",
+                (issue_id, project_key, now, now),
+            )
+            connection.execute(
+                "INSERT INTO resource_samples(sample_id, sampled_at, "
+                "pressure, available_memory_bytes, total_memory_bytes, "
+                "swap_used_bytes, load_one, logical_cpus, disk_json, "
+                "managed_rss_bytes) VALUES ('sample-1', ?, 'green', 1, 2, "
+                "0, 0.1, 8, '{}', 0)",
+                (now,),
+            )
+            connection.execute(
+                "INSERT INTO events(event_id, event_type, aggregate_type, "
+                "aggregate_id, occurred_at, actor, payload_json) VALUES "
+                "('evt-stop', 'lead_turn.stopped', 'lead_session', ?, ?, "
+                "'lead', '{}')",
+                (session_id, now),
+            )
+    finally:
+        database.close()
+
+
+def test_runtime_wires_replenishment_to_work_ready_wakes(tmp_path: Path) -> None:
+    """INFRA-215: both the post-merge advance path and child settlement
+    are wired, in ``open_runtime``, to the SAME immediate-replenishment
+    function -- the one that makes the daemon's per-tick
+    ``commit_work_ready`` call right away instead of waiting for the
+    next maintenance tick."""
+
+    repo_root, state_dir = active_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    seed_idle_runnable_seat(state_dir)
+
+    runtime = open_runtime(
+        settings,
+        enable_live=True,
+        profile_command=EligibleProfileCommand(),
+        keychain=FakeKeychain(),
+        base_env={},
+    )
+    try:
+        assert runtime.post_merge is not None
+        assert runtime.lead_children is not None
+        assert runtime.post_merge.replenish is not None
+        assert runtime.post_merge.replenish is runtime.lead_children._replenish
+
+        runtime.post_merge.replenish("demo")
+
+        assert runtime.lead_wakes is not None
+        pending = runtime.lead_wakes.pending()
+        assert len(pending) == 1
+        assert pending[0].kind == "work_ready"
+        assert pending[0].issue_id == "INFRA-1"
+    finally:
+        runtime.close()
+
+
 def test_active_runtime_assembles_cmux_visibility_when_configured(
     tmp_path: Path,
 ) -> None:

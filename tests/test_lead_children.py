@@ -109,6 +109,47 @@ def test_a_duplicated_completion_never_reactivates_early(
     assert reactivations(database) == 1
 
 
+def test_child_completion_replenishes_when_runnable_work_exists(
+    database: Database, control: ControlOperations
+) -> None:
+    """INFRA-215: settling a child is one of the durable events that
+    can make a project's next eligible transition possible, so it
+    fires the immediate replenishment hook with that project -- whether
+    or not this exact completion also happened to reactivate a waiting
+    continuation."""
+
+    seed_active_cell(database)
+    calls: list[str] = []
+    tracker = LeadChildTracker(
+        database, control=control, now=lambda: NOW, replenish=calls.append
+    )
+    tracker.child_started(SESSION, "child-a")
+
+    reactivation = tracker.child_completed(SESSION, "child-a")
+
+    assert reactivation is None
+    assert calls == ["demo"]
+
+
+def test_child_completion_replenish_failure_is_swallowed(
+    database: Database, control: ControlOperations
+) -> None:
+    """A replenish hook that raises never surfaces out of a durably
+    settled completion."""
+
+    seed_active_cell(database)
+
+    def _explode(project_key: str) -> None:
+        raise RuntimeError("boom")
+
+    tracker = LeadChildTracker(
+        database, control=control, now=lambda: NOW, replenish=_explode
+    )
+    tracker.child_started(SESSION, "child-a")
+
+    assert tracker.child_completed(SESSION, "child-a") is None
+
+
 def test_replayed_hooks_record_exactly_one_start_and_completion(
     database: Database, tracker: LeadChildTracker
 ) -> None:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -120,11 +121,19 @@ class LeadChildTracker:
         control: ControlOperations,
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
+        replenish: Callable[[str], None] | None = None,
     ) -> None:
         self._database = database
         self._control = control
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or (lambda: datetime.now(UTC))
+        # INFRA-215: an injectable immediate-replenishment hook, called
+        # after a child settles for a project that may now have
+        # runnable work. ``None`` is the ordinary shape everywhere this
+        # tracker is built ad hoc from a hook payload; the daemon's
+        # per-tick sweep still discovers the same work, just not
+        # immediately.
+        self._replenish = replenish
 
     def child_started(self, session_id: str, child_id: str) -> bool:
         """Record one distinct child start; a duplicate is a no-op.
@@ -187,69 +196,96 @@ class LeadChildTracker:
         idle dispatch already share; an unbound session changes no
         child row, no continuation row and no control operation, and
         returns the same "no effect" ``None`` the CAS-miss path does.
+
+        INFRA-215: once the child row itself is durably settled (this
+        method's own compare-and-swap succeeded), :attr:`_replenish`
+        (when wired) is called with the session's project exactly once
+        more, AFTER the transaction commits -- whether or not this
+        exact completion also happened to empty the outstanding set and
+        reactivate a continuation. Child completion is one of the
+        events the durable project-completion contract lists as
+        needing a fresh eligibility check, independent of whether a
+        lead is waiting on it. A failed replenish signal never raises
+        here; the daemon's own per-tick sweep repairs it.
         """
 
         if not child_id.strip():
             return None
         stamp = self._now().isoformat()
-        operation: ControlOperation | None = None
-        with self._database.transaction() as connection:
-            if _bound_cell(connection, session_id) is None:
-                return None
-            settled = connection.execute(
-                "UPDATE lead_children SET state = 'completed', "
-                "completed_at = ? "
-                "WHERE session_id = ? AND child_id = ? "
-                "AND state = 'started'",
-                (stamp, session_id, child_id.strip()),
-            )
-            if settled.rowcount != 1:
-                return None
-            outstanding = connection.execute(
-                "SELECT COUNT(*) AS outstanding FROM lead_children "
-                "WHERE session_id = ? AND state = 'started'",
-                (session_id,),
-            ).fetchone()
-            if int(outstanding["outstanding"]) > 0:
-                return None
-            waiting = connection.execute(
-                "SELECT continuation_id, project_key, cell_id, condition "
-                "FROM lead_continuations "
-                "WHERE session_id = ? AND state = 'waiting'",
-                (session_id,),
-            ).fetchone()
-            if waiting is None:
-                return None
-            reactivated = connection.execute(
-                "UPDATE lead_continuations SET state = 'reactivated', "
-                "updated_at = ? "
-                "WHERE continuation_id = ? AND state = 'waiting'",
-                (stamp, str(waiting["continuation_id"])),
-            )
-            if reactivated.rowcount != 1:
-                return None
-            completed = connection.execute(
-                "SELECT COUNT(*) AS completed FROM lead_children "
-                "WHERE session_id = ? AND state = 'completed'",
-                (session_id,),
-            ).fetchone()
-            operation = self._control.record_in(
-                connection,
-                kind="children.completed",
-                project_key=str(waiting["project_key"]),
-                cell_id=str(waiting["cell_id"]),
-                session_id=session_id,
-                result={
-                    "completed_children": int(completed["completed"]),
-                    "continuation": str(waiting["condition"]),
-                },
-                dedup_key=(
-                    f"children.completed:{waiting['continuation_id']}"
-                ),
-            )
-        if operation is not None:
-            self._control.notify_committed(operation)
-        return operation
+        outcome: dict[str, object | None] = {"operation": None, "project_key": None}
+        try:
+            with self._database.transaction() as connection:
+                bound = _bound_cell(connection, session_id)
+                if bound is None:
+                    return None
+                settled = connection.execute(
+                    "UPDATE lead_children SET state = 'completed', "
+                    "completed_at = ? "
+                    "WHERE session_id = ? AND child_id = ? "
+                    "AND state = 'started'",
+                    (stamp, session_id, child_id.strip()),
+                )
+                if settled.rowcount != 1:
+                    return None
+                outcome["project_key"] = str(bound["project_key"])
+                outstanding = connection.execute(
+                    "SELECT COUNT(*) AS outstanding FROM lead_children "
+                    "WHERE session_id = ? AND state = 'started'",
+                    (session_id,),
+                ).fetchone()
+                if int(outstanding["outstanding"]) > 0:
+                    return None
+                waiting = connection.execute(
+                    "SELECT continuation_id, project_key, cell_id, condition "
+                    "FROM lead_continuations "
+                    "WHERE session_id = ? AND state = 'waiting'",
+                    (session_id,),
+                ).fetchone()
+                if waiting is None:
+                    return None
+                reactivated = connection.execute(
+                    "UPDATE lead_continuations SET state = 'reactivated', "
+                    "updated_at = ? "
+                    "WHERE continuation_id = ? AND state = 'waiting'",
+                    (stamp, str(waiting["continuation_id"])),
+                )
+                if reactivated.rowcount != 1:
+                    return None
+                completed = connection.execute(
+                    "SELECT COUNT(*) AS completed FROM lead_children "
+                    "WHERE session_id = ? AND state = 'completed'",
+                    (session_id,),
+                ).fetchone()
+                operation = self._control.record_in(
+                    connection,
+                    kind="children.completed",
+                    project_key=str(waiting["project_key"]),
+                    cell_id=str(waiting["cell_id"]),
+                    session_id=session_id,
+                    result={
+                        "completed_children": int(completed["completed"]),
+                        "continuation": str(waiting["condition"]),
+                    },
+                    dedup_key=(
+                        f"children.completed:{waiting['continuation_id']}"
+                    ),
+                )
+                outcome["operation"] = operation
+                return operation
+        finally:
+            operation = outcome["operation"]
+            if operation is not None:
+                self._control.notify_committed(operation)
+            project_key = outcome["project_key"]
+            if project_key is not None and self._replenish is not None:
+                try:
+                    self._replenish(str(project_key))
+                except Exception as error:
+                    print(
+                        "lead_children: immediate replenish failed for "
+                        f"{project_key!r}: {type(error).__name__}: {error}",
+                        file=sys.stderr,
+                    )
 
     def record_turn_stop(self, session_id: str) -> LeadContinuation | None:
         """At a Stop boundary, durably promise the outstanding work.
