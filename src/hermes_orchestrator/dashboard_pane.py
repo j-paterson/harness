@@ -84,6 +84,7 @@ class DashboardPane:
 _HIDE_CURSOR = "\x1b[?25l"
 _SHOW_CURSOR = "\x1b[?25h"
 _CLEAR_SCREEN = "\x1b[2J"
+_CLEAR_SCROLLBACK = "\x1b[3J"
 _CLEAR_BELOW = "\x1b[J"
 _RESET_ATTRIBUTES = "\x1b[0m"
 
@@ -118,7 +119,7 @@ class FramePane:
         lines = tuple(lines)
         height = len(lines)
         if self._established_height != height:
-            parts = [f"{_CLEAR_SCREEN}{_HIDE_CURSOR}"]
+            parts = [f"{_CLEAR_SCROLLBACK}{_CLEAR_SCREEN}{_HIDE_CURSOR}"]
             for index, line in enumerate(lines):
                 parts.append(f"\x1b[{index + 1};1H{line}{_CLEAR_TO_EOL}")
             parts.append(_CLEAR_BELOW)

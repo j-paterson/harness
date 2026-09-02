@@ -557,6 +557,53 @@ def test_tasks_join_lead_children_pr_and_settlement(tmp_path: Path) -> None:
     database.close()
 
 
+def test_tasks_use_the_issue_assignment_instead_of_an_arbitrary_project_lane(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-198",
+            project_key="agent-orchestration",
+            priority=1,
+            state="post_merge_acceptance",
+            updated_at="2026-09-02T02:00:00+00:00",
+        )
+        _insert_cell(
+            connection,
+            cell_id="cell-development",
+            project_key="agent-orchestration",
+            state="active",
+            profile_alias="max-a",
+            session_id="session-development",
+            lane_role="development",
+        )
+        _insert_cell(
+            connection,
+            cell_id="cell-harness",
+            project_key="agent-orchestration",
+            state="active",
+            profile_alias="max-d",
+            session_id="session-harness",
+            lane_role="harness",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="assignment-harness",
+            project_key="agent-orchestration",
+            issue_id="INFRA-198",
+            cell_id="cell-harness",
+            session_id="session-harness",
+            state="acknowledged",
+        )
+
+    [task] = TaskProvider(database).tasks()
+
+    assert task.lead_profile == "max-d"
+    database.close()
+
+
 def test_tasks_observed_at_is_the_latest_updated_at_or_none(
     tmp_path: Path,
 ) -> None:
@@ -913,6 +960,33 @@ def test_capacity_provider_returns_latest_per_alias_and_none_when_absent(
     database.close()
 
 
+def test_capacity_provider_uses_observation_time_not_insertion_order(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES ('max-a', 'fable', 'capped', 'provider_limit', "
+            "'2026-09-02T02:47:00+00:00', '2026-09-02T03:47:00+00:00')"
+        )
+        # A delayed write carrying older evidence must not replace the
+        # fresher provider observation merely because its row id is newer.
+        connection.execute(
+            "INSERT INTO profile_capacity_observations("
+            "profile_alias, model, state, source, observed_at, resets_at"
+            ") VALUES ('max-a', 'fable', 'available', 'operator_attestation', "
+            "'2026-09-01T03:44:00+00:00', NULL)"
+        )
+
+    [max_a, *_] = CapacityProvider(database, _registry(tmp_path)).capacity()
+
+    assert max_a.state == "capped"
+    assert max_a.resets_at == "2026-09-02T03:47:00+00:00"
+    database.close()
+
+
 def test_resource_provider_returns_the_latest_sample_and_min_disk_free(
     tmp_path: Path,
 ) -> None:
@@ -1092,6 +1166,32 @@ def test_control_attention_provider_finds_the_latest_whitelisted_published_op(
     assert fact is not None
     assert fact.project_key == "proj-b"
     assert fact.kind == "channel.approval_required"
+    database.close()
+
+
+def test_control_attention_ignores_a_replaced_sessions_unresolved_prompt(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_cell(
+            connection,
+            cell_id="cell-current",
+            project_key="proj-a",
+            state="active",
+            profile_alias="max-b",
+            session_id="session-current",
+        )
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, state, created_at, updated_at"
+            ") VALUES ('op-stale', 1, 'channel.approval_required', 'proj-a', "
+            "'cell-old', 'session-old', 'dedup-old', '{}', 'published', "
+            "'2026-09-02T02:00:00+00:00', '2026-09-02T02:00:00+00:00')"
+        )
+
+    assert ControlAttentionProvider(database).latest() is None
     database.close()
 
 

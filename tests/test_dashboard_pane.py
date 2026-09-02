@@ -124,6 +124,7 @@ def test_frame_pane_first_draw_clears_screen_and_hides_cursor() -> None:
     output = stream.getvalue()
 
     assert "\x1b[2J" in output
+    assert "\x1b[3J" in output
     assert "\x1b[?25l" in output
     for index, line in enumerate(_LINES):
         assert f"\x1b[{index + 1};1H{line}\x1b[K" in output

@@ -463,7 +463,8 @@ class TaskProvider:
                     max(rows, key=lambda row: str(row["updated_at"]))
                 )
 
-        leads = self._leads()
+        issue_leads = self._issue_leads()
+        project_leads = self._leads()
         latest_review = self._latest_reviews()
         latest_settlement = self._latest_settlements()
         children = self._children_by_session()
@@ -472,7 +473,9 @@ class TaskProvider:
         for row in selected_rows:
             issue_id = str(row["issue_id"])
             project_key = str(row["project_key"])
-            lead_profile, lead_session = leads.get(project_key, (None, None))
+            lead_profile, lead_session = issue_leads.get(
+                issue_id, project_leads.get(project_key, (None, None))
+            )
             total, completed = (
                 children.get(lead_session, (0, 0)) if lead_session else (0, 0)
             )
@@ -516,11 +519,17 @@ class TaskProvider:
     def _leads(self) -> dict[str, tuple[str | None, str | None]]:
         rows = self._database.execute(
             "SELECT project_key, profile_alias, session_id FROM "
-            "project_cells WHERE state IN (?, ?, ?, ?)",
+            "project_cells WHERE state IN (?, ?, ?, ?) "
+            "ORDER BY CASE lane_role WHEN 'development' THEN 0 ELSE 1 END, "
+            "updated_at DESC",
             _ACTIVE_CELL_STATES,
         ).fetchall()
-        return {
-            str(row["project_key"]): (
+        leads: dict[str, tuple[str | None, str | None]] = {}
+        for row in rows:
+            project_key = str(row["project_key"])
+            if project_key in leads:
+                continue
+            leads[project_key] = (
                 str(row["profile_alias"])
                 if row["profile_alias"] is not None
                 else None,
@@ -528,8 +537,38 @@ class TaskProvider:
                 if row["session_id"] is not None
                 else None,
             )
-            for row in rows
-        }
+        return leads
+
+    def _issue_leads(self) -> dict[str, tuple[str | None, str | None]]:
+        """Resolve ownership from each issue's current lane assignment.
+
+        A project may have development and harness cells concurrently, so
+        project-level ownership is only a fallback for pre-assignment rows.
+        """
+
+        placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
+        rows = self._database.execute(
+            "SELECT la.issue_id, pc.profile_alias, pc.session_id "
+            "FROM lead_assignments la JOIN project_cells pc "
+            "ON pc.cell_id = la.cell_id AND pc.session_id = la.session_id "
+            f"WHERE la.state != 'superseded' AND pc.state IN ({placeholders}) "
+            "ORDER BY la.updated_at DESC",
+            _ACTIVE_CELL_STATES,
+        ).fetchall()
+        leads: dict[str, tuple[str | None, str | None]] = {}
+        for row in rows:
+            issue_id = str(row["issue_id"])
+            if issue_id in leads:
+                continue
+            leads[issue_id] = (
+                str(row["profile_alias"])
+                if row["profile_alias"] is not None
+                else None,
+                str(row["session_id"])
+                if row["session_id"] is not None
+                else None,
+            )
+        return leads
 
     def lane_cells(self) -> tuple[LaneCellFact, ...]:
         """One row per live lead cell, development and harness alike
@@ -715,7 +754,8 @@ class CapacityProvider:
             row = self._database.execute(
                 "SELECT state, source, observed_at, resets_at, detail FROM "
                 "profile_capacity_observations WHERE profile_alias = ? "
-                "AND model = 'fable' ORDER BY observation_id DESC LIMIT 1",
+                "AND model = 'fable' "
+                "ORDER BY observed_at DESC, observation_id DESC LIMIT 1",
                 (profile.alias,),
             ).fetchone()
             if row is None:
@@ -1017,11 +1057,26 @@ class ControlAttentionProvider:
 
     def latest(self) -> ControlAttentionFact | None:
         placeholders = ",".join("?" for _ in _CONTROL_OPERATION_ATTENTION_KINDS)
+        cell_states = ",".join("?" for _ in _ACTIVE_CELL_STATES)
         row = self._database.execute(
-            "SELECT kind, project_key, created_at FROM control_operations "
-            f"WHERE state = 'published' AND kind IN ({placeholders}) "
-            "ORDER BY created_at DESC LIMIT 1",
-            tuple(_CONTROL_OPERATION_ATTENTION_KINDS),
+            "SELECT co.kind, co.project_key, co.created_at "
+            "FROM control_operations co "
+            f"WHERE co.state = 'published' AND co.kind IN ({placeholders}) "
+            "AND (co.session_id IS NULL OR EXISTS ("
+            "SELECT 1 FROM project_cells exact WHERE exact.cell_id = co.cell_id "
+            "AND exact.session_id = co.session_id "
+            f"AND exact.state IN ({cell_states})"
+            ") OR NOT EXISTS ("
+            "SELECT 1 FROM project_cells current "
+            "WHERE current.project_key = co.project_key "
+            f"AND current.state IN ({cell_states})"
+            ")) "
+            "ORDER BY co.created_at DESC LIMIT 1",
+            (
+                *_CONTROL_OPERATION_ATTENTION_KINDS,
+                *_ACTIVE_CELL_STATES,
+                *_ACTIVE_CELL_STATES,
+            ),
         ).fetchone()
         if row is None:
             return None
