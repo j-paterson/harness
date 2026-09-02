@@ -2,6 +2,7 @@ import uuid
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.resources import (
     PressureLevel,
     ResourceSampler,
+    bound_process_rss,
     read_fresh_sample,
 )
 
@@ -95,6 +97,93 @@ def test_vanished_sampling_target_degrades_to_zero_free(tmp_path: Path) -> None:
     snapshot = sampler.sample()
 
     assert snapshot.disk_free_bytes == {"demo": 40, "gone": 0}
+
+
+class FakeManagedProcess:
+    def __init__(
+        self,
+        pid: int,
+        *,
+        command: tuple[str, ...] = (),
+        rss: int = 0,
+        children: tuple["FakeManagedProcess", ...] = (),
+        inaccessible: bool = False,
+    ) -> None:
+        self.pid = pid
+        self._command = command
+        self._rss = rss
+        self._children = children
+        self._inaccessible = inaccessible
+
+    def cmdline(self) -> tuple[str, ...]:
+        if self._inaccessible:
+            raise OSError("gone")
+        return self._command
+
+    def children(self, *, recursive: bool) -> tuple["FakeManagedProcess", ...]:
+        assert recursive is True
+        if self._inaccessible:
+            raise OSError("gone")
+        return self._children
+
+    def memory_info(self) -> SimpleNamespace:
+        if self._inaccessible:
+            raise OSError("gone")
+        return SimpleNamespace(rss=self._rss)
+
+
+def test_bound_process_rss_counts_daemon_and_exact_active_lead_tree(
+    database: Database,
+) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells(cell_id, project_key, state, session_id, "
+            "created_at, updated_at) VALUES "
+            "('active', 'demo', 'active', 'session-active', 'now', 'now'), "
+            "('retired', 'demo', 'retired', 'session-retired', 'now', 'now')"
+        )
+
+    sidecar = FakeManagedProcess(12, rss=30)
+    daemon = FakeManagedProcess(10, command=("hermes-orchestrator",), rss=100)
+    active_lead = FakeManagedProcess(
+        11,
+        command=("claude", "--resume", "session-active"),
+        rss=200,
+        children=(sidecar,),
+    )
+    retired_lead = FakeManagedProcess(
+        13,
+        command=("claude", "--session-id", "session-retired"),
+        rss=400,
+    )
+    unrelated = FakeManagedProcess(
+        14,
+        command=("claude", "--resume", "someone-else"),
+        rss=500,
+    )
+    rss = bound_process_rss(
+        database,
+        process_iter=lambda: iter(
+            (daemon, active_lead, sidecar, retired_lead, unrelated)
+        ),
+        daemon_pid=10,
+    )
+
+    assert rss == 330
+
+
+def test_bound_process_rss_ignores_inaccessible_processes(
+    database: Database,
+) -> None:
+    daemon = FakeManagedProcess(10, rss=100)
+    gone = FakeManagedProcess(11, inaccessible=True)
+    rss = bound_process_rss(
+        database,
+        process_iter=lambda: iter((daemon, gone)),
+        daemon_pid=10,
+    )
+
+    assert rss == 100
 
 
 # --- read_fresh_sample (INFRA-199 Finding 2) --------------------------------

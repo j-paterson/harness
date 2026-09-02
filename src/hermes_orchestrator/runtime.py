@@ -109,7 +109,7 @@ from hermes_orchestrator.reconcile import (
     Reconciler,
     ReconciliationReport,
 )
-from hermes_orchestrator.resources import ResourceSampler
+from hermes_orchestrator.resources import ResourceSampler, bound_process_rss
 from hermes_orchestrator.scheduler import Scheduler
 from hermes_orchestrator.service import OrchestratorService
 from hermes_orchestrator.stalls import ScheduledResets
@@ -977,7 +977,9 @@ def open_runtime(
         sampler = ResourceSampler(
             policy=settings.policy,
             repository_paths=repository_paths,
-            managed_rss=processes.managed_rss_bytes,
+            managed_rss=lambda: max(
+                bound_process_rss(database), processes.managed_rss_bytes()
+            ),
             classifier=classifier,
         )
         service = OrchestratorService(
