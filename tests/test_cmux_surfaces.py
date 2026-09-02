@@ -3434,6 +3434,95 @@ async def test_dead_lead_sweep_stops_on_a_mid_pass_cmux_failure(
     assert _cell_state(database, "cell-demo") == "active"
 
 
+def test_retire_dead_lead_cell_retires_a_stale_lead_binding(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """INFRA-219 (observed live): the harness lead's cmux pane
+    survived while its Claude process exited. Seat-restore correctly
+    refused to reactivate the dead worker, leaving the binding
+    ``stale`` -- which made the cell invisible to ``tick()``, whose
+    sweep only iterates ACTIVE lead bindings. ``retire_dead_lead_cell``
+    is the cell-scoped retirement ``start-lane`` calls instead, after
+    measuring the dead worker itself; it must never touch
+    ``lead_assignments``."""
+
+    seed_cell(database)
+    control = ControlOperations(database, events=EventStore(database))
+    binding = bind_demo_lead(bindings)
+    database.execute(
+        "UPDATE cmux_surface_bindings SET state = 'stale' "
+        "WHERE binding_id = ?",
+        (binding.binding_id,),
+    )
+    database.execute(
+        "INSERT INTO profile_leases("
+        "profile_alias, project_key, lane_role, state, acquired_at) "
+        "VALUES ('max-a', 'demo', 'development', 'active', ?)",
+        (NOW.isoformat(),),
+    )
+    database.execute(
+        "INSERT INTO lead_assignments("
+        "assignment_id, schema_version, project_key, issue_id, cell_id, "
+        "session_id, profile_alias, instruction_id, queue_transition, "
+        "state, created_at, updated_at) VALUES ("
+        "'assign-1', 1, 'demo', 'issue-1', 'cell-demo', ?, 'max-a', "
+        "'instr-1', 'dispatch', 'published', ?, ?)",
+        (SESSION, NOW.isoformat(), NOW.isoformat()),
+    )
+
+    retired = _dead_lead_sweep(
+        database, bindings, FakePort(), control=control
+    ).retire_dead_lead_cell("cell-demo")
+
+    assert retired is True
+    # Only an ACTIVE binding is closed; this one was already 'stale'
+    # (seat-restore's own refusal) and is left exactly as found.
+    assert bindings.get(binding.binding_id).state == "stale"
+    assert _cell_state(database, "cell-demo") == "failed"
+    lease_row = database.execute(
+        "SELECT 1 FROM profile_leases "
+        "WHERE project_key = 'demo' AND lane_role = 'development'"
+    ).fetchone()
+    assert lease_row is None
+    assert control_operation_kinds(database) == ["lead.dead_worker_retired"]
+    result = json.loads(
+        str(
+            database.execute(
+                "SELECT result_json FROM control_operations "
+                "WHERE kind = 'lead.dead_worker_retired'"
+            ).fetchone()["result_json"]
+        )
+    )
+    assert result["condemning_signal"] == "worker_absent"
+    # The versioned assignment packet is untouched -- this is a seat
+    # retirement, never a durable-assignment mutation.
+    assignment_row = database.execute(
+        "SELECT state FROM lead_assignments WHERE assignment_id = 'assign-1'"
+    ).fetchone()
+    assert assignment_row is not None
+    assert str(assignment_row["state"]) == "published"
+
+
+def test_retire_dead_lead_cell_returns_false_when_cell_is_not_active(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """A cell that has already moved on (or never existed) is left
+    exactly as found -- zero writes, no receipt."""
+
+    seed_cell(database, state="failed")
+    control = ControlOperations(database, events=EventStore(database))
+    binding = bind_demo_lead(bindings)
+
+    retired = _dead_lead_sweep(
+        database, bindings, FakePort(), control=control
+    ).retire_dead_lead_cell("cell-demo")
+
+    assert retired is False
+    assert bindings.get(binding.binding_id).state == "active"
+    assert _cell_state(database, "cell-demo") == "failed"
+    assert control_operation_kinds(database) == []
+
+
 # -- relaunched trusted seat restoration (INFRA-198) ---------------------
 
 

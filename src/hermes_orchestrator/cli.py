@@ -1618,13 +1618,61 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
         # only signal that the lane was down. The worker is measured
         # here, tri-state: ``True`` (running) and ``None`` (unknown --
         # ``ps`` failed or was ambiguous, therefore treated as alive) are
-        # both adopted as before; only a DEFINITIVE absence refuses.
-        # Retirement stays the daemon's ``CmuxDeadLeadSweep``'s alone --
-        # this command never tears down durable state on its own.
+        # both adopted as before; only a DEFINITIVE absence retires.
         if managed_claude_worker_alive(str(existing.session_id)) is False:
+            # INFRA-219 (observed live): deferring to "the daemon's
+            # dead-lead sweep" left the lane stuck forever -- the sweep
+            # only iterates ACTIVE lead bindings, and seat-restore
+            # correctly refuses to reactivate a dead worker, so a
+            # ``stale`` binding on this exact cell is invisible to it.
+            # Retire the cell HERE, through the sweep's own cell-scoped
+            # retirement, composed exactly as the daemon composes
+            # ``CmuxDeadLeadSweep`` (runtime.py:841). Only a DEFINITIVE
+            # False result (a concurrent transition won the CAS) keeps
+            # today's refusal.
+            environment = dict(os.environ)
+            assert settings.cmux is not None
+            dead_lead_sweep = CmuxDeadLeadSweep(
+                bindings=runtime.cmux_bindings,
+                port=CmuxCliAdapter(
+                    settings.cmux.cli,
+                    base_env=environment,
+                    password_source=cmux_password_source(Keychain()),
+                ),
+                database=runtime.database,
+                events=EventStore(runtime.database),
+                control=runtime.control_operations,
+                leases=runtime.worktree_leases,
+                # The in-memory profile pool this one-shot command would
+                # use is local to ``_open_rotation_collaborators`` and
+                # not exposed on ``Runtime`` -- the durable retirement
+                # (cell state, profile-lease row, receipt) does not
+                # depend on it; only the daemon's cached pool affinity
+                # would, and this process has none to release.
+                profiles=None,
+            )
+            if not dead_lead_sweep.retire_dead_lead_cell(existing.cell_id):
+                _print(
+                    {
+                        "error": "dead_worker",
+                        "lane": lane_role,
+                        "cell_id": existing.cell_id,
+                        "session_id": str(existing.session_id),
+                    },
+                    json_output=args.json,
+                    human=(
+                        f"{lane_role} lane cell {existing.cell_id} for "
+                        f"{args.project} is still marked active but its "
+                        f"worker (session {existing.session_id}) is gone: "
+                        "no managed claude process is running for it. "
+                        "Nothing was started. Retiring it lost a "
+                        "concurrent transition; re-run start-lane."
+                    ),
+                )
+                return 1
             _print(
                 {
-                    "error": "dead_worker",
+                    "status": "dead_worker_retired",
                     "lane": lane_role,
                     "cell_id": existing.cell_id,
                     "session_id": str(existing.session_id),
@@ -1632,30 +1680,30 @@ def _start_lane(args: Any, settings: Settings, runtime: Runtime) -> int:
                 json_output=args.json,
                 human=(
                     f"{lane_role} lane cell {existing.cell_id} for "
-                    f"{args.project} is still marked active but its worker "
-                    f"(session {existing.session_id}) is gone: no managed "
-                    "claude process is running for it. Nothing was started. "
-                    "The daemon's dead-lead sweep retires this cell on its "
-                    "next tick; re-run start-lane after that to seat the "
-                    "replacement."
+                    f"{args.project} was marked active but its worker "
+                    f"(session {existing.session_id}) was gone; retired it "
+                    "and seating the replacement now."
                 ),
             )
-            return 1
-        _print(
-            {
-                "status": "already_running",
-                "lane": lane_role,
-                "cell_id": existing.cell_id,
-                "session_id": str(existing.session_id),
-            },
-            json_output=args.json,
-            human=(
-                f"{lane_role} lane already running for {args.project}: "
-                f"cell {existing.cell_id} (session {existing.session_id}) "
-                "-- adopted, not duplicated."
-            ),
-        )
-        return 0
+            # Fall through to the normal seating path below -- the cell
+            # is retired, so this invocation seats the replacement
+            # itself rather than requiring a second start-lane call.
+        else:
+            _print(
+                {
+                    "status": "already_running",
+                    "lane": lane_role,
+                    "cell_id": existing.cell_id,
+                    "session_id": str(existing.session_id),
+                },
+                json_output=args.json,
+                human=(
+                    f"{lane_role} lane already running for {args.project}: "
+                    f"cell {existing.cell_id} (session {existing.session_id}) "
+                    "-- adopted, not duplicated."
+                ),
+            )
+            return 0
 
     if not args.issue:
         _print(
