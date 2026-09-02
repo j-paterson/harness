@@ -2059,6 +2059,7 @@ def test_worktree_state_fails_closed_on_a_non_git_directory(tmp_path: Path) -> N
     assert state.branch == ""
     assert state.head == ""
     assert state.origin_head == ""
+    assert state.origin_integration_head == ""
     assert state.dirty is True
 
 
