@@ -2037,6 +2037,75 @@ class CmuxDeadLeadSweep:
                 )
         return True
 
+    def retire_dead_lead_cell(self, cell_id: str) -> bool:
+        """Retire one cell's dead lead seat for a caller outside a tick.
+
+        INFRA-219 (observed live): ``start-lane`` measures a dead
+        worker directly for a cell whose lead binding is no longer
+        ``active`` -- e.g. ``stale`` after seat-restore correctly
+        refused a dead worker -- so the cell is invisible to
+        :meth:`tick`, which only iterates ACTIVE lead bindings. This
+        exposes the exact same retirement for that cell-scoped caller
+        instead of leaving the lane stuck behind a manual teardown.
+
+        The cell's most recent lead binding in ANY state is looked up
+        as the identity evidence for the receipt (there may be no
+        active one); it is closed via
+        :meth:`CmuxSurfaceBindings.mark_closed` ONLY if it is currently
+        active. Retirement itself is the exact ``_retire_cell`` and
+        ``_release_issue_lease`` bodies :meth:`tick` uses -- zero
+        duplicated transaction logic -- and never touches
+        ``lead_assignments``. Returns False (and changes nothing) when
+        the cell is not currently 'active': ``_retire_cell`` re-checks
+        the cell's state under its own CAS before any write, so a cell
+        that has already moved on is left exactly as found.
+        """
+
+        row = self._database.execute(
+            "SELECT * FROM cmux_surface_bindings WHERE role = 'lead' "
+            "AND cell_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (cell_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        binding = _row_to_binding(row)
+        cell_retired = self._retire_cell(cell_id, binding)
+        if not cell_retired:
+            return False
+        if binding.state == "active":
+            binding = self._bindings.mark_closed(
+                binding.binding_id, reason=_DEAD_LEAD_BINDING_REASON
+            )
+        lease_id = self._release_issue_lease(
+            str(binding.project_key), cell_id, str(binding.session_id)
+        )
+        if self._control is not None:
+            with suppress(Exception):
+                self._control.record(
+                    kind="lead.dead_worker_retired",
+                    project_key=str(binding.project_key),
+                    cell_id=cell_id,
+                    session_id=str(binding.session_id),
+                    result={
+                        "cell_id": cell_id,
+                        "binding_id": binding.binding_id,
+                        "workspace_uuid": binding.workspace_uuid,
+                        "surface_uuid": binding.surface_uuid,
+                        "lane_role": binding.lane_role,
+                        "cell_retired": cell_retired,
+                        "worktree_lease_released": lease_id,
+                        "condemning_signal": _DEAD_LEAD_SIGNAL_WORKER,
+                    },
+                    reason=(
+                        "start-lane measured the lead's managed claude "
+                        "worker provably gone for a cell whose lead "
+                        "binding was not active; its binding is closed "
+                        "and the cell released so start-lane can seat "
+                        "the replacement in the same invocation"
+                    ),
+                )
+        return True
+
     def _release_issue_lease(
         self, project_key: str, cell_id: str, session_id: str
     ) -> str | None:
