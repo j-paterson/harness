@@ -527,9 +527,21 @@ def open_runtime(
             profile_path = settings.repo_root / "config" / "profiles.yaml"
             if not profile_path.exists():
                 raise ValueError("live runtime requires config/profiles.yaml")
-            prompt_path = settings.repo_root / "prompts" / "claude-lead.md"
+            prompt_path = resolve_prompt_file(
+                "claude-lead.md",
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            )
             if not prompt_path.is_file():
                 raise ValueError("live runtime requires prompts/claude-lead.md")
+            prompt_files = {"development": prompt_path}
+            harness_prompt = resolve_prompt_file(
+                "claude-harness.md",
+                repo_root=settings.repo_root,
+                state_dir=settings.state_dir,
+            )
+            if harness_prompt.is_file():
+                prompt_files[HARNESS_LANE] = harness_prompt
             missing_repositories = sorted(
                 alias
                 for alias, project in settings.projects.items()
@@ -803,6 +815,7 @@ def open_runtime(
                     port=cmux_port,
                     project_paths=cmux_project_paths,
                     lane_project_paths=cmux_lane_project_paths,
+                    prompt_files=prompt_files,
                     profile_dirs=cmux_profile_dirs,
                     # The read-only auth-status probe under the leased
                     # profile's exact CLAUDE_CONFIG_DIR: a seat is
@@ -818,6 +831,7 @@ def open_runtime(
                     port=cmux_port,
                     project_paths=cmux_project_paths,
                     lane_project_paths=cmux_lane_project_paths,
+                    prompt_files=prompt_files,
                     profile_dirs=cmux_profile_dirs,
                     environ=environment,
                     # Sol correction a06cbce0: restart recovery reseats a

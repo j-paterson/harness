@@ -1477,6 +1477,21 @@ def _open_rotation_collaborators(
             repo_path=harness_project.repo_path,
             harness_path=_harness_lead_cwd(harness_project.lead_cwd),
         )
+    prompt_name = (
+        "claude-harness.md"
+        if lane_role == HARNESS_LANE
+        else "claude-lead.md"
+    )
+    from hermes_orchestrator.runtime import resolve_prompt_file
+
+    prompt_file = resolve_prompt_file(
+        prompt_name, repo_root=settings.repo_root, state_dir=settings.state_dir
+    )
+    if not prompt_file.is_file():
+        raise FileNotFoundError(
+            f"the {lane_role} lead prompt is missing at {prompt_file}; "
+            "refusing to launch a lead with an unresolvable prompt asset"
+        )
     cmux_port = CmuxCliAdapter(
         settings.cmux.cli,
         base_env=environment,
@@ -1497,6 +1512,7 @@ def _open_rotation_collaborators(
         bindings=runtime.cmux_bindings,
         port=cmux_port,
         project_paths=project_paths,
+        prompt_files={lane_role: prompt_file},
         profile_dirs=RegistryProfileDirectory(registry),
         auth_probe=lambda alias: probe.check(alias).eligible,
         channel_launch=channel_launcher,
@@ -1510,23 +1526,6 @@ def _open_rotation_collaborators(
     # harness lane owns restart/rotation/wake-confirm/recovery/dedup/
     # acceptance testing only and never selects or implements product
     # issues (see ``prompts/claude-harness.md``).
-    prompt_name = "claude-harness.md" if lane_role == HARNESS_LANE else "claude-lead.md"
-    # INFRA-214 (observed live 2026-09-01): resolving this from
-    # ``settings.repo_root`` pointed at the stale primary checkout,
-    # which does not carry the merged ``claude-harness.md`` — Claude
-    # exited 1 on a prompt file that was not there. Assets resolve from
-    # the ACTIVATED runtime, version-matched to the running code, and a
-    # missing asset fails closed HERE, before any process is launched.
-    from hermes_orchestrator.runtime import resolve_prompt_file
-
-    prompt_file = resolve_prompt_file(
-        prompt_name, repo_root=settings.repo_root, state_dir=settings.state_dir
-    )
-    if not prompt_file.is_file():
-        raise FileNotFoundError(
-            f"the {lane_role} lead prompt is missing at {prompt_file}; "
-            "refusing to launch a lead with an unresolvable prompt asset"
-        )
     runner = ClaudeRunner(
         registry,
         prompt_file=prompt_file,

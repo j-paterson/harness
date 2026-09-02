@@ -796,8 +796,10 @@ async def test_composed_classic_seat_attaches_hermes_control_and_registers(
             config_path = (
                 settings.state_dir / "channels" / f"{SEAT_SESSION}.mcp.json"
             )
+            prompt_path = settings.repo_root / "prompts" / "claude-lead.md"
             assert command == (
                 f"claude --session-id {SEAT_SESSION} {SKIP_PERMISSIONS_FLAG} "
+                f"--append-system-prompt-file {prompt_path} "
                 f"--mcp-config {config_path} "
                 f"--dangerously-load-development-channels {CHANNEL_ENTRY}"
             )

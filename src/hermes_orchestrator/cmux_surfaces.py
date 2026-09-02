@@ -71,8 +71,9 @@ class SeatAuthRefused(RuntimeError):
 
 
 # The complete grammar of a classic in-pane lead command: the native
-# interactive Claude TUI addressing exactly one session — never a
-# prompt, flag soup, or credential. Immediately after the session UUID
+# interactive Claude TUI addressing exactly one session, optionally extended
+# by the controller-resolved project-lead prompt — never caller-supplied
+# prompt text, flag soup, or a credential. Immediately after the session UUID
 # sits the fixed ``--dangerously-skip-permissions`` literal (INFRA-197
 # operator decision infra-197-managed-claude-skip-permissions-20260830-
 # v1: every Hermes-managed classic launch carries it) — it is not
@@ -97,7 +98,9 @@ FAKECHAT_CHANNEL_ENTRY = "plugin:fakechat@claude-plugins-official"
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 _CLASSIC_COMMAND = re.compile(
     r"^claude --(resume|session-id) " + _UUID_PATTERN
-    + " " + re.escape(SKIP_PERMISSIONS_FLAG) + r"("
+    + " " + re.escape(SKIP_PERMISSIONS_FLAG)
+    + r"( --append-system-prompt-file /[A-Za-z0-9._/-]+/prompts/"
+    r"claude-(lead|harness)\.md)?("
     r" --mcp-config /[A-Za-z0-9._/-]+/" + _UUID_PATTERN + r"\.mcp\.json"
     r" --dangerously-load-development-channels " + re.escape(CHANNEL_ENTRY)
     + r"| --channels " + re.escape(FAKECHAT_CHANNEL_ENTRY)
@@ -106,9 +109,14 @@ _CLASSIC_COMMAND = re.compile(
 # The config path may hold nothing a shell, cmux, or argv parser could
 # reinterpret — no spaces, quotes, or metacharacters.
 _CHANNEL_CONFIG_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
+_LEAD_PROMPT_PATH = re.compile(
+    r"^/[A-Za-z0-9._/-]+/prompts/claude-(lead|harness)\.md$"
+)
 
 
-def classic_resume_command(session_id: str, *, resume: bool) -> str:
+def classic_resume_command(
+    session_id: str, *, resume: bool, prompt_file: Path | None = None
+) -> str:
     """The sanitized native command that runs the classic TUI in-pane.
 
     ``--resume`` reattaches an existing session; ``--session-id`` starts
@@ -123,11 +131,23 @@ def classic_resume_command(session_id: str, *, resume: bool) -> str:
 
     canonical = str(uuid.UUID(str(session_id)))
     flag = "--resume" if resume else "--session-id"
-    return f"claude {flag} {canonical} {SKIP_PERMISSIONS_FLAG}"
+    command = f"claude {flag} {canonical} {SKIP_PERMISSIONS_FLAG}"
+    if prompt_file is None:
+        return command
+    path = str(prompt_file)
+    if _LEAD_PROMPT_PATH.fullmatch(path) is None:
+        raise CmuxBindingConflict(
+            "only a resolved Claude lead prompt may extend a classic seat"
+        )
+    return f"{command} --append-system-prompt-file {path}"
 
 
 def classic_channel_command(
-    session_id: str, *, resume: bool, channel_config: Path
+    session_id: str,
+    *,
+    resume: bool,
+    channel_config: Path,
+    prompt_file: Path | None = None,
 ) -> str:
     """The classic command extended with exactly one channel load.
 
@@ -140,7 +160,9 @@ def classic_channel_command(
     ahead of this extension.
     """
 
-    base = classic_resume_command(session_id, resume=resume)
+    base = classic_resume_command(
+        session_id, resume=resume, prompt_file=prompt_file
+    )
     canonical = str(uuid.UUID(str(session_id)))
     path = str(channel_config)
     if (
@@ -1163,9 +1185,10 @@ class CmuxSurfaceReconciler:
     Each active binding is validated against the exact live workspace and
     surface UUIDs. A missing lead surface is replaced with one new
     generation whose workspace carries the recorded project cwd, the
-    profile's CLAUDE_CONFIG_DIR, and the same channel-enabled classic
-    launch command normal seating composes (Sol correction a06cbce0) —
-    never a prompt, credential, or blank terminal: when the channel
+    profile's CLAUDE_CONFIG_DIR, and the same role-prompted,
+    channel-enabled classic launch command normal seating composes (Sol
+    correction a06cbce0) — never caller-supplied prompt text, a credential,
+    or a blank terminal: when the channel
     launch cannot be built, the seat is recorded lost with one durable
     ``channel.blocked`` receipt instead of an active binding over an
     empty pane. A missing Orchestrator seat is rebound only to this
@@ -1215,6 +1238,7 @@ class CmuxSurfaceReconciler:
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
         lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
+        prompt_files: Mapping[str, Path] | None = None,
         profile_dirs: ProfileDirectory,
         environ: Mapping[str, str],
         channel_launch: ChannelLaunchSource | None = None,
@@ -1233,6 +1257,7 @@ class CmuxSurfaceReconciler:
         # INFRA-219 R5b: lane-keyed checkout overrides, so a harness
         # seat/binding never resolves into the development worktree.
         self._lane_project_paths = dict(lane_project_paths or {})
+        self._prompt_files = dict(prompt_files or {})
         self._profile_dirs = profile_dirs
         self._environ = dict(environ)
         self._channel_launch = channel_launch
@@ -1440,7 +1465,12 @@ class CmuxSurfaceReconciler:
                 generation=self._bindings.next_lead_generation(cell_id),
             )
             command = classic_channel_command(
-                session_id, resume=True, channel_config=config
+                session_id,
+                resume=True,
+                channel_config=config,
+                prompt_file=self._prompt_files.get(
+                    getattr(binding, "lane_role", "development")
+                ),
             )
         except Exception as error:
             # Fail closed: no launch command, no replacement seat. An
@@ -2512,6 +2542,7 @@ class CmuxLeadSeater:
         port: CmuxControlPort,
         project_paths: Mapping[str, Path],
         lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
+        prompt_files: Mapping[str, Path] | None = None,
         profile_dirs: ProfileDirectory,
         auth_probe: Callable[[str], bool] | None = None,
         channel_launch: ChannelLaunchSource | None = None,
@@ -2524,6 +2555,7 @@ class CmuxLeadSeater:
         # INFRA-219 R5b: lane-keyed checkout overrides, so a harness
         # seat/binding never resolves into the development worktree.
         self._lane_project_paths = dict(lane_project_paths or {})
+        self._prompt_files = dict(prompt_files or {})
         self._profile_dirs = profile_dirs
         self._auth_probe = auth_probe
         self._channel_launch = channel_launch
@@ -2649,6 +2681,17 @@ class CmuxLeadSeater:
         # below is the one production extension path for a classic
         # seat, with the documented plain-classic fallback.
         channel_launched = False
+        prompt_file = self._prompt_files.get(lane_role)
+        if classic_command is not None and self._prompt_files:
+            if prompt_file is None:
+                raise CmuxBindingConflict(
+                    f"no classic lead prompt is configured for lane {lane_role!r}"
+                )
+            classic_command = classic_resume_command(
+                session_id,
+                resume="--resume" in classic_command,
+                prompt_file=prompt_file,
+            )
         if classic_command is not None and self._channel_launch is not None:
             # Channel attachment for the new pane: the session-scoped
             # config and capability are generated under the private
@@ -2670,6 +2713,7 @@ class CmuxLeadSeater:
                     session_id,
                     resume="--resume" in classic_command,
                     channel_config=config,
+                    prompt_file=prompt_file,
                 )
                 channel_launched = True
             except Exception as error:

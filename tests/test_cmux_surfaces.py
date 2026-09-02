@@ -279,6 +279,7 @@ def reconciler(
     *,
     environ: dict[str, str] | None = None,
     profiles: dict[str, Path] | None = None,
+    prompt_files: dict[str, Path] | None = None,
     channel_launch: FakeChannelLaunch | None = None,
     control: ControlOperations | None = None,
     channel_trust: object | None = None,
@@ -287,6 +288,7 @@ def reconciler(
         bindings=bindings,
         port=port,
         project_paths={"demo": Path("/repos/demo")},
+        prompt_files=prompt_files,
         profile_dirs=FakeProfileDirs(
             profiles if profiles is not None else {"max-a": Path("/profiles/max-a")}
         ),
@@ -422,9 +424,14 @@ async def test_stale_lead_surface_is_replaced_with_exact_identity(
     # trust-gating contract itself is covered by
     # ``TestReconcilerChannelTrust``.
     trust = FakeTrustTrigger(verdict=TrustVerdict(confirmed=True))
+    prompt = Path("/runtime/prompts/claude-lead.md")
 
     report = await reconciler(
-        bindings, port, channel_launch=launch, channel_trust=trust
+        bindings,
+        port,
+        prompt_files={"development": prompt},
+        channel_launch=launch,
+        channel_trust=trust,
     ).reconcile()
 
     successor = bindings.active_lead("cell-demo")
@@ -451,6 +458,7 @@ async def test_stale_lead_surface_is_replaced_with_exact_identity(
         SESSION,
         resume=True,
         channel_config=Path(f"/state/channels/{SESSION}.mcp.json"),
+        prompt_file=prompt,
     )
     [created] = port.created
     assert created["cwd"] == Path("/repos/demo")
@@ -711,6 +719,7 @@ def seater(
     port: FakePort,
     *,
     profiles: dict[str, Path] | None = None,
+    prompt_files: dict[str, Path] | None = None,
     channel_launch: object | None = None,
     control: object | None = None,
     channel_trust: object | None = None,
@@ -724,6 +733,7 @@ def seater(
         profile_dirs=FakeProfileDirs(
             profiles if profiles is not None else {"max-a": Path("/profiles/max-a")}
         ),
+        prompt_files=prompt_files,
         channel_launch=channel_launch,
         control=control,
         channel_trust=channel_trust,
@@ -1624,6 +1634,24 @@ def test_intent_binds_only_once_and_never_revives(
 
 
 class TestClassicSeats:
+    def test_classic_resume_command_adds_the_project_lead_contract(self) -> None:
+        from hermes_orchestrator.cmux_surfaces import classic_resume_command
+
+        prompt = Path("/runtime/prompts/claude-lead.md")
+
+        assert classic_resume_command(
+            SESSION, resume=False, prompt_file=prompt
+        ) == (
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG} "
+            f"--append-system-prompt-file {prompt}"
+        )
+        with pytest.raises(CmuxBindingConflict):
+            classic_resume_command(
+                SESSION,
+                resume=False,
+                prompt_file=Path("/runtime/operator-supplied.md"),
+            )
+
     def test_classic_resume_command_is_sanitized(self) -> None:
         from hermes_orchestrator.cmux_surfaces import classic_resume_command
 
@@ -1731,6 +1759,32 @@ class TestClassicSeats:
 
 
 class TestChannelLaunch:
+    @pytest.mark.asyncio
+    async def test_a_visible_lead_loads_its_role_contract(
+        self, database: Database, bindings: CmuxSurfaceBindings
+    ) -> None:
+        port = FakePort(next_refs=[LEAD])
+        prompt = Path("/runtime/prompts/claude-lead.md")
+        launch = FakeChannelLaunch(config=Path(f"/state/channels/{SESSION}.mcp.json"))
+
+        await seater(
+            bindings,
+            port,
+            prompt_files={"development": prompt},
+            channel_launch=launch,
+        ).ensure(
+            **demo_seat(),
+            classic_command=f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG}",
+        )
+
+        [created] = port.created
+        assert created["command"] == (
+            f"claude --session-id {SESSION} {SKIP_PERMISSIONS_FLAG} "
+            f"--append-system-prompt-file {prompt} "
+            f"--mcp-config /state/channels/{SESSION}.mcp.json "
+            "--dangerously-load-development-channels server:hermes-control"
+        )
+
     def test_the_extended_command_is_exact_and_grammar_bound(self) -> None:
         from hermes_orchestrator.cmux_surfaces import (
             classic_channel_command,
