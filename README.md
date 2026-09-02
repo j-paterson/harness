@@ -18,6 +18,8 @@ Copy `config/profiles.example.yaml` to the ignored `config/profiles.yaml`. Keep 
 
 Before a profile can receive work, its scrubbed probe must report `loggedIn=true`, `authMethod=claude.ai`, and `apiProvider=firstParty`. Provider selectors such as Bedrock, AWS, Vertex, Foundry, and Anthropic API-key variables are removed from every Max-profile child process.
 
+Copy `config/providers.example.yaml` to the ignored `config/providers.yaml`. It names which Max alias ordinary `claude` uses (`default_max_alias`) and, optionally, the one Bedrock route (`bedrock.config_dir`, plus plain `aws_profile`/`aws_region` names). It carries selection metadata only — never a credential — and Bedrock is never one of the four Max slots. See "Provider routes" below.
+
 Copy `config/linear.example.yaml` to the ignored `config/linear.yaml`. Register only the team IDs and exact state IDs used by projects in `projects.yaml`, plus the operator and QA assignee IDs. The runtime reads the issue first and proves that its Linear team matches the selected project before starting Claude.
 
 The final live switch is an ignored `config/policies.local.yaml` containing `mode: active`. The tracked `config/policies.yaml` stays observation-only, so a fresh clone cannot produce external effects. Active startup runs the ordered cross-system reconciliation to completion first, then probes all four Max profiles and reads the Linear token from macOS Keychain; it does not persist account identity or the token.
@@ -117,6 +119,18 @@ Install the fallback poll on a classic lead by adding a Stop hook to the profile
 ```
 
 Validate an installation by running the exact hook command once with `--session <session-id>`: it must resolve the deployed binary and open the live state database, returning either one offer or nothing. The hook receives the session id on stdin, returns at most one offer as hook JSON, and is a silent no-op when nothing is pending.
+
+## Provider routes: first-party Max by default, Bedrock by explicit opt-in
+
+INFRA-192: an ordinary `claude` launch used to inherit Amazon Bedrock provider selection from the shell depending on the current working directory. `provider_routes.py` makes the route an explicit, named input that never reads `$PWD`. The routes are `default` (the configured `default_max_alias`), `max-a` … `max-d`, and — only when `config/providers.yaml` has a `bedrock` section — `bedrock`. Every first-party route builds its child environment by removing all Bedrock/AWS/Vertex/Foundry selectors, static AWS credentials, and `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL`, then setting exactly one `CLAUDE_CONFIG_DIR`; the managed Fable seats share the same scrub set. The Bedrock route starts from the same clean slate and re-adds only `CLAUDE_CODE_USE_BEDROCK=1`, its config directory, and the configured AWS profile/region names — the AWS credential chain supplies credentials, and nothing in this repository ever injects one.
+
+```bash
+uv run hermes-orchestrator provider-probe --json      # live, non-inference `claude auth status` per route
+uv run hermes-orchestrator claude-launch --route default -- --resume <id>
+uv run hermes-orchestrator claude-shell-init >> ~/.zshrc.d/hermes-claude.zsh   # or eval in ~/.zshrc
+```
+
+`claude-launch` probes the route first and refuses to `execve` (exit 3) when a Max route reports Bedrock or any non-first-party provider, or when the Bedrock route reports a subscription login; an unknown or unconfigured route is refused before any probe (exit 2). `provider-probe` prints one identity-free line per route (`route`, `kind`, `ok`/`REFUSED`, reason, reported provider) and exits 1 when any route fails; `--json` adds the non-secret route metadata, where Bedrock carries `subscription: false`. `claude-shell-init` renders `claude`, `claude-max-a` … `claude-max-d`, and `claude-bedrock` as shell functions that forward to `claude-launch` through the stable launcher with a fixed route each, so no shell function ever consults the working directory; adopt it at a session boundary — existing Claude sessions are untouched.
 
 ## Migration-heavy work: disposable environment and pre-candidate gate
 
