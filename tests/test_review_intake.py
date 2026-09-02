@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from hermes_orchestrator.codex_merger import CodexMerger
+from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.manifests import (
@@ -22,6 +22,7 @@ from hermes_orchestrator.manifests import (
     wake_event_for,
     write_manifest,
 )
+from hermes_orchestrator.review_drift import DriftVerdict
 from hermes_orchestrator.review_intake import (
     AdmittedCandidate,
     BranchHeadUnknown,
@@ -727,3 +728,144 @@ def test_validate_only_rejects_exactly_like_admit(
     assert database.scalar(
         "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
     ) == "delivered"
+
+
+# -- INFRA-200: administrative-drift hint ----------------------------------
+
+
+class FakeAdmissionStore:
+    """A minimal ``AdmissionStore`` double for exercising the drift hint
+    independently of ``CodexMerger``'s real durable wiring.
+    """
+
+    def __init__(self, channel: ReviewerChannel, *, admits: bool = True) -> None:
+        self._channel = channel
+        self._admits = admits
+        self.admit_calls: list[tuple[str, str, str, int]] = []
+
+    def read_channel(self, project_key: str) -> ReviewerChannel | None:
+        return self._channel
+
+    def admit_wake(
+        self,
+        project_key: str,
+        event: WakeEvent,
+        *,
+        thread_id: str,
+        generation: int,
+        manifest: Any,
+    ) -> bool:
+        self.admit_calls.append(
+            (project_key, event.event_id, thread_id, generation)
+        )
+        return self._admits
+
+
+def _ready_channel(
+    *, generation: int = 1, last_delivered_candidate_sha: str | None
+) -> ReviewerChannel:
+    return ReviewerChannel(
+        project_key="demo",
+        thread_id="thr_stored",
+        generation=generation,
+        state="ready",
+        integration_branch="main",
+        prior_thread_id=None,
+        replacement_reason=None,
+        last_delivered_event_id="evt-0",
+        last_delivered_candidate_sha=last_delivered_candidate_sha,
+        last_delivery_failure_at=None,
+        heartbeat_enabled=False,
+        contract_version=None,
+    )
+
+
+def _standalone_wake(tmp_path: Path) -> WakeEvent:
+    """Write the immutable manifest and its wake event with no durable
+    ``CodexMerger`` registration -- the drift tests exercise
+    ``CandidateAdmission`` against a bare :class:`FakeAdmissionStore`.
+    """
+
+    document = manifest()
+    path = write_manifest(tmp_path, document, head_sha=HEAD)
+    return wake_event_for(document, path)
+
+
+def test_drift_hint_is_attached_when_a_describer_is_supplied(
+    tmp_path: Path,
+) -> None:
+    event = _standalone_wake(tmp_path)
+    previous_sha = "9" * 40
+    channel = _ready_channel(last_delivered_candidate_sha=previous_sha)
+    store = FakeAdmissionStore(channel)
+    described = {
+        previous_sha: ("tree-prev", ()),
+        HEAD: ("tree-current", ("docs/guide.md",)),
+    }
+
+    def describe_candidate(candidate_sha: str) -> tuple[str, tuple[str, ...]]:
+        return described[candidate_sha]
+
+    admitted = CandidateAdmission(
+        channels=store,
+        manifest_root=tmp_path,
+        branch_head=lambda project_key, branch: HEAD,
+        base_policy=lambda project_key, base_sha: True,
+        intake_gate=PassingGate(),
+        describe_candidate=describe_candidate,
+    ).admit("demo", event, received_generation=1)
+
+    assert admitted.drift == DriftVerdict(
+        kind="administrative",
+        reason="only administrative paths changed",
+        changed_paths=("docs/guide.md",),
+    )
+    assert store.admit_calls == [("demo", "evt-1", "thr_stored", 1)]
+
+
+def test_omitting_describe_candidate_leaves_the_payload_unchanged(
+    tmp_path: Path,
+) -> None:
+    event = _standalone_wake(tmp_path)
+    channel = _ready_channel(last_delivered_candidate_sha=HEAD)
+    store = FakeAdmissionStore(channel)
+
+    admitted = CandidateAdmission(
+        channels=store,
+        manifest_root=tmp_path,
+        branch_head=lambda project_key, branch: HEAD,
+        base_policy=lambda project_key, base_sha: True,
+        intake_gate=PassingGate(),
+    ).admit("demo", event, received_generation=1)
+
+    assert admitted.drift is None
+    assert admitted.manifest == manifest()
+    assert admitted.thread_id == "thr_stored"
+    assert admitted.generation == 1
+
+
+def test_stale_generation_wake_fails_closed_even_when_drift_is_administrative(
+    tmp_path: Path,
+) -> None:
+    event = _standalone_wake(tmp_path)
+    # The channel's live generation (3) does not match the received
+    # generation (1) the caller passes below -- a stale wake -- even
+    # though, were it reached, the describer would report no change at
+    # all (an even weaker signal than "administrative-only").
+    channel = _ready_channel(generation=3, last_delivered_candidate_sha="9" * 40)
+    store = FakeAdmissionStore(channel)
+
+    def describe_candidate(candidate_sha: str) -> tuple[str, tuple[str, ...]]:
+        return ("same-tree", ())
+
+    with pytest.raises(CandidateRejected, match="generation"):
+        CandidateAdmission(
+            channels=store,
+            manifest_root=tmp_path,
+            branch_head=lambda project_key, branch: HEAD,
+            base_policy=lambda project_key, base_sha: True,
+            intake_gate=PassingGate(),
+            describe_candidate=describe_candidate,
+        ).admit("demo", event, received_generation=1)
+
+    assert store.admit_calls == []
