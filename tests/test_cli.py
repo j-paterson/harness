@@ -218,6 +218,123 @@ def test_hermes_command_retry_refuses_a_non_retryable_issue(
     assert payload["state"] == {"reason": "retry_not_applicable"}
 
 
+def _seed_done_issue(
+    configured_repo: tuple[Path, Path], issue_id: str = "ENG-9"
+) -> None:
+    add = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-add",
+            issue_id,
+            "--project",
+            "demo",
+            "--priority",
+            "2",
+            "--operator-instruction",
+            f"chat-{issue_id}-original",
+            "--json",
+        ]
+    )
+    assert add.exit_code == 0
+    completed = invoke(
+        [
+            *base_arguments(configured_repo),
+            "queue-complete",
+            issue_id,
+            "--reason",
+            "linear_completed",
+            "--evidence",
+            f"https://linear.example/{issue_id}",
+            "--json",
+        ]
+    )
+    assert completed.exit_code == 0
+
+
+def test_hermes_command_queue_issue_reactivates_done_issue_via_faked_reader(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-227: reopening a ``done`` row reaches the daemon dispatch
+    path by reusing plain ``queue_issue`` -- the reader is faked here
+    since ``hermes-command`` never runs live and cannot reach Linear."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    _seed_done_issue(configured_repo, "ENG-9")
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="In Development")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "queue_issue",
+                    "issue_id": "ENG-9",
+                    "project_key": "demo",
+                    "priority": 1,
+                    "operator_instruction_id": "chat-reopen",
+                }
+            ),
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "queued"
+    assert payload["state"]["state"] == "queued"
+    assert payload["state"]["reactivated"] is True
+
+
+def test_hermes_command_queue_issue_reactivation_keychain_failure_is_denied(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Keychain outage must surface as ``admission_denied``, never a
+    traceback (the CLI's Linear reader is deliberately lazy -- only a
+    reactivation attempt should ever touch the Keychain at all)."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    _seed_done_issue(configured_repo, "ENG-9")
+
+    class _FailingKeychain:
+        def read(self, service: str, account: str) -> str:
+            raise RuntimeError("keychain unavailable")
+
+    monkeypatch.setattr(cli_module, "Keychain", _FailingKeychain)
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "queue_issue",
+                    "issue_id": "ENG-9",
+                    "project_key": "demo",
+                    "priority": 1,
+                    "operator_instruction_id": "chat-reopen",
+                }
+            ),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "admission_denied"
+    assert payload["state"] == {"reason": "linear read failed"}
+
+
 def test_queue_complete_reconciles_externally_completed_issue(
     configured_repo: tuple[Path, Path],
 ) -> None:

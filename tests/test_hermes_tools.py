@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.queue import QueueService
@@ -699,3 +701,147 @@ def test_supports_reflects_acceptance_intents(database: Database) -> None:
     )
     assert wired.supports("require_acceptance")
     assert wired.supports("satisfy_acceptance")
+
+
+class _FakeLinearReads:
+    """A stand-in for ``LinearReadPort`` that returns a fixed status."""
+
+    def __init__(self, status: str) -> None:
+        self._status = status
+        self.calls: list[str] = []
+
+    def get_issue(self, issue_id: str) -> object:
+        self.calls.append(issue_id)
+        return SimpleNamespace(status=self._status)
+
+
+def _done_issue(queue: QueueService, issue_id: str = "ENG-9") -> None:
+    queue.admit(
+        AdmissionRequest(
+            issue_id=issue_id,
+            project_key="demo",
+            linear_priority=2,
+            admitted_by="operator",
+            instruction_id=f"chat-{issue_id}-original",
+        )
+    )
+    queue.complete(
+        issue_id,
+        reason="linear_completed",
+        evidence=f"https://linear.example/{issue_id}",
+    )
+
+
+def test_queue_issue_reactivates_done_issue_with_non_terminal_linear(
+    database: Database,
+) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    _done_issue(queue)
+    linear = _FakeLinearReads("In Development")
+    service = HermesCommandService(queue, linear_reads=linear)
+
+    result = service.execute(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-reopen",
+        }
+    )
+
+    assert result.code == "queued"
+    assert result.state == {
+        "issue_id": "ENG-9",
+        "project_key": "demo",
+        "priority": 1,
+        "state": "queued",
+        "reactivated": True,
+    }
+    assert linear.calls == ["ENG-9"]
+
+
+def test_queue_issue_on_done_issue_without_linear_reads_is_denied(
+    database: Database,
+) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    _done_issue(queue)
+    service = HermesCommandService(queue)
+
+    result = service.execute(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-reopen",
+        }
+    )
+
+    assert result.code == "admission_denied"
+    assert result.state == {"reason": "reactivation requires a Linear read"}
+
+
+def test_queue_issue_reactivation_is_idempotent(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    _done_issue(queue)
+    service = HermesCommandService(
+        queue, linear_reads=_FakeLinearReads("In Development")
+    )
+    command = {
+        "intent": "queue_issue",
+        "issue_id": "ENG-9",
+        "project_key": "demo",
+        "priority": 1,
+        "operator_instruction_id": "chat-reopen",
+    }
+
+    first = service.execute(command)
+    second = service.execute(command)
+
+    # The first call denies plain ``admit`` ("already admitted") and
+    # reactivates instead. The replay is idempotent end-to-end: the row
+    # it left behind now satisfies plain ``admit``'s own idempotency
+    # check directly, so the second call never touches reactivation at
+    # all -- it is simply, correctly, already exactly what was asked
+    # for. Either way the reported queue state is identical.
+    assert first.code == second.code == "queued"
+    assert first.state["reactivated"] is True
+    for state in (first.state, second.state):
+        assert state["issue_id"] == "ENG-9"
+        assert state["project_key"] == "demo"
+        assert state["priority"] == 1
+        assert state["state"] == "queued"
+    count = database.execute(
+        "SELECT count(*) AS n FROM events WHERE event_type = 'issue.reactivated'"
+    ).fetchone()
+    assert count["n"] == 1
+
+
+def test_queue_issue_on_active_issue_still_denied(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    queue.admit(
+        AdmissionRequest(
+            issue_id="ENG-9",
+            project_key="demo",
+            linear_priority=2,
+            admitted_by="operator",
+            instruction_id="chat-9",
+        )
+    )
+    service = HermesCommandService(
+        queue, linear_reads=_FakeLinearReads("In Development")
+    )
+
+    result = service.execute(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-again",
+        }
+    )
+
+    assert result.code == "admission_denied"
+    assert result.state == {"reason": "issue ENG-9 is already admitted"}

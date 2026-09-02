@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import (
     BaseModel,
@@ -20,6 +20,18 @@ from pydantic import (
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.qa import QaOrigin, QaRouter
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict, QueueService
+
+
+class LinearReadPort(Protocol):
+    """Read-only access to one Linear issue's current workflow status.
+
+    INFRA-227: kept minimal and local rather than importing
+    ``reconcile.LinearReadPort`` -- this boundary needs only ``.status``
+    off whatever ``get_issue`` returns, never the reconciler's own
+    machinery.
+    """
+
+    def get_issue(self, issue_id: str) -> Any: ...
 
 NonEmptyText = Annotated[
     str,
@@ -349,11 +361,13 @@ class HermesCommandService:
         handlers: Mapping[str, CommandHandler] | None = None,
         correlation_ids: Callable[[], str] | None = None,
         qa: QaRouter | None = None,
+        linear_reads: LinearReadPort | None = None,
     ) -> None:
         self._queue = queue
         self._qa = qa
         self._handlers = dict(handlers or {})
         self._correlation_ids = correlation_ids or (lambda: str(uuid.uuid4()))
+        self._linear_reads = linear_reads
 
     def supports(self, intent: str) -> bool:
         """True when the intent reaches real code instead of failing.
@@ -424,18 +438,50 @@ class HermesCommandService:
     ) -> HermesCommandResult:
         if command.qa_origin is not None and self._qa is None:
             return HermesCommandResult(correlation_id, "qa_routing_unavailable", {})
+        request = AdmissionRequest(
+            issue_id=command.issue_id,
+            project_key=command.project_key,
+            linear_priority=command.priority,
+            admitted_by="operator",
+            instruction_id=command.operator_instruction_id,
+        )
+        reactivated = False
         try:
-            issue = self._queue.admit(
-                AdmissionRequest(
-                    issue_id=command.issue_id,
-                    project_key=command.project_key,
-                    linear_priority=command.priority,
-                    admitted_by="operator",
-                    instruction_id=command.operator_instruction_id,
-                )
-            )
-        except (AdmissionDenied, IdempotencyConflict):
+            issue = self._queue.admit(request)
+        except IdempotencyConflict:
             return HermesCommandResult(correlation_id, "admission_denied", {})
+        except AdmissionDenied as error:
+            if not str(error).endswith("is already admitted"):
+                return HermesCommandResult(correlation_id, "admission_denied", {})
+            # INFRA-227: the only admission_denied shape that might be a
+            # reopened issue, not a genuine duplicate admission -- try
+            # reactivation, which itself fails closed on every other
+            # local or Linear-side condition.
+            if self._linear_reads is None:
+                return HermesCommandResult(
+                    correlation_id,
+                    "admission_denied",
+                    {"reason": "reactivation requires a Linear read"},
+                )
+            try:
+                linear_issue = self._linear_reads.get_issue(command.issue_id)
+            except Exception:
+                return HermesCommandResult(
+                    correlation_id,
+                    "admission_denied",
+                    {"reason": "linear read failed"},
+                )
+            try:
+                issue = self._queue.reactivate(
+                    request, linear_status=linear_issue.status
+                )
+            except (AdmissionDenied, IdempotencyConflict) as reactivate_error:
+                return HermesCommandResult(
+                    correlation_id,
+                    "admission_denied",
+                    {"reason": str(reactivate_error)},
+                )
+            reactivated = True
         if command.qa_origin is not None and self._qa is not None:
             self._qa.record_origin(issue.issue_id, QaOrigin(command.qa_origin))
         state = {
@@ -446,4 +492,6 @@ class HermesCommandService:
         }
         if self._qa is not None:
             state["qa_origin"] = self._qa.origin_of(issue.issue_id).kind
+        if reactivated:
+            state["reactivated"] = True
         return HermesCommandResult(correlation_id, "queued", state)

@@ -23,6 +23,14 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+# INFRA-227: Linear workflow states that mean the issue is genuinely
+# finished. Any other status (including one this orchestrator does not
+# yet recognize) is treated as non-terminal, but ``None`` (the read
+# failed or the issue could not be resolved) is never treated as
+# non-terminal -- reactivation fails closed on an unknown status.
+_LINEAR_TERMINAL_STATUSES = frozenset({"Done", "Canceled", "Cancelled", "Duplicate"})
+
+
 class QueueService:
     """Own explicit admission, reprioritization, and stable queue ordering."""
 
@@ -93,6 +101,107 @@ class QueueService:
                         "priority": request.linear_priority,
                         "dependency_ready": request.dependency_ready,
                         "overlap_risk": request.overlap_risk,
+                    },
+                ),
+            )
+        return self.get(request.issue_id)
+
+    def reactivate(
+        self, request: AdmissionRequest, *, linear_status: str | None
+    ) -> QueuedIssue:
+        """Reactivate an already-admitted ``done`` row an operator reopened.
+
+        INFRA-227: Linear can be reopened to a non-terminal workflow
+        state while the local row still reads ``done`` from a prior
+        explicit completion (``complete``). Plain ``admit`` refuses this
+        outright ("already admitted"), and there is no supported
+        transition to move a ``done`` row back to ``queued``. This reuses
+        the existing admission machinery -- the same
+        :class:`AdmissionRequest` an operator would use to admit the
+        issue -- gated by the Linear status the caller already read, so
+        no new intent, protocol, or workflow state is introduced.
+
+        Every precondition fails closed with :class:`AdmissionDenied`
+        before any write. Idempotent: replaying the exact same
+        ``instruction_id`` for this issue after a successful reactivation
+        returns the row unchanged and journals nothing new; reusing that
+        instruction id for a *different* issue raises
+        :class:`IdempotencyConflict`, exactly as ``admit`` does.
+        """
+
+        self._validate_admission(request)
+
+        existing_instruction = self._database.execute(
+            "SELECT * FROM admitted_issues WHERE instruction_id = ?",
+            (request.instruction_id,),
+        ).fetchone()
+        if existing_instruction is not None:
+            existing = self._row_to_issue(existing_instruction)
+            if existing.issue_id != request.issue_id:
+                raise IdempotencyConflict(
+                    f"instruction id {request.instruction_id} was already used"
+                )
+            if existing.state is not IssueState.DONE:
+                return existing
+
+        row = self._database.execute(
+            "SELECT * FROM admitted_issues WHERE issue_id = ?",
+            (request.issue_id,),
+        ).fetchone()
+        if row is None:
+            raise AdmissionDenied(
+                f"issue {request.issue_id} is not admitted; nothing to reactivate"
+            )
+        current = self._row_to_issue(row)
+        if current.project_key != request.project_key:
+            raise AdmissionDenied(
+                f"issue {request.issue_id} does not belong to project "
+                f"{request.project_key}"
+            )
+        if current.state is not IssueState.DONE:
+            raise AdmissionDenied(f"issue {request.issue_id} is already admitted")
+        if linear_status is None or linear_status in _LINEAR_TERMINAL_STATUSES:
+            raise AdmissionDenied(
+                f"issue {request.issue_id} is not reactivatable while Linear "
+                f"reports status {linear_status!r}"
+            )
+
+        now = self._aware_now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE admitted_issues SET state = ?, instruction_id = ?, "
+                "priority = ?, dependency_ready = ?, overlap_risk = ?, "
+                "updated_at = ? WHERE issue_id = ? AND state = ?",
+                (
+                    IssueState.QUEUED.value,
+                    request.instruction_id,
+                    request.linear_priority,
+                    int(request.dependency_ready),
+                    request.overlap_risk,
+                    now,
+                    request.issue_id,
+                    IssueState.DONE.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise AdmissionDenied(
+                    f"issue {request.issue_id} is already admitted"
+                )
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="issue.reactivated",
+                    aggregate_type="issue",
+                    aggregate_id=request.issue_id,
+                    correlation_id=request.instruction_id,
+                    actor="operator",
+                    payload={
+                        "from": "done",
+                        "to": "queued",
+                        "linear_status": linear_status,
+                        "project_key": request.project_key,
+                        "priority": request.linear_priority,
+                        "dependency_ready": request.dependency_ready,
                     },
                 ),
             )
