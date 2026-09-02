@@ -2329,8 +2329,11 @@ def _seed_rotation_cell_state(state_dir: Path) -> None:
                 surface_uuid="33333333-3333-4333-8333-333333333333",
             ),
         )
+        # INFRA-184: the rotation staleness gate compares the submitted
+        # handoff's branch/HEAD with the probed worktree (``main`` at
+        # ``a`` in the rotation fakes), so the seeded document must agree.
         HandoffService(database, handoff_ids=lambda: "handoff-1").submit(
-            valid_handoff()
+            valid_handoff().model_copy(update={"branch": "main", "commits": ["a"]})
         )
     finally:
         database.close()
@@ -6920,6 +6923,319 @@ def test_submit_handoff_keeps_the_single_active_issue_fallback(
         database.close()
     assert document["branch"] == "main"
     assert "issue INFRA-212 is in_development" in document["status"]
+
+
+# -- derived handoff completeness + identity validation (INFRA-184) --------
+
+
+def _install_modified_files_probe(
+    monkeypatch: pytest.MonkeyPatch, files: list[str]
+) -> None:
+    """Replace the read-only ``git diff --name-only`` probe with a fixed
+    result, exactly the way ``_install_detached_coordinator_probe``
+    replaces ``_worktree_state`` -- the fake lane paths these tests use
+    are not real git checkouts."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module, "_modified_files", lambda _path, _base_branch: list(files)
+    )
+
+
+def _seed_review(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    project_key: str = "demo",
+    pr_number: int = 91,
+    repository: str = "owner/demo",
+    branch: str = "feature/infra-215-lane",
+    state: str = "approved",
+) -> None:
+    """Durably record one review naming the recorded pull request for an
+    issue (the source ``_derived_pull_request`` reads)."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reviews("
+                "review_id, project_key, issue_id, event_id, repository, "
+                "branch, pr_number, reviewed_sha, state, merge_sha, reason, "
+                "projection_json, created_at, updated_at"
+                ") VALUES (?, ?, ?, 'event-1', ?, ?, ?, ?, ?, NULL, NULL, "
+                "NULL, ?, ?)",
+                (
+                    f"review:{project_key}:{issue_id}",
+                    project_key,
+                    issue_id,
+                    repository,
+                    branch,
+                    pr_number,
+                    "a" * 40,
+                    state,
+                    now,
+                    now,
+                ),
+            )
+    finally:
+        database.close()
+
+
+def _seed_accepted_subagent_packet(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    packet_id: str = "packet-1",
+    project_key: str = "demo",
+    cell_id: str = "cell-demo",
+    session_id: str = _SEAT_SESSION,
+    evidence: dict[str, str] | None = None,
+) -> None:
+    """Durably record one accepted subagent packet's reviewed evidence
+    (the source ``_derived_test_results`` reads first)."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO subagent_packets("
+                "packet_id, issue_id, project_key, cell_id, session_id, "
+                "generation, model_tier, effort, allowed_files_json, "
+                "worktree, depends_on_json, red_test, verification_json, "
+                "invariants, resource_note, state, evidence_json, "
+                "tool_use_id, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, 1, 'sonnet', 'medium', '[]', "
+                "'/tmp/lane', '[]', 'test_x', '[]', 'inv', 'note', "
+                "'accepted', ?, 'tool-1', ?, ?)",
+                (
+                    packet_id,
+                    issue_id,
+                    project_key,
+                    cell_id,
+                    session_id,
+                    json.dumps(evidence or {"diff_scope": "src/example.py"}),
+                    now,
+                    now,
+                ),
+            )
+    finally:
+        database.close()
+
+
+def _seed_satisfied_acceptance_gate(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    instruction_id: str = "instr-1",
+    evidence: tuple[tuple[str, str], ...] = (("predicate-1", "proof-1"),),
+) -> None:
+    """Durably record one satisfied acceptance gate's evidence (the
+    second source ``_derived_test_results`` reads)."""
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        now = datetime.now(UTC).isoformat()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO acceptance_gates("
+                "issue_id, instruction_id, predicates_json, state, "
+                "evidence_json, created_at, updated_at"
+                ") VALUES (?, ?, ?, 'satisfied', ?, ?, ?)",
+                (
+                    issue_id,
+                    instruction_id,
+                    json.dumps([pair[0] for pair in evidence]),
+                    json.dumps([list(pair) for pair in evidence]),
+                    now,
+                    now,
+                ),
+            )
+    finally:
+        database.close()
+
+
+def _seed_pending_correction(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    project_key: str = "demo",
+    correction_id: str = "correction-1",
+    pr_number: int = 91,
+    branch: str = "feature/infra-215-lane",
+) -> None:
+    """Durably record one pending Merger correction packet through the
+    real :class:`LeadCorrectionOutbox` port (the source
+    ``_derived_pending_corrections`` reads)."""
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_outbox import LeadCorrectionOutbox
+    from hermes_orchestrator.verdicts import CorrectionPacket
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        outbox = LeadCorrectionOutbox(
+            database=database,
+            events=EventStore(database),
+            project_for_issue=lambda _issue_id: project_key,
+            ids=lambda: correction_id,
+        )
+        outbox.deliver(
+            issue_id,
+            (
+                CorrectionPacket(
+                    severity="Critical",
+                    repository="owner/demo",
+                    branch=branch,
+                    pr_number=pr_number,
+                    reviewed_sha="a" * 40,
+                    evidence="the retry loses the last event on restart. " * 5,
+                    acceptance_criterion="a restart never drops an event",
+                    required_correction="persist the offset before acking",
+                    required_tests=("test_restart_preserves_offset",),
+                ),
+            ),
+        )
+    finally:
+        database.close()
+
+
+def test_submit_handoff_reports_derived_pull_request_files_tests_and_corrections(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-184: every additional mechanical fact -- the pull request,
+    the files actually changed, observed test/acceptance evidence, and
+    pending Merger corrections -- is read from durable state, not
+    synthesized, and lands in the stored document."""
+
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane,
+        branch="feature/infra-215-lane",
+    )
+    _seed_review(state_dir, issue_id="INFRA-215", pr_number=91, state="approved")
+    _seed_accepted_subagent_packet(
+        state_dir, issue_id="INFRA-215", evidence={"diff_scope": "src/example.py"}
+    )
+    _seed_satisfied_acceptance_gate(
+        state_dir,
+        issue_id="INFRA-215",
+        evidence=(("operator-instruction", "verified in staging"),),
+    )
+    _seed_pending_correction(state_dir, issue_id="INFRA-215", pr_number=91)
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_detached_coordinator_probe(monkeypatch, {lane: "feature/infra-215-lane"})
+    _install_modified_files_probe(monkeypatch, ["src/example.py", "README.md"])
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    database = Database.open(state_dir / "state.db")
+    try:
+        document = json.loads(
+            str(
+                database.scalar(
+                    "SELECT document_json FROM handoffs WHERE handoff_id = ?",
+                    (payload["handoff_id"],),
+                )
+            )
+        )
+    finally:
+        database.close()
+    assert document["pull_request"] == (
+        "#91 approved https://github.com/owner/demo/pull/91"
+    )
+    assert document["modified_files"] == ["src/example.py", "README.md"]
+    commands = [test["command"] for test in document["tests"]]
+    outcomes = [test["outcome"] for test in document["tests"]]
+    assert "subagent packet packet-1" in commands
+    assert any("diff_scope=src/example.py" in outcome for outcome in outcomes)
+    assert "acceptance gate instr-1" in commands
+    assert any("operator-instruction=verified in staging" in o for o in outcomes)
+    assert any(
+        "correction-1" in note and "codex_review" in note
+        for note in document["environment_notes"]
+    )
+
+
+def test_submit_handoff_refuses_when_the_live_seat_session_has_moved(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-184 mechanical identity validation: a concurrent rotation
+    reassigns the seat's session AFTER this command already read the
+    cell but BEFORE it submits -- the exact TOCTOU window
+    ``validate_handoff_identity`` closes. The submission must refuse
+    fail-closed and write nothing rather than store a handoff for a
+    seat that has since moved."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _write_cmux_config(repo_root)
+    _write_profiles_config(repo_root)
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212")
+    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+
+    def _rotate_seat_mid_submission(_database: Any, _issue_id: str) -> list[str]:
+        # Runs after ``_submit_handoff``'s initial cell read and before
+        # its pre-submit re-read, standing in for a concurrent rotation
+        # that completes in that exact window.
+        rotating = Database.open(state_dir / "state.db")
+        try:
+            with rotating.transaction() as connection:
+                connection.execute(
+                    "UPDATE project_cells SET session_id = ? "
+                    "WHERE cell_id = 'cell-demo'",
+                    ("99999999-9999-4999-8999-999999999999",),
+                )
+        finally:
+            rotating.close()
+        return []
+
+    monkeypatch.setattr(
+        cli_module, "_derived_test_results", _rotate_seat_mid_submission
+    )
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        before = database.scalar("SELECT count(*) FROM handoffs")
+    finally:
+        database.close()
+
+    result = _submit_handoff_for_demo_cell(configured_repo)
+
+    assert result.exit_code == 1
+    message = json.loads(result.stdout)["error"]
+    assert "cell-demo" in message
+    assert "session" in message
+    database = Database.open(state_dir / "state.db")
+    try:
+        assert database.scalar("SELECT count(*) FROM handoffs") == before
+    finally:
+        database.close()
 
 
 def _install_seat_lane_probe(

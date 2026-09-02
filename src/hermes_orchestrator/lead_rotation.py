@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable
@@ -51,6 +52,26 @@ from hermes_orchestrator.lead_wakes import LeadTerminalWakes, TerminalWakeInput
 _LIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 
 _RESUMABLE_HANDOFF_STATES = ("submitted", "acknowledged")
+
+# admitted_issues.state values understood as "implementation still
+# ongoing" — mirrors the exact filter ``_inflight_issue`` already
+# applies below. The staleness gate's issue criterion (see
+# ``_stale_submitted_handoff_evidence``) applies ONLY when the
+# handoff's own recorded status names an issue that WAS in one of
+# these states at submission time — a handoff correctly recording a
+# completed issue (a cell can carry several issue lanes; "issue X is
+# done, next action: dispatch the next admitted issue" is a legitimate
+# fresh handoff) or one with no parseable status is never penalized for
+# that (INFRA-184 correction: the prior "most recently updated
+# admitted_issues row" heuristic falsely staled exactly this shape, and
+# also a newly admitted sibling issue could poison the lookup).
+_IN_PROGRESS_ISSUE_STATES = ("in_development", "review")
+
+# ``handoffs.derived_handoff_document`` writes ``status`` as
+# ``"issue {issue_id} is {issue_state}; branch ... "`` — the only place
+# the issue identity/state recorded AT SUBMISSION survives on the
+# document. Matched, never reimplemented, by the staleness gate below.
+_STATUS_ISSUE_PATTERN = re.compile(r"^issue (\S+) is (\S+);")
 
 # Margin added to ``registration_wait_seconds`` to form the rotation
 # claim-EXPIRY bound (see ``LeadRotation._claim_attempt``). Sol 04d013b0
@@ -286,6 +307,28 @@ class LeadRotation:
                 ),
             )
 
+        # Sol INFRA-192: a submitted-but-never-consumed handoff can still
+        # be STALE — its mechanically derived facts (branch/HEAD) or the
+        # issue it presumes is still in flight can predate reality (the
+        # issue already merged, or the worktree moved on). Never
+        # acknowledged merely for having gone unconsumed: route into the
+        # SAME fresh-handoff request path the already-consumed handoff
+        # uses, before any claim/transfer/ack work is attempted.
+        if handoff.state == "submitted":
+            stale_evidence = self._stale_submitted_handoff_evidence(
+                handoff, project_key, worktree
+            )
+            if stale_evidence is not None:
+                return self._request_fresh_handoff(
+                    cell_id=cell_id,
+                    consumed_handoff_id=handoff_id,
+                    project_key=project_key,
+                    incumbent_session=incumbent_session,
+                    incumbent_profile=incumbent_profile,
+                    worktree=worktree,
+                    stale_evidence=stale_evidence,
+                )
+
         replacement_from_handoff = (
             str(handoff.replacement_session_id)
             if handoff.replacement_session_id is not None
@@ -416,6 +459,7 @@ class LeadRotation:
         incumbent_session: str,
         incumbent_profile: str | None,
         worktree: WorktreeState,
+        stale_evidence: dict[str, str] | None = None,
     ) -> RotationReport:
         """File the fresh durable handoff request and report awaiting.
 
@@ -431,16 +475,35 @@ class LeadRotation:
         non-derivable content. Idempotent: a repeat call while the cell
         already awaits re-reports the same request without duplicating
         the row, the wake, or the awaiting marker.
+
+        ``stale_evidence`` is set only by the staleness gate in
+        :meth:`rotate` (INFRA-192): a submitted-but-never-consumed
+        handoff whose mechanical facts disagree with durable/worktree
+        reality. Its compact dict is folded into the SAME durably
+        journaled reason (rather than a new mechanism), so the evidence
+        that justified refusing the handoff survives on the
+        ``handoff_requests`` row and the terminal wake.
         """
 
         issue_id, issue_state = self._inflight_issue(project_key)
+        kind = (
+            "lead_rotation:stale_handoff_detected"
+            if stale_evidence is not None
+            else "lead_rotation:fresh_handoff_required"
+        )
         reason = (
-            "lead_rotation:fresh_handoff_required "
+            f"{kind} "
             f"consumed={consumed_handoff_id} cell={cell_id} "
             f"project={project_key} session={incumbent_session} "
             f"profile={incumbent_profile} issue={issue_id} "
             f"issue_state={issue_state} branch={worktree.branch} "
-            f"head={worktree.head}; every mechanical handoff field is "
+            f"head={worktree.head}; "
+        )
+        if stale_evidence is not None:
+            evidence = " ".join(f"{k}={v}" for k, v in stale_evidence.items())
+            reason += f"stale_evidence: {evidence}; "
+        reason += (
+            "every mechanical handoff field is "
             "derived from durable state — provide only "
             f"{NON_DERIVABLE_HANDOFF_CONTENT} "
             "(hermes-orchestrator submit-handoff); the rotation resumes "
@@ -453,14 +516,23 @@ class LeadRotation:
             # cell the request channel refuses): fail closed exactly as
             # before rather than reporting an awaiting state no durable
             # row backs.
+            if stale_evidence is not None:
+                context = (
+                    f"handoff {consumed_handoff_id!r} is stale relative to "
+                    "durable state and cannot satisfy this rotation"
+                )
+            else:
+                context = (
+                    f"handoff {consumed_handoff_id!r} already completed a "
+                    "rotation onto the current incumbent "
+                    f"({incumbent_profile!r} / {incumbent_session})"
+                )
             return self._blocked(
                 cell_id,
                 consumed_handoff_id,
                 phase="precondition",
                 failure=(
-                    f"handoff {consumed_handoff_id!r} already completed a "
-                    "rotation onto the current incumbent "
-                    f"({incumbent_profile!r} / {incumbent_session}) and a "
+                    f"{context} and a "
                     "fresh handoff request could not be filed "
                     f"(request_checkpoint refused, filed={filed}); submit "
                     "a fresh handoff for this cell, then retry rotate-lead"
@@ -482,6 +554,90 @@ class LeadRotation:
             handoff_id=consumed_handoff_id,
             request_id=request_id,
         )
+
+    def _stale_submitted_handoff_evidence(
+        self,
+        handoff: HandoffRecord,
+        project_key: str,
+        worktree: WorktreeState,
+    ) -> dict[str, str] | None:
+        """Compare a SUBMITTED handoff's mechanically derived facts
+        against current durable/worktree reality (INFRA-192: a stale
+        submitted handoff was consumed for rotation whose derived
+        branch/HEAD and next action predated the issue's completed
+        merge).
+
+        - the document's ``branch`` no longer matching the current
+          worktree branch is enough alone;
+        - the document's first ``commits`` entry (HEAD at submission)
+          matching neither the current worktree HEAD nor the fetched
+          origin HEAD is enough alone;
+        - the issue criterion is narrower, and deliberately does NOT use
+          "the project's current admitted issue" (a cell can carry
+          several issue lanes, and a legitimate handoff can correctly
+          say "issue X is done; next action: dispatch the next admitted
+          issue" — INFRA-184 correction). Instead it parses the ONE
+          issue identity/state the document itself recorded at
+          submission from ``status`` (written by
+          ``handoffs.derived_handoff_document`` as
+          ``"issue {id} is {state}; ..."``, via
+          ``_STATUS_ISSUE_PATTERN``). The criterion applies ONLY when
+          that parse succeeds AND the recorded state was itself
+          in-progress (``_IN_PROGRESS_ISSUE_STATES``) — i.e. the
+          handoff itself presumed ongoing implementation on that issue.
+          When it applies, THAT issue's CURRENT ``admitted_issues.state``
+          is looked up by issue id (never "most recently updated", which
+          a newly admitted sibling issue could poison); stale iff it no
+          longer equals the recorded state (e.g. in_development -> done).
+          A status line that does not parse, or records a
+          non-in-progress state (``done``/unknown/no issue), leaves the
+          issue criterion inapplicable — branch/HEAD still apply.
+
+        Returns a compact evidence dict (``handoff_head``,
+        ``current_head``, ``handoff_branch``, ``current_branch``,
+        ``issue_state``, the last being the recorded issue's CURRENT
+        state or ``"n/a"`` when the criterion did not apply) when stale,
+        ``None`` when the handoff is fresh.
+        """
+
+        document = handoff.document
+        handoff_head = document.commits[0]
+        branch_stale = document.branch != worktree.branch
+        head_stale = handoff_head not in (worktree.head, worktree.origin_head)
+
+        issue_state = "n/a"
+        issue_stale = False
+        match = _STATUS_ISSUE_PATTERN.match(document.status)
+        if match is not None:
+            recorded_issue_id, recorded_state = match.group(1), match.group(2)
+            if recorded_state in _IN_PROGRESS_ISSUE_STATES:
+                issue_state = self._issue_state_by_id(recorded_issue_id, project_key)
+                issue_stale = issue_state != recorded_state
+
+        if not (branch_stale or head_stale or issue_stale):
+            return None
+        return {
+            "handoff_head": handoff_head,
+            "current_head": worktree.head,
+            "handoff_branch": document.branch,
+            "current_branch": worktree.branch,
+            "issue_state": issue_state,
+        }
+
+    def _issue_state_by_id(self, issue_id: str, project_key: str) -> str:
+        """The CURRENT durable state of one specific admitted issue —
+        looked up by identity, never by recency, so an unrelated sibling
+        issue (a newly admitted one, or another lane's) can never be
+        mistaken for the issue a handoff's status line recorded.
+        ``"unknown"`` when that issue no longer has an admitted_issues
+        row for this project."""
+
+        row = self._database.execute(
+            "SELECT state FROM admitted_issues "
+            "WHERE issue_id = ? AND project_key = ?",
+            (issue_id, project_key),
+        ).fetchone()
+        return "unknown" if row is None else str(row["state"])
 
     def _inflight_issue(self, project_key: str) -> tuple[str, str]:
         """The single in-flight issue for the project, from durable rows

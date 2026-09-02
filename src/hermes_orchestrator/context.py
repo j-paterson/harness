@@ -14,7 +14,7 @@ error bypasses the safe-boundary wait after an emergency checkpoint.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -25,6 +25,103 @@ from hermes_orchestrator.events import EventInput, EventStore
 
 STATES = ("healthy", "prepare", "rotation_pending", "rotate_now")
 _RANK = {state: index for index, state in enumerate(STATES)}
+# INFRA-184: the fields a single top-level invocation's usage dict may
+# carry that, together, describe THAT call's own prompt size. Summing
+# these for one record is legitimate; summing them across records is
+# exactly the "1704% full" bug this module exists to prevent.
+_OCCUPANCY_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ContextMeasurement:
+    """One occupancy measurement scoped to a single context window.
+
+    ``source`` is ``"authoritative"`` when a real current-window percent
+    was supplied (a provider-reported figure, never derived by us) and
+    ``"lead_estimate"`` when it was derived from one individual model
+    invocation's own usage. ``uncertainty`` is ``None`` for a trustworthy
+    reading and a short machine-parsable reason (e.g.
+    ``"impossible_percent:1704.0"``) when the telemetry had to be
+    clamped -- callers must journal that reason but must never rotate on
+    the clamped percentage alone.
+    """
+
+    percent: float
+    occupied_tokens: int
+    source: str
+    uncertainty: str | None = None
+
+
+def derive_context_occupancy(
+    usage: Mapping[str, int],
+    *,
+    window_tokens: int,
+    authoritative_percent: float | None = None,
+) -> ContextMeasurement:
+    """Derive one current-window occupancy percent for a single invocation.
+
+    Never call this with usage summed or accumulated across calls,
+    records, or subagents -- ``usage`` must be exactly one individual
+    top-level model invocation's own usage dict. An authoritative
+    current-window percent, when supplied and within ``[0, 100]``,
+    always wins. Otherwise this estimates from the three prompt-size
+    fields of THIS ONE invocation; a negative or non-integer field is
+    dropped (treated as zero) and flagged, and a computed percent over
+    100 -- impossible for a single call against its own window -- is
+    clamped to 100 and flagged rather than trusted.
+    """
+
+    if authoritative_percent is not None and 0.0 <= authoritative_percent <= 100.0:
+        occupied = (
+            round(window_tokens * authoritative_percent / 100.0)
+            if window_tokens > 0
+            else 0
+        )
+        return ContextMeasurement(
+            percent=float(authoritative_percent),
+            occupied_tokens=occupied,
+            source="authoritative",
+            uncertainty=None,
+        )
+
+    uncertainty: str | None = None
+    occupied = 0
+    for name in _OCCUPANCY_FIELDS:
+        raw = usage.get(name, 0)
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            uncertainty = uncertainty or f"non_integer_field:{name}"
+            continue
+        if raw < 0:
+            uncertainty = uncertainty or f"negative_field:{name}:{raw}"
+            continue
+        occupied += raw
+
+    if window_tokens <= 0:
+        return ContextMeasurement(
+            percent=0.0,
+            occupied_tokens=0,
+            source="lead_estimate",
+            uncertainty=uncertainty or "non_positive_window_tokens",
+        )
+
+    percent = 100.0 * occupied / window_tokens
+    if percent > 100.0:
+        uncertainty = uncertainty or f"impossible_percent:{round(percent, 1)}"
+        percent = 100.0
+    elif percent < 0.0:
+        uncertainty = uncertainty or f"impossible_percent:{round(percent, 1)}"
+        percent = 0.0
+
+    return ContextMeasurement(
+        percent=percent,
+        occupied_tokens=occupied,
+        source="lead_estimate",
+        uncertainty=uncertainty,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +137,13 @@ class ContextSignal:
     behavioral_warning: bool = False
     active_hours: float | None = None
     safe_boundary: bool = False
+    # INFRA-184: a short machine-parsable reason (see
+    # ``ContextMeasurement.uncertainty``) when ``percent`` came from
+    # telemetry that had to be clamped. Such a signal is still journaled
+    # -- it is visible measurement uncertainty -- but it can never, on
+    # its own, satisfy a prepare/rotate threshold or become the durable
+    # fallback percent for a later signal that carries none.
+    uncertainty: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +261,16 @@ class ContextMonitor:
             rapid_refills += int(signal.rapid_refill)
             context_errors += int(signal.context_error)
             warnings += int(signal.behavioral_warning)
-            percent = signal.percent if signal.percent is not None else last_percent
+            # INFRA-184: an uncertain measurement (impossible/clamped
+            # telemetry) is journaled below but must never itself become
+            # a usable occupancy percent -- it can't satisfy a threshold
+            # this call, and it can't become the durable fallback that a
+            # later, signal-less turn would otherwise inherit.
+            percent = (
+                last_percent
+                if signal.uncertainty is not None
+                else (signal.percent if signal.percent is not None else last_percent)
+            )
             active_hours = (
                 signal.active_hours if signal.active_hours is not None else stored_hours
             )
@@ -168,6 +281,8 @@ class ContextMonitor:
             reasons: list[str] = []
             pending = False
             emergency = False
+            if signal.uncertainty is not None:
+                reasons.append(f"context measurement uncertain: {signal.uncertainty}")
             if context_errors > 0:
                 emergency = True
                 reasons.append("context error reported; emergency checkpoint")
@@ -228,6 +343,7 @@ class ContextMonitor:
                 "warnings": warnings,
                 "active_hours": round(active_hours, 3),
                 "safe_boundary": signal.safe_boundary,
+                "uncertainty": signal.uncertainty,
             }
             connection.execute(
                 "INSERT INTO context_evidence("
@@ -265,6 +381,25 @@ class ContextMonitor:
                         aggregate_id=signal.worker_id,
                         payload={
                             "from": previous_state,
+                            "reasons": reasons,
+                            **evidence,
+                        },
+                    ),
+                )
+            if signal.uncertainty is not None:
+                # INFRA-184: journaled unconditionally -- independent of
+                # any state transition -- so a measurement anomaly that
+                # (correctly) never moves the sticky state stays visible
+                # in the durable event log rather than only in a
+                # context_evidence row a later call can overwrite.
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="context.measurement_uncertain",
+                        aggregate_type="worker",
+                        aggregate_id=signal.worker_id,
+                        payload={
+                            "uncertainty": signal.uncertainty,
                             "reasons": reasons,
                             **evidence,
                         },

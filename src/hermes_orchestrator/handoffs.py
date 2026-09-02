@@ -297,6 +297,86 @@ class HandoffService:
         return value.astimezone(UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class DerivedFacts:
+    """Every additional mechanically-derived handoff fact beyond issue
+    identity, branch, and head (INFRA-184): the pull request recorded
+    for this issue, the files changed relative to the fetched
+    integration branch, observed test/acceptance evidence, and Merger
+    correction packets still pending the lead's acknowledgement.
+
+    Every field here is read from durable rows or a read-only git
+    probe by the caller — never supplied by the incumbent. The
+    incumbent's own inputs to :func:`derived_handoff_document` stay
+    exactly ``decisions``, ``caveats``, ``risks``, and ``next_action``
+    (see ``lead_rotation.NON_DERIVABLE_HANDOFF_CONTENT``).
+    """
+
+    pull_request: str = "none recorded in durable state"
+    modified_files: tuple[str, ...] = ()
+    test_results: tuple[str, ...] = ()
+    pending_corrections: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LiveCell:
+    """The live seat identity read from ``project_cells`` at the moment
+    a handoff is about to be submitted — the ground truth
+    :func:`validate_handoff_identity` checks the document and the
+    requesting session against."""
+
+    cell_id: str
+    session_id: str | None
+
+
+def validate_handoff_identity(
+    document: HandoffDocument,
+    live_cell: LiveCell,
+    *,
+    requesting_session_id: str,
+) -> None:
+    """Fail closed on a handoff whose identity does not match the live
+    cell it claims to come from (INFRA-184).
+
+    Two independent facts must hold before a handoff is ever durably
+    stored: the document's own ``cell_id`` must name the live cell
+    that is submitting, and that live cell's CURRENT session must be
+    the exact session doing the submitting — not a session an
+    in-flight rotation has already replaced. Either mismatch means the
+    document was built from a stale or wrong seat snapshot, so it is
+    refused (no write) before ``HandoffService.submit`` is ever
+    called.
+    """
+
+    if document.cell_id != live_cell.cell_id:
+        raise HandoffRejected(
+            f"handoff refused: document names cell {document.cell_id!r} "
+            f"but the live submitting seat is cell {live_cell.cell_id!r}"
+        )
+    if live_cell.session_id is None or live_cell.session_id != requesting_session_id:
+        raise HandoffRejected(
+            f"handoff refused: cell {live_cell.cell_id!r} is now owned by "
+            f"session {live_cell.session_id!r}, not the submitting session "
+            f"{requesting_session_id!r}; the seat has moved since this "
+            "handoff was derived"
+        )
+
+
+def _handoff_test(entry: str) -> HandoffTest:
+    """Split one derived ``name — outcome`` evidence line into the
+    document's command/outcome pair, using the same " — " separator the
+    markdown renderer already places between them. A line with no
+    separator becomes the command verbatim with a generic outcome."""
+
+    if " — " in entry:
+        command, outcome = entry.split(" — ", 1)
+        command = command.strip()
+        outcome = outcome.strip()
+        if command and outcome:
+            return HandoffTest(command=command, outcome=outcome)
+    return HandoffTest(command=entry, outcome="recorded in durable state")
+
+
 def derived_handoff_document(
     *,
     cell_id: str,
@@ -311,18 +391,44 @@ def derived_handoff_document(
     caveats: list[str],
     risks: list[str],
     next_action: str,
+    facts: DerivedFacts | None = None,
 ) -> HandoffDocument:
     """Assemble a complete handoff document from durable facts plus the
     incumbent's non-derivable content (INFRA-198, Sol 52d15493).
 
     Every mechanical field — identity, git position, issue state,
-    environment — comes from the caller's durable rows and worktree
-    probe; the incumbent supplies ONLY decisions, caveats (blockers),
-    risks, and the exact next action. Validation stays with
-    :meth:`HandoffService.submit`: an unreadable worktree (empty branch
-    or head) fails the document's own non-empty constraints, so an
-    unverifiable checkpoint can never be dressed up as a handoff.
+    environment, pull request, modified files, observed test evidence,
+    and pending Merger corrections — comes from the caller's durable
+    rows and worktree/git probes (``facts``, INFRA-184); the incumbent
+    supplies ONLY decisions, caveats (blockers), risks, and the exact
+    next action. Validation stays with :meth:`HandoffService.submit`:
+    an unreadable worktree (empty branch or head) fails the document's
+    own non-empty constraints, so an unverifiable checkpoint can never
+    be dressed up as a handoff.
     """
+
+    resolved = facts if facts is not None else DerivedFacts()
+    modified_files = list(resolved.modified_files) or [
+        "(derived) no files changed relative to the fetched integration "
+        f"branch on {branch or '?'}"
+    ]
+    tests = [_handoff_test(entry) for entry in resolved.test_results] or [
+        HandoffTest(
+            command="durable test/acceptance evidence probe",
+            outcome="none recorded in durable state",
+        )
+    ]
+    environment_notes = [
+        f"incumbent session {session_id} on profile {profile_alias}; "
+        f"project {project_key}"
+    ]
+    if resolved.pending_corrections:
+        environment_notes.extend(
+            f"pending Merger correction: {entry}"
+            for entry in resolved.pending_corrections
+        )
+    else:
+        environment_notes.append("no pending Merger corrections")
 
     return HandoffDocument.model_construct(
         cell_id=cell_id,
@@ -338,22 +444,13 @@ def derived_handoff_document(
         decisions=decisions,
         branch=branch,
         commits=[head],
-        pull_request="not recorded in durable state (derived)",
-        modified_files=[f"(derived) all changes are committed on {branch or '?'}"],
-        tests=[
-            HandoffTest(
-                command="git status --porcelain && git rev-parse HEAD "
-                "(lead worktree probe)",
-                outcome=f"clean; HEAD {head} matches the pushed origin branch",
-            )
-        ],
+        pull_request=resolved.pull_request,
+        modified_files=modified_files,
+        tests=tests,
         blockers=caveats,
         remaining_steps=[next_action],
         commands=["hermes-orchestrator status --json"],
-        environment_notes=[
-            f"incumbent session {session_id} on profile {profile_alias}; "
-            f"project {project_key}"
-        ],
+        environment_notes=environment_notes,
         risks=risks,
         next_action=next_action,
     )

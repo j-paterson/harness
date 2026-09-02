@@ -18,7 +18,12 @@ from hermes_orchestrator.cmux_surfaces import (
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest
 from hermes_orchestrator.events import EventStore
-from hermes_orchestrator.handoffs import HandoffDocument, HandoffService, HandoffTest
+from hermes_orchestrator.handoffs import (
+    HandoffDocument,
+    HandoffService,
+    HandoffTest,
+    derived_handoff_document,
+)
 from hermes_orchestrator.lead_rotation import LeadRotation, WorktreeState
 from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.profiles import ProfileHealth, ProfilePool, ProfileRegistry
@@ -334,14 +339,25 @@ def admit(queue: QueueService, issue_id: str) -> None:
     )
 
 
-def submit_handoff(handoffs: HandoffService) -> str:
+def submit_handoff(
+    handoffs: HandoffService,
+    *,
+    branch: str = "feature/infra-197",
+    commits: list[str] | None = None,
+) -> str:
+    """Submit a handoff document whose ``branch``/``commits`` match
+    ``make_worktree_state()``'s default (branch ``feature/infra-197``,
+    head ``deadbeef``) unless overridden — so this stays the "fresh"
+    shape for the staleness gate (INFRA-184) in every test that does not
+    explicitly want a stale one."""
+
     document = HandoffDocument(
         cell_id="cell-demo",
         objective="Finish INFRA-197 packet P1",
         status="ready to rotate",
         decisions=["compose from existing primitives"],
-        branch="feature/infra-197",
-        commits=["abc123"],
+        branch=branch,
+        commits=commits or ["deadbeef"],
         pull_request="https://example.invalid/pr/1",
         modified_files=["src/hermes_orchestrator/lead_rotation.py"],
         tests=[HandoffTest(command="pytest", outcome="passed")],
@@ -351,6 +367,39 @@ def submit_handoff(handoffs: HandoffService) -> str:
         environment_notes=["none"],
         risks=[],
         next_action="run the seat phase",
+    )
+    return handoffs.submit(document).handoff_id
+
+
+def submit_derived_handoff(
+    handoffs: HandoffService,
+    *,
+    issue_id: str = "ENG-9",
+    issue_state: str,
+    branch: str = "feature/infra-197",
+    head: str = "deadbeef",
+    next_action: str = "run the seat phase",
+) -> str:
+    """Submit a handoff through the REAL ``derived_handoff_document``
+    producer (the shape rotate-lead sees in production), so its
+    ``status`` line is genuinely ``"issue {id} is {state}; ..."`` —
+    :func:`submit_handoff`'s hand-authored ``status="ready to rotate"``
+    never parses, and only a document built this way can exercise the
+    staleness gate's issue criterion (INFRA-184 correction)."""
+
+    document = derived_handoff_document(
+        cell_id="cell-demo",
+        project_key="demo",
+        session_id=str(SESSION_ID),
+        profile_alias="max-a",
+        issue_id=issue_id,
+        issue_state=issue_state,
+        branch=branch,
+        head=head,
+        decisions=["derived"],
+        caveats=[],
+        risks=[],
+        next_action=next_action,
     )
     return handoffs.submit(document).handoff_id
 
@@ -458,7 +507,9 @@ async def test_zero_work_head_is_integration_ancestor_passes_precondition(
     trivial ancestor case) to ``head_is_integration_ancestor=True``, so
     this one case covers both."""
     await start_cell(cells, queue)
-    handoff_id = submit_handoff(handoffs)
+    # commits[0] matches the zero-work worktree's HEAD, so the staleness
+    # gate (INFRA-184) reads this as fresh, not stale.
+    handoff_id = submit_handoff(handoffs, commits=["integration1"])
     runner.emit_handoff_ack = True
     rotation = make_rotation(
         database,
@@ -596,6 +647,10 @@ async def test_happy_path_runs_ack_transfer_and_seat_in_order(
     seater: RecordingSeater,
     runner: RecordingRunner,
 ) -> None:
+    """Also exercises the INFRA-184 staleness gate's fresh path: the
+    submitted handoff's branch/HEAD match the current worktree and the
+    issue is still in-progress, so rotation proceeds exactly as before —
+    a matching submitted handoff is never treated as stale."""
     await start_cell(cells, queue)
     handoff_id = submit_handoff(handoffs)
     runner.emit_handoff_ack = True
@@ -1808,3 +1863,275 @@ async def test_ordinary_handoff_submission_never_triggers_the_continuation(
     assert database.scalar(
         "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
     ) == str(SESSION_ID)
+
+
+# -- session vs. account rotation kind, derived end to end (INFRA-184) -----
+
+
+@pytest.mark.asyncio
+async def test_provider_limit_cause_derives_account_rotation_kind(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A provider-limit-caused handoff episode (``request_checkpoint``
+    with the ``"subscription_limit"`` reason ``_require_handoff``'s own
+    ``provider.limit`` callers write) derives the ACCOUNT rotation kind
+    end to end: the completed rotation lands on a genuinely different
+    profile from the incumbent's, exactly as before this issue."""
+
+    await start_cell(cells, queue)
+    assert cells.request_checkpoint("cell-demo", "subscription_limit") is True
+    submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.profile == "max-b"
+
+
+@pytest.mark.asyncio
+async def test_context_and_ordinary_handoff_causes_derive_session_rotation_kind(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A context-threshold cause derives the SESSION rotation kind end to
+    end: the completed rotation stays on the incumbent's own healthy
+    profile with only a fresh session. An ordinary operator handoff
+    request (a ``request_checkpoint`` reason that names neither a
+    provider limit nor the rotation's own internal fresh-handoff
+    bookkeeping -- e.g. a six-hour-renewal or stall-remedy request)
+    derives the very same session kind."""
+
+    await start_cell(cells, queue)
+    assert cells.request_checkpoint("cell-demo", "context_rotation") is True
+    submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.profile == "max-a"
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+
+
+# -- submitted-but-stale handoff staleness gate (INFRA-184 / INFRA-192) ----
+
+
+def handoff_request_reason(database: Database) -> str:
+    return str(
+        database.execute(
+            "SELECT reason FROM handoff_requests WHERE cell_id = 'cell-demo'"
+        ).fetchone()["reason"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_submitted_but_stale_handoff_requests_fresh_handoff(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """Reproduces the observed INFRA-192 regression: rotate-lead consumed
+    a still-``submitted`` handoff whose recorded status named an issue
+    that was ``in_development`` at submission, but the issue has since
+    merged to ``done`` while the handoff's next action still presumes
+    ongoing implementation. Branch and HEAD otherwise MATCH the current
+    worktree — isolating the issue criterion (INFRA-184 correction: this
+    must be detected by looking up the SPECIFIC issue the handoff
+    recorded, never "the project's most recently updated admitted
+    issue"). rotate-lead must never transfer the cell onto it: it routes
+    into the SAME fresh-handoff request path the already-consumed
+    handoff uses, journals the stale evidence on the existing durable
+    request/wake channel, and leaves the stale handoff untouched and
+    reusable (still ``submitted``)."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_derived_handoff(handoffs, issue_state="in_development")
+    queue.complete("ENG-9", reason="merged upstream", evidence="pr merged")
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "awaiting_handoff"
+    assert report.failure is None
+    assert report.handoff_id == handoff_id
+    assert report.request_id is not None
+
+    # Nothing transferred, launched, or acknowledged.
+    assert runner.start_count == 1  # only the initial dispatch
+    assert runner.resume_count == 0
+    assert seater.calls == []
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+    # The stale handoff stays reusable: never acknowledged or superseded.
+    stale = handoffs.get(handoff_id)
+    assert stale.state == "submitted"
+    assert stale.replacement_session_id is None
+
+    # The compact evidence dict is durably journaled through the
+    # existing request/wake channel — branch/HEAD matched, so only the
+    # issue criterion (recorded in_development, now done) is why.
+    reason = handoff_request_reason(database)
+    assert "lead_rotation:stale_handoff_detected" in reason
+    assert "handoff_head=deadbeef" in reason
+    assert "current_head=deadbeef" in reason
+    assert "handoff_branch=feature/infra-197" in reason
+    assert "current_branch=feature/infra-197" in reason
+    assert "issue_state=done" in reason
+    assert rotation_event_count(database, "lead_rotation.attempt") == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_issue_handoff_with_matching_head_is_fresh(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-184 correction: a legitimate handoff whose status correctly
+    records the issue as ALREADY ``done`` (a cell can carry several
+    issue lanes — "issue X is done; next action: dispatch the next
+    admitted issue" is exactly the shape that rotated successfully in
+    production) must never be treated as stale. The recorded state was
+    never in-progress, so the issue criterion does not apply at all;
+    branch and HEAD match, so rotation proceeds through the normal path
+    with no fresh-handoff request filed."""
+
+    await start_cell(cells, queue)
+    queue.complete("ENG-9", reason="merged upstream", evidence="pr merged")
+    handoff_id = submit_derived_handoff(
+        handoffs,
+        issue_state="done",
+        next_action="dispatch the next admitted issue",
+    )
+    runner.emit_handoff_ack = True
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.handoff_id == handoff_id
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+    # No fresh-handoff request was ever filed: the normal path ran.
+    assert database.scalar(
+        "SELECT COUNT(*) FROM handoff_requests WHERE cell_id = 'cell-demo'"
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_newly_admitted_sibling_issue_does_not_mark_handoff_stale(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-184 correction: the issue criterion must look up the
+    SPECIFIC issue the handoff's status recorded, by id — never "the
+    project's most recently updated admitted_issues row". A newly
+    admitted sibling issue (state ``queued``, admitted and thus updated
+    AFTER the recorded issue) must never poison that lookup: the
+    recorded issue (ENG-9) is genuinely still ``in_development``, branch
+    and HEAD match, so rotation proceeds through the normal path."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_derived_handoff(handoffs, issue_state="in_development")
+    admit(queue, "ENG-10")  # a later-admitted, later-updated sibling issue
+    assert (
+        database.scalar(
+            "SELECT state FROM admitted_issues WHERE issue_id = 'ENG-10'"
+        )
+        == "queued"
+    )
+    runner.emit_handoff_ack = True
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.handoff_id == handoff_id
+    assert report.replacement_session == str(REPLACEMENT_SESSION)
+    assert database.scalar(
+        "SELECT COUNT(*) FROM handoff_requests WHERE cell_id = 'cell-demo'"
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_head_alone_with_issue_in_progress_requests_fresh_handoff(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A stale HEAD alone is enough, even while the issue is still
+    genuinely in progress: the branch matches and the issue is
+    ``in_development``, but the submitted handoff's HEAD no longer
+    matches the current worktree HEAD (the worktree moved on since
+    submission) — that alone routes into the fresh-handoff request path,
+    exactly like the already-consumed case."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)  # commits=["deadbeef"] by default
+    rotation = make_rotation(
+        database,
+        handoffs,
+        cells,
+        bindings,
+        seater,
+        worktree=make_worktree_state(head="movedon", origin_head="movedon"),
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "awaiting_handoff"
+    assert report.failure is None
+    assert report.request_id is not None
+    assert seater.calls == []
+    assert runner.start_count == 1  # only the initial dispatch
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+    stale = handoffs.get(handoff_id)
+    assert stale.state == "submitted"
+
+    reason = handoff_request_reason(database)
+    assert "lead_rotation:stale_handoff_detected" in reason
+    assert "handoff_head=deadbeef" in reason
+    assert "current_head=movedon" in reason
+    # The issue itself is genuinely still in progress — the HEAD
+    # mismatch alone is what made this stale.
+    assert "issue_state=in_development" in reason
