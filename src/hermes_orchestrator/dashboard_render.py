@@ -1166,10 +1166,6 @@ def _attention_text(snapshot: DashboardSnapshot, now: datetime) -> str:
     if blocked is not None:
         return f"blocked: {blocked.issue_id}"
 
-    if snapshot.transitions:
-        latest = max(snapshot.transitions, key=lambda t: t.occurred_at)
-        return f"{latest.project_key}: {_age(latest.occurred_at, now)} {latest.phrase}"
-
     return "nothing needs attention"
 
 
