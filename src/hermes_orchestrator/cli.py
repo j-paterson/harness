@@ -41,7 +41,9 @@ from hermes_orchestrator.channel_hub import (
 from hermes_orchestrator.checkpoints import CheckpointDispatcher, CheckpointSafetyStore
 from hermes_orchestrator.claude import (
     ClaudeRunner,
+    configured_model_tiers,
     control_launch_failure_recorder,
+    tier_default_effort,
 )
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
@@ -2366,7 +2368,8 @@ def _hermes_handlers(
             session_id=session_id,
             generation=1,
             model_tier="fable",
-            effort="high",
+            # INFRA-211: the fable tier's configured default, not a literal.
+            effort=tier_default_effort("fable"),
             allowed_files=command.expected_files,
             worktree=worktree,
             red_test="direct-work exception",
@@ -2488,6 +2491,21 @@ def _print(payload: Any, *, json_output: bool, human: str) -> None:
 _GATE_PACKET_MARKER = re.compile(r"\bpacket:([0-9a-f]{32})\b")
 
 
+def _requested_tier_default_effort(model: str) -> str:
+    """Configured default effort of the tier this launch requests.
+
+    INFRA-211: an Agent launch that names no effort takes its tier's
+    configured default rather than an amplifying literal. An unrecognized
+    model yields "", so admission refuses on the tier mismatch it already
+    checks instead of on an effort nobody asked for.
+    """
+
+    for tier in configured_model_tiers().values():
+        if tier.model == model:
+            return tier.default_effort
+    return ""
+
+
 def subagent_gate(
     freeze_dir: Path,
     payload: str,
@@ -2535,11 +2553,15 @@ def subagent_gate(
         return 0, ""
 
     tool_use_id = document.get("tool_use_id")
+    requested_model = str(tool_input.get("model") or "")
     decision = admission.admit(
         session_id=session_id,
         packet_id=packet_id,
-        model=str(tool_input.get("model") or ""),
-        effort=str(tool_input.get("effort") or "high"),
+        model=requested_model,
+        effort=str(
+            tool_input.get("effort")
+            or _requested_tier_default_effort(requested_model)
+        ),
         tool_use_id=str(tool_use_id) if tool_use_id else f"gate:{packet_id}",
     )
     if not decision.allowed:
