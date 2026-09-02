@@ -35,9 +35,11 @@ class _RecordingLinear:
 
     def __init__(self) -> None:
         self.projected: list[str] = []
+        self.effect_ids: list[str] = []
 
     async def project(self, issue_id: str, target: object, effect_id: str) -> object:
         self.projected.append(issue_id)
+        self.effect_ids.append(effect_id)
         return object()
 
 
@@ -533,6 +535,59 @@ async def test_duplicate_confirmation_after_success_has_no_second_effect(
         _cell_touch(database),
         _assignment_row(database, assignment_id),
     ) == after_success
+
+
+@pytest.mark.asyncio
+async def test_requeued_issue_gets_a_new_linear_projection_effect(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """A completed prior run must not suppress the next run's Linear state.
+
+    INFRA-192 was started once in August, returned to Todo, and started
+    again in September.  The old per-issue effect id made the second
+    projection look completed before it ran.  Each assignment is the
+    durable identity of one activation, so the two runs need two effect
+    ids while retries of either run remain idempotent.
+    """
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    linear = _RecordingLinear()
+
+    first_assignment = _publish(database, assignments, events)
+    first = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=first_assignment,
+        session_id=SESSION_ID,
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE admitted_issues SET state = 'queued' WHERE issue_id = ?",
+            ("INFRA-9",),
+        )
+    second_assignment = _publish(database, assignments, events)
+    second = await acknowledge_target(
+        database,
+        events=events,
+        linear=linear,
+        assignments=assignments,
+        assignment_id=second_assignment,
+        session_id=SESSION_ID,
+    )
+
+    assert first.activated is True
+    assert second.activated is True
+    assert first_assignment != second_assignment
+    assert linear.effect_ids == [
+        f"linear:INFRA-9:in-development:{first_assignment}",
+        f"linear:INFRA-9:in-development:{second_assignment}",
+    ]
+    assert database.scalar(
+        "SELECT COUNT(*) FROM external_effects WHERE target = 'INFRA-9'"
+    ) == 2
 
 
 @pytest.mark.asyncio

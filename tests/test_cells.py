@@ -141,10 +141,10 @@ class RecordingLinear:
         target: LinearProjection,
         effect_id: str,
     ) -> object:
-        # One stable, permanent effect id per issue — no epoch suffix:
-        # local activation is authoritative and never re-projects under
-        # a bumped id (the removed compensation machinery used to).
-        assert effect_id == f"linear:{issue_id}:in-development:v2"
+        # Retries of one activation reuse its id; a later activation of the
+        # same issue must get a fresh id so an old completed projection cannot
+        # suppress the new Working transition.
+        assert effect_id.startswith(f"linear:{issue_id}:in-development:")
         self.effect_ids.append(effect_id)
         self.targets.append((issue_id, target.status, target.assignee_alias))
         return object()
@@ -4417,8 +4417,6 @@ async def test_activate_admitted_issue_projection_failure_leaves_durable_pending
         assignee_ids={"operator": "assignee-op", "ryan": "assignee-ryan"},
         expected_team_id="team-1",
     )
-    effect_id = "linear:ENG-9:in-development:v2"
-
     def _activate_via_client() -> object:
         return activate_admitted_issue(
             database=database,
@@ -4441,6 +4439,7 @@ async def test_activate_admitted_issue_projection_failure_leaves_durable_pending
     assert _issue_started_count(database) == 1
     assert _assignment_count(database) == 1
 
+    effect_id = f"linear:ENG-9:in-development:{assignment.assignment_id}"
     effect = effects.get(effect_id)
     assert effect is not None
     assert effect.state == "pending"
@@ -4717,11 +4716,13 @@ async def test_activation_commit_journals_the_stable_pending_projection_row(
         int(database.scalar("SELECT count(*) FROM external_effects")) == 0
     )
 
-    activated, _ = await _activate(database, linear)
+    activated, assignment = await _activate(database, linear)
 
     assert activated is True
+    assert assignment is not None
+    effect_id = f"linear:ENG-9:in-development:{assignment.assignment_id}"
     assert _pending_projection_rows(database) == [
-        ("linear:ENG-9:in-development:v2", _IN_DEV_REQUEST)
+        (effect_id, _IN_DEV_REQUEST)
     ]
     # The fake projector ran after the commit but never completed the
     # journal entry — exactly the durable trace reconciliation reads.
@@ -4731,7 +4732,7 @@ async def test_activation_commit_journals_the_stable_pending_projection_row(
     replayed, _ = await _activate(database, linear)
     assert replayed is True
     assert _pending_projection_rows(database) == [
-        ("linear:ENG-9:in-development:v2", _IN_DEV_REQUEST)
+        (effect_id, _IN_DEV_REQUEST)
     ]
 
 
@@ -4796,6 +4797,11 @@ async def test_activation_adopts_legacy_revision_bearing_projection_row(
     assert row is not None
     assert str(row["state"]) == effect_state
     assert json.loads(row["request_json"]) == legacy_request
+    current_effect_id = (
+        f"linear:ENG-9:in-development:{assignment.assignment_id}"
+    )
+    effects = _pending_projection_rows(database)
+    assert (current_effect_id, _IN_DEV_REQUEST) in effects
 
 
 class _ReadOutageTransport:
@@ -4879,8 +4885,6 @@ async def test_initial_read_failure_leaves_the_pending_effect_for_reconciliation
         assignee_ids={"operator": "assignee-op", "ryan": "assignee-ryan"},
         expected_team_id="team-1",
     )
-    effect_id = "linear:ENG-9:in-development:v2"
-
     def _activate_via_client() -> object:
         return activate_admitted_issue(
             database=database,
@@ -4900,6 +4904,7 @@ async def test_initial_read_failure_leaves_the_pending_effect_for_reconciliation
     # pending record — visible to reconciliation — not nothing.
     assert activated is True
     assert assignment is not None
+    effect_id = f"linear:ENG-9:in-development:{assignment.assignment_id}"
     assert queue.get("ENG-9").state == IssueState.IN_DEVELOPMENT
     assert transport.update_calls == 0
     assert _pending_projection_rows(database) == [(effect_id, _IN_DEV_REQUEST)]

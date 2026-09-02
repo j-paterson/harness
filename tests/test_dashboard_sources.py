@@ -1195,6 +1195,44 @@ def test_control_attention_ignores_a_replaced_sessions_unresolved_prompt(
     database.close()
 
 
+def test_control_attention_ignores_channel_block_resolved_by_active_binding(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_cell(
+            connection,
+            cell_id="cell-current",
+            project_key="proj-a",
+            state="active",
+            profile_alias="max-b",
+            session_id="session-current",
+        )
+        connection.execute(
+            "INSERT INTO cmux_surface_bindings("
+            "binding_id, role, project_key, cell_id, session_id, "
+            "profile_alias, workspace_uuid, surface_uuid, generation, "
+            "state, created_at, updated_at, lane_role) VALUES ("
+            "'binding-1', 'lead', 'proj-a', 'cell-current', "
+            "'session-current', 'max-b', 'workspace-1', 'surface-1', 1, "
+            "'active', '2026-09-02T03:00:00+00:00', "
+            "'2026-09-02T03:00:00+00:00', 'development')"
+        )
+        connection.execute(
+            "INSERT INTO control_operations("
+            "operation_id, schema_version, kind, project_key, cell_id, "
+            "session_id, dedup_key, result_json, state, created_at, updated_at"
+            ") VALUES ('op-blocked', 1, 'channel.blocked', 'proj-a', "
+            "'cell-current', 'session-current', 'dedup-blocked', "
+            "'{\"refusal\":\"no active seat binding for this cell\"}', "
+            "'published', '2026-09-02T02:00:00+00:00', "
+            "'2026-09-02T02:00:00+00:00')"
+        )
+
+    assert ControlAttentionProvider(database).latest() is None
+    database.close()
+
+
 @pytest.mark.asyncio
 async def test_collect_fills_work_capacity_system_and_attention_facts(
     tmp_path: Path,

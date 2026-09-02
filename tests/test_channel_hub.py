@@ -1049,15 +1049,14 @@ class TestAssignmentEvents:
 class TestControlOperationEvents:
     """INFRA-195: recovery is provable through ACKable receipts."""
 
-    async def test_a_lifecycle_receipt_wakes_the_exact_registered_channel(
+    async def test_a_lifecycle_receipt_stays_off_the_model_channel(
         self,
         database: Database,
         bindings: CmuxSurfaceBindings,
         capabilities: ChannelCapabilities,
         socket_path: Path,
     ) -> None:
-        """Removing lifecycle kinds from channel delivery is a regression:
-        an already-idle lead cannot discover a later Stop-hook offer."""
+        """Runtime bookkeeping is durable but never starts a Fable turn."""
 
         operations = ControlOperations(database, events=EventStore(database))
         hub = ChannelHub(
@@ -1082,30 +1081,17 @@ class TestControlOperationEvents:
 
             await hub.publish_pending()
 
-            delivered = [await sidecar.receive(), await sidecar.receive()]
-            target = next(
-                event
-                for event in delivered
-                if event["packet_id"] == recorded.operation_id
-            )
-            assert target["kind"] == "HERMES_CONTROL_READY"
-            assert target["session_id"] == SESSION
-            await sidecar.send(
-                {
-                    "op": "ack",
-                    "event_id": target["event_id"],
-                    "packet_id": recorded.operation_id,
-                    "session_id": SESSION,
-                }
-            )
-            assert await sidecar.receive() == {
-                "op": "ack_ok",
-                "event_id": target["event_id"],
-            }
+            assert database.scalar(
+                "SELECT COUNT(*) FROM channel_events WHERE packet_id = ?",
+                (recorded.operation_id,),
+            ) == 0
             await sidecar.close()
         finally:
             await hub.stop()
 
+        assert operations.get(recorded.operation_id).state == "published"
+        settled = operations.settle_maintenance_for_session(SESSION)
+        assert recorded.operation_id in settled
         assert operations.get(recorded.operation_id).state == "acknowledged"
 
     async def test_a_replay_receipts_its_exact_count_including_zero(
@@ -1271,14 +1257,7 @@ class TestControlOperationEvents:
             assert recorded is not None
             sidecar = await registered_sidecar(hub, capabilities)
             await hub.publish_pending()
-            # INFRA-219: registration's lifecycle receipt now rides the
-            # channel too; select the independently seeded receipt.
-            delivered = [await sidecar.receive(), await sidecar.receive()]
-            target = next(
-                event
-                for event in delivered
-                if event["packet_id"] == recorded.operation_id
-            )
+            target = await sidecar.receive()
             assert target["packet_id"] == recorded.operation_id
             assert target["kind"] == "HERMES_CONTROL_READY"
             await sidecar.send(
@@ -1304,8 +1283,7 @@ class TestControlOperationEvents:
         capabilities: ChannelCapabilities,
         socket_path: Path,
     ) -> None:
-        """INFRA-201's silent churn stays off-channel while lifecycle
-        and other lead-actionable facts ride it."""
+        """Maintenance stays off-channel; actionable facts still ride it."""
 
         operations = ControlOperations(database, events=EventStore(database))
         hub = ChannelHub(
@@ -1321,16 +1299,6 @@ class TestControlOperationEvents:
             seed_active_cell(database)
             sidecar = await registered_sidecar(hub, capabilities)
             await hub.publish_pending()
-            replayed_event = await sidecar.receive()
-            await sidecar.send(
-                {
-                    "op": "ack",
-                    "event_id": replayed_event["event_id"],
-                    "packet_id": replayed_event["packet_id"],
-                    "session_id": SESSION,
-                }
-            )
-            assert (await sidecar.receive())["op"] == "ack_ok"
             silent = operations.record(
                 kind="intake.dedup_repaired",
                 project_key="demo",

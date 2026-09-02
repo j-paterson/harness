@@ -545,23 +545,22 @@ def admission_priority_ceiling(
     )
 
 
-def _in_development_effect_id(issue_id: str) -> str:
-    """The one stable Linear ``In Development`` projection effect id.
+def _in_development_effect_id(issue_id: str, activation_key: str) -> str:
+    """The stable Linear projection id for one activation.
 
-    Hermes' durable local lifecycle is authoritative (INFRA-199 v2):
-    local activation commits before this projection is ever attempted,
-    and nothing here ever compensates or re-projects under a bumped
-    epoch, so — unlike the removed intent machinery's per-compensation
-    suffix — a single, permanently stable id is correct: at most one
-    legitimate ``In Development`` projection exists per issue's
-    activation, and ``ExternalEffectStore``/``LinearClient`` (see
-    ``linear.py``) make any replay of it idempotent for free.
+    An issue may legitimately return to the queue and start again.  A
+    single id per issue incorrectly reused the *completed* projection
+    from its previous run, so the new activation never updated Linear.
+    The assignment id is the existing durable activation identity: retries
+    of one activation reuse it, while a later activation gets a new one.
     """
 
-    return f"linear:{issue_id}:in-development:v2"
+    return f"linear:{issue_id}:in-development:{activation_key}"
 
 
-async def _project_in_development(linear: LinearProjector, issue_id: str) -> None:
+async def _project_in_development(
+    linear: LinearProjector, issue_id: str, *, activation_key: str
+) -> None:
     """Best-effort, idempotent ``In Development`` projection attempted
     ONLY after the local activation transaction already committed
     (INFRA-199 v2: local-first activation).
@@ -589,8 +588,8 @@ async def _project_in_development(linear: LinearProjector, issue_id: str) -> Non
     reads every ``pending`` Linear effect and surfaces it as a durable
     finding; that existing, read-only mechanism — not a retry loop
     here — is what an operator or a later reconciliation pass resolves
-    it through. A later legitimate replay of this same stable effect
-    id (the issue's project cell resuming after a restart, say) is
+    it through. A later legitimate replay of this activation's stable
+    effect id (the issue's project cell resuming after a restart) is
     naturally idempotent through that same store, so it converges the
     pending row forward on its own without any bespoke convergence
     protocol.
@@ -600,7 +599,7 @@ async def _project_in_development(linear: LinearProjector, issue_id: str) -> Non
         await linear.project(
             issue_id,
             LinearProjection(status="In Development", assignee_alias="operator"),
-            effect_id=_in_development_effect_id(issue_id),
+            effect_id=_in_development_effect_id(issue_id, activation_key),
         )
 
 
@@ -629,7 +628,8 @@ def _activate_issue_transaction(
     guard: Callable[[sqlite3.Connection], bool] | None = None,
     on_eligible: Callable[[sqlite3.Connection], bool] | None = None,
     lane_role: str = DEVELOPMENT_LANE,
-) -> tuple[bool, LeadAssignment | None]:
+    projection_key: str | None = None,
+) -> tuple[bool, LeadAssignment | None, str | None]:
     """The one durable, LOCAL-ONLY activation transaction every dispatch
     path shares: the full commit-time eligibility recheck, the
     ``project_cells`` active-lease guard, the ``admitted_issues`` CAS
@@ -746,11 +746,12 @@ def _activate_issue_transaction(
             on_eligible=on_eligible,
             harness=harness,
             lane_role=lane_role,
+            projection_key=projection_key,
         )
     except _ActivationRefused:
         # The transaction rolled back: neither the activation nor
         # anything ``on_eligible`` wrote alongside it is durable.
-        return False, None
+        return False, None, None
 
 
 def _activate_issue_body(
@@ -768,7 +769,8 @@ def _activate_issue_body(
     on_eligible: Callable[[sqlite3.Connection], bool] | None,
     harness: bool,
     lane_role: str,
-) -> tuple[bool, LeadAssignment | None]:
+    projection_key: str | None,
+) -> tuple[bool, LeadAssignment | None, str | None]:
     """The transaction body of :func:`_activate_issue_transaction`.
 
     NEVER call this directly: it can raise :class:`_ActivationRefused`
@@ -792,14 +794,14 @@ def _activate_issue_body(
         replaying = (not harness) and prior_state == IssueState.IN_DEVELOPMENT.value
         if harness:
             if guard is not None and not guard(connection):
-                return False, None
+                return False, None, None
         elif not replaying:
             if guard is not None and not guard(connection):
-                return False, None
+                return False, None, None
             if prior_state not in _RUNNABLE_ISSUE_STATES:
-                return False, None
+                return False, None, None
             if not int(issue_row["dependency_ready"]):
-                return False, None
+                return False, None, None
             # INFRA-219 R6 (Sol correction 110ed759): a bounded COUNT of
             # other occupying issues, re-proven transactionally, on the
             # very same connection as the CAS below — never a plain
@@ -816,14 +818,14 @@ def _activate_issue_body(
                 project_key=str(issue_row["project_key"]),
                 issue_id=issue_id,
             ):
-                return False, None
+                return False, None, None
             pending_decision = connection.execute(
                 "SELECT 1 FROM operator_decisions WHERE issue_id = ? "
                 "AND status = 'pending' LIMIT 1",
                 (issue_id,),
             ).fetchone()
             if pending_decision is not None:
-                return False, None
+                return False, None, None
         # INFRA-220 (Sol correction 25689ebd packet 1): the cell must
         # still BE the cell this activation names. Every identity
         # column the caller bound itself to -- the project, the lane
@@ -858,7 +860,7 @@ def _activate_issue_body(
             ),
         )
         if activated.rowcount == 0:
-            return False, None
+            return False, None, None
         if not harness and not replaying:
             updated = connection.execute(
                 "UPDATE admitted_issues SET state = ?, updated_at = ? "
@@ -871,7 +873,7 @@ def _activate_issue_body(
                 ),
             )
             if updated.rowcount == 0:
-                return False, None
+                return False, None, None
             events.append(
                 connection,
                 EventInput(
@@ -881,6 +883,7 @@ def _activate_issue_body(
                     payload={"cell_id": cell_id},
                 ),
             )
+        activation_key = projection_key or issue_id
         if not harness and assignments is not None:
             assignment = assignments.publish_in(
                 connection,
@@ -894,9 +897,20 @@ def _activate_issue_body(
                     f"{prior_state}->{IssueState.IN_DEVELOPMENT.value}"
                 ),
             )
+            if assignment is not None:
+                activation_key = assignment.assignment_id
+            else:
+                existing_assignment = connection.execute(
+                    "SELECT assignment_id FROM lead_assignments "
+                    "WHERE issue_id = ? AND session_id = ? "
+                    "AND state != 'superseded' LIMIT 1",
+                    (issue_id, session_id),
+                ).fetchone()
+                if existing_assignment is not None:
+                    activation_key = str(existing_assignment["assignment_id"])
         if not harness:
-            # Sol ec0ed7fe gap 2: the stable TARGET-ONLY ``In Development``
-            # projection record becomes durable in this very commit, BEFORE
+            # The activation-keyed ``In Development`` projection record
+            # becomes durable in this very commit, BEFORE
             # any fallible Linear operation can run — no live client is
             # required to write it. ``LinearClient.project`` later ADOPTS
             # this exact row (same effect id, byte-identical
@@ -912,7 +926,7 @@ def _activate_issue_body(
             # either -- there is no product-issue transition to project.
             ExternalEffectStore.begin_in(
                 connection,
-                _in_development_effect_id(issue_id),
+                _in_development_effect_id(issue_id, activation_key),
                 target=issue_id,
                 request=projection_request(
                     issue_id,
@@ -930,7 +944,7 @@ def _activate_issue_body(
             # hook's own write survives. There is no window in which
             # one is durable without the other.
             raise _ActivationRefused
-    return True, assignment
+    return True, assignment, activation_key
 
 
 async def activate_admitted_issue(
@@ -948,6 +962,7 @@ async def activate_admitted_issue(
     guard: Callable[[sqlite3.Connection], bool] | None = None,
     on_eligible: Callable[[sqlite3.Connection], bool] | None = None,
     lane_role: str = DEVELOPMENT_LANE,
+    projection_key: str | None = None,
 ) -> tuple[bool, LeadAssignment | None]:
     """Dispatch one already-admitted issue onto a live cell durably.
 
@@ -988,7 +1003,7 @@ async def activate_admitted_issue(
     behavior exactly.
     """
 
-    activated, assignment = _activate_issue_transaction(
+    activated, assignment, activation_key = _activate_issue_transaction(
         database=database,
         events=events,
         cell_id=cell_id,
@@ -1001,10 +1016,14 @@ async def activate_admitted_issue(
         guard=guard,
         on_eligible=on_eligible,
         lane_role=lane_role,
+        projection_key=projection_key,
     )
     if not activated:
         return False, None
-    await _project_in_development(linear, issue_id)
+    assert activation_key is not None
+    await _project_in_development(
+        linear, issue_id, activation_key=activation_key
+    )
     return True, assignment
 
 
@@ -2441,11 +2460,14 @@ class ProjectCellService:
         alone (the cell lease) is all a harness dispatch commits.
         """
 
-        activated, assignment = self._activate_issue(cell, issue_id)
+        activated, assignment, activation_key = self._activate_issue(cell, issue_id)
         if not activated:
             return False, None
         if cell.lane_role != HARNESS_LANE:
-            await _project_in_development(self._linear, issue_id)
+            assert activation_key is not None
+            await _project_in_development(
+                self._linear, issue_id, activation_key=activation_key
+            )
         return True, assignment
 
     def bind_missing_issue_lanes(
@@ -2576,7 +2598,7 @@ class ProjectCellService:
         self,
         cell: ProjectCell,
         issue_id: str,
-    ) -> tuple[bool, LeadAssignment | None]:
+    ) -> tuple[bool, LeadAssignment | None, str | None]:
         """Activate the cell and issue; on the classic path, commit the
         durable assignment packet in the very same transaction, so a
         queue transition can never again outrun its assignment.
@@ -2607,7 +2629,7 @@ class ProjectCellService:
         # lease; only publication needs it — so a refusal or git failure
         # is reported and activation continues.
         if not self._bind_issue_lane(cell, issue_id):
-            return False, None
+            return False, None, None
         return _activate_issue_transaction(
             database=self._database,
             events=self._events,

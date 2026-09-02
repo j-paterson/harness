@@ -413,6 +413,7 @@ async def acknowledge_target(
         issue_id=assignment.issue_id,
         guard=confirmation_is_exact,
         on_eligible=consume_confirmation,
+        projection_key=assignment_id,
     )
     # ``activated`` is now one answer for both writes: the transition
     # and the consume shared a single commit.

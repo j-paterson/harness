@@ -496,11 +496,9 @@ class ChannelHub:
             )
             if status == "published":
                 published.append(f"{ASSIGNMENT_READY} {row['assignment_id']}")
-        # INFRA-201: only lead-actionable kinds are derived into a
-        # channel event here — maintenance receipts stay durable and
-        # recorded but reach the lead through
-        # ``settle_maintenance_for_session`` at the lead's own Stop
-        # hook instead of a visible wake.
+        # Only lead-actionable kinds become channel events. Maintenance
+        # receipts stay durable and are settled by the Stop hook without
+        # appearing in the model-visible conversation.
         maintenance_placeholders = ",".join(
             "?" * len(SILENT_MAINTENANCE_CONTROL_KINDS)
         )
