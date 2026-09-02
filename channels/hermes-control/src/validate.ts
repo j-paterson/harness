@@ -63,8 +63,10 @@ export function validateHubEvent(
 }
 
 /**
- * Compose the notification envelope content for the client's
- * `notifications/claude/channel` contract: `<KIND> <packet_id>`. The
+ * Compose concise operator- and agent-readable content for the client's
+ * `notifications/claude/channel` contract. The durable identifiers remain
+ * in metadata and the packet id stays in the action sentence so a lead can
+ * retrieve the exact item without inspecting raw protocol vocabulary. The
  * client treats a malformed `content` as a ProtocolError that kills
  * the whole stdio connection (observed live), so the sidecar must
  * never hand it one. Returns null when either input would violate the
@@ -77,7 +79,18 @@ export function composeNotificationContent(
 ): string | null {
   if (!EVENT_KINDS.has(kind)) return null;
   if (!PACKET_ID_RE.test(packetId)) return null;
-  return `${kind} ${packetId}`;
+  switch (kind) {
+    case "HERMES_ASSIGNMENT_READY":
+      return `Hermes: a new assignment is ready. Retrieve and confirm packet ${packetId}, then begin it.`;
+    case "HERMES_CORRECTION_READY":
+      return `Hermes: Sol returned corrections. Retrieve and confirm packet ${packetId}, then resume work.`;
+    case "HERMES_WORK_READY":
+      return `Hermes: work is ready to continue. Retrieve and confirm packet ${packetId}, then proceed.`;
+    case "HERMES_CONTROL_READY":
+      return `Hermes: a control update needs attention. Retrieve and confirm packet ${packetId}.`;
+    default:
+      return null;
+  }
 }
 
 export interface AckToolArgs {
