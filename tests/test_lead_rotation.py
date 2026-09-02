@@ -169,10 +169,18 @@ class RecordingSeater:
 
 
 def make_worktree_state(
-    *, dirty: bool = False, head: str = "deadbeef", origin_head: str = "deadbeef"
+    *,
+    dirty: bool = False,
+    head: str = "deadbeef",
+    origin_head: str = "deadbeef",
+    origin_integration_head: str = "",
 ) -> WorktreeState:
     return WorktreeState(
-        branch="feature/infra-197", head=head, origin_head=origin_head, dirty=dirty
+        branch="feature/infra-197",
+        head=head,
+        origin_head=origin_head,
+        dirty=dirty,
+        origin_integration_head=origin_integration_head,
     )
 
 
@@ -427,6 +435,146 @@ async def test_head_behind_origin_blocks_precondition(
     assert report.ok is False
     assert report.phase == "precondition"
     assert "origin" in (report.failure or "").lower()
+    assert seater.calls == []
+
+
+@pytest.mark.asyncio
+async def test_zero_work_head_matches_integration_head_passes_precondition(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A leased seat with no remote issue branch (``origin_head == ""``)
+    whose HEAD exactly matches the fetched integration head proves zero
+    implementation delta — the gate must let it proceed past the
+    worktree precondition rather than refuse for an unpushed head."""
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    rotation = make_rotation(
+        database,
+        handoffs,
+        cells,
+        bindings,
+        seater,
+        worktree=make_worktree_state(
+            head="integration1", origin_head="", origin_integration_head="integration1"
+        ),
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    assert report.handoff_id == handoff_id
+
+
+@pytest.mark.asyncio
+async def test_zero_work_head_diverges_from_integration_head_blocks(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+) -> None:
+    """No remote issue branch, but local HEAD carries unpushed work not
+    reflected in the fetched integration head — this is not the
+    zero-work shape, so the strict refusal still applies."""
+    await start_cell(cells, queue)
+    submit_handoff(handoffs)
+    rotation = make_rotation(
+        database,
+        handoffs,
+        cells,
+        bindings,
+        seater,
+        worktree=make_worktree_state(
+            head="local1", origin_head="", origin_integration_head="integration1"
+        ),
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "precondition"
+    assert "origin" in (report.failure or "").lower()
+    assert seater.calls == []
+
+
+@pytest.mark.asyncio
+async def test_remote_issue_branch_present_still_blocks_despite_integration_match(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+) -> None:
+    """A remote issue branch exists but disagrees with local HEAD: the
+    zero-work exception only ever applies when ``origin_head == ""``,
+    so this keeps today's strict refusal verbatim regardless of how
+    the integration head compares."""
+    await start_cell(cells, queue)
+    submit_handoff(handoffs)
+    rotation = make_rotation(
+        database,
+        handoffs,
+        cells,
+        bindings,
+        seater,
+        worktree=make_worktree_state(
+            head="local1",
+            origin_head="origin1",
+            origin_integration_head="local1",
+        ),
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "precondition"
+    assert "origin" in (report.failure or "").lower()
+    assert seater.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dirty_zero_work_shaped_worktree_still_blocks_precondition(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+) -> None:
+    """The dirty check runs before the zero-work exception is even
+    considered: uncommitted changes refuse rotation even when the rest
+    of the state otherwise matches the zero-work shape."""
+    await start_cell(cells, queue)
+    submit_handoff(handoffs)
+    rotation = make_rotation(
+        database,
+        handoffs,
+        cells,
+        bindings,
+        seater,
+        worktree=make_worktree_state(
+            dirty=True,
+            head="integration1",
+            origin_head="",
+            origin_integration_head="integration1",
+        ),
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "precondition"
+    assert "uncommitted" in (report.failure or "")
     assert seater.calls == []
 
 
