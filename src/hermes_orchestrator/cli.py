@@ -3691,10 +3691,10 @@ class WorktreeState:
 
     Structurally matches the rotation gate's own ``WorktreeState``
     (``branch``, ``head``, ``origin_head``, ``dirty``,
-    ``origin_integration_head``): the gate reads these fields directly
-    and refuses when ``head != origin_head`` or ``dirty`` is true
-    (except the narrow zero-work shape keyed on
-    ``origin_integration_head``), so an unknown value here must
+    ``head_is_integration_ancestor``): the gate reads these fields
+    directly and refuses when ``head != origin_head`` or ``dirty`` is
+    true (except the narrow zero-work shape keyed on
+    ``head_is_integration_ancestor``), so an unknown value here must
     resolve to something that fails that comparison rather than to
     ``None``, which the gate never expects.
     """
@@ -3703,7 +3703,11 @@ class WorktreeState:
     head: str
     origin_head: str
     dirty: bool
-    origin_integration_head: str = ""
+    # Whether ``head`` is a PROVEN ancestor of the fetched integration
+    # head (``origin/HEAD``). Fails closed to False: absence of proof,
+    # a missing ``origin/HEAD``, or a broken git probe must never read
+    # as an ancestor relationship.
+    head_is_integration_ancestor: bool = False
 
 
 def _worktree_state(path: Path) -> WorktreeState:
@@ -3738,7 +3742,9 @@ def _worktree_state(path: Path) -> WorktreeState:
     branch = _run(["branch", "--show-current"]) or ""
     head = _run(["rev-parse", "HEAD"]) or ""
     origin_head = (_run(["rev-parse", f"origin/{branch}"]) or "") if branch else ""
-    origin_integration_head = _run(["rev-parse", "origin/HEAD"]) or ""
+    head_is_integration_ancestor = bool(head) and (
+        _run(["merge-base", "--is-ancestor", head, "origin/HEAD"]) is not None
+    )
     status = _run(["status", "--porcelain"])
     dirty = status is None or status != ""
     return WorktreeState(
@@ -3746,7 +3752,7 @@ def _worktree_state(path: Path) -> WorktreeState:
         head=head,
         origin_head=origin_head,
         dirty=dirty,
-        origin_integration_head=origin_integration_head,
+        head_is_integration_ancestor=head_is_integration_ancestor,
     )
 
 

@@ -2059,8 +2059,57 @@ def test_worktree_state_fails_closed_on_a_non_git_directory(tmp_path: Path) -> N
     assert state.branch == ""
     assert state.head == ""
     assert state.origin_head == ""
-    assert state.origin_integration_head == ""
+    assert state.head_is_integration_ancestor is False
     assert state.dirty is True
+
+
+def test_worktree_state_proves_ancestor_when_head_is_older_reachable_integration_commit(
+    tmp_path: Path,
+) -> None:
+    """INFRA-205 generation-97 shape: a clean worktree whose HEAD is a
+    PRIOR integration commit (still reachable from, but not equal to,
+    the current ``origin/HEAD``) must probe as a proven ancestor -- the
+    ancestor probe is the fact the zero-work rotation exception now
+    keys on, replacing the too-strict HEAD-equality check."""
+    from hermes_orchestrator.cli import _worktree_state
+
+    def _git(repository: Path, *arguments: str) -> None:
+        subprocess.run(
+            ("git", *arguments), cwd=repository, check=True, capture_output=True
+        )
+
+    origin = tmp_path / "origin.git"
+    repository = tmp_path / "project"
+    repository.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", "-b", "main", str(origin)),
+        check=True,
+        capture_output=True,
+    )
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    (repository / "README.md").write_text("first\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "first")
+    _git(repository, "remote", "add", "origin", str(origin))
+    _git(repository, "push", "-u", "origin", "main")
+
+    # The remote gains a second, newer commit that this worktree never
+    # fetches its way onto -- HEAD stays at the older, still-reachable
+    # commit while a fetch updates the remote-tracking ``origin/HEAD``.
+    (repository / "README.md").write_text("second\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "second")
+    _git(repository, "push", "origin", "main")
+    _git(repository, "reset", "--hard", "HEAD~1")
+    _git(repository, "fetch", "origin")
+    _git(repository, "remote", "set-head", "origin", "main")
+
+    state = _worktree_state(repository)
+
+    assert state.head_is_integration_ancestor is True
+    assert state.dirty is False
 
 
 def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
