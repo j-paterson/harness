@@ -532,10 +532,12 @@ async def test_upper_pane_stays_live_across_maintenance_intervals(
 # long-lived mode=ro connection for the schema probe and every read.
 # ---------------------------------------------------------------------------
 
+import argparse  # noqa: E402
 import os  # noqa: E402
 import stat  # noqa: E402
 
 from hermes_orchestrator.cli import (  # noqa: E402
+    _dashboard,
     _dashboard_replacement_launcher,
     _ReadOnlyDashboardDatabase,
 )
@@ -555,9 +557,43 @@ def _recording_connect(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return recorded
 
 
+def test_dashboard_reexecs_into_the_active_runtimes_own_console_script(
+    tmp_path: Path,
+) -> None:
+    # INFRA-225: when the newly activated runtime already carries its
+    # own venv console script, exec into THAT (not the uv-run shim) so
+    # the process replaces itself in place instead of stacking another
+    # `uv run` wrapper as a parent of the new python.
+    old_runtime = tmp_path / "runtimes" / "old"
+    new_runtime = tmp_path / "runtimes" / "new"
+    old_runtime.mkdir(parents=True)
+    new_runtime.mkdir()
+    (new_runtime / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    console_script = new_runtime / ".venv" / "bin" / "hermes-orchestrator"
+    console_script.parent.mkdir(parents=True)
+    console_script.write_text("#!/path/to/venv/python\n", encoding="utf-8")
+    console_script.chmod(console_script.stat().st_mode | stat.S_IEXEC)
+    active = tmp_path / "runtimes" / "ACTIVE"
+    active.write_text(f"{new_runtime}\n", encoding="utf-8")
+    launcher = tmp_path / "bin" / "hermes-orchestrator"
+    launcher.parent.mkdir()
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    assert _dashboard_replacement_launcher(tmp_path, old_runtime) == console_script
+    assert _dashboard_replacement_launcher(tmp_path, new_runtime) is None
+
+    # Still prefers the console script even when the shim is absent.
+    launcher.unlink()
+    assert _dashboard_replacement_launcher(tmp_path, old_runtime) == console_script
+
+
 def test_dashboard_detects_a_new_active_runtime_through_the_stable_launcher(
     tmp_path: Path,
 ) -> None:
+    # Fallback path: the newly activated runtime has NO venv console
+    # script yet (not synced), so the uv-run shim is the only bootable
+    # exec target — this remains the one case that still nests a `uv
+    # run` wrapper.
     old_runtime = tmp_path / "runtimes" / "old"
     new_runtime = tmp_path / "runtimes" / "new"
     old_runtime.mkdir(parents=True)
@@ -585,6 +621,42 @@ def test_dashboard_stays_put_without_a_complete_deployed_replacement(
         f"{tmp_path / 'runtimes' / 'new'}\n", encoding="utf-8"
     )
     assert _dashboard_replacement_launcher(tmp_path, runtime) is None
+
+
+def test_dashboard_loop_execvs_the_console_script_not_the_shim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Drives the real dashboard loop (not just the helper) and pins
+    # that its os.execv target is the console script INFRA-225 adds,
+    # never the uv-run shim, when both are present.
+    repo_root, state_dir = active_repo(tmp_path)
+    Database.open(state_dir / "state.db").close()
+    settings = load_settings(repo_root, state_dir)
+
+    new_runtime = state_dir / "runtimes" / "new"
+    console_script = new_runtime / ".venv" / "bin" / "hermes-orchestrator"
+    console_script.parent.mkdir(parents=True)
+    (new_runtime / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    console_script.write_text("#!/path/to/venv/python\n", encoding="utf-8")
+    console_script.chmod(console_script.stat().st_mode | stat.S_IEXEC)
+    shim = state_dir / "bin" / "hermes-orchestrator"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    (state_dir / "runtimes" / "ACTIVE").write_text(f"{new_runtime}\n", encoding="utf-8")
+
+    execv_calls: list[tuple[str, list[str]]] = []
+
+    def fake_execv(path: str, argv: list[str]) -> None:
+        execv_calls.append((path, argv))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(os, "execv", fake_execv)
+    args = argparse.Namespace(once=False, interval=0, json=True, detail=False)
+    with pytest.raises(SystemExit):
+        _dashboard(args, settings)
+
+    assert execv_calls
+    assert execv_calls[0][0] == str(console_script)
 
 
 def test_write_forbidden_filesystem_fails_closed_no_immutable_retry(
