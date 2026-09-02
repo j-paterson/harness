@@ -27,6 +27,7 @@ from hermes_orchestrator.acceptance import AcceptanceGates
 from hermes_orchestrator.cells import (
     DEVELOPMENT_LANE,
     HARNESS_LANE,
+    DevSeatRecovery,
     ProfileCapacityEvidence,
     ProjectCellService,
     admission_priority_ceiling,
@@ -936,6 +937,7 @@ async def _run_daemon(
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
     cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
+    dev_seat_recovery: DevSeatRecovery | None = None,
     lead_intake: LeadIntakeRouter | None = None,
     channel_hub: ChannelHub | None = None,
     control_operations: ControlOperations | None = None,
@@ -959,6 +961,15 @@ async def _run_daemon(
             # every tick and retires ONLY an authoritatively absent
             # seat: an unreachable socket retires nothing.
             await cmux_dead_lead_sweep.tick()
+        if dev_seat_recovery is not None:
+            # INFRA-198: the dead-lead sweep above can retire a
+            # development lane's only cell, but nothing else in the
+            # daemon re-dispatches that lane while the project still
+            # has non-done admitted work -- only a human running
+            # start-lane could. This closes that gap through the
+            # identical dispatch lifecycle, bounded to one recovery
+            # dispatch per project per tick; it never raises.
+            await dev_seat_recovery.tick(projects)
         if cmux_hibernation is not None:
             await cmux_hibernation.tick()
         if session is not None:
@@ -1022,6 +1033,7 @@ async def _run_daemon(
             None
             if (
                 cmux_dead_lead_sweep is None
+                and dev_seat_recovery is None
                 and cmux_hibernation is None
                 and lead_intake is None
                 and channel_hub is None
@@ -5374,6 +5386,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ),
                     cmux_reconciler=runtime.cmux_reconciler,
                     cmux_dead_lead_sweep=runtime.cmux_dead_lead_sweep,
+                    dev_seat_recovery=(
+                        None
+                        if runtime.cells is None
+                        else DevSeatRecovery(
+                            runtime.cells, runtime.queue, runtime.database
+                        )
+                    ),
                     cmux_hibernation=runtime.cmux_hibernation,
                     lead_intake=runtime.lead_intake,
                     channel_hub=runtime.channel_hub,
