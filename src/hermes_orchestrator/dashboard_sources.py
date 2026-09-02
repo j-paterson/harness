@@ -62,12 +62,10 @@ _TRANSITION_EVENT_TYPES = frozenset(
         "review.corrections",
         "project_cell.rotated",
         "cmux_binding.bound",
-        "control_operation.published",
     }
 )
 
-# Only these control_operation.published kinds are meaningful
-# transitions (Work's "last:" line) or Attention-worthy on their own.
+# These published control operations are Attention-worthy while unresolved.
 _CONTROL_OPERATION_ATTENTION_KINDS = frozenset(
     {
         "channel.approval_required",
@@ -1028,11 +1026,6 @@ class TransitionProvider:
             except ValueError:
                 continue
             if not isinstance(payload, dict):
-                continue
-            if (
-                event_type == "control_operation.published"
-                and payload.get("kind") not in _CONTROL_OPERATION_ATTENTION_KINDS
-            ):
                 continue
             project_key = payload.get("project_key")
             if not isinstance(project_key, str):
