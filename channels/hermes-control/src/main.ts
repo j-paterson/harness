@@ -96,12 +96,6 @@ function main(): void {
   // the parked retry cadence. Absent in normal operation, where the
   // 60s default applies.
   const parkedRetryMs = optionalPositiveInteger("HERMES_CONTROL_PARK_RETRY_MS", 60000);
-  // Not part of the documented sidecar configuration (PROTOCOL.md):
-  // an internal knob so tests don't have to wait a full 15 minutes
-  // for the event coalescing window. Absent in normal operation,
-  // where the 15-minute default applies.
-  const coalesceMs = optionalPositiveInteger("HERMES_CONTROL_COALESCE_MS", 900000);
-
   const onLog = (message: string): void => {
     process.stderr.write(`${message}\n`);
   };
@@ -117,7 +111,6 @@ function main(): void {
     generation,
     capability,
     parkedRetryMs,
-    coalesceMs,
     readCapability: () => {
       // A reissued capability heals a running session on the next
       // registration attempt; a failed re-read falls back to the

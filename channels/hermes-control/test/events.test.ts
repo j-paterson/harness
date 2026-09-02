@@ -120,7 +120,7 @@ test("an event delivered before initialize is queued and flushed exactly once af
       event_id: "evt-1",
     });
 
-    // A resend of the same event_id within the coalesce window must
+    // A resend of the same event_id in this sidecar process must
     // not be forwarded again.
     conn.send({
       op: "event",
@@ -138,14 +138,14 @@ test("an event delivered before initialize is queued and flushed exactly once af
   }
 });
 
-test("a replayed event_id within the coalesce window forwards exactly once", async () => {
+test("a replayed event_id forwards exactly once per sidecar process", async () => {
   // The hub re-sends every unacknowledged event on each registration and
   // on each publish pass (which fires per maintenance tick AND per
   // outbox commit), so at cold start the same event can arrive several
   // times in quick succession before the lead has a chance to ACK.
   // Forwarding every one of those as a separate visible notification is
   // an operator-rejected burst; the sidecar coalesces repeats of the
-  // same event_id within one connection epoch inside a bounded window.
+  // same event_id for the sidecar process lifetime.
   const fx = await startFixture();
   try {
     await initializeSidecar(fx.sidecar);
@@ -166,7 +166,7 @@ test("a replayed event_id within the coalesce window forwards exactly once", asy
     );
     assert.equal(notif1.params.meta.event_id, "evt-1");
 
-    // Immediate re-send (well inside the default 15-minute coalesce window):
+    // Immediate re-send in the same sidecar process:
     // must NOT produce a second visible notification.
     sendEvent();
 
@@ -179,11 +179,11 @@ test("a replayed event_id within the coalesce window forwards exactly once", asy
   }
 });
 
-test("a replayed event_id forwards again once the coalesce window lapses (genuine-loss retry)", async () => {
-  // A genuinely lost, still-unacknowledged event must still self-heal
-  // on the next hub resend once the bounded coalescing window has
-  // passed — coalescing must never turn into permanent dedup.
-  const fx = await startFixture({ HERMES_CONTROL_COALESCE_MS: "150" });
+test("a replayed event_id stays quiet for the sidecar process lifetime", async () => {
+  // The MCP server queues notifications until Claude initializes, so
+  // repeatedly surfacing the same event cannot heal a loss. Recovery is
+  // a sidecar restart, which gets a fresh process-local set and hub replay.
+  const fx = await startFixture();
   try {
     await initializeSidecar(fx.sidecar);
     const conn = await registerAndGetConn(fx);
@@ -206,20 +206,19 @@ test("a replayed event_id forwards again once the coalesce window lapses (genuin
     await sleep(200);
     sendEvent();
 
-    const notif2 = await fx.sidecar.nextMessage(
-      (m) => m.method === "notifications/claude/channel"
+    await assert.rejects(
+      () => fx.sidecar.nextMessage((m) => m.method === "notifications/claude/channel", 300),
+      /timed out/
     );
-    assert.deepEqual(notif2.params.meta, notif1.params.meta);
-    assert.equal(notif2.params.content, notif1.params.content);
   } finally {
     await fx.teardown();
   }
 });
 
-test("re-registration after reconnect does not re-surface a still-unacknowledged event_id within the coalesce window, but a new event_id forwards immediately", async () => {
-  // forwardedAt is process-scoped now (not cleared on registration):
+test("re-registration does not re-surface an event already shown by this sidecar, but a new event forwards immediately", async () => {
+  // forwarded is process-scoped (not cleared on registration):
   // a reconnect must not cause a still-unacknowledged event to
-  // re-surface before its coalesce window lapses. A brand-new
+  // re-surface. A brand-new
   // event_id on the new connection is unaffected and still forwards
   // right away.
   const fx = await startFixture();
@@ -249,7 +248,7 @@ test("re-registration after reconnect does not re-surface a still-unacknowledged
     second.send({ op: "registered", proto: 1 });
 
     // Replay of the SAME event_id right after re-registration: still
-    // within the coalesce window, so it must NOT produce a second
+    // in the same sidecar process, so it must NOT produce a second
     // visible notification.
     second.send({
       op: "event",
