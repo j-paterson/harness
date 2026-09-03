@@ -1410,37 +1410,34 @@ class ChannelTrustAnchors:
         by definition have no siblings in its own project yet.
         """
 
-        same_project = self._proven_source_cell_query(
-            project_key=project_key,
-            exclude_cell_id=exclude_cell_id,
-            other_projects=False,
+        candidates = self.proven_source_cells(
+            project_key, exclude_cell_id=exclude_cell_id
         )
-        if same_project is not None:
-            return same_project
-        return self._proven_source_cell_query(
-            project_key=project_key,
-            exclude_cell_id=exclude_cell_id,
-            other_projects=True,
-        )
+        return None if not candidates else candidates[0]
 
-    def _proven_source_cell_query(
-        self, *, project_key: str, exclude_cell_id: str, other_projects: bool
-    ) -> str | None:
-        comparison = "!=" if other_projects else "="
-        row = self._database.execute(
+    def proven_source_cells(
+        self, project_key: str, *, exclude_cell_id: str
+    ) -> tuple[str, ...]:
+        """All proven candidates, preferred project first.
+
+        Selection alone cannot prove that a historical anchor still
+        matches the current launch.  Callers may therefore try these in
+        order and let :meth:`adopt` perform the authoritative comparison.
+        """
+
+        rows = self._database.execute(
             "SELECT anchors.cell_id AS cell_id FROM channel_trust_anchors "
             "AS anchors JOIN project_cells AS cells "
             "ON cells.cell_id = anchors.cell_id "
-            f"WHERE cells.project_key {comparison} ? AND anchors.cell_id != ? "
-            "AND anchors.state = 'active' "
+            "WHERE anchors.cell_id != ? AND anchors.state = 'active' "
             "AND anchors.prompt_pattern IS NOT NULL "
-            "ORDER BY CASE WHEN cells.state = 'active' THEN 0 ELSE 1 END, "
+            "ORDER BY CASE WHEN cells.project_key = ? THEN 0 ELSE 1 END, "
+            "CASE WHEN cells.state = 'active' THEN 0 ELSE 1 END, "
             "CASE WHEN cells.lane_role = 'development' THEN 0 ELSE 1 END, "
-            "anchors.created_at DESC, anchors.rowid DESC "
-            "LIMIT 1",
-            (project_key, exclude_cell_id),
-        ).fetchone()
-        return None if row is None else str(row["cell_id"])
+            "anchors.created_at DESC, anchors.rowid DESC",
+            (exclude_cell_id, project_key),
+        ).fetchall()
+        return tuple(str(row["cell_id"]) for row in rows)
 
     def get(self, anchor_id: str) -> ChannelTrustAnchor:
         row = self._database.execute(

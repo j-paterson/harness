@@ -2389,6 +2389,90 @@ class TestChannelTrustLifecycle:
         assert kept.anchor_id == source.anchor_id
 
     @pytest.mark.asyncio
+    async def test_anchorless_cell_skips_an_incompatible_legacy_anchor(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """A stale same-project proof must not mask a compatible proof.
+
+        The live rotation had an old same-project anchor whose argv was
+        captured before launch-argument normalization.  A current anchor
+        for the identical build existed on another project, but selecting
+        only the first source left the replacement at the manual prompt.
+        """
+
+        seed_cell(database)
+        seed_harness_cell(database)
+        seed_new_project_cell(database)
+        entry = trust_package(tmp_path)
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        anchors.capture(
+            cell_id="cell-demo",
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            channel_entry="server:hermes-control",
+            launch_argv_template=[*CHANNEL_ARGV, "--legacy-extra-flag"],
+            workspace_uuid=LEAD.workspace_uuid,
+            surface_uuid=LEAD.surface_uuid,
+            session_id=SESSION,
+            prompt_pattern=APPROVED_PROMPT_PATTERN,
+        )
+        source_argv = [
+            "claude",
+            "--session-id",
+            NEW_PROJECT_SESSION,
+            SKIP_PERMISSIONS_FLAG,
+            "--mcp-config",
+            f"/state/channels/{NEW_PROJECT_SESSION}.mcp.json",
+            "--dangerously-load-development-channels",
+            "server:hermes-control",
+        ]
+        current = anchors.capture(
+            cell_id="cell-newproj",
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            channel_entry="server:hermes-control",
+            launch_argv_template=source_argv,
+            workspace_uuid=NEWPROJ.workspace_uuid,
+            surface_uuid=NEWPROJ.surface_uuid,
+            session_id=NEW_PROJECT_SESSION,
+            prompt_pattern=APPROVED_PROMPT_PATTERN,
+        )
+        live_argv = [
+            "claude",
+            "--session-id",
+            HARNESS_SESSION,
+            SKIP_PERMISSIONS_FLAG,
+            "--mcp-config",
+            f"/state/channels/{HARNESS_SESSION}.mcp.json",
+            "--dangerously-load-development-channels",
+            "server:hermes-control",
+        ]
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_harness_lead(bindings)
+        confirmer = trust_confirmer(
+            database, port, entry, control=control, argv=live_argv
+        )
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert port.confirmed == [HARNESS]
+        adopted = anchors.active_for_cell("cell-harness")
+        assert adopted is not None
+        assert adopted.launch_argv_template == current.launch_argv_template
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+
+    @pytest.mark.asyncio
     async def test_an_adopt_refusal_records_a_receipt_and_still_reaches_approval(
         self,
         database: Database,

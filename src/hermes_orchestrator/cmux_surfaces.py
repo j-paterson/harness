@@ -2438,10 +2438,13 @@ class ChannelTrustConfirmer:
             # ``proven_source_cell`` widens to a proven anchor held by an
             # active cell of ANOTHER project — still only ever a
             # candidate name; ``adopt`` decides.
-            source_cell_id = anchors.proven_source_cell(
+            source_cell_ids = anchors.proven_source_cells(
                 binding.project_key or "", exclude_cell_id=str(binding.cell_id)
             )
-            if source_cell_id is not None:
+            last_error: Exception | None = None
+            attempted_source_cell_ids: list[str] = []
+            for source_cell_id in source_cell_ids:
+                attempted_source_cell_ids.append(source_cell_id)
                 try:
                     anchors.adopt(
                         source_cell_id=source_cell_id,
@@ -2455,34 +2458,27 @@ class ChannelTrustConfirmer:
                         surface_uuid=binding.surface_uuid,
                         session_id=session_id,
                     )
+                    last_error = None
+                    break
                 except Exception as error:
-                    with suppress(Exception):
-                        source_project_key = None
-                        source_row = self._database.execute(
-                            "SELECT project_key FROM project_cells "
-                            "WHERE cell_id = ?",
-                            (source_cell_id,),
-                        ).fetchone()
-                        if source_row is not None:
-                            source_project_key = str(source_row["project_key"])
-                        self._control.record(
-                            kind="channel.adopt_refused",
-                            project_key=binding.project_key or "",
-                            cell_id=str(binding.cell_id),
-                            session_id=session_id,
-                            result={
-                                "error": str(error)[:200],
-                                "source_cell_id": source_cell_id,
-                                "source_project_key": source_project_key,
-                            },
-                            reason=(
-                                "CHANNEL ADOPT REFUSED: this cell has no "
-                                "trust anchor and the project's proven "
-                                "anchor could not be carried onto it; the "
-                                "operator must confirm the development-"
-                                "channel dialog manually for this seat"
-                            ),
-                        )
+                    last_error = error
+            if last_error is not None:
+                with suppress(Exception):
+                    self._control.record(
+                        kind="channel.adopt_refused",
+                        project_key=binding.project_key or "",
+                        cell_id=str(binding.cell_id),
+                        session_id=session_id,
+                        result={
+                            "error": str(last_error)[:200],
+                            "source_cell_ids": attempted_source_cell_ids,
+                        },
+                        reason=(
+                            "CHANNEL ADOPT REFUSED: no proven trust anchor "
+                            "matched this seat; the operator must confirm "
+                            "the development-channel dialog manually"
+                        ),
+                    )
 
         def _run_bounded(operation: Callable[[], Awaitable[Any]]) -> Any:
             # The gate calls its collaborators synchronously between
