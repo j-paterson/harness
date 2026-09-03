@@ -643,6 +643,40 @@ def seed_harness_cell(database: Database, state: str = "active") -> None:
     )
 
 
+#: A brand-new project's first cell (INFRA-187 reopened, observed live
+#: 2026-09-02) -- a DIFFERENT project than ``cell-demo``, with no
+#: sibling of its own to adopt from.
+NEW_PROJECT_SESSION = "66666666-6666-4666-8666-777777777777"
+NEWPROJ = CmuxSurfaceRef(
+    workspace_uuid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    surface_uuid="cccccccc-cccc-4ccc-8ccc-dddddddddddd",
+)
+
+
+def seed_new_project_cell(database: Database, state: str = "active") -> None:
+    """A cell in a project OTHER than ``demo`` -- the shape a brand-new
+    project's first cell takes: no sibling anywhere in its own
+    project."""
+
+    database.execute(
+        "INSERT INTO project_cells("
+        "cell_id, project_key, lane_role, state, profile_alias, "
+        "session_id, created_at, updated_at) VALUES "
+        "('cell-newproj', 'harness-lab', 'development', ?, 'max-a', ?, ?, ?)",
+        (state, NEW_PROJECT_SESSION, NOW.isoformat(), NOW.isoformat()),
+    )
+
+
+def bind_new_project_lead(bindings: CmuxSurfaceBindings) -> object:
+    return bindings.bind_lead(
+        project_key="harness-lab",
+        cell_id="cell-newproj",
+        session_id=NEW_PROJECT_SESSION,
+        profile_alias="max-a",
+        ref=NEWPROJ,
+    )
+
+
 def seed_running_lease(database: Database) -> None:
     database.execute(
         "INSERT INTO process_leases("
@@ -2397,6 +2431,69 @@ class TestChannelTrustLifecycle:
         anchors = ChannelTrustAnchors(database, events=EventStore(database))
         assert anchors.active_for_cell("cell-harness") is None
         assert anchors.active_for_cell("cell-demo").anchor_id == source.anchor_id
+
+    @pytest.mark.asyncio
+    async def test_a_new_project_cell_adopts_another_projects_proven_anchor(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """INFRA-187 reopened (observed live 2026-09-02): the first
+        Fable cell of a brand-new project (``harness-lab``) launched on
+        the SAME unchanged hermes-control build as every proven cell of
+        an existing project (``demo``), yet ``anchor_present`` refused
+        because ``proven_source_cell`` only ever considered siblings of
+        the SAME project -- and a brand-new project has none, ever.
+
+        With no same-project sibling, the new project's cell now adopts
+        the OTHER project's proven anchor before the gate runs, and
+        ``evaluate`` passes ``anchor_present`` and auto-confirms with
+        zero manual dialog clicks -- exactly the same wiring the
+        same-project adoption test exercises, just across a project
+        boundary."""
+
+        seed_cell(database)
+        seed_new_project_cell(database)
+        entry = trust_package(tmp_path)
+        # The one proven anchor belongs to project "demo"'s cell.
+        source = capture_trust_anchor(database, entry)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_new_project_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert port.confirmed == [NEWPROJ]
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        adopted = anchors.active_for_cell("cell-newproj")
+        assert adopted is not None
+        assert adopted.anchor_id != source.anchor_id
+        assert adopted.prompt_pattern == source.prompt_pattern
+        # Adoption COPIES across the project boundary: the source
+        # project's cell keeps its own trust untouched.
+        kept = anchors.active_for_cell("cell-demo")
+        assert kept is not None
+        assert kept.anchor_id == source.anchor_id
+        payload = json.loads(
+            str(
+                database.execute(
+                    "SELECT payload_json FROM events "
+                    "WHERE aggregate_type = 'channel_trust_anchor' "
+                    "AND aggregate_id = ?",
+                    (adopted.anchor_id,),
+                ).fetchone()["payload_json"]
+            )
+        )
+        assert payload["source_cell_id"] == "cell-demo"
+        assert payload["source_project_key"] == "demo"
 
     @pytest.mark.asyncio
     async def test_a_same_session_and_surface_re_ensure_never_rebinds(

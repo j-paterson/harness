@@ -901,6 +901,19 @@ class ChannelTrustAnchors:
         active anchor of its own — an existing one is a different trust
         decision and refuses, exactly as :meth:`capture`'s at-most-one-
         active-per-cell rule requires.
+
+        INFRA-187 (reopened): ``source_cell_id`` may belong to a
+        DIFFERENT project than ``cell_id`` — a brand-new project's first
+        cell has no same-project sibling to adopt from, and
+        :meth:`proven_source_cell` widens to a cross-project candidate
+        only in that case. Nothing above changes for that case: every
+        program-identity fact is still re-measured from disk and
+        compared to the predecessor's exactly, so a proven anchor from
+        another project is accepted only when the build it proves is
+        genuinely unchanged. The adopted anchor's event payload records
+        the source cell's project (``source_project_key``) alongside
+        ``source_cell_id`` purely for audit trail; it is never compared
+        against anything.
         """
 
         if channel_entry != CHANNEL_ENTRY:
@@ -1017,6 +1030,18 @@ class ChannelTrustAnchors:
                     f"cell {cell_id!r} already has an active channel trust "
                     "anchor; retire it first"
                 )
+            # Audit trail only (INFRA-187 reopened): which project the
+            # source cell belongs to, so a cross-project adoption is
+            # visible in the event log. Never compared against anything.
+            source_project_row = connection.execute(
+                "SELECT project_key FROM project_cells WHERE cell_id = ?",
+                (source_cell_id,),
+            ).fetchone()
+            source_project_key = (
+                None
+                if source_project_row is None
+                else str(source_project_row["project_key"])
+            )
             connection.execute(
                 "INSERT INTO channel_trust_anchors("
                 "anchor_id, cell_id, profile_alias, canonical_entry_path, "
@@ -1058,6 +1083,7 @@ class ChannelTrustAnchors:
                     payload={
                         "cell_id": cell_id,
                         "source_cell_id": source_cell_id,
+                        "source_project_key": source_project_key,
                         "profile_alias": profile_alias,
                         "canonical_entry_path": str(entry_path),
                         "session_id": canonical_session,
@@ -1237,13 +1263,50 @@ class ChannelTrustAnchors:
         equally valid proofs of the same program identity, and any that
         no longer matches the live entry is refused by the
         re-measurement rather than trusted.
+
+        INFRA-187 (reopened): a same-project sibling is always tried
+        FIRST, exactly as above and with the same ordering. Only when
+        ``project_key`` has no qualifying sibling of its own does the
+        search widen to a proven, actively-held anchor belonging to
+        ANOTHER project — same ``active``-holding-cell requirement, same
+        development-over-harness preference, same newest-wins tiebreak,
+        just without the ``project_key`` filter. This is safe to widen
+        SOLELY because selecting a candidate here still decides nothing:
+        :meth:`adopt` unconditionally re-measures and compares every
+        program-identity fact (canonical entry path, owner uid, entry
+        sha256, dist-tree sha256, manifest name/version, the fixed
+        channel entry, and the launch argv template modulo its two
+        permitted substitution slots) against whatever candidate is
+        returned here, and refuses with zero database writes on any
+        difference. An unchanged build is the same operator-proven
+        PROGRAM identity regardless of which project's cell happens to
+        hold the anchor that proves it — a brand-new project's first
+        cell would otherwise have no possible source, ever, since it can
+        by definition have no siblings in its own project yet.
         """
 
+        same_project = self._proven_source_cell_query(
+            project_key=project_key,
+            exclude_cell_id=exclude_cell_id,
+            other_projects=False,
+        )
+        if same_project is not None:
+            return same_project
+        return self._proven_source_cell_query(
+            project_key=project_key,
+            exclude_cell_id=exclude_cell_id,
+            other_projects=True,
+        )
+
+    def _proven_source_cell_query(
+        self, *, project_key: str, exclude_cell_id: str, other_projects: bool
+    ) -> str | None:
+        comparison = "!=" if other_projects else "="
         row = self._database.execute(
             "SELECT anchors.cell_id AS cell_id FROM channel_trust_anchors "
             "AS anchors JOIN project_cells AS cells "
             "ON cells.cell_id = anchors.cell_id "
-            "WHERE cells.project_key = ? AND anchors.cell_id != ? "
+            f"WHERE cells.project_key {comparison} ? AND anchors.cell_id != ? "
             "AND cells.state = 'active' "
             "AND anchors.state = 'active' "
             "AND anchors.prompt_pattern IS NOT NULL "
