@@ -44,7 +44,11 @@ from hermes_orchestrator.cmux_surfaces import (
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.handoffs import HandoffRecord, HandoffService
-from hermes_orchestrator.lead_wakes import LeadTerminalWakes, TerminalWakeInput
+from hermes_orchestrator.lead_wakes import (
+    LeadTerminalWakes,
+    TerminalWake,
+    TerminalWakeInput,
+)
 
 # Mirrors cells._ACTIVE_CELL_STATES: the lifecycle states in which a
 # project cell is understood to hold a live, addressable lead — never
@@ -226,7 +230,9 @@ class LeadRotation:
         self._sleep = sleep
         self._renewal_interval_seconds = renewal_interval_seconds
 
-    async def rotate(self, cell_id: str) -> RotationReport:
+    async def rotate(
+        self, cell_id: str, *, rearm_delivered_handoff: bool = False
+    ) -> RotationReport:
         """Advance one cell's lead rotation exactly as far as durable
         state allows, resuming idempotently from wherever a prior run
         (or this same run, replayed) left off — up to, but not through,
@@ -351,6 +357,7 @@ class LeadRotation:
                     incumbent_profile=incumbent_profile,
                     worktree=worktree,
                     stale_evidence=stale_evidence,
+                    rearm_delivered=rearm_delivered_handoff,
                 )
 
         if transfer_already_committed:
@@ -385,6 +392,7 @@ class LeadRotation:
                 incumbent_session=incumbent_session,
                 incumbent_profile=incumbent_profile,
                 worktree=worktree,
+                rearm_delivered=rearm_delivered_handoff,
             )
         else:
             # Sol 524a38ed finding 3: the claim is acquired atomically,
@@ -466,6 +474,7 @@ class LeadRotation:
         incumbent_profile: str | None,
         worktree: WorktreeState,
         stale_evidence: dict[str, str] | None = None,
+        rearm_delivered: bool = False,
     ) -> RotationReport:
         """File the fresh durable handoff request and report awaiting.
 
@@ -544,7 +553,7 @@ class LeadRotation:
                     "a fresh handoff for this cell, then retry rotate-lead"
                 ),
             )
-        self._commit_handoff_request_wake(
+        wake = self._commit_handoff_request_wake(
             cell_id=cell_id,
             project_key=project_key,
             issue_id=issue_id,
@@ -552,6 +561,21 @@ class LeadRotation:
             incumbent_profile=incumbent_profile,
             reason=reason,
         )
+        if rearm_delivered and wake is not None and wake.state == "delivered":
+            self._wakes.commit(
+                TerminalWakeInput(
+                    project_key=project_key,
+                    issue_id=issue_id,
+                    cell_id=cell_id,
+                    session_id=uuid.UUID(incumbent_session),
+                    profile_alias=incumbent_profile or "unknown",
+                    turn_key=(
+                        f"handoff-retry:{request_id}:{wake.wake_id}"
+                    ),
+                    kind="handoff_required",
+                    reason=reason,
+                )
+            )
         self._journal_awaiting(cell_id, consumed_handoff_id, request_id)
         return RotationReport(
             ok=False,
@@ -676,7 +700,7 @@ class LeadRotation:
         incumbent_session: str,
         incumbent_profile: str | None,
         reason: str,
-    ) -> None:
+    ) -> TerminalWake | None:
         """Wake the incumbent through the existing terminal-wake outbox.
 
         The turn key binds to the newest ``project_cell.handoff_required``
@@ -692,8 +716,8 @@ class LeadRotation:
             (cell_id,),
         ).fetchone()
         if evidence is None:
-            return
-        self._wakes.commit(
+            return None
+        return self._wakes.commit(
             TerminalWakeInput(
                 project_key=project_key,
                 issue_id=issue_id,

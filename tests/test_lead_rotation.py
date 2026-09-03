@@ -1770,6 +1770,54 @@ async def test_consumed_handoff_files_the_fresh_request_with_derived_fields(
 
 
 @pytest.mark.asyncio
+async def test_explicit_rotation_retry_rearms_a_delivered_handoff_wake(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A recoverable incumbent failure can consume the first wake without
+    submitting a handoff. A later explicit rotate command rearms that request
+    once; daemon recovery retains the existing no-duplicate behavior."""
+    from hermes_orchestrator.lead_wakes import LeadTerminalWakes
+
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+    await consume_one_full_rotation(cells, queue, handoffs, runner, rotation)
+    first = await rotation.rotate("cell-demo")
+    wakes = database.execute(
+        "SELECT wake_id, state FROM lead_terminal_wakes "
+        "WHERE cell_id = 'cell-demo' ORDER BY rowid"
+    ).fetchall()
+    assert len(wakes) == 1
+    LeadTerminalWakes(
+        database=database, events=EventStore(database)
+    ).mark_delivered(str(wakes[0]["wake_id"]))
+
+    retry = await rotation.rotate("cell-demo", rearm_delivered_handoff=True)
+
+    assert retry.request_id == first.request_id
+    wakes = database.execute(
+        "SELECT wake_id, state, turn_key FROM lead_terminal_wakes "
+        "WHERE cell_id = 'cell-demo' ORDER BY rowid"
+    ).fetchall()
+    assert len(wakes) == 2
+    assert str(wakes[0]["state"]) == "delivered"
+    assert str(wakes[1]["state"]) == "pending"
+    assert str(wakes[1]["turn_key"]) == (
+        f"handoff-retry:{first.request_id}:{wakes[0]['wake_id']}"
+    )
+
+    # Repeating while that retry is still pending never creates another.
+    await rotation.rotate("cell-demo", rearm_delivered_handoff=True)
+    assert database.scalar(
+        "SELECT count(*) FROM lead_terminal_wakes WHERE cell_id = 'cell-demo'"
+    ) == 2
+
+
+@pytest.mark.asyncio
 async def test_fresh_submission_resumes_the_same_rotation_changing_both(
     database: Database,
     queue: QueueService,
