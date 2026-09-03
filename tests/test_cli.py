@@ -561,6 +561,24 @@ async def test_daemon_opens_and_closes_the_channel_hub(
 
 
 @pytest.mark.asyncio
+async def test_daemon_runs_rotation_recovery_during_maintenance() -> None:
+    calls = 0
+
+    async def recover() -> None:
+        nonlocal calls
+        calls += 1
+
+    await _run_daemon(
+        FakeService(),
+        once=True,
+        interval=60,
+        lead_rotation_recovery=recover,
+    )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_daemon_starts_when_cmux_fails_after_ping(
     tmp_path: Path,
 ) -> None:
@@ -6699,18 +6717,19 @@ def _seed_consumed_handoff_cell_state(state_dir: Path) -> None:
         database.close()
 
 
-def test_one_rotation_request_resumes_automatically_on_submit_handoff(
+def test_daemon_resumes_rotation_after_submit_handoff_returns(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The INFRA-198 acceptance shape end to end over the real CLI: ONE
-    Hermes-owned rotate-lead on the consumed newest handoff files the
-    durable fresh-handoff request and wake; the incumbent's ONE
-    submit-handoff (non-derivable content only) submits the derived
-    document and the SAME rotation resumes automatically to completion,
-    changing both profile and session — no second rotate-lead, no
-    manual prompt input anywhere."""
+    """The incumbent returns before the daemon closes its workspace.
 
+    The daemon then resumes the same durable rotation to completion,
+    changing both profile and session without manual prompt input.
+    """
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.config import load_settings
     from hermes_orchestrator.db import Database
+    from hermes_orchestrator.runtime import open_runtime
 
     repo_root, state_dir = configured_repo
     _write_cmux_config(repo_root)
@@ -6791,14 +6810,28 @@ def test_one_rotation_request_resumes_automatically_on_submit_handoff(
 
     assert second.exit_code == 0
     payload = json.loads(second.stdout)
-    resumed = payload["resumed_rotation"]
-    assert resumed is not None
-    assert resumed["phase"] == "complete"
-    assert resumed["profile"] == "max-c"
-    assert resumed["replacement_session"] != (
+    assert payload["resumed_rotation"] is None
+    assert started == []  # submit-handoff cannot retire its own process
+
+    settings = load_settings(repo_root, state_dir)
+    runtime = open_runtime(settings, enable_live=False)
+    try:
+        reports = asyncio.run(
+            cli_module._recover_pending_lead_rotations(
+                settings, runtime, runtime.database
+            )
+        )
+    finally:
+        runtime.close()
+
+    assert len(reports) == 1
+    resumed = reports[0]
+    assert resumed.phase == "complete"
+    assert resumed.profile == "max-c"
+    assert resumed.replacement_session != (
         "11111111-1111-4111-8111-111111111111"
     )
-    assert started == ["max-c"]  # exactly one replacement launch, post-resume
+    assert started == ["max-c"]  # exactly one daemon-owned replacement launch
 
     database = Database.open(state_dir / "state.db")
     try:
@@ -6808,7 +6841,7 @@ def test_one_rotation_request_resumes_automatically_on_submit_handoff(
         ).fetchone()
         assert str(cell["state"]) == "active"
         assert str(cell["profile_alias"]) == "max-c"
-        assert str(cell["session_id"]) == resumed["replacement_session"]
+        assert str(cell["session_id"]) == resumed.replacement_session
         submitted = database.execute(
             "SELECT handoff_id, state FROM handoffs "
             "WHERE handoff_id = ?",

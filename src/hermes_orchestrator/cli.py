@@ -82,7 +82,6 @@ from hermes_orchestrator.fakechat_router import FakechatWakeRouter
 from hermes_orchestrator.git import GitError, GitRunner, WorktreeGit
 from hermes_orchestrator.handoffs import (
     DerivedFacts,
-    HandoffRecord,
     HandoffRejected,
     HandoffService,
     LiveCell,
@@ -1002,6 +1001,7 @@ async def _run_daemon(
     dashboard_refresh: DashboardRefreshAction | None = None,
     orchestrator_workspace: OrchestratorWorkspaceOwner | None = None,
     post_merge: PostMergeAdvance | None = None,
+    lead_rotation_recovery: Callable[[], Awaitable[object]] | None = None,
 ) -> Supervisor:
     # INFRA-198 P1: bound to the merge flow's lifetime once merge_flow is
     # created below (only in the non-``once`` path); the maintenance
@@ -1010,6 +1010,12 @@ async def _run_daemon(
     session: MergerSession | None = None
 
     async def _maintenance() -> None:
+        if lead_rotation_recovery is not None:
+            # Rotation must finish outside the incumbent's process: closing
+            # its cmux workspace also terminates any submit-handoff command
+            # still running there.  The daemon owns the durable continuation.
+            with suppress(Exception):
+                await lead_rotation_recovery()
         if cmux_dead_lead_sweep is not None:
             # INFRA-198: the cmux reconciler runs once at startup, so a
             # lead that died mid-run stayed active until the next daemon
@@ -1098,6 +1104,7 @@ async def _run_daemon(
                 and merge_flow is None
                 and post_merge is None
                 and wakes is None
+                and lead_rotation_recovery is None
             )
             else _maintenance
         ),
@@ -4756,8 +4763,8 @@ def _compose_lead_rotation(
 ) -> Any:
     """Build the one-shot ``LeadRotation`` exactly as ``rotate-lead`` does.
 
-    Shared by ``rotate-lead`` and the ``submit-handoff`` continuation so
-    both drive the SAME durable transition with identical collaborators.
+    Shared by ``rotate-lead`` and the daemon's handoff continuation so
+    both drive the same durable transition with identical collaborators.
     Both callers name the cell being rotated, because the worktree the
     precondition measures is a property of that SEAT, not of the project
     (INFRA-198; see :func:`_rotation_worktree`).
@@ -4917,18 +4924,107 @@ def _derived_pending_corrections(
     ]
 
 
+def _pending_rotation_work(
+    database: Database,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Return daemon-owned rotation continuations, one per cell."""
+
+    work: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+    attempts = database.execute(
+        "SELECT h.cell_id, c.project_key, h.handoff_id FROM handoffs AS h "
+        "JOIN project_cells AS c ON c.cell_id = h.cell_id "
+        "WHERE EXISTS (SELECT 1 FROM events AS started "
+        "WHERE started.event_type = 'lead_rotation.attempt' "
+        "AND started.aggregate_id = h.handoff_id) "
+        "AND NOT EXISTS (SELECT 1 FROM events AS finished "
+        "WHERE finished.event_type = 'lead_rotation.completed' "
+        "AND finished.aggregate_id = h.handoff_id) "
+        "AND h.rowid = (SELECT MAX(latest.rowid) FROM handoffs AS latest "
+        "WHERE latest.cell_id = h.cell_id) "
+        "ORDER BY h.created_at DESC, h.rowid DESC"
+    ).fetchall()
+    for row in attempts:
+        cell_id = str(row["cell_id"])
+        if cell_id in seen:
+            continue
+        seen.add(cell_id)
+        work.append(
+            ("attempt", cell_id, str(row["project_key"]), str(row["handoff_id"]))
+        )
+
+    awaiting = database.execute(
+        "SELECT h.cell_id, c.project_key, h.handoff_id FROM handoffs AS h "
+        "JOIN project_cells AS c ON c.cell_id = h.cell_id "
+        "WHERE h.state = 'submitted' AND h.rowid = ("
+        "SELECT MAX(latest.rowid) FROM handoffs AS latest "
+        "WHERE latest.cell_id = h.cell_id AND latest.state = 'submitted') "
+        "AND EXISTS (SELECT 1 FROM events AS waiting "
+        "WHERE waiting.event_type = 'lead_rotation.awaiting_handoff' "
+        "AND waiting.aggregate_id = h.cell_id "
+        "AND waiting.sequence > COALESCE((SELECT MAX(resumed.sequence) "
+        "FROM events AS resumed "
+        "WHERE resumed.event_type = 'lead_rotation.awaiting_resumed' "
+        "AND resumed.aggregate_id = h.cell_id), 0)) "
+        "ORDER BY h.created_at ASC, h.rowid ASC"
+    ).fetchall()
+    for row in awaiting:
+        cell_id = str(row["cell_id"])
+        if cell_id in seen:
+            continue
+        seen.add(cell_id)
+        work.append(
+            ("submission", cell_id, str(row["project_key"]), str(row["handoff_id"]))
+        )
+    return tuple(work)
+
+
+async def _recover_pending_lead_rotations(
+    settings: Settings, runtime: Runtime, database: Database
+) -> tuple[object, ...]:
+    """Resume durable rotations from the daemon, never the retiring lead."""
+
+    reports: list[object] = []
+    handoffs = HandoffService(database)
+    for kind, cell_id, project_key, handoff_id in _pending_rotation_work(database):
+        project = settings.projects.get(project_key)
+        if project is None:
+            continue
+        try:
+            rotation = _compose_lead_rotation(
+                settings,
+                runtime,
+                database,
+                project,
+                project_key=project_key,
+                cell_id=cell_id,
+            )
+            if kind == "submission":
+                report = await rotation.resume_on_submission(handoffs.get(handoff_id))
+            else:
+                report = await rotation.rotate(cell_id)
+        except Exception as error:
+            print(
+                f"lead rotation recovery for {cell_id!r} failed: "
+                f"{type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            continue
+        if report is not None:
+            reports.append(report)
+    return tuple(reports)
+
+
 def _submit_handoff(
     args: argparse.Namespace, settings: Any, runtime: Any, database: Database
 ) -> int:
-    """Submit the incumbent's fresh durable handoff and drive the
-    awaiting rotation's event-driven continuation (INFRA-198).
+    """Submit the incumbent's fresh durable handoff for daemon continuation.
 
     Every mechanical handoff field is derived from durable rows and the
     lead-worktree probe; the caller supplies only decisions, caveats,
-    risks, and the exact next action. The submission commits first; the
-    post-commit listener signal then hands each submitted record to
-    ``LeadRotation.resume_on_submission``, which continues an awaiting
-    rotation exactly once and never fires for an ordinary handoff.
+    risks, and the exact next action. The daemon resumes any awaiting
+    rotation from this durable record, so this incumbent process returns
+    before its own workspace can be retired.
     """
 
     cell = database.execute(
@@ -5086,10 +5182,6 @@ def _submit_handoff(
         )
         return 1
     handoffs = HandoffService(database)
-    submitted: list[HandoffRecord] = []
-    # The existing post-commit listener idiom: the durable submission
-    # commits first, then the signal drives the continuation.
-    handoffs.subscribe(submitted.append)
     try:
         record = handoffs.submit(document)
     except HandoffRejected as error:
@@ -5099,67 +5191,19 @@ def _submit_handoff(
             human=f"handoff refused: {error}",
         )
         return 1
-    resumed = None
-    continuation_note: str | None = None
-    if settings.cmux is None or runtime.cmux_bindings is None:
-        continuation_note = "cmux is not configured; no rotation was resumed"
-    else:
-        try:
-            rotation = _compose_lead_rotation(
-                settings,
-                runtime,
-                database,
-                project,
-                project_key=project_key,
-                cell_id=args.cell,
-            )
-        except (OSError, ValueError) as error:
-            continuation_note = f"rotation collaborators unavailable: {error}"
-        else:
-            for signaled in submitted:
-                resumed = asyncio.run(rotation.resume_on_submission(signaled))
     payload: dict[str, Any] = {
         "handoff_id": record.handoff_id,
         "cell_id": record.cell_id,
         "state": record.state,
-        "resumed_rotation": (
-            None if resumed is None else dataclasses.asdict(resumed)
-        ),
-        "continuation_note": continuation_note,
+        "resumed_rotation": None,
+        "continuation_note": "Hermes daemon will resume any awaiting rotation",
     }
-    if resumed is None:
-        _print(
-            payload,
-            json_output=args.json,
-            human=(
-                f"Handoff {record.handoff_id} submitted for cell "
-                f"{record.cell_id}; no lead rotation was awaiting it"
-                + (f" ({continuation_note})" if continuation_note else "")
-                + "."
-            ),
-        )
-        return 0
-    if resumed.ok:
-        _print(
-            payload,
-            json_output=args.json,
-            human=(
-                f"Handoff {record.handoff_id} submitted; the awaiting "
-                f"rotation resumed and completed: session "
-                f"{resumed.replacement_session} seated on {resumed.profile} "
-                f"(binding {resumed.binding_id})."
-            ),
-        )
-        return 0
     _print(
         payload,
         json_output=args.json,
-        human=(
-            f"Handoff {record.handoff_id} submitted; the awaiting rotation "
-            f"resumed but did not complete: {resumed.failure}"
-        ),
+        human=f"Handoff {record.handoff_id} submitted for Hermes to resume.",
     )
-    return 1
+    return 0
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -6094,6 +6138,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     orchestrator_workspace=runtime.orchestrator_workspace,
                     fakechat_router=runtime.fakechat_router,
                     post_merge=runtime.post_merge,
+                    lead_rotation_recovery=(
+                        None
+                        if settings.cmux is None or runtime.cmux_bindings is None
+                        else lambda: _recover_pending_lead_rotations(
+                            settings, runtime, runtime.database
+                        )
+                    ),
                 )
             )
             payload = {
