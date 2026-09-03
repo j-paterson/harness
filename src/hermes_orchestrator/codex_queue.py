@@ -159,6 +159,10 @@ class QueueDeliveryResult:
     #: ``None`` when ``_start_queued_head`` was never invoked for this
     #: delivery.
     policy_reason: str | None = None
+    #: INFRA-223 (generation-132 start-proof blocker): True only when the
+    #: bounded queue/start proved the exact owned head started; queue
+    #: persistence alone never sets it.
+    started: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +279,7 @@ class CodexQueueDelivery:
                 ),
                 policy_sandbox=start_outcome.sandbox if start_outcome else None,
                 policy_reason=start_outcome.reason if start_outcome else None,
+                started=bool(start_outcome and start_outcome.started),
             )
         if registration.state == "queued":
             # INFRA-221: another candidate holds the reviewer with an
@@ -361,6 +366,7 @@ class CodexQueueDelivery:
                         policy_applied=start_outcome.policy_applied,
                         policy_sandbox=start_outcome.sandbox,
                         policy_reason=start_outcome.reason,
+                        started=start_outcome.started,
                     )
                 reason = "redelivery_required"
             else:

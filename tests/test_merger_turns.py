@@ -3050,3 +3050,47 @@ async def test_issue_scoped_retry_loads_a_not_loaded_thread_before_proving_idle(
     assert "thread/resume" in flow.rpc.methods
     assert flow.rpc.methods.count("turn/start") == turns_before
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-14") == ()
+
+
+@pytest.mark.asyncio
+async def test_retry_keeps_the_wake_actionable_until_the_queued_turn_starts(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 generation-132 start-proof blocker: queue persistence is
+    # not turn start. When the bounded queue/start cannot prove the exact
+    # owned head started, the retry reports the failure, the wake goes
+    # back to stalled with the reason journaled, and the SAME issue-scoped
+    # retry works again once the head can be started.
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-15", SHA_A, pr_number=20)
+    emitted = await flow.emitter.emit("demo", "ENG-15", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    await flow.turns.on_notification(
+        RpcNotification(
+            method="turn/completed",
+            params={"threadId": "thr_legacy", "turnId": "turn-1"},
+        )
+    )
+    assert _wake_states(flow)[event_id] == "stalled"
+
+    flow.queue_head_missing = True
+    failed = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-15")
+
+    assert [(r.retried, r.delivered, r.reason) for r in failed] == [
+        (True, False, "start_failed: no_owned_head")
+    ]
+    assert _wake_states(flow)[event_id] == "stalled"
+    assert flow.database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'merger.turn_start_failed' "
+        "AND correlation_id = ?",
+        (event_id,),
+    ) == 1
+    assert flow.database.scalar("SELECT count(*) FROM submitted_verdicts") == 0
+
+    flow.queue_head_missing = False
+    started = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-15")
+
+    assert [(r.retried, r.delivered) for r in started] == [(True, True)]
+    assert _wake_states(flow)[event_id] == "delivered"
+    assert "thread/queue/start" in [m for m, _ in flow.queue_rpc.requests]
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-15") == ()

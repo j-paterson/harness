@@ -1277,6 +1277,23 @@ class MergerTurnService:
         reason = getattr(result, "reason", None)
         if not isinstance(reason, str) or not reason:
             reason = "delivered" if delivered else "queued"
+        if delivered and not bool(getattr(result, "started", False)):
+            # INFRA-223 (generation-132 start-proof blocker): queue
+            # persistence is not turn start. The exact wake goes back to
+            # ``stalled`` with the start failure retained, so the same
+            # issue-scoped retry stays actionable until the bound turn is
+            # proven started -- never a duplicate effective review.
+            start_reason = getattr(result, "policy_reason", None) or "unknown"
+            self._retain_start_failure(
+                project_key, requeued, reason=str(start_reason)
+            )
+            return RetryResult(
+                event_id=event_id,
+                issue_id=requeued.issue_id,
+                retried=True,
+                delivered=False,
+                reason=f"start_failed: {start_reason}",
+            )
         return RetryResult(
             event_id=event_id,
             issue_id=requeued.issue_id,
@@ -1347,6 +1364,40 @@ class MergerTurnService:
         if status != "idle":
             return None
         return event, state, channel
+
+    def _retain_start_failure(
+        self, project_key: str, event: WakeEvent, *, reason: str
+    ) -> None:
+        """CAS the exact just-delivered wake back to ``stalled`` and journal
+        the start failure; a wake that already moved on is left alone."""
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET state = 'stalled', updated_at = ? "
+                "WHERE project_key = ? AND event_id = ? "
+                "AND state IN ('delivered', 'admitted')",
+                (stamp, project_key, event.event_id),
+            )
+            if cursor.rowcount != 1:
+                return
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="merger.turn_start_failed",
+                    aggregate_type="wake_delivery",
+                    aggregate_id=f"wake:{project_key}:{event.event_id}",
+                    correlation_id=event.event_id,
+                    actor="merger_turns",
+                    payload={
+                        "project_key": project_key,
+                        "issue_id": event.issue_id,
+                        "reason": reason,
+                        "retry_hint": "the exact queued turn did not start; "
+                        "the same issue-scoped retry remains actionable",
+                    },
+                ),
+            )
 
     async def retry_stalled_wakes_for_issue(
         self, project_key: str, issue_id: str

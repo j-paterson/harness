@@ -94,6 +94,34 @@ class FakeStatusPort:
         )
 
 
+class _FlowQueueRpc:
+    """Bounded queue/start connection double for ``ProductionShapedFlow``."""
+
+    def __init__(self, flow: Any) -> None:
+        self._flow = flow
+        self.requests: list[tuple[str, dict[str, Any] | None]] = []
+        self.started = 0
+        self.closed = 0
+
+    async def start(self) -> None:
+        self.started += 1
+
+    async def request(
+        self, method: str, params: dict[str, Any] | None, timeout: float
+    ) -> dict[str, Any]:
+        self.requests.append((method, params))
+        if method == "thread/queue/list":
+            if self._flow.queue_head_missing:
+                return {"items": []}
+            messages = self._flow.processes.messages()
+            text = messages[-1] if messages else ""
+            return {"items": [{"id": "queue-item-1", "text": text}]}
+        return {}
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
 class ProductionShapedFlow:
     """The real merge flow over a legacy-upgraded temp database."""
 
@@ -122,10 +150,16 @@ class ProductionShapedFlow:
         self.rpc = FakeRpc()
         self.merger = self.new_merger(self.rpc)
         self.processes = FakeQueueProcessFactory()
+        # INFRA-223: the bounded queue/start proof. By default the fake
+        # reports the last queued envelope as the owned idle head and
+        # starts it; ``queue_head_missing`` makes the start fail closed.
+        self.queue_head_missing = False
+        self.queue_rpc = _FlowQueueRpc(self)
         self.delivery = CodexQueueDelivery(
             channels=self.merger,
             manifest_root=self.manifest_root,
             process_factory=self.processes,
+            rpc_factory=lambda: self.queue_rpc,
         )
         self.git_runner = FakeGitRunner()
         self.emitter = CandidateEmitter(
