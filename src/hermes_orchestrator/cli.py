@@ -4152,6 +4152,12 @@ def _worktree_state(path: Path) -> WorktreeState:
     branch = _run(["branch", "--show-current"]) or ""
     head = _run(["rev-parse", "HEAD"]) or ""
     origin_head = (_run(["rev-parse", f"origin/{branch}"]) or "") if branch else ""
+    if not branch and head:
+        remote_heads = _run(
+            ["for-each-ref", "--format=%(objectname)", "refs/remotes/origin"]
+        )
+        if remote_heads is not None and head in remote_heads.splitlines():
+            origin_head = head
     head_is_integration_ancestor = bool(head) and (
         _run(["merge-base", "--is-ancestor", head, "origin/HEAD"]) is not None
     )

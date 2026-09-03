@@ -2545,6 +2545,54 @@ def test_worktree_state_proves_ancestor_when_head_is_older_reachable_integration
     assert state.dirty is False
 
 
+def test_worktree_state_recognizes_only_an_exact_detached_remote_head(
+    tmp_path: Path,
+) -> None:
+    """A clean coordinator may be detached at a pushed issue-branch tip.
+    That exact remote checkpoint is safe to rotate; a later detached local
+    commit is not."""
+    from hermes_orchestrator.cli import _worktree_state
+
+    def _git(repository: Path, *arguments: str) -> None:
+        subprocess.run(
+            ("git", *arguments), cwd=repository, check=True, capture_output=True
+        )
+
+    origin = tmp_path / "origin.git"
+    repository = tmp_path / "project"
+    repository.mkdir()
+    subprocess.run(
+        ("git", "init", "--bare", "-b", "main", str(origin)),
+        check=True,
+        capture_output=True,
+    )
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test")
+    (repository / "README.md").write_text("pushed\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "pushed")
+    _git(repository, "remote", "add", "origin", str(origin))
+    _git(repository, "push", "-u", "origin", "main")
+    _git(repository, "switch", "--detach", "HEAD")
+
+    pushed = _worktree_state(repository)
+
+    assert pushed.branch == ""
+    assert pushed.origin_head == pushed.head
+    assert pushed.dirty is False
+
+    (repository / "README.md").write_text("local only\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "local only")
+
+    local_only = _worktree_state(repository)
+
+    assert local_only.branch == ""
+    assert local_only.origin_head == ""
+    assert local_only.dirty is False
+
+
 def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
