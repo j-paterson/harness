@@ -2528,7 +2528,10 @@ async def test_reviewer_fix_successor_submission_advances_the_outstanding_wake(
         await flow.turns.submit_review(
             "demo",
             **_submission(
-                successor_id, "ENG-11", SHA_A, flow.verdict(SHA_A, branch, 16, defect=True)
+                successor_id,
+                "ENG-11",
+                SHA_A,
+                flow.verdict(SHA_A, branch, 16, defect=True),
             ),
         )
     assert flow.database.scalar(
@@ -2564,6 +2567,9 @@ async def test_reviewer_fix_successor_submission_advances_the_outstanding_wake(
         await flow.turns.submit_review(
             "demo",
             **_submission(
-                original_id, "ENG-11", SHA_A, flow.verdict(SHA_A, branch, 16, defect=True)
+                original_id,
+                "ENG-11",
+                SHA_A,
+                flow.verdict(SHA_A, branch, 16, defect=True),
             ),
         )
