@@ -4807,6 +4807,11 @@ def _compose_lead_rotation(
             )
         ),
         registration_wait_seconds=ROTATION_REGISTRATION_WAIT_SECONDS,
+        handoff_command=(
+            f"{settings.state_dir / 'bin' / 'hermes-orchestrator'} "
+            f"--repo-root {settings.repo_root} "
+            f"--state-dir {settings.state_dir} submit-handoff"
+        ),
     )
 
 

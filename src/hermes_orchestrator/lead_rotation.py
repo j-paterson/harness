@@ -217,6 +217,7 @@ class LeadRotation:
         registration_wait_seconds: float = 60.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         renewal_interval_seconds: float = _RENEWAL_INTERVAL_SECONDS,
+        handoff_command: str = "hermes-orchestrator submit-handoff",
     ) -> None:
         self._database = database
         self._events = EventStore(database)
@@ -229,6 +230,7 @@ class LeadRotation:
         self._registration_wait_seconds = registration_wait_seconds
         self._sleep = sleep
         self._renewal_interval_seconds = renewal_interval_seconds
+        self._handoff_command = handoff_command
 
     async def rotate(
         self, cell_id: str, *, rearm_delivered_handoff: bool = False
@@ -521,7 +523,7 @@ class LeadRotation:
             "every mechanical handoff field is "
             "derived from durable state — provide only "
             f"{NON_DERIVABLE_HANDOFF_CONTENT} "
-            "(hermes-orchestrator submit-handoff); the rotation resumes "
+            f"({self._handoff_command}); the rotation resumes "
             "automatically on the durable submission"
         )
         filed = self._cells.request_checkpoint(cell_id, reason)
