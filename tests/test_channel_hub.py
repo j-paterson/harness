@@ -588,6 +588,45 @@ class TestDelivery:
         finally:
             await second.stop()
 
+    async def test_work_ready_ack_settles_the_source_wake(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        """One channel confirmation completes the originating delivery."""
+
+        seat(bindings)
+        seed_packets(database)
+        sidecar = await registered_sidecar(hub, capabilities)
+        await hub.publish(
+            kind="HERMES_WORK_READY",
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+        event = await sidecar.receive()
+
+        await sidecar.send(
+            {
+                "op": "ack",
+                "event_id": event["event_id"],
+                "packet_id": WAKE_ID,
+                "session_id": SESSION,
+            }
+        )
+
+        assert (await sidecar.receive())["op"] == "ack_ok"
+        row = database.execute(
+            "SELECT state, delivered_at FROM lead_terminal_wakes "
+            "WHERE wake_id = ?",
+            (WAKE_ID,),
+        ).fetchone()
+        assert str(row["state"]) == "delivered"
+        assert row["delivered_at"] is not None
+        await sidecar.close()
+
     async def test_a_nudge_routes_committed_packets_to_the_channel(
         self,
         database: Database,
