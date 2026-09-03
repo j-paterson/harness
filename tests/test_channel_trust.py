@@ -1580,18 +1580,13 @@ def _seed_cell(
         )
 
 
-def test_proven_source_cell_skips_an_anchor_whose_cell_is_dead(
+def test_proven_source_cell_prefers_live_anchor_then_uses_failed_fallback(
     database: Database,
     anchors: ChannelTrustAnchors,
     package: tuple[Path, Path],
 ) -> None:
-    """A retired ``failed`` cell's anchor is the residue of a seat
-    Hermes has already torn down; its launch template is whatever that
-    dead seat happened to use, so it is never the trust source for a
-    live one. The dead cell's anchor here is the NEWEST and sits in the
-    same (preferred) lane, so only the holding cell's own state can
-    disqualify it — and with the live cell excluded too, there is no
-    source at all rather than a dead one."""
+    """Prefer a live holder, but retain its proven build trust after
+    the process dies so an unchanged replacement can start unattended."""
 
     package_root, entry_path = package
     _seed_cell(database, CELL, state="active", lane_role="development")
@@ -1605,7 +1600,7 @@ def test_proven_source_cell_skips_an_anchor_whose_cell_is_dead(
     assert (
         anchors.proven_source_cell("demo", exclude_cell_id=ADOPTING_CELL) == CELL
     )
-    assert anchors.proven_source_cell("demo", exclude_cell_id=CELL) is None
+    assert anchors.proven_source_cell("demo", exclude_cell_id=CELL) == DEAD_CELL
 
 
 def test_proven_source_cell_prefers_a_development_cell_over_a_harness_cell(
@@ -1830,17 +1825,13 @@ def test_cross_project_source_refuses_on_any_changed_build_fact(
     assert anchors.active_for_cell(NEW_PROJECT_CELL) is None
 
 
-def test_cross_project_source_requires_an_active_holding_cell_and_bound_prompt(
+def test_cross_project_source_requires_bound_prompt_not_live_process(
     database: Database,
     anchors: ChannelTrustAnchors,
     package: tuple[Path, Path],
 ) -> None:
-    """The same two bars a same-project source must clear apply
-    identically across projects: the holding cell must still be
-    ``active`` (a retired or failed cell's anchor is dead-seat residue)
-    and the anchor's trust must be fully proven (bound prompt evidence).
-    A cross-project candidate failing either bar is never selected --
-    there is simply no source, not a lesser one."""
+    """A proven build survives its process; incomplete manual prompt
+    evidence still never becomes an adoption source."""
 
     package_root, entry_path = package
     _seed_cell(
@@ -1855,16 +1846,18 @@ def test_cross_project_source_requires_an_active_holding_cell_and_bound_prompt(
     # A dead holding cell in the other project: its anchor is fully
     # proven but the cell itself is torn down.
     _seed_cell(database, DEAD_CELL, state="failed", lane_role="development")
-    _capture(
+    dead_anchor = _capture(
         anchors, package_root=package_root, entry_path=entry_path, cell_id=DEAD_CELL
     )
     assert (
         anchors.proven_source_cell(NEW_PROJECT, exclude_cell_id=NEW_PROJECT_CELL)
-        is None
+        == DEAD_CELL
     )
 
-    # A live holding cell in the other project whose anchor is not yet
-    # fully proven (no bound prompt evidence).
+    anchors.retire(dead_anchor.anchor_id)
+
+    # A live holding cell whose manual prompt evidence is incomplete is
+    # still not proven and therefore cannot be selected.
     _seed_cell(database, CELL, state="active", lane_role="development")
     _capture(
         anchors,

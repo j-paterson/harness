@@ -1342,11 +1342,11 @@ class ChannelTrustAnchors:
         nothing on its own, since every content fact is re-measured and
         re-compared there before anything is written.
 
-        The holding CELL must itself still be ``active`` (observed live
-        2026-09-01): a retired or ``failed`` cell's anchor is the
-        residue of a seat Hermes has already torn down, and its launch
-        template is whatever that dead seat happened to use — never the
-        trust source for a live one. Among the cells that qualify, a
+        A live holding cell is preferred, but the trust decision does
+        not die with the process that displayed it. If no live cell has
+        a matching proven anchor, a failed cell's still-active anchor is
+        a valid fallback; :meth:`adopt` re-measures the build and launch
+        facts before copying it. Among otherwise equal candidates, a
         ``development`` lane cell is preferred over a ``harness`` one:
         the development lane is where the operator's one manual trust
         decision is actually made, so its anchor is the closest thing
@@ -1362,7 +1362,7 @@ class ChannelTrustAnchors:
         FIRST, exactly as above and with the same ordering. Only when
         ``project_key`` has no qualifying sibling of its own does the
         search widen to a proven, actively-held anchor belonging to
-        ANOTHER project — same ``active``-holding-cell requirement, same
+        ANOTHER project — same live-cell preference, same
         development-over-harness preference, same newest-wins tiebreak,
         just without the ``project_key`` filter. This is safe to widen
         SOLELY because selecting a candidate here still decides nothing:
@@ -1401,10 +1401,10 @@ class ChannelTrustAnchors:
             "AS anchors JOIN project_cells AS cells "
             "ON cells.cell_id = anchors.cell_id "
             f"WHERE cells.project_key {comparison} ? AND anchors.cell_id != ? "
-            "AND cells.state = 'active' "
             "AND anchors.state = 'active' "
             "AND anchors.prompt_pattern IS NOT NULL "
-            "ORDER BY CASE WHEN cells.lane_role = 'development' THEN 0 ELSE 1 END, "
+            "ORDER BY CASE WHEN cells.state = 'active' THEN 0 ELSE 1 END, "
+            "CASE WHEN cells.lane_role = 'development' THEN 0 ELSE 1 END, "
             "anchors.created_at DESC, anchors.rowid DESC "
             "LIMIT 1",
             (project_key, exclude_cell_id),
