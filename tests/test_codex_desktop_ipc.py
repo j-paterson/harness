@@ -41,6 +41,11 @@ class FakeDesktopRouter:
             "resumeState": "resumed",
             "threadRuntimeStatus": {"type": "idle"},
         }
+        # Sol 98ea8970: decoys emitted BEFORE the owner's own snapshot.
+        self.snapshot_source = OWNER
+        self.snapshot_targets: list[str] | None = "requester"  # type: ignore[assignment]
+        self.snapshot_host = "local"
+        self.decoys: list[dict[str, Any]] = []
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -61,10 +66,9 @@ class FakeDesktopRouter:
                 message = json.loads((await reader.readexactly(length)).decode())
                 self.requests.append(message)
                 if message.get("type") == "broadcast":
-                    reply = self._on_broadcast(message)
-                    if reply is not None:
+                    for reply in self._on_broadcast(message):
                         writer.write(_frame(reply))
-                        await writer.drain()
+                    await writer.drain()
                     continue
                 writer.write(_frame(self._respond(message)))
                 await writer.drain()
@@ -73,28 +77,67 @@ class FakeDesktopRouter:
         finally:
             writer.close()
 
-    def _on_broadcast(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def _on_broadcast(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         if message["method"] != "thread-stream-following-status-requested":
-            return None
+            return []
         assert message["version"] == 1
-        if self.snapshot is None:
-            return None
-        return {
-            "type": "broadcast",
-            "method": "thread-stream-state-changed",
-            "sourceClientId": OWNER,
-            "targetClientIds": [message["sourceClientId"]],
-            "version": 11,
-            "params": {
-                "conversationId": message["params"]["conversationId"],
-                "hostId": "local",
-                "change": {
-                    "type": "snapshot",
-                    "revision": 7,
-                    "conversationState": self.snapshot,
+        requester = message["sourceClientId"]
+        conversation_id = message["params"]["conversationId"]
+
+        def snapshot_frame(
+            state: dict[str, Any],
+            *,
+            source: str = OWNER,
+            targets: list[str] | None = None,
+            host: str = "local",
+            change_type: str = "snapshot",
+        ) -> dict[str, Any]:
+            frame: dict[str, Any] = {
+                "type": "broadcast",
+                "method": "thread-stream-state-changed",
+                "sourceClientId": source,
+                "version": 11,
+                "params": {
+                    "conversationId": conversation_id,
+                    "hostId": host,
+                    "change": {
+                        "type": change_type,
+                        "revision": 7,
+                        "conversationState": state,
+                    },
                 },
-            },
-        }
+            }
+            if targets is not None:
+                frame["targetClientIds"] = targets
+            return frame
+
+        frames = [
+            snapshot_frame(
+                d["state"],
+                source=d.get("source", OWNER),
+                targets=(
+                    [requester] if d.get("targets") == "requester" else d.get("targets")
+                ),
+                host=d.get("host", "local"),
+                change_type=d.get("change_type", "snapshot"),
+            )
+            for d in self.decoys
+        ]
+        if self.snapshot is not None:
+            targets = (
+                [requester]
+                if self.snapshot_targets == "requester"
+                else self.snapshot_targets
+            )
+            frames.append(
+                snapshot_frame(
+                    self.snapshot,
+                    source=self.snapshot_source,
+                    targets=targets,
+                    host=self.snapshot_host,
+                )
+            )
+        return frames
 
     def _respond(self, message: dict[str, Any]) -> dict[str, Any]:
         request_id = message["requestId"]
@@ -334,5 +377,48 @@ async def test_thread_activity_is_proven_by_the_owner_snapshot(
             if m["method"] == "thread-stream-following-changed"
         ]
         assert following[:2] == [True, False]
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_only_the_owners_snapshot_targeted_to_this_client_is_authoritative(
+    socket_path: Path,
+) -> None:
+    # Sol correction 98ea8970: a matching-conversation idle snapshot from a
+    # non-owner client, an owner snapshot not targeted to this client, a
+    # wrong-host snapshot and a patches change are all ignored; only the
+    # owner's targeted snapshot decides, and it still distinguishes
+    # active from idle.
+    router = FakeDesktopRouter(socket_path)
+    router.registered = True
+    await router.start()
+    idle = {"resumeState": "resumed", "threadRuntimeStatus": {"type": "idle"}}
+    active = {"resumeState": "resumed", "threadRuntimeStatus": {"type": "active"}}
+    try:
+        starter = OwnerTurnStarter(socket_path, timeout=1.5)
+        # Decoys say idle; the owner's targeted snapshot says active.
+        router.decoys = [
+            {"state": idle, "source": "not-the-owner", "targets": "requester"},
+            {"state": idle, "source": OWNER, "targets": None},
+            {"state": idle, "source": OWNER, "targets": ["someone-else"]},
+            {"state": idle, "source": OWNER, "targets": "requester", "host": "ssh"},
+            {
+                "state": idle,
+                "source": OWNER,
+                "targets": "requester",
+                "change_type": "patches",
+            },
+        ]
+        router.snapshot = active
+        assert (await starter.thread_activity(THREAD)).active is True
+
+        # Decoys alone (no owner snapshot) never authorize: unknown.
+        router.snapshot = None
+        assert (await starter.thread_activity(THREAD)).active is None
+
+        # The owner's targeted idle snapshot after the same decoys: idle.
+        router.snapshot = idle
+        assert (await starter.thread_activity(THREAD)).active is False
     finally:
         await router.stop()

@@ -198,16 +198,14 @@ class DesktopIpcClient:
                     frame = await asyncio.wait_for(self._read_frame(), remaining)
                 except (TimeoutError, DesktopIpcUnavailable):
                     return None
-                if frame.get("type") != "broadcast":
+                if not self._is_owner_snapshot_for_me(
+                    frame,
+                    conversation_id=conversation_id,
+                    owner_client_id=owner_client_id,
+                    host_id=host_id,
+                ):
                     continue
-                if frame.get("method") != "thread-stream-state-changed":
-                    continue
-                inner = frame.get("params") or {}
-                if inner.get("conversationId") != conversation_id:
-                    continue
-                change = inner.get("change") or {}
-                if change.get("type") != "snapshot":
-                    continue
+                change = (frame.get("params") or {}).get("change") or {}
                 state = change.get("conversationState")
                 return state if isinstance(state, dict) else None
         finally:
@@ -217,6 +215,37 @@ class DesktopIpcClient:
                     {**params, "following": False},
                     target_client_ids=[owner_client_id],
                 )
+
+    def _is_owner_snapshot_for_me(
+        self,
+        frame: dict[str, Any],
+        *,
+        conversation_id: str,
+        owner_client_id: str,
+        host_id: str,
+    ) -> bool:
+        """Sol correction 98ea8970: only the discovered OWNER's snapshot,
+        addressed to this initialized client, for this conversation and
+        host, is authoritative. Anything else -- a non-owner or stale
+        client's state, an untargeted broadcast, another host, patches --
+        is ignored until the bounded timeout."""
+
+        if frame.get("type") != "broadcast":
+            return False
+        if frame.get("method") != "thread-stream-state-changed":
+            return False
+        if frame.get("sourceClientId") != owner_client_id:
+            return False
+        targets = frame.get("targetClientIds")
+        if not isinstance(targets, list) or self.client_id not in targets:
+            return False
+        inner = frame.get("params") or {}
+        if inner.get("conversationId") != conversation_id:
+            return False
+        if inner.get("hostId") != host_id:
+            return False
+        change = inner.get("change") or {}
+        return change.get("type") == "snapshot"
 
     async def _broadcast(
         self,
