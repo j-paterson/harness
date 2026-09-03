@@ -971,23 +971,55 @@ async def test_request_before_start_is_unavailable(
         await client.request("thread/read", {"threadId": "a"}, 5)
 
 
-def test_app_server_command_attaches_through_the_app_control_socket_proxy() -> None:
+def test_app_server_command_relays_through_the_control_socket_only_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # INFRA-223 (2026-09-03): a spawned ``app-server --listen stdio://``
-    # owned the exact queued turn it started and interrupted it on exit
-    # (turn 01a0655d…, 348 ms). Every bounded client now relays through
-    # the Codex app's existing control socket, so the app stays the sole
-    # owner of the thread and its turns; an exact socket may be pinned.
+    # owned the exact queued turn it started and interrupted it on exit.
+    # When the desktop app's control socket exists the bounded client
+    # relays through ``codex app-server proxy`` (app stays the owner);
+    # Sol correction b4c58b13: when it does NOT exist on this host, the
+    # working stdio launch is kept rather than replaced with an
+    # unavailable socket.
+    import socket
+    import tempfile
+
+    import hermes_orchestrator.codex_rpc as codex_rpc
+
+    # AF_UNIX paths are length-limited; bind under a short temp root.
+    short_root = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
+    missing = short_root / "control" / "app-server-control.sock"
+    monkeypatch.setattr(codex_rpc, "DEFAULT_CONTROL_SOCKET", missing)
     assert app_server_command() == [
         "/Applications/Codex.app/Contents/Resources/codex",
         "app-server",
-        "proxy",
+        "--listen",
+        "stdio://",
     ]
-    assert app_server_command(socket_path="/tmp/codex/app-server.sock") == [
-        "/Applications/Codex.app/Contents/Resources/codex",
-        "app-server",
-        "proxy",
-        "--sock",
-        "/tmp/codex/app-server.sock",
+
+    missing.parent.mkdir()
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(missing))
+    try:
+        assert app_server_command() == [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "app-server",
+            "proxy",
+        ]
+        assert app_server_command(socket_path=str(missing)) == [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "app-server",
+            "proxy",
+            "--sock",
+            str(missing),
+        ]
+    finally:
+        listener.close()
+        missing.unlink(missing_ok=True)
+    # A pinned socket that is not exposed keeps the stdio launch too.
+    assert app_server_command(socket_path=str(short_root / "absent.sock"))[-2:] == [
+        "--listen",
+        "stdio://",
     ]
     with pytest.raises(ValueError, match="absolute"):
         app_server_command(socket_path="relative.sock")

@@ -65,21 +65,35 @@ ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 CODEX_BINARY = "/Applications/Codex.app/Contents/Resources/codex"
 
 
+#: The Codex app's control socket that ``codex app-server proxy`` relays
+#: to by default. Present only when the desktop app (or its managed
+#: daemon) exposes the control endpoint on this host.
+DEFAULT_CONTROL_SOCKET = Path.home() / ".codex" / "app-server-control" / (
+    "app-server-control.sock"
+)
+
+
 def app_server_command(
     executable: str | None = None, *, socket_path: str | None = None
 ) -> list[str]:
-    """Return the stable argv that attaches a stdio client to the Codex
-    app's already-running App Server through ``codex app-server proxy``.
+    """Return the stable argv for one bounded App Server client.
 
     INFRA-223 (turn-interruption ownership blocker, 2026-09-03): a
     second ``app-server --listen stdio://`` process spawned by Hermes
     became the OWNER of the exact queued turn it started, so the turn
-    was interrupted the moment that bounded helper exited. The proxy
-    only relays bytes to the app's control socket -- the Codex app stays
-    the sole owner of the thread and its turns -- so a bounded client
-    connecting, starting the queue head, and disconnecting leaves the
-    turn running. ``socket_path`` pins an exact validated socket
-    (``--sock``); by default the proxy resolves the app's own socket.
+    was interrupted the moment that bounded helper exited. When the
+    Codex desktop app exposes its control socket, the client relays
+    through ``codex app-server proxy`` instead: the app stays the sole
+    owner of the thread and its turns while the bounded client connects,
+    acts, and disconnects.
+
+    Sol correction b4c58b13 (Critical): the proxy is selected ONLY when
+    that desktop-owned endpoint is proven present on this host -- the
+    exact ``socket_path`` given, else :data:`DEFAULT_CONTROL_SOCKET`.
+    When no such endpoint exists the previously working bounded stdio
+    launch is kept, never replaced with an unavailable socket; the
+    ownership defect stays observable there until the endpoint is
+    exposed, but nothing that works today stops working.
 
     Only an absolute executable path (and socket path) is accepted; a
     bare or relative name would resolve through the caller's PATH and
@@ -91,14 +105,17 @@ def app_server_command(
         raise ValueError(
             "the codex app-server executable must be an absolute path"
         )
-    command = [resolved, "app-server", "proxy"]
-    if socket_path is not None:
-        if not Path(socket_path).is_absolute():
-            raise ValueError(
-                "the codex app-server control socket must be an absolute path"
-            )
-        command.extend(["--sock", socket_path])
-    return command
+    if socket_path is not None and not Path(socket_path).is_absolute():
+        raise ValueError(
+            "the codex app-server control socket must be an absolute path"
+        )
+    endpoint = Path(socket_path) if socket_path is not None else DEFAULT_CONTROL_SOCKET
+    if endpoint.is_socket():
+        command = [resolved, "app-server", "proxy"]
+        if socket_path is not None:
+            command.extend(["--sock", socket_path])
+        return command
+    return [resolved, "app-server", "--listen", "stdio://"]
 
 
 class CodexUnavailable(RuntimeError):
