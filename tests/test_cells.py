@@ -44,6 +44,7 @@ from hermes_orchestrator.profiles import (
 )
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import SubagentPacket
+from hermes_orchestrator.work_claims import WorkClaims
 
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 REPLACEMENT_SESSION = UUID("22222222-2222-4222-8222-222222222222")
@@ -4444,6 +4445,146 @@ async def test_activate_admitted_issue_commits_locally_then_projects(
 
 
 @pytest.mark.asyncio
+async def test_activate_admitted_issue_opens_a_development_work_claim(
+    database: Database, queue: QueueService
+) -> None:
+    """INFRA-222: the same activation transaction that publishes the
+    assignment also opens the cell's work claim, keyed by its own
+    ``lane_role`` -- ``development`` for the default lane."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+
+    activated, assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=RecordingLinear(),
+        assignments=LeadAssignments(database, events=events),
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+    )
+
+    assert activated is True
+    assert assignment is not None
+    claim = WorkClaims(database, events=events).current_for_cell(
+        "cell-demo", role="development"
+    )
+    assert claim is not None
+    assert claim.issue_id == "ENG-9"
+    assert claim.project_key == "demo"
+    assert claim.state == "active"
+
+
+@pytest.mark.asyncio
+async def test_activate_admitted_issue_opens_a_harness_work_claim(
+    database: Database, queue: QueueService
+) -> None:
+    """The harness lane never publishes a delivery packet for its
+    primary activation, but the SAME activation transaction still
+    opens the cell's ``harness``-role work claim."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET lane_role = ? WHERE cell_id = ?",
+            (HARNESS_LANE, "cell-demo"),
+        )
+        connection.execute(
+            "UPDATE profile_leases SET lane_role = ? WHERE profile_alias = ?",
+            (HARNESS_LANE, "max-a"),
+        )
+    events = EventStore(database)
+
+    activated, assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=RecordingLinear(),
+        assignments=LeadAssignments(database, events=events),
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+        lane_role=HARNESS_LANE,
+    )
+
+    assert activated is True
+    assert assignment is None  # the harness lane never gets a packet
+    assert queue.get("ENG-9").state == IssueState.QUEUED  # never transitioned
+    claim = WorkClaims(database, events=events).current_for_cell(
+        "cell-demo", role="harness"
+    )
+    assert claim is not None
+    assert claim.issue_id == "ENG-9"
+    assert claim.state == "active"
+
+
+@pytest.mark.asyncio
+async def test_superseding_or_acknowledging_the_assignment_leaves_the_claim_active(
+    database: Database, queue: QueueService
+) -> None:
+    """INFRA-222: the work claim is the durable "what is this cell
+    working on" record -- it survives whatever the delivery packet's
+    own lifecycle does next, whether that is a rotation that supersedes
+    it or the exact session's own acknowledgement."""
+
+    admit(queue, "ENG-9")
+    _seed_active_cell(database)
+    events = EventStore(database)
+    assignments = LeadAssignments(database, events=events)
+    claims = WorkClaims(database, events=events)
+
+    activated, assignment = await activate_admitted_issue(
+        database=database,
+        events=events,
+        linear=RecordingLinear(),
+        assignments=assignments,
+        cell_id="cell-demo",
+        project_key="demo",
+        profile_alias="max-a",
+        session_id=str(SESSION_ID),
+        issue_id="ENG-9",
+    )
+    assert activated is True
+    assert assignment is not None
+    claim_id = claims.current_for_cell("cell-demo", role="development").claim_id
+
+    # A rotation on the SAME cell supersedes the live packet...
+    with database.transaction() as connection:
+        rotated = assignments.publish_in(
+            connection,
+            project_key="demo",
+            issue_id="ENG-9",
+            cell_id="cell-demo",
+            session_id=str(REPLACEMENT_SESSION),
+            profile_alias="max-a",
+            instruction_id="instr-ENG-9",
+            queue_transition="in_development->in_development",
+        )
+    assert rotated is not None
+    assert assignments.get(assignment.assignment_id).state == "superseded"
+    # ... but the claim is untouched: same claim id, still active.
+    claim = claims.current_for_cell("cell-demo", role="development")
+    assert claim is not None
+    assert claim.claim_id == claim_id
+    assert claim.state == "active"
+
+    # Acknowledging the fresh packet leaves the claim exactly as it was.
+    assert assignments.acknowledge(
+        rotated.assignment_id, session_id=str(REPLACEMENT_SESSION)
+    )
+    claim = claims.current_for_cell("cell-demo", role="development")
+    assert claim is not None
+    assert claim.claim_id == claim_id
+    assert claim.state == "active"
+
+
+@pytest.mark.asyncio
 async def test_activate_admitted_issue_refuses_transactionally_without_touching_linear(
     database: Database, queue: QueueService
 ) -> None:
@@ -6457,3 +6598,350 @@ async def test_recovery_never_proposes_an_unstartable_assigned_state(
     cells = _RecoveryCells(active=frozenset())
     await DevSeatRecovery(cells, queue, database).tick(("demo",))
     assert cells.dispatched == []
+
+
+def _seed_work_claim(
+    database: Database,
+    *,
+    issue_id: str,
+    cell_id: str = "cell-recovery",
+    role: str = "development",
+    project_key: str = "demo",
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO work_claims("
+            "claim_id, project_key, issue_id, cell_id, role, child_lane, "
+            "state, opened_at, closed_at, closed_reason, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, '', 'active', ?, NULL, NULL, ?)",
+            (f"claim-{issue_id}", project_key, issue_id, cell_id, role, now, now),
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_finds_the_issue_from_an_active_development_claim(
+    database: Database, queue: QueueService
+) -> None:
+    """INFRA-222: once a work claim exists, recovery reads ownership
+    from it directly -- it never needs a live (non-superseded)
+    lead_assignments row to find the issue the development lane owns,
+    since the claim is the durable ownership record and the packet
+    lifecycle is not."""
+
+    admit(queue, "REC-9")
+    queue.transition(
+        "REC-9",
+        IssueState.IN_DEVELOPMENT,
+        actor="orchestrator",
+        reason="occupying its owner lane",
+    )
+    _seed_assignment_owner_cell(database, DEVELOPMENT_LANE)
+    _seed_work_claim(database, issue_id="REC-9")
+    # No lead_assignments row exists at all -- e.g. it was superseded
+    # or never replayed -- yet the claim alone is enough to recover.
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == [("REC-9", DEVELOPMENT_LANE)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_falls_back_to_the_assignment_join_without_a_claim(
+    database: Database, queue: QueueService
+) -> None:
+    """A pre-INFRA-222 row the backfill missed has no work_claims row at
+    all; recovery must still fall back to the existing lead_assignments
+    join rather than finding nothing."""
+
+    admit(queue, "REC-10")
+    queue.transition(
+        "REC-10",
+        IssueState.IN_DEVELOPMENT,
+        actor="orchestrator",
+        reason="occupying its owner lane",
+    )
+    _publish_assignment(database, "REC-10")
+    _seed_assignment_owner_cell(database, DEVELOPMENT_LANE)
+    cells = _RecoveryCells(active=frozenset())
+    await DevSeatRecovery(cells, queue, database).tick(("demo",))
+    assert cells.dispatched == [("REC-10", DEVELOPMENT_LANE)]
+
+
+# -- worker bindings and rotation cwd (INFRA-222) ---------------------------
+
+
+class _IssueLaneGit:
+    """A minimal ``HarnessCheckoutPort``-shaped git fake, in the style of
+    ``_RecordingGit`` above -- just enough for ``bind_issue_worktree`` to
+    materialize a first-assignment lane without touching real git."""
+
+    def worktree_add_branch(self, repo_path: Path, path: Path, branch: str) -> None:
+        return None
+
+    def local_branch_exists(self, repo_path: Path, branch: str) -> bool:
+        return False
+
+    def fetch(self, repo_path: Path, remote: str, branch: str) -> None:
+        return None
+
+    def worktree_add_new_branch(
+        self, repo_path: Path, path: Path, branch: str, start_point: str
+    ) -> None:
+        return None
+
+    def worktree_list(self, repo_path: Path) -> tuple[str, ...]:
+        return ()
+
+    def branch(self, path: Path) -> str | None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_binds_a_generation_one_worker_binding(
+    cell_service: ProjectCellService,
+    queue: QueueService,
+    database: Database,
+) -> None:
+    """INFRA-222: migration 0062 backfilled one binding per then-LIVE
+    cell; a cell created from this point on only gets one if
+    ``_create_cell`` binds it itself."""
+
+    from hermes_orchestrator.work_claims import WorkerBindings
+
+    admit(queue, "ENG-9")
+    cell = await cell_service.dispatch("ENG-9")
+
+    bindings = WorkerBindings(database, events=EventStore(database))
+    binding = bindings.active_for_cell(cell.cell_id)
+
+    assert binding is not None
+    assert binding.generation == 1
+    assert binding.session_id == str(cell.session_id)
+    assert binding.profile_alias == cell.profile_alias
+    assert binding.state == "active"
+
+
+@pytest.mark.asyncio
+async def test_rotation_swaps_the_binding_generation_and_preserves_the_claim(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-222 requirement (d): replacing a worker changes only the
+    binding generation -- the logical cell and its durable work claim
+    survive byte-identical."""
+
+    from hermes_orchestrator.work_claims import WorkClaims, WorkerBindings
+
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+
+    claims = WorkClaims(database, events=EventStore(database))
+    bindings = WorkerBindings(database, events=EventStore(database))
+    claim_before = claims.current_for_cell("cell-demo")
+    binding_before = bindings.active_for_cell("cell-demo")
+    assert claim_before is not None
+    assert binding_before is not None
+    assert binding_before.generation == 1
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-demo", record.handoff_id)
+
+    claim_after = claims.current_for_cell("cell-demo")
+    binding_after = bindings.active_for_cell("cell-demo")
+
+    assert claim_after == claim_before
+    assert binding_after is not None
+    assert binding_after.generation == 2
+    assert binding_after.session_id == str(rotated.session_id)
+    assert binding_after.profile_alias == rotated.profile_alias
+    history = bindings.history("cell-demo")
+    assert [b.generation for b in history] == [1, 2]
+    assert [b.state for b in history] == ["retired", "active"]
+
+
+@pytest.mark.asyncio
+async def test_rotation_binds_generation_one_for_a_legacy_cell_with_no_binding(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """A cell whose worker_bindings row migration 0062's backfill missed
+    -- or one created before this packet's ``_create_cell`` change --
+    must still be rotatable: the first rotation binds the replacement's
+    generation 1 directly instead of refusing over a gap the cell
+    itself never caused."""
+
+    from hermes_orchestrator.work_claims import WorkerBindings
+
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+
+    with database.transaction() as connection:
+        connection.execute("DELETE FROM worker_bindings WHERE cell_id = 'cell-demo'")
+
+    bindings = WorkerBindings(database, events=EventStore(database))
+    assert bindings.active_for_cell("cell-demo") is None
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-demo", record.handoff_id)
+
+    binding = bindings.active_for_cell("cell-demo")
+    assert binding is not None
+    assert binding.generation == 1
+    assert binding.session_id == str(rotated.session_id)
+    assert binding.profile_alias == rotated.profile_alias
+
+
+@pytest.mark.asyncio
+async def test_rotation_cwd_returns_the_leased_path_for_a_fable_writer(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-222 (the live 2026-09-01 rotation defect): a replacement
+    must launch in the cell's OWN leased issue worktree -- never the
+    lane's shared cwd -- whenever a live lease is open for the cell's
+    current claim AND that lease's writer is this cell's own lane
+    ('fable'), never a Sol review checkout mid-candidate."""
+
+    from hermes_orchestrator.worktrees import WorktreeLeases, dedicated_issue_path
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        worktree_leases=WorktreeLeases(database, EventStore(database)),
+        issue_git=_IssueLaneGit(),
+        issue_repo_paths={"demo": repo},
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+    cell = service.active_cell("demo")
+    assert cell is not None
+
+    expected = dedicated_issue_path(repo, "ENG-9")
+    assert service.rotation_cwd(cell) == expected
+    # never the lane's shared cwd once a fable-writer lease is open.
+    assert service.rotation_cwd(cell) != repo
+
+
+@pytest.mark.asyncio
+async def test_rotation_cwd_falls_back_to_the_lane_cwd_when_the_writer_is_sol(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    runner: RecordingRunner,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """A lease currently held by Sol (mid-candidate review) is never
+    the replacement's launch cwd -- the lane's own configured cwd is,
+    exactly as if no lease existed at all."""
+
+    from hermes_orchestrator.worktrees import WorktreeLeases
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": repo},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        worktree_leases=WorktreeLeases(database, EventStore(database)),
+        issue_git=_IssueLaneGit(),
+        issue_repo_paths={"demo": repo},
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+    cell = service.active_cell("demo")
+    assert cell is not None
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE worktree_leases SET writer_role = 'sol' "
+            "WHERE issue_id = 'ENG-9'"
+        )
+
+    assert service.rotation_cwd(cell) == repo
+
+
+@pytest.mark.asyncio
+async def test_rotation_cwd_falls_back_to_the_lane_cwd_with_no_open_claim(
+    cell_service: ProjectCellService, tmp_path: Path
+) -> None:
+    """No open work claim for the cell -- e.g. never dispatched, or its
+    claim already closed -- is exactly the pre-INFRA-222 shape: the
+    lane's own configured cwd, unconditionally."""
+
+    cell = ProjectCell(
+        cell_id="cell-none",
+        project_key="demo",
+        state="active",
+        profile_alias="max-a",
+        session_id=SESSION_ID,
+    )
+
+    assert cell_service.rotation_cwd(cell) == tmp_path

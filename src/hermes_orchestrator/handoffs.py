@@ -54,6 +54,17 @@ class HandoffRejected(ValueError):
     """The handoff or acknowledgement is incomplete or inconsistent."""
 
 
+class HandoffStale(HandoffRejected):
+    """The document's mechanically derived branch/head predates the
+    leased worktree it is about to be consumed against (INFRA-222).
+
+    A subclass of :class:`HandoffRejected`, not a sibling: every
+    existing ``except HandoffRejected`` catch still catches this, while
+    callers that care specifically about staleness (as opposed to an
+    incomplete or malformed document) can match on it directly.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class HandoffRequest:
     """A durable request for a lead to stop at a safe boundary."""
@@ -179,6 +190,52 @@ class HandoffService:
                 # continuation recovers by rerunning rotate-lead).
                 continue
         return record
+
+    def refresh(self, handoff_id: str, document: HandoffDocument) -> HandoffRecord:
+        """Persist a mechanically refreshed document over an EXISTING
+        handoff row, in place (INFRA-222).
+
+        A previously submitted handoff's branch/HEAD can predate later
+        commits pushed to the same leased branch while a rotation's
+        acknowledgement turn runs (the live 2026-09-01 defect: the
+        reused handoff still named an older head after the leased
+        branch had advanced). ``refresh_handoff_head`` derives the
+        corrected document; this durably rewrites ``document_json`` and
+        its rendered ``markdown`` for the SAME ``handoff_id`` -- the
+        state, replacement acknowledgement fields, and every other
+        column are untouched, so an already-acknowledged handoff stays
+        acknowledged and a submitted one stays submitted. No submission
+        listener fires: a refresh is a correction of an existing
+        snapshot, not a new one.
+
+        Refuses (no write) when the refreshed document names a
+        different ``cell_id`` than the row it would refresh -- a
+        refresh corrects an existing document's derived facts, it never
+        migrates a handoff onto a different cell.
+        """
+
+        try:
+            validated = HandoffDocument.model_validate(document.model_dump())
+        except ValidationError as error:
+            field = ".".join(str(part) for part in error.errors()[0]["loc"])
+            raise HandoffRejected(f"handoff field is incomplete: {field}") from error
+        current = self.get(handoff_id)
+        if validated.cell_id != current.cell_id:
+            raise HandoffRejected(
+                f"refresh refused: document names cell {validated.cell_id!r} "
+                f"but handoff {handoff_id!r} belongs to cell "
+                f"{current.cell_id!r}"
+            )
+        now = self._aware_now().isoformat()
+        markdown = self._render(validated)
+        document_json = validated.model_dump_json()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE handoffs SET document_json = ?, markdown = ?, "
+                "updated_at = ? WHERE handoff_id = ?",
+                (document_json, markdown, now, handoff_id),
+            )
+        return self.get(handoff_id)
 
     def acknowledge(
         self,
@@ -360,6 +417,72 @@ def validate_handoff_identity(
             f"{requesting_session_id!r}; the seat has moved since this "
             "handoff was derived"
         )
+
+
+def require_current_head(document: HandoffDocument, *, branch: str, head: str) -> None:
+    """Fail closed on a handoff document whose mechanically derived
+    branch or head no longer matches the leased worktree (INFRA-222;
+    the live 2026-09-01 rotation defect this closes: a reused handoff
+    named an older head after the leased branch had advanced).
+
+    ``branch``/``head`` are the CURRENT facts read straight off the
+    leased worktree probe -- never the document's own recorded values.
+    A branch mismatch means the document was derived against a
+    different lane entirely (a leased branch renamed, or a document
+    reused across issues) and can never be repaired by touching the
+    head alone. Absent that, the document's recorded head -- its first
+    ``commits`` entry, the exact convention
+    :func:`derived_handoff_document` writes and
+    ``lead_rotation._stale_submitted_handoff_evidence`` already reads
+    back -- must equal the leased HEAD; anything else means the branch
+    advanced past this handoff since it was derived. Both raise
+    :class:`HandoffStale`; neither ever mutates the document -- pair
+    a head mismatch with :func:`refresh_handoff_head` when the caller's
+    handoff kind allows a mechanical refresh instead of an outright
+    refusal.
+    """
+
+    if document.branch != branch:
+        raise HandoffStale(
+            f"handoff branch {document.branch!r} does not match the "
+            f"leased worktree's branch {branch!r}"
+        )
+    recorded_head = document.commits[0] if document.commits else ""
+    if recorded_head != head:
+        raise HandoffStale(
+            f"handoff head {recorded_head!r} is behind the leased "
+            f"worktree's HEAD {head!r}"
+        )
+
+
+def refresh_handoff_head(
+    document: HandoffDocument, *, branch: str, head: str
+) -> HandoffDocument:
+    """Return a copy of ``document`` with its mechanically derived
+    branch and head refreshed to the leased worktree's CURRENT facts
+    (INFRA-222).
+
+    Every handoff's branch and head are themselves mechanically derived
+    in the first place (:func:`derived_handoff_document` always writes
+    them from a worktree probe, never from the incumbent's own account)
+    -- refreshing them here is re-deriving from a FRESHER probe, not
+    fabricating content the incumbent never attested to. The document's
+    previous recorded head is preserved as an environment note, so the
+    refresh is auditable on the durable row rather than a silent
+    overwrite of what the incumbent's own turn produced.
+    """
+
+    previous_head = document.commits[0] if document.commits else ""
+    notes = [
+        *document.environment_notes,
+        (
+            f"handoff head refreshed at rotation: {previous_head!r} -> "
+            f"{head!r} on branch {branch!r}"
+        ),
+    ]
+    return document.model_copy(
+        update={"branch": branch, "commits": [head], "environment_notes": notes}
+    )
 
 
 def _handoff_test(entry: str) -> HandoffTest:

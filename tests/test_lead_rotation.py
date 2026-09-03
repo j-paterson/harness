@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1264,6 +1265,14 @@ class CountingCells:
             await self.release.wait()
         return await self._inner.rotate(cell_id, handoff_id)
 
+    def rotation_cwd(self, cell: object) -> object:
+        # INFRA-222: LeadRotation.rotate() calls this (through
+        # ``self._cells``) before ever reaching ``rotate`` above --
+        # delegate to the real service so this stall fake stays a
+        # faithful stand-in rather than an ``AttributeError`` a
+        # polling test loop would wait on forever.
+        return self._inner.rotation_cwd(cell)
+
 
 @pytest.mark.asyncio
 async def test_concurrent_rotations_one_claim_one_launch_loser_fails_closed(
@@ -2212,3 +2221,212 @@ async def test_stale_head_alone_with_issue_in_progress_requests_fresh_handoff(
     # The issue itself is genuinely still in progress — the HEAD
     # mismatch alone is what made this stale.
     assert "issue_state=in_development" in reason
+
+
+# -- pre-transfer currency probe and launch cwd (INFRA-222) -----------------
+
+
+def _sequential_worktree_states(
+    *states: WorktreeState,
+) -> object:
+    """A ``worktree_state`` callable that returns each of ``states`` in
+    order, then repeats the last one -- so a test can give the
+    precondition gate's probe and the pre-transfer CAS probe two
+    DIFFERENT answers, exactly as two real calls separated in time
+    could observe (e.g. a branch renamed between them)."""
+
+    values = iter(states)
+    held = states[-1]
+
+    def _call(_key: str) -> WorktreeState:
+        nonlocal held
+        with contextlib.suppress(StopIteration):
+            held = next(values)
+        return held
+
+    return _call
+
+
+@pytest.mark.asyncio
+async def test_pre_transfer_probe_refreshes_a_head_that_advanced_while_waiting(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """INFRA-222 (the live 2026-09-01 rotation defect): an already-
+    acknowledged handoff whose transfer never committed can still name
+    an older head than the leased branch now carries -- every handoff's
+    head is mechanically derived in the first place, so the transfer
+    CAS refreshes it rather than transferring a stale document."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)  # branch=infra-197, head=deadbeef
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    rotation = make_rotation(
+        database,
+        handoffs,
+        cells,
+        bindings,
+        seater,
+        worktree=make_worktree_state(head="newhead", origin_head="newhead"),
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.phase == "complete"
+    # zero additional runner calls -- this is the SAME acknowledged-
+    # recovery path ``test_resume_after_crash_handoff_acknowledged_cell_
+    # not_yet_rotated`` exercises, only with a stale head this time.
+    assert runner.start_count == 1
+
+    refreshed = handoffs.get(handoff_id)
+    assert refreshed.document.branch == "feature/infra-197"
+    assert refreshed.document.commits == ["newhead"]
+    assert any(
+        "deadbeef" in note and "newhead" in note
+        for note in refreshed.document.environment_notes
+    )
+    # the acknowledgement itself survives the mechanical refresh untouched.
+    assert refreshed.state == "acknowledged"
+    assert refreshed.replacement_session_id == REPLACEMENT_SESSION
+    assert refreshed.replacement_profile_alias == "max-b"
+
+
+@pytest.mark.asyncio
+async def test_pre_transfer_probe_refuses_a_branch_mismatch(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A leased branch that no longer matches the handoff's recorded
+    branch can never be repaired by refreshing the head alone: unlike a
+    head that merely advanced, this refuses outright rather than
+    transferring onto the wrong lane."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)  # branch=infra-197, head=deadbeef
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    rotation = LeadRotation(
+        database=database,
+        handoffs=handoffs,
+        cells=cells,
+        bindings=bindings,
+        seater=seater,
+        # First call is the ordinary worktree precondition gate (a
+        # clean, pushed leased worktree); the SECOND call is this
+        # packet's pre-transfer probe, observing that the branch was
+        # renamed in between.
+        worktree_state=_sequential_worktree_states(
+            make_worktree_state(head="newhead", origin_head="newhead"),
+            WorktreeState(
+                branch="feature/renamed",
+                head="newhead",
+                origin_head="newhead",
+                dirty=False,
+            ),
+        ),
+        registration_wait_seconds=0,
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "transfer"
+    assert "branch" in (report.failure or "").lower()
+    assert seater.calls == []
+    # nothing was transferred and the handoff document is untouched.
+    still = handoffs.get(handoff_id)
+    assert still.document.branch == "feature/infra-197"
+    assert still.document.commits == ["deadbeef"]
+    assert database.scalar(
+        "SELECT session_id FROM project_cells WHERE cell_id = 'cell-demo'"
+    ) == str(SESSION_ID)
+
+
+@pytest.mark.asyncio
+async def test_pre_transfer_probe_refuses_a_failed_worktree_probe(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+) -> None:
+    """A probe that could not resolve a branch/head at all (the
+    worktree probe's own fail-closed shape: empty strings) refuses
+    exactly like a genuine branch mismatch -- never mistaken for "no
+    work to refresh"."""
+
+    await start_cell(cells, queue)
+    handoff_id = submit_handoff(handoffs)
+    handoffs.acknowledge(
+        handoff_id,
+        REPLACEMENT_SESSION,
+        "Run the failing test and finish INFRA-197.",
+        profile_alias="max-b",
+    )
+    rotation = LeadRotation(
+        database=database,
+        handoffs=handoffs,
+        cells=cells,
+        bindings=bindings,
+        seater=seater,
+        worktree_state=_sequential_worktree_states(
+            make_worktree_state(head="newhead", origin_head="newhead"),
+            WorktreeState(branch="", head="", origin_head="", dirty=False),
+        ),
+        registration_wait_seconds=0,
+    )
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is False
+    assert report.phase == "transfer"
+    assert seater.calls == []
+
+
+@pytest.mark.asyncio
+async def test_completion_report_names_the_launch_cwd_and_binding_generation(
+    database: Database,
+    queue: QueueService,
+    cells: ProjectCellService,
+    handoffs: HandoffService,
+    bindings: CmuxSurfaceBindings,
+    seater: RecordingSeater,
+    runner: RecordingRunner,
+    tmp_path: Path,
+) -> None:
+    """INFRA-222: the completion report names the exact cwd the
+    replacement launched in and the cell's post-rotation
+    ``worker_bindings`` generation."""
+
+    await start_cell(cells, queue)
+    submit_handoff(handoffs)
+    runner.emit_handoff_ack = True
+    rotation = make_rotation(database, handoffs, cells, bindings, seater)
+
+    report = await rotation.rotate("cell-demo")
+
+    assert report.ok is True
+    assert report.cwd == str(tmp_path)
+    assert report.binding_generation == 2

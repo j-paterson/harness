@@ -38,6 +38,7 @@ from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
+from hermes_orchestrator.work_claims import ClaimRefused, WorkClaims, WorkerBindings
 from hermes_orchestrator.worktrees import bind_issue_worktree
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
@@ -649,6 +650,7 @@ def _activate_issue_transaction(
     on_eligible: Callable[[sqlite3.Connection], bool] | None = None,
     lane_role: str = DEVELOPMENT_LANE,
     projection_key: str | None = None,
+    claims: WorkClaims | None = None,
 ) -> tuple[bool, LeadAssignment | None, str | None]:
     """The one durable, LOCAL-ONLY activation transaction every dispatch
     path shares: the full commit-time eligibility recheck, the
@@ -767,6 +769,7 @@ def _activate_issue_transaction(
             harness=harness,
             lane_role=lane_role,
             projection_key=projection_key,
+            claims=claims,
         )
     except _ActivationRefused:
         # The transaction rolled back: neither the activation nor
@@ -790,6 +793,7 @@ def _activate_issue_body(
     harness: bool,
     lane_role: str,
     projection_key: str | None,
+    claims: WorkClaims | None = None,
 ) -> tuple[bool, LeadAssignment | None, str | None]:
     """The transaction body of :func:`_activate_issue_transaction`.
 
@@ -881,6 +885,26 @@ def _activate_issue_body(
         )
         if activated.rowcount == 0:
             return False, None, None
+        # INFRA-222: the cell's work claim opens in THIS activation
+        # transaction, independent of whether a delivery packet
+        # publishes below (the harness lane never gets one) and
+        # independent of whether ``admitted_issues`` transitions (a
+        # replay does not). ``WorkClaims.open_in`` is idempotent -- an
+        # already-active claim for this exact (issue, cell, role) is
+        # returned unchanged, no write, no event -- so this durable
+        # "what is this cell working on" record survives any number of
+        # confirmed/superseded/replayed/deduplicated lead_assignments
+        # packets and is never itself a function of packet lifecycle.
+        work_claims = (
+            claims if claims is not None else WorkClaims(database, events=events)
+        )
+        work_claims.open_in(
+            connection,
+            project_key=project_key,
+            issue_id=issue_id,
+            cell_id=cell_id,
+            role=lane_role,
+        )
         if not harness and not replaying:
             updated = connection.execute(
                 "UPDATE admitted_issues SET state = ?, updated_at = ? "
@@ -983,6 +1007,7 @@ async def activate_admitted_issue(
     on_eligible: Callable[[sqlite3.Connection], bool] | None = None,
     lane_role: str = DEVELOPMENT_LANE,
     projection_key: str | None = None,
+    claims: WorkClaims | None = None,
 ) -> tuple[bool, LeadAssignment | None]:
     """Dispatch one already-admitted issue onto a live cell durably.
 
@@ -1037,6 +1062,7 @@ async def activate_admitted_issue(
         on_eligible=on_eligible,
         lane_role=lane_role,
         projection_key=projection_key,
+        claims=claims,
     )
     if not activated:
         return False, None
@@ -1075,6 +1101,8 @@ class ProjectCellService:
         classic_seats: bool = False,
         decisions: OperatorDecisions | None = None,
         assignments: LeadAssignments | None = None,
+        claims: WorkClaims | None = None,
+        bindings: WorkerBindings | None = None,
         packets: SubagentPackets | None = None,
         dispatch_freshness_minutes: int | None = None,
         lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
@@ -1125,6 +1153,25 @@ class ProjectCellService:
         self._classic_seats = classic_seats
         self._decisions = decisions
         self._assignments = assignments
+        # INFRA-222: the cell's work-ownership claims are separate from
+        # the lead_assignments delivery ledger. A caller may hand in a
+        # shared instance; otherwise one is constructed here so every
+        # existing zero-``claims`` composition (production and tests
+        # alike) keeps working unchanged.
+        self._claims = (
+            claims if claims is not None else WorkClaims(database, events=events)
+        )
+        # INFRA-222: the cell's durable IDENTITY -- which worker occupies
+        # it, as a monotonic generation sequence -- is likewise separate
+        # from the project_cells row's mutable profile_alias/session_id
+        # pair. Bound at cell creation (``_create_cell``) and swapped, not
+        # overwritten, on rotation (``_finalize_transfer``); the same
+        # default-construction idiom as ``claims`` above.
+        self._bindings = (
+            bindings
+            if bindings is not None
+            else WorkerBindings(database, events=events)
+        )
         self._packets = packets
         self._dispatch_freshness_minutes = dispatch_freshness_minutes
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
@@ -1196,6 +1243,37 @@ class ProjectCellService:
         if override is not None:
             return override
         return self._project_paths[project_key]
+
+    def rotation_cwd(self, cell: ProjectCell) -> Path:
+        """The exact worktree the cell's REPLACEMENT process must launch
+        into (INFRA-222; the live 2026-09-01 rotation defect).
+
+        A replacement that launches in the lane's shared
+        ``project.lead_cwd`` while the cell's actual work lives in a
+        dedicated per-issue worktree lease starts in the wrong
+        directory entirely -- exactly what was observed live, where the
+        replacement's PWD named the coordinator's own checkout while
+        the leased issue worktree (and its later commits) lived
+        elsewhere. When the cell's current open work claim names an
+        issue with a LIVE worktree lease whose ``writer_role`` is
+        ``'fable'`` (this cell's own development/harness lane, never a
+        Sol review checkout mid-candidate), that lease's path is the
+        one true answer. Every other case -- no open claim, no worktree
+        lease store wired, no live lease for that issue, or a lease
+        currently held by ``'sol'`` -- falls back to the lane's own
+        configured cwd exactly as :meth:`_cell_cwd` already resolves it
+        for a first dispatch.
+        """
+
+        claim = self._claims.current_for_cell(cell.cell_id, role=cell.lane_role)
+        if claim is not None and self._worktree_leases is not None:
+            for lease in self._worktree_leases.active(cell.project_key):
+                if (
+                    lease.issue_id == claim.issue_id
+                    and lease.writer_role == "fable"
+                ):
+                    return Path(lease.path)
+        return self._cell_cwd(cell.project_key, cell.lane_role)
 
     async def dispatch(
         self,
@@ -1963,7 +2041,7 @@ class ProjectCellService:
 
             request = LeadTurnRequest(
                 session_id=replacement_session,
-                cwd=self._project_paths[current.project_key],
+                cwd=self.rotation_cwd(current),
                 prompt=(
                     f"{getattr(handoff, 'markdown', '')}\n\n"
                     "Acknowledge this handoff and restate the exact next action."
@@ -2196,6 +2274,43 @@ class ProjectCellService:
                         rotated.cell_id,
                     ),
                 )
+                # INFRA-222: the project_cells UPDATE above stays, for
+                # byte-compatibility with every existing reader, but it is
+                # no longer the durable record of who is bound to this
+                # cell -- worker_bindings is. Retire the incumbent's
+                # generation and bind the replacement's as one CAS keyed
+                # on the incumbent's OWN session_id, so a foreign or
+                # already-superseded session can never retire a live
+                # binding out from under it.
+                try:
+                    self._bindings.swap_in(
+                        connection,
+                        cell_id=current.cell_id,
+                        expected_session_id=str(current.session_id),
+                        session_id=str(rotated.session_id),
+                        profile_alias=rotated.profile_alias,
+                        reason=f"rotation:{handoff_id}",
+                    )
+                except ClaimRefused:
+                    if self._bindings.active_for_cell(current.cell_id) is not None:
+                        # A genuine CAS mismatch (some OTHER session is the
+                        # active binding) -- never silently paper over
+                        # that by binding on top of it; re-raise the
+                        # original refusal verbatim.
+                        raise
+                    # A cell created before this packet's _create_cell
+                    # change (or whose row migration 0062's backfill
+                    # missed) can reach its FIRST rotation with no durable
+                    # binding at all. That gap is the backfill's, not this
+                    # cell's: bind the replacement's generation 1 directly
+                    # rather than refusing a rotation the cell is otherwise
+                    # fully entitled to.
+                    self._bindings.bind_in(
+                        connection,
+                        cell_id=current.cell_id,
+                        session_id=str(rotated.session_id),
+                        profile_alias=rotated.profile_alias,
+                    )
                 self._events.append(
                     connection,
                     EventInput(
@@ -2533,6 +2648,19 @@ class ProjectCellService:
                     ") VALUES (?, ?, ?, 'active', ?)",
                     (cell.profile_alias, cell.project_key, cell.lane_role, now),
                 )
+                # INFRA-222: migration 0062 backfilled one active
+                # generation-1 binding per then-LIVE project_cells row --
+                # a cell created from this point on only gets a durable
+                # worker binding if code binds one, so it happens here,
+                # in the SAME transaction as the cell row itself, rather
+                # than leaving newly created cells to silently miss the
+                # backfill.
+                self._bindings.bind_in(
+                    connection,
+                    cell_id=cell.cell_id,
+                    session_id=str(cell.session_id),
+                    profile_alias=cell.profile_alias,
+                )
                 self._events.append(
                     connection,
                     EventInput(
@@ -2765,6 +2893,7 @@ class ProjectCellService:
             now=self._aware_now,
             guard=self._capacity_guard(issue_id),
             lane_role=cell.lane_role,
+            claims=self._claims,
         )
 
     def _capacity_guard(
@@ -3179,13 +3308,24 @@ class ProjectCellService:
 
         if self._handoffs is None or not hasattr(self._handoffs, "submit"):
             return
-        row = self._database.execute(
-            "SELECT assignment_id FROM lead_assignments "
-            "WHERE cell_id = ? AND session_id = ? "
-            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (cell.cell_id, str(cell.session_id)),
-        ).fetchone()
-        assignment = str(row["assignment_id"]) if row is not None else "none"
+        # INFRA-222: the cell's durable work claim, when one is active,
+        # is the stable reference to what this seat owns -- it survives
+        # whatever state its lead_assignments delivery packet is in
+        # (confirmed, superseded, or absent from a lost race). Only
+        # when no claim exists yet (a pre-INFRA-222 row the backfill
+        # missed, or a seat capped before its claim ever opened) does
+        # this fall back to the newest raw assignment row.
+        claim = self._claims.current_for_cell(cell.cell_id, role=cell.lane_role)
+        if claim is not None:
+            assignment = claim.claim_id
+        else:
+            row = self._database.execute(
+                "SELECT assignment_id FROM lead_assignments "
+                "WHERE cell_id = ? AND session_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (cell.cell_id, str(cell.session_id)),
+            ).fetchone()
+            assignment = str(row["assignment_id"]) if row is not None else "none"
         from hermes_orchestrator.handoffs import HandoffDocument, HandoffTest
 
         machine_formed = (
@@ -3381,8 +3521,32 @@ class DevSeatRecovery:
         await self._cells.dispatch(issue_id, lane_role=DEVELOPMENT_LANE)
 
     def _pick_issue(self, project_key: str) -> str | None:
-        # (a) a DEVELOPMENT-owned live (non-superseded) assignment.
-        # Observed live (2026-09-02): the sole live INFRA-198 assignment
+        # (a) INFRA-222: the project's DEVELOPMENT lane's own active
+        # work claim -- the durable "what is this cell working on"
+        # record -- is the primary source: it stays put across
+        # whatever a delivery packet's own lifecycle is doing
+        # (confirmed, superseded, replayed, or deduplicated), so unlike
+        # (b) below it is never wrong merely because the newest live
+        # lead_assignments row happens to belong to another cell/lane.
+        states = (*_RUNNABLE_ISSUE_STATES, IssueState.IN_DEVELOPMENT.value)
+        placeholders = ", ".join("?" for _ in states)
+        claim_row = self._database.execute(
+            "SELECT wc.issue_id AS issue_id FROM work_claims AS wc "
+            "JOIN project_cells AS pc ON pc.cell_id = wc.cell_id "
+            "AND pc.lane_role = 'development' "
+            "JOIN admitted_issues AS ai ON ai.issue_id = wc.issue_id "
+            "WHERE wc.project_key = ? AND wc.role = 'development' "
+            "AND wc.state = 'active' "
+            f"AND ai.state IN ({placeholders}) "
+            "ORDER BY wc.opened_at DESC LIMIT 1",
+            (project_key, *states),
+        ).fetchone()
+        if claim_row is not None:
+            return str(claim_row["issue_id"])
+        # (b) Fallback for rows the INFRA-222 backfill missed (a claim
+        # never opened for a pre-migration assignment): a
+        # DEVELOPMENT-owned live (non-superseded) assignment. Observed
+        # live (2026-09-02): the sole live INFRA-198 assignment
         # belonged to the HARNESS cell, and picking it here dispatched a
         # development seat for work the development lane does not own --
         # a create-seat/start_failed churn loop. The assignment's owner
@@ -3391,8 +3555,6 @@ class DevSeatRecovery:
         # the issue must be in a state ``_activate_issue_body`` can
         # actually start or resume; anything else (paused, acceptance
         # without the replay path, a foreign lane) is never proposed.
-        states = (*_RUNNABLE_ISSUE_STATES, IssueState.IN_DEVELOPMENT.value)
-        placeholders = ", ".join("?" for _ in states)
         row = self._database.execute(
             "SELECT la.issue_id AS issue_id FROM lead_assignments AS la "
             "JOIN admitted_issues AS ai ON ai.issue_id = la.issue_id "
@@ -3406,7 +3568,7 @@ class DevSeatRecovery:
         ).fetchone()
         if row is not None:
             return str(row["issue_id"])
-        # (b) otherwise, the same ranked-queue head the scheduler itself
+        # (c) otherwise, the same ranked-queue head the scheduler itself
         # would pick for this project (``Scheduler.plan`` /
         # ``QueueService.list_ranked``) -- no second definition of
         # "runnable".

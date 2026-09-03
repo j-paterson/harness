@@ -11,7 +11,10 @@ from hermes_orchestrator.handoffs import (
     HandoffDocument,
     HandoffRejected,
     HandoffService,
+    HandoffStale,
     HandoffTest,
+    refresh_handoff_head,
+    require_current_head,
 )
 
 
@@ -410,3 +413,127 @@ def test_validate_handoff_identity_refuses_mismatched_cell_or_session() -> None:
         LiveCell(cell_id="cell-demo", session_id="session-1"),
         requesting_session_id="session-1",
     )
+
+
+# -- currency verification and mechanical refresh (INFRA-222) --------------
+
+
+def test_handoff_stale_is_a_handoff_rejected() -> None:
+    """Every existing ``except HandoffRejected`` catch must still catch
+    a staleness refusal."""
+
+    assert issubclass(HandoffStale, HandoffRejected)
+
+
+def test_require_current_head_accepts_a_matching_branch_and_head() -> None:
+    document = valid_handoff()
+
+    require_current_head(
+        document,
+        branch="feature/eng-9",
+        head="abc123 feat: implement ENG-9",
+    )
+
+
+def test_require_current_head_raises_on_a_branch_mismatch() -> None:
+    document = valid_handoff()
+
+    with pytest.raises(HandoffStale, match="branch"):
+        require_current_head(
+            document,
+            branch="feature/eng-9-renamed",
+            head="abc123 feat: implement ENG-9",
+        )
+
+
+def test_require_current_head_raises_on_a_stale_head() -> None:
+    """The branch still matches, but the leased worktree's HEAD has
+    advanced past what this document recorded."""
+
+    document = valid_handoff()
+
+    with pytest.raises(HandoffStale, match="head"):
+        require_current_head(
+            document,
+            branch="feature/eng-9",
+            head="def456 later commit",
+        )
+
+
+def test_refresh_handoff_head_updates_branch_and_notes_the_previous_head() -> None:
+    document = valid_handoff()
+
+    refreshed = refresh_handoff_head(
+        document, branch="feature/eng-9", head="def456 later commit"
+    )
+
+    assert refreshed.branch == "feature/eng-9"
+    assert refreshed.commits == ["def456 later commit"]
+    assert any(
+        "abc123 feat: implement ENG-9" in note and "def456 later commit" in note
+        for note in refreshed.environment_notes
+    )
+    # every other field survives untouched
+    assert refreshed.cell_id == document.cell_id
+    assert refreshed.next_action == document.next_action
+    # the original document is never mutated
+    assert document.commits == ["abc123 feat: implement ENG-9"]
+
+    # the refreshed document is now current.
+    require_current_head(refreshed, branch="feature/eng-9", head="def456 later commit")
+
+
+def test_handoff_service_refresh_persists_the_new_document_in_place(
+    handoffs: HandoffService, database: Database
+) -> None:
+    record = handoffs.submit(valid_handoff())
+
+    refreshed_document = refresh_handoff_head(
+        record.document, branch="feature/eng-9", head="def456 later commit"
+    )
+
+    refreshed = handoffs.refresh(record.handoff_id, refreshed_document)
+
+    assert refreshed.handoff_id == record.handoff_id
+    assert refreshed.state == "submitted"
+    assert refreshed.document.commits == ["def456 later commit"]
+    assert "def456 later commit" in refreshed.markdown
+    row = database.execute(
+        "SELECT document_json, markdown FROM handoffs WHERE handoff_id = ?",
+        (record.handoff_id,),
+    ).fetchone()
+    assert "def456 later commit" in str(row["markdown"])
+    assert "def456 later commit" in str(row["document_json"])
+
+
+def test_handoff_service_refresh_preserves_acknowledgement_state(
+    handoffs: HandoffService,
+) -> None:
+    record = handoffs.submit(valid_handoff())
+    handoffs.acknowledge(
+        record.handoff_id, REPLACEMENT, NEXT_ACTION, profile_alias="max-b"
+    )
+
+    refreshed_document = refresh_handoff_head(
+        record.document, branch="feature/eng-9", head="def456 later commit"
+    )
+    refreshed = handoffs.refresh(record.handoff_id, refreshed_document)
+
+    assert refreshed.state == "acknowledged"
+    assert refreshed.replacement_session_id == REPLACEMENT
+    assert refreshed.replacement_profile_alias == "max-b"
+    assert refreshed.document.commits == ["def456 later commit"]
+
+
+def test_handoff_service_refresh_refuses_a_document_naming_a_different_cell(
+    handoffs: HandoffService,
+) -> None:
+    record = handoffs.submit(valid_handoff())
+
+    mismatched = valid_handoff().model_copy(update={"cell_id": "cell-other"})
+
+    with pytest.raises(HandoffRejected, match="cell"):
+        handoffs.refresh(record.handoff_id, mismatched)
+
+    # nothing changed on the durable row.
+    assert handoffs.get(record.handoff_id).document == valid_handoff()
