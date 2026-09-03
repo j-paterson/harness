@@ -563,21 +563,35 @@ class LeadRotation:
             incumbent_profile=incumbent_profile,
             reason=reason,
         )
-        if rearm_delivered and wake is not None and wake.state == "delivered":
-            self._wakes.commit(
-                TerminalWakeInput(
-                    project_key=project_key,
-                    issue_id=issue_id,
-                    cell_id=cell_id,
-                    session_id=uuid.UUID(incumbent_session),
-                    profile_alias=incumbent_profile or "unknown",
-                    turn_key=(
-                        f"handoff-retry:{request_id}:{wake.wake_id}"
-                    ),
-                    kind="handoff_required",
-                    reason=reason,
+        if rearm_delivered and wake is not None:
+            latest = self._database.execute(
+                "SELECT wake_id FROM lead_terminal_wakes WHERE cell_id = ? "
+                "AND session_id = ? AND kind = 'handoff_required' "
+                "AND (wake_id = ? OR turn_key LIKE ?) "
+                "ORDER BY rowid DESC LIMIT 1",
+                (
+                    cell_id,
+                    incumbent_session,
+                    wake.wake_id,
+                    f"handoff-retry:{request_id}:%",
+                ),
+            ).fetchone()
+            source = self._wakes.get(str(latest["wake_id"])) if latest else wake
+            if source.state == "delivered":
+                self._wakes.commit(
+                    TerminalWakeInput(
+                        project_key=project_key,
+                        issue_id=issue_id,
+                        cell_id=cell_id,
+                        session_id=uuid.UUID(incumbent_session),
+                        profile_alias=incumbent_profile or "unknown",
+                        turn_key=(
+                            f"handoff-retry:{request_id}:{source.wake_id}"
+                        ),
+                        kind="handoff_required",
+                        reason=reason,
+                    )
                 )
-            )
         self._journal_awaiting(cell_id, consumed_handoff_id, request_id)
         return RotationReport(
             ok=False,
