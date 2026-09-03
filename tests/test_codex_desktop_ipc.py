@@ -255,8 +255,8 @@ async def test_owner_starter_registers_the_owner_then_starts_without_stdio(
     await router.start()
     registered: list[str] = []
 
-    async def register(thread_id: str) -> None:
-        registered.append(thread_id)
+    async def register(thread_id: str, cwd: str | None = None) -> None:
+        registered.append(f"{thread_id}:{cwd}")
         router.registered = True
 
     try:
@@ -272,7 +272,7 @@ async def test_owner_starter_registers_the_owner_then_starts_without_stdio(
             OWNER,
             "owner_started",
         )
-        assert registered == [THREAD]
+        assert registered == [f"{THREAD}:/repo"]
         start = router.requests[-1]
         assert start["params"]["turnStart"]["request"] == {
             "threadId": THREAD,
@@ -297,7 +297,7 @@ async def test_owner_starter_fails_closed_when_no_window_owns_the_thread(
     router = FakeDesktopRouter(socket_path, owns=False)
     await router.start()
 
-    async def register(thread_id: str) -> None:
+    async def register(thread_id: str, cwd: str | None = None) -> None:
         return None
 
     try:
@@ -339,12 +339,13 @@ async def test_open_thread_creates_a_dedicated_codex_window_before_deep_linking(
         calls.append(argv)
         return Process()
 
-    await open_thread_in_desktop(THREAD, process_factory=spawn)
+    await open_thread_in_desktop(THREAD, cwd="/repo", process_factory=spawn)
 
-    assert calls[0][0:2] == ("/usr/bin/osascript", "-e")
-    assert 'application id "com.openai.codex"' in calls[0][2]
-    assert "make new window" in calls[0][2]
-    assert "System Events" not in calls[0][2]
+    assert calls[0] == (
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "app",
+        "/repo",
+    )
     assert calls[1] == ("/usr/bin/open", "-g", f"codex://threads/{THREAD}")
 
 
