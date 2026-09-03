@@ -3625,6 +3625,9 @@ def _seed_channel_registration(
 def _install_rotation_process_and_probe_fakes(
     monkeypatch: pytest.MonkeyPatch,
     state_dir: Path,
+    *,
+    branch: str = "main",
+    head: str = "a",
 ) -> list[str]:
     """Fake ONLY the rotate-lead seams that reach outside the process.
 
@@ -3658,7 +3661,7 @@ def _install_rotation_process_and_probe_fakes(
         cli_module,
         "_worktree_state",
         lambda path: cli_module.WorktreeState(
-            branch="main", head="a", origin_head="a", dirty=False
+            branch=branch, head=head, origin_head=head, dirty=False
         ),
     )
 
@@ -3880,7 +3883,9 @@ def test_rotate_lead_resumes_an_acknowledged_replacement_when_the_seat_was_lost(
     _write_cmux_config(repo_root)
     _write_profiles_config(repo_root)
     _seed_acknowledged_replacement_with_lost_binding(state_dir)
-    started = _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    started = _install_rotation_process_and_probe_fakes(
+        monkeypatch, state_dir, branch="feature/eng-9"
+    )
 
     result = invoke(
         [
@@ -3948,7 +3953,9 @@ def test_rotate_lead_retry_after_seating_the_recovery_reuses_the_same_binding(
     _write_cmux_config(repo_root)
     _write_profiles_config(repo_root)
     _seed_acknowledged_replacement_with_lost_binding(state_dir)
-    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
+    _install_rotation_process_and_probe_fakes(
+        monkeypatch, state_dir, branch="feature/eng-9"
+    )
 
     ensure_calls: list[str] = []
 
