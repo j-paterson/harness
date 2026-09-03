@@ -1049,6 +1049,44 @@ class TestAssignmentEvents:
 class TestControlOperationEvents:
     """INFRA-195: recovery is provable through ACKable receipts."""
 
+    async def test_reregistration_retries_confirmation_anchor_capture(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        socket_path: Path,
+    ) -> None:
+        class FlakyAnchors:
+            attempts = 0
+            captured = False
+
+            def capture_after_confirmation(self, **_: object) -> None:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("transient capture failure")
+                self.captured = True
+
+        anchors = FlakyAnchors()
+        hub = ChannelHub(
+            database=database,
+            bindings=bindings,
+            capabilities=capabilities,
+            socket_path=socket_path,
+            anchors=anchors,  # type: ignore[arg-type]
+        )
+        await hub.start()
+        try:
+            seat(bindings)
+            first = await registered_sidecar(hub, capabilities)
+            await first.close()
+            second = await registered_sidecar(hub, capabilities)
+            await second.close()
+        finally:
+            await hub.stop()
+
+        assert anchors.attempts == 2
+        assert anchors.captured
+
     async def test_a_lifecycle_receipt_stays_off_the_model_channel(
         self,
         database: Database,

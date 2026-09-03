@@ -788,10 +788,10 @@ class ChannelHub:
         # A registration that follows any earlier one is a recovery:
         # the lead gets a durable, ACKable receipt instead of the
         # operator having to notice a reconnect in a terminal.
-        if self._anchors is not None and int(prior[0]) == 0:
-            # INFRA-187: the first registration of this exact session is
-            # the proof that the operator's manual channel confirmation
-            # succeeded -- persist its trust anchor once, best effort.
+        if self._anchors is not None:
+            # INFRA-187: registration proves the operator's manual channel
+            # confirmation succeeded. Retry this idempotent capture after a
+            # transient failure until its refusal receipt is superseded.
             with suppress(Exception):
                 binding = self._bindings.active_lead(str(message["cell_id"]))
                 if binding is not None:
