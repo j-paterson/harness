@@ -1778,3 +1778,83 @@ async def test_queue_start_is_skipped_when_policy_resume_fails(
     assert result.policy_reason is not None
     assert "policy_resume_failed" in result.policy_reason
     assert delivered_event_ids(database) == ["evt-1"]
+
+
+class _OwnerStart:
+    def __init__(self, started: bool) -> None:
+        self._started = started
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    async def start(self, thread_id: str, message: str, *, cwd: str | None = None):
+        from hermes_orchestrator.codex_desktop_ipc import OwnerStartOutcome
+
+        self.calls.append((thread_id, message, cwd))
+        return OwnerStartOutcome(
+            started=self._started,
+            owner_client_id="owner-1" if self._started else None,
+            reason="owner_started" if self._started else "owner_not_found: none",
+        )
+
+
+@pytest.mark.asyncio
+async def test_owner_routed_start_delivers_without_codex_queue_or_stdio(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    # INFRA-223: with the desktop owner adapter present, the envelope is
+    # delivered as a turn the OWNING window starts -- no `codex queue`
+    # process, no stdio helper -- and the result proves the start.
+    stored_channel(database)
+    owner = _OwnerStart(started=True)
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+        owner_start=owner,
+        cwd_for_project=lambda project_key: "/repo/demo",
+    )
+    event = wake_event(manifest_root)
+
+    result = await delivery.deliver("demo", event)
+
+    assert (result.delivered, result.started, result.reason) == (
+        True,
+        True,
+        "owner_started",
+    )
+    assert factory.calls == []
+    assert owner.calls == [("thr_stored", event.render(1), "/repo/demo")]
+    assert delivery.owner_endpoint_available is True
+    row = database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = ?", (event.event_id,)
+    ).fetchone()
+    assert row["state"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_owner_routed_start_failure_keeps_the_wake_actionable(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    stored_channel(database)
+    delivery = CodexQueueDelivery(
+        channels=merger,
+        manifest_root=manifest_root,
+        process_factory=factory,
+        owner_start=_OwnerStart(started=False),
+    )
+    event = wake_event(manifest_root)
+
+    result = await delivery.deliver("demo", event)
+
+    assert (result.delivered, result.started) == (False, False)
+    assert result.reason.startswith("owner_not_found")
+    assert factory.calls == []
+    row = database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = ?", (event.event_id,)
+    ).fetchone()
+    assert row["state"] == "pending"
