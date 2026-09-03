@@ -2660,14 +2660,32 @@ def _hermes_handlers(
             project_key = runtime.queue.get(command.issue_id).project_key
         except KeyError:
             return base_retry(command)
-        turns = _open_merge_flow(settings, runtime).turns
+        flow = _open_merge_flow(settings, runtime)
         # INFRA-223 (INFRA-228 blocker): the turn service itself decides
         # whether the issue has a stalled wake OR a legacy delivered wake
         # that ended without a verdict; only when it retried nothing does
         # this fall through to the existing requeue handler unchanged.
-        results = asyncio.run(
-            turns.retry_stalled_wakes_for_issue(project_key, command.issue_id)
-        )
+        #
+        # Generation-131 call-path blocker: the legacy proof reads the
+        # exact thread's runtime status through the App Server, so this
+        # command opens the SAME bounded connection ``merger-turn`` uses
+        # (start, re-verify channels, act, close) around the retry. With
+        # no App Server the stalled path still runs and the legacy proof
+        # fails closed exactly as before.
+
+        async def _retry_bounded() -> tuple[Any, ...]:
+            started = await _start_merge_flow(flow, [project_key])
+            try:
+                return tuple(
+                    await flow.turns.retry_stalled_wakes_for_issue(
+                        project_key, command.issue_id
+                    )
+                )
+            finally:
+                if started:
+                    await flow.rpc.close()
+
+        results = asyncio.run(_retry_bounded())
         if not results:
             return base_retry(command)
         return {

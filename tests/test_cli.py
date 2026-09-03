@@ -8695,3 +8695,97 @@ def test_candidate_submit_emits_the_same_durable_record_as_candidate_ready(
     # One immutable record, and both publications woke the same event.
     assert len(list((state_dir / "manifests").glob("*.json"))) == 1
     assert deliverer.events[0][1] == deliverer.events[1][1]
+
+
+def test_hermes_command_retry_opens_a_bounded_app_server_connection(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # INFRA-223 generation-131 call-path blocker: the issue-scoped retry's
+    # legacy proof reads the exact thread's runtime status, which needs a
+    # bounded App Server connection. The retry command must start it
+    # before asking the turn service and close it afterwards -- the same
+    # bounded shape merger-turn uses -- never leaving it attached.
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.merger_turns import RetryResult
+
+    request = json.dumps(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-9",
+        }
+    )
+    assert invoke(
+        [*base_arguments(configured_repo), "hermes-command", "--json", request]
+    ).exit_code == 0
+
+    class _Rpc:
+        def __init__(self) -> None:
+            self.started = 0
+            self.closed = 0
+            self.open = False
+
+        async def start(self) -> None:
+            self.started += 1
+            self.open = True
+
+        async def close(self) -> None:
+            self.closed += 1
+            self.open = False
+
+    class _Merger:
+        def __init__(self, rpc: _Rpc) -> None:
+            self.rpc = rpc
+            self.ensured: list[str] = []
+
+        async def ensure_thread(self, project_key: str) -> object:
+            assert self.rpc.open
+            self.ensured.append(project_key)
+            return types.SimpleNamespace(thread_id="thr")
+
+    class _Turns:
+        def __init__(self, rpc: _Rpc) -> None:
+            self.rpc = rpc
+            self.calls: list[tuple[str, str, bool]] = []
+
+        async def retry_stalled_wakes_for_issue(
+            self, project_key: str, issue_id: str
+        ) -> tuple[RetryResult, ...]:
+            self.calls.append((project_key, issue_id, self.rpc.open))
+            return (
+                RetryResult(
+                    event_id="evt-legacy-1",
+                    issue_id=issue_id,
+                    retried=True,
+                    delivered=True,
+                    reason="delivered",
+                ),
+            )
+
+    rpc = _Rpc()
+    turns = _Turns(rpc)
+    flow = types.SimpleNamespace(rpc=rpc, merger=_Merger(rpc), turns=turns)
+    monkeypatch.setattr(
+        cli_module, "_open_merge_flow", lambda settings, runtime: flow
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "retry", "issue_id": "ENG-9"}),
+        ]
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "accepted"
+    assert payload["state"] == {
+        "retried": ["evt-legacy-1"],
+        "delivered": ["evt-legacy-1"],
+    }
+    assert turns.calls == [("demo", "ENG-9", True)]
+    assert (rpc.started, rpc.closed, rpc.open) == (1, 1, False)
