@@ -528,7 +528,7 @@ async def open_thread_in_desktop(
     """
 
     script = """tell application "System Events"
-  tell first application process whose bundle identifier is "com.openai.codex"
+  tell process "ChatGPT"
     click menu item "New Window" of menu "File" of menu bar 1
   end tell
 end tell
