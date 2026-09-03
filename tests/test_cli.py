@@ -9036,10 +9036,26 @@ def test_start_lane_harness_checkout_refusal_exits_nonzero(
 
 
 def test_target_issue_refuses_an_unknown_issue_without_writes(
-    configured_repo: tuple[Path, Path],
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # INFRA-220: the CLI surface reaches the strict transition and its
     # fail-closed refusal exits non-zero without publishing anything.
+    #
+    # INFRA-230: ``target-issue`` now reads Linear before it reaches
+    # that local admission predicate at all, so a fake non-terminal
+    # reader is wired in here -- exactly like the ``hermes-command``
+    # tests above -- to keep this test about the unknown-issue refusal
+    # rather than the real Keychain/Linear reader.
+    import hermes_orchestrator.cli as cli_module
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="In Development")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
     invoke([*base_arguments(configured_repo), "init"])
 
     result = invoke(
@@ -9060,6 +9076,154 @@ def test_target_issue_refuses_an_unknown_issue_without_writes(
 
     assert result.exit_code == 1
     assert result.output.strip()
+
+
+def _seed_target_issue_fixture(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    cell_id: str = "cell-demo",
+    session_id: str = "11111111-2222-4333-8444-555555555555",
+    profile_alias: str = "max-c",
+) -> None:
+    """A queued admitted issue plus a live development cell with an
+    active profile lease -- exactly what ``target_issue`` requires
+    before it will publish anything."""
+
+    from hermes_orchestrator.db import Database
+
+    now = "2026-08-30T12:00:00+00:00"
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at) "
+                "VALUES (?, 'demo', 2, 'queued', ?, 1, 0, ?, ?)",
+                (issue_id, f"instr-{issue_id}", now, now),
+            )
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) VALUES (?, 'demo', 'active', ?, ?, ?, ?)",
+                (cell_id, profile_alias, session_id, now, now),
+            )
+            connection.execute(
+                "INSERT INTO profile_leases("
+                "profile_alias, project_key, state, acquired_at) "
+                "VALUES (?, 'demo', 'active', ?)",
+                (profile_alias, now),
+            )
+    finally:
+        database.close()
+
+
+def test_target_issue_refuses_a_terminal_linear_issue_with_no_assignment(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-230 end to end: ``target-issue`` reads Linear before
+    publishing, and a ``Done`` issue is refused closed -- exit 1, no
+    ``lead_assignments`` row, and the local queued row untouched."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_target_issue_fixture(state_dir, issue_id="INFRA-208")
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="Done")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "target-issue",
+            "INFRA-208",
+            "--project",
+            "demo",
+            "--cell",
+            "cell-demo",
+            "--session",
+            "11111111-2222-4333-8444-555555555555",
+            "--instruction",
+            "work this issue next",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert "INFRA-208" in result.output
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assignment_count = database.execute(
+            "SELECT COUNT(*) AS n FROM lead_assignments"
+        ).fetchone()["n"]
+        issue_state = database.execute(
+            "SELECT state FROM admitted_issues WHERE issue_id = 'INFRA-208'"
+        ).fetchone()["state"]
+    finally:
+        database.close()
+    assert assignment_count == 0
+    assert str(issue_state) == "queued"
+
+
+def test_target_issue_publishes_when_linear_status_is_not_terminal(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart happy path: a non-terminal Linear status never
+    blocks ``target-issue`` -- it publishes exactly as before."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_target_issue_fixture(state_dir, issue_id="INFRA-208")
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="In Development")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "target-issue",
+            "INFRA-208",
+            "--project",
+            "demo",
+            "--cell",
+            "cell-demo",
+            "--session",
+            "11111111-2222-4333-8444-555555555555",
+            "--instruction",
+            "work this issue next",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["issue_id"] == "INFRA-208"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assignment_count = database.execute(
+            "SELECT COUNT(*) AS n FROM lead_assignments"
+        ).fetchone()["n"]
+    finally:
+        database.close()
+    assert assignment_count == 1
 
 
 def test_open_rotation_collaborators_selects_prompt_by_lane(
@@ -9399,6 +9563,278 @@ def test_reconcile_reports_an_unbindable_issue_lane_instead_of_exiting_clean(
     assert not (tmp_path / "project-issue-ENG-404").exists()
 
     assert result.output.strip()
+
+
+def _seed_linear_reconcile_row(
+    state_dir: Path, *, issue_id: str, project_key: str, state: str
+) -> None:
+    """One raw ``admitted_issues`` row, free to name a project the
+    fixture never registered -- ``reconcile --linear`` never validates
+    project registration, so this exercises the same isolation the
+    reconciler itself is tested against in ``test_linear_reconcile.py``."""
+
+    from hermes_orchestrator.db import Database
+
+    now = datetime.now(UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at"
+                ") VALUES (?, ?, 1, ?, ?, 1, 0, ?, ?)",
+                (issue_id, project_key, state, f"instr-{issue_id}", now, now),
+            )
+    finally:
+        database.close()
+
+
+def test_reconcile_linear_completes_stale_row_and_isolates_unavailable_project(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-230 end to end: ``reconcile --linear`` moves a Done-in-Linear
+    row to ``done`` locally and reports it as completed, leaves a
+    non-terminal row unchanged, and isolates a read failure in another
+    project to just that one issue -- the base read-only reconcile's own
+    keys survive untouched and the JSON payload gains a ``linear`` block."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_linear_reconcile_row(
+        state_dir, issue_id="INFRA-1", project_key="demo", state="review"
+    )
+    _seed_linear_reconcile_row(
+        state_dir, issue_id="INFRA-2", project_key="demo", state="queued"
+    )
+    _seed_linear_reconcile_row(
+        state_dir, issue_id="INFRA-3", project_key="other", state="review"
+    )
+
+    constructed: list[object] = []
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            if issue_id == "INFRA-1":
+                return types.SimpleNamespace(status="Done")
+            if issue_id == "INFRA-2":
+                return types.SimpleNamespace(status="In Development")
+            raise RuntimeError("linear timed out")
+
+    def _lazy_linear_reads(keychain: object) -> object:
+        constructed.append(keychain)
+        return _FakeLinearReads()
+
+    monkeypatch.setattr(cli_module, "_LazyLinearReads", _lazy_linear_reads)
+
+    result = invoke(
+        [*base_arguments(configured_repo), "reconcile", "--linear", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # The pre-existing keys are untouched.
+    assert set(["completed", "findings", "admission_open"]) <= payload.keys()
+
+    linear = payload["linear"]
+    assert linear["completed"] == 1
+    assert linear["unchanged"] == 1
+    assert linear["unavailable"] == 1
+    outcomes_by_id = {outcome["issue_id"]: outcome for outcome in linear["outcomes"]}
+    assert outcomes_by_id["INFRA-1"]["action"] == "completed"
+    assert outcomes_by_id["INFRA-2"]["action"] == "unchanged"
+    assert outcomes_by_id["INFRA-3"]["action"] == "unavailable"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        rows = {
+            str(row["issue_id"]): str(row["state"])
+            for row in database.execute(
+                "SELECT issue_id, state FROM admitted_issues"
+            ).fetchall()
+        }
+    finally:
+        database.close()
+    assert rows["INFRA-1"] == "done"
+    assert rows["INFRA-2"] == "queued"
+    assert rows["INFRA-3"] == "review"
+    assert constructed  # the reader was actually built for --linear
+
+
+def _seed_completion_proof(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    project_key: str,
+    settlement_id: str,
+) -> None:
+    """A ``done`` admitted issue with an exact settled-merge proof --
+    the same shape ``tests/test_linear_reconcile.py`` seeds for
+    ``project_completed``: a merged review row (with a merge sha)
+    joined to a settled ``merge_settlements`` row sharing its id."""
+
+    from hermes_orchestrator.db import Database
+
+    now = datetime.now(UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at"
+                ") VALUES (?, ?, 1, 'done', ?, 1, 0, ?, ?)",
+                (issue_id, project_key, f"instr-{issue_id}", now, now),
+            )
+            connection.execute(
+                "INSERT INTO reviews("
+                "review_id, project_key, issue_id, event_id, repository, "
+                "branch, pr_number, reviewed_sha, state, merge_sha, reason, "
+                "projection_json, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?, NULL, NULL, "
+                "?, ?)",
+                (
+                    settlement_id,
+                    project_key,
+                    issue_id,
+                    f"event-{settlement_id}",
+                    "j-paterson/demo",
+                    "feature/x",
+                    40,
+                    "a" * 40,
+                    "f5dee512039d197d1c8f5061a52a75f454b3decc",
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO merge_settlements("
+                "settlement_id, project_key, issue_id, event_id, repository, "
+                "branch, pr_number, base_sha, candidate_sha, thread_id, "
+                "thread_generation, manifest_version, path, state, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'guarded', "
+                "'settled', ?, ?)",
+                (
+                    settlement_id,
+                    project_key,
+                    issue_id,
+                    f"event-{settlement_id}",
+                    "j-paterson/demo",
+                    "feature/x",
+                    40,
+                    "b" * 40,
+                    "c" * 40,
+                    "thread-1",
+                    now,
+                    now,
+                ),
+            )
+    finally:
+        database.close()
+
+
+def test_reconcile_linear_projects_locally_done_issue_back_to_linear(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-230 (Sol d3b5c972): ``reconcile --linear --json`` also runs
+    the reverse pass -- a locally ``done`` issue with durable settled-
+    merge proof but a stale, non-terminal Linear status is restored to
+    Done and reported under the sibling ``linear_projection`` key,
+    alongside the existing (untouched) forward ``linear`` block."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_completion_proof(
+        state_dir,
+        issue_id="INFRA-210",
+        project_key="demo",
+        settlement_id="rev-210",
+    )
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="In Progress")
+
+    projected: list[tuple[str, str | None, str]] = []
+
+    class _FakeLinearWriter:
+        def __init__(self, settings: object, *, database: object, queue: object):
+            del settings, database, queue
+
+        async def project(
+            self, issue_id: str, target: object, effect_id: str
+        ) -> object:
+            projected.append((issue_id, getattr(target, "status", None), effect_id))
+            return object()
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+    monkeypatch.setattr(cli_module, "_LazyIdleLinearProjector", _FakeLinearWriter)
+
+    result = invoke(
+        [*base_arguments(configured_repo), "reconcile", "--linear", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # The existing forward block is untouched in shape.
+    assert set(["completed", "findings", "admission_open", "linear"]) <= payload.keys()
+
+    projection = payload["linear_projection"]
+    assert projection["completed"] == 1
+    assert projection["unchanged"] == 0
+    assert projection["unavailable"] == 0
+    outcome = projection["outcomes"][0]
+    assert outcome["issue_id"] == "INFRA-210"
+    assert outcome["action"] == "completed"
+    assert projected == [
+        ("INFRA-210", "Done", "linear:INFRA-210:merge-settled-done:rev-210")
+    ]
+
+    from hermes_orchestrator.db import Database
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        row = database.execute(
+            "SELECT state FROM admitted_issues WHERE issue_id = 'INFRA-210'"
+        ).fetchone()
+    finally:
+        database.close()
+    assert str(row["state"]) == "done"
+
+
+def test_reconcile_without_linear_flag_omits_block_and_never_builds_reader(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``--linear``, ``reconcile --json`` is byte-identical to
+    the pre-INFRA-230 shape: no ``linear`` key, and the Keychain-backed
+    reader is never even constructed."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    invoke([*base_arguments(configured_repo), "init"])
+
+    constructed: list[object] = []
+
+    def _lazy_linear_reads(keychain: object) -> object:
+        constructed.append(keychain)
+        raise AssertionError("reconcile without --linear must not build a reader")
+
+    monkeypatch.setattr(cli_module, "_LazyLinearReads", _lazy_linear_reads)
+
+    result = invoke([*base_arguments(configured_repo), "reconcile", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "linear" not in payload
+    assert constructed == []
 
 
 def test_target_issue_requires_every_binding_flag(

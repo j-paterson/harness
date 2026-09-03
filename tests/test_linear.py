@@ -230,6 +230,96 @@ async def test_projection_refuses_every_other_done_regression(
         assert transport.operations == ["Issue"]
 
 
+@pytest.mark.asyncio
+async def test_in_development_to_done_refused_without_merge_settled_prefix(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    """INFRA-230 (Sol d3b5c972): the merge-settled-done carve-out is
+    keyed on the effect-id prefix alone — an ordinary effect id must
+    not smuggle a stale Linear In Development issue to Done."""
+
+    transport.issue(
+        status="In Development",
+        state_id="state-development",
+        assignee_id="user-operator",
+        revision="development-r1",
+    )
+
+    with pytest.raises(ValueError, match=r"status transition.*not allowed"):
+        await linear_client.project(
+            "ENG-9",
+            LinearProjection(status="Done", assignee_alias="operator"),
+            effect_id="effect-ordinary",
+        )
+
+    assert transport.operations == ["Issue"]
+
+
+@pytest.mark.asyncio
+async def test_in_development_to_done_accepted_for_merge_settled_projection(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    """INFRA-230 (Sol d3b5c972): a locally Done issue with durable,
+    exact settled-merge proof may restore stale Linear In Development
+    state to Done through the ``merge-settled-done`` carve-out — the
+    live INFRA-210 case."""
+
+    transport.issue(
+        status="In Development",
+        state_id="state-development",
+        assignee_id="user-operator",
+        revision="development-r1",
+    )
+
+    result = await linear_client.project(
+        "ENG-9",
+        LinearProjection(status="Done", assignee_alias="operator"),
+        effect_id="linear:ENG-9:merge-settled-done:settlement-1",
+    )
+
+    assert result.changed_fields == ("status",)
+    assert transport.operations == ["Issue", "IssueUpdate", "Issue"]
+    assert transport.variables[1] == {
+        "id": "linear-eng-9",
+        "input": {"stateId": "state-done"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_merge_settled_projection_replay_is_idempotent(
+    linear_client: LinearClient,
+    transport: RecordingLinearTransport,
+) -> None:
+    """The same replay guarantee every other effect id gets: a second
+    call with the identical merge-settled-done effect id answers from
+    the completed journal entry without touching the network again."""
+
+    transport.issue(
+        status="In Development",
+        state_id="state-development",
+        assignee_id="user-operator",
+        revision="development-r1",
+    )
+    effect_id = "linear:ENG-9:merge-settled-done:settlement-1"
+
+    first = await linear_client.project(
+        "ENG-9",
+        LinearProjection(status="Done", assignee_alias="operator"),
+        effect_id=effect_id,
+    )
+    transport.operations.clear()
+    second = await linear_client.project(
+        "ENG-9",
+        LinearProjection(status="Done", assignee_alias="operator"),
+        effect_id=effect_id,
+    )
+
+    assert second == first
+    assert transport.operations == []
+
+
 def _pending_linear_rows(database: Database) -> list[dict[str, Any]]:
     """Read pending Linear effects EXACTLY the way reconciliation does
     (``reconcile._stage_linear`` /

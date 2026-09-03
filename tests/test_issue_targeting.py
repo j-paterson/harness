@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -219,6 +220,36 @@ def _admitted_snapshot(database: Database) -> list[tuple[object, ...]]:
     return [tuple(row) for row in rows]
 
 
+def _admitted_state_and_touch(database: Database, issue_id: str) -> tuple[str, str]:
+    """(state, updated_at) for one admitted issue -- INFRA-230's zero-write
+    contract requires this pair untouched on a Linear-closed refusal, not
+    just the ``state`` column ``_admitted_snapshot`` already covers."""
+
+    row = database.execute(
+        "SELECT state, updated_at FROM admitted_issues WHERE issue_id = ?",
+        (issue_id,),
+    ).fetchone()
+    return str(row["state"]), str(row["updated_at"])
+
+
+class _FakeLinearReads:
+    """A stand-in for ``LinearReadPort`` (INFRA-230) that returns a fixed
+    status, or raises a fixed error, for every ``get_issue`` call."""
+
+    def __init__(
+        self, status: str | None = None, *, error: Exception | None = None
+    ) -> None:
+        self._status = status
+        self._error = error
+        self.calls: list[str] = []
+
+    def get_issue(self, issue_id: str) -> object:
+        self.calls.append(issue_id)
+        if self._error is not None:
+            raise self._error
+        return SimpleNamespace(status=self._status)
+
+
 def _assignment_count(database: Database) -> int:
     row = database.execute("SELECT COUNT(*) AS n FROM lead_assignments").fetchone()
     return int(row["n"])
@@ -423,6 +454,130 @@ def test_refuses_empty_instruction_with_zero_writes(
         )
 
     assert _assignment_count(database) == 0
+
+
+# ---------------------------------------------------------------------------
+# INFRA-230 -- reject targeting completed Linear issues; a transient Linear
+# read failure isolates only the issue it names.
+# ---------------------------------------------------------------------------
+
+
+def test_refuses_terminal_linear_status_with_zero_writes(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """A queued local row whose Linear issue has already reached ``Done``
+    is refused before publication -- the base defect this packet fixes."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    before_snapshot = _admitted_snapshot(database)
+    before_touch = _admitted_state_and_touch(database, "INFRA-9")
+    linear = _FakeLinearReads(status="Done")
+
+    with pytest.raises(IssueTargetingRefused, match="Done"):
+        target_issue(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-9",
+            project_key="demo",
+            cell_id=CELL_ID,
+            session_id=SESSION_ID,
+            instruction="focus on INFRA-9",
+            known_projects={"demo"},
+            linear_reads=linear,
+        )
+
+    assert linear.calls == ["INFRA-9"]
+    assert _assignment_count(database) == 0
+    assert _admitted_snapshot(database) == before_snapshot
+    assert _admitted_state_and_touch(database, "INFRA-9") == before_touch
+
+
+def test_transient_linear_read_failure_isolates_this_issue_with_zero_writes(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Requirement (c): a transient Linear read failure refuses THIS
+    targeting closed -- it never raises anything but the module's own
+    refusal type, and it leaves the local row exactly as it was."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    before_touch = _admitted_state_and_touch(database, "INFRA-9")
+    linear = _FakeLinearReads(error=ConnectionError("linear.example is unreachable"))
+
+    with pytest.raises(IssueTargetingRefused, match="linear read failed"):
+        target_issue(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-9",
+            project_key="demo",
+            cell_id=CELL_ID,
+            session_id=SESSION_ID,
+            instruction="focus on INFRA-9",
+            known_projects={"demo"},
+            linear_reads=linear,
+        )
+
+    assert _assignment_count(database) == 0
+    assert _admitted_state_and_touch(database, "INFRA-9") == before_touch
+
+
+def test_non_terminal_linear_status_proceeds_exactly_as_before(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """A live Linear status (``In Development``) never blocks targeting --
+    the happy path publishes exactly as it did before this packet."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    linear = _FakeLinearReads(status="In Development")
+
+    result = target_issue(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id="INFRA-9",
+        project_key="demo",
+        cell_id=CELL_ID,
+        session_id=SESSION_ID,
+        instruction="focus on INFRA-9",
+        known_projects={"demo"},
+        linear_reads=linear,
+    )
+
+    assert linear.calls == ["INFRA-9"]
+    assert result.idempotent is False
+    assert result.assignment.issue_id == "INFRA-9"
+    assert _assignment_count(database) == 1
+
+
+def test_linear_reads_none_is_byte_identical_to_before_infra_230(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """Passing ``linear_reads=None`` explicitly (the default) behaves
+    exactly like every pre-INFRA-230 caller that never heard of it."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+
+    result = target_issue(
+        database,
+        assignments=assignments,
+        events=events,
+        issue_id="INFRA-9",
+        project_key="demo",
+        cell_id=CELL_ID,
+        session_id=SESSION_ID,
+        instruction="focus on INFRA-9",
+        known_projects={"demo"},
+        linear_reads=None,
+    )
+
+    assert result.idempotent is False
+    assert result.assignment.issue_id == "INFRA-9"
+    assert _assignment_count(database) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1519,41 @@ def test_harness_lead_receives_one_admitted_followup_lane_preserving(
     assert claim is not None
     assert claim.issue_id == "INFRA-205"
     assert claim.state == "active"
+
+
+def test_harness_followup_refuses_terminal_linear_status_with_zero_writes(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """INFRA-230 on the harness-followup path: the Linear-closed check
+    runs before ANY local predicate, including the admission-state
+    check -- so it refuses closed even for a row sitting in the
+    INFRA-184/200 ``review`` shape, which ``target_harness_followup``
+    would otherwise refuse for an entirely different reason. Zero
+    writes either way; the local row is left exactly as it was."""
+
+    _seed_harness_cell(database)
+    _seed_admitted(database, issue_id="INFRA-205", state="review")
+    before_touch = _admitted_state_and_touch(database, "INFRA-205")
+    linear = _FakeLinearReads(status="Done")
+
+    with pytest.raises(IssueTargetingRefused, match="Done"):
+        target_harness_followup(
+            database,
+            assignments=assignments,
+            events=events,
+            issue_id="INFRA-205",
+            project_key="demo",
+            cell_id=HARNESS_CELL_ID,
+            session_id=SESSION_ID,
+            instruction="pick up INFRA-205 as a harness follow-up",
+            known_projects={"demo"},
+            linear_reads=linear,
+        )
+
+    assert linear.calls == ["INFRA-205"]
+    assert _assignment_count(database) == 0
+    assert _admitted_state_and_touch(database, "INFRA-205") == before_touch
+    assert _issue_state(database, "INFRA-205") == "review"
 
 
 def test_second_followup_refused_while_one_is_live(

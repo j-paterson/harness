@@ -497,9 +497,29 @@ class LinearClient:
                     f"linear:{issue_id}:acceptance-satisfied:"
                 )
             )
+            # INFRA-230 (Sol d3b5c972): a second narrow, evidence-gated
+            # carve-out mirroring ``acceptance_projection`` above. The
+            # reconciler (``linear_reconcile.LinearQueueReconciler
+            # .project_completed``) is the only caller that ever mints
+            # an effect id with this prefix, and it does so exclusively
+            # for an admitted issue that is already locally ``done``
+            # AND has a durable, exact settled-merge proof (a merged
+            # review row joined to a settled ``merge_settlements`` row)
+            # -- never merely because a caller asked for Done. This does
+            # not widen the plain allow-list: an ordinary effect id
+            # still refuses Todo/In Development -> Done exactly as
+            # before.
+            merge_settled_projection = (
+                current_status in ("Todo", "In Development")
+                and target.status == "Done"
+                and effect_id.startswith(
+                    f"linear:{issue_id}:merge-settled-done:"
+                )
+            )
             if (
                 (current_status, target.status) not in _ALLOWED_STATUS_TRANSITIONS
                 and not acceptance_projection
+                and not merge_settled_projection
             ):
                 raise ValueError(
                     f"Linear status transition {current_status} -> "

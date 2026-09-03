@@ -273,6 +273,27 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="explicit validated branch for --bind-issue-lane",
     )
+    reconcile.add_argument(
+        "--linear",
+        action="store_true",
+        help=(
+            "also reconcile stale local queue projections from cheap "
+            "live Linear reads (INFRA-230); a Done/Canceled/Duplicate "
+            "issue is moved to done locally, and any lease it holds is "
+            "released through the normal custodian chain"
+        ),
+    )
+    reconcile.add_argument(
+        "--project",
+        default=None,
+        help="restrict --linear to one project key",
+    )
+    reconcile.add_argument(
+        "--max-reads",
+        type=int,
+        default=None,
+        help="cap the number of Linear reads --linear takes this run",
+    )
     reconcile.add_argument("--json", action="store_true")
 
     daemon = commands.add_parser("daemon", help="run the local supervisor loop")
@@ -6487,9 +6508,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     session_id=args.session,
                     instruction=args.instruction,
                     known_projects=settings.projects.keys(),
+                    # INFRA-230: read the issue's authoritative Linear
+                    # state before any assignment is published; a
+                    # terminal status or an unreadable Keychain/Linear
+                    # read refuses this targeting closed (see
+                    # ``_LazyLinearReads`` and
+                    # ``issue_targeting._refuse_if_linear_closed``).
+                    linear_reads=_LazyLinearReads(Keychain()),
                 )
             except IssueTargetingRefused as error:
-                print(str(error), file=sys.stderr)
+                print(
+                    f"target-issue refused for {args.issue_id}: {error}",
+                    file=sys.stderr,
+                )
                 return 1
             _print(
                 result.assignment.as_dict(),
@@ -6968,11 +6999,77 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         human=f"issue-lane binding failed: {error}",
                     )
                     return 1
+            linear_report = None
+            linear_projection_report = None
+            if args.linear:
+                # INFRA-230: a cheap, bounded, read-only-except-for-repair
+                # pass over stale local queue projections. This runs
+                # AFTER the read-only reconcile above and never changes
+                # its output or this command's exit code -- an
+                # unavailable Linear read is reported per-issue, not
+                # fatal, and isolates only the one issue it happened to.
+                from hermes_orchestrator.linear_reconcile import (
+                    LinearQueueReconciler,
+                )
+                from hermes_orchestrator.queue import QueueService
+
+                events = EventStore(database)
+                linear_queue = QueueService(database, events, registered_projects=())
+                linear_reconciler = LinearQueueReconciler(
+                    database,
+                    queue=linear_queue,
+                    linear_reads=_LazyLinearReads(Keychain()),
+                    events=events,
+                    custodian=runtime.worktree_custodian,
+                    leases=runtime.worktree_leases,
+                    max_reads=args.max_reads,
+                    linear_writer=_LazyIdleLinearProjector(
+                        settings, database=database, queue=linear_queue
+                    ),
+                )
+                linear_report = linear_reconciler.run(project_key=args.project)
+                payload["linear"] = linear_report.as_dict()
+                # INFRA-230 (Sol d3b5c972): the other drift direction --
+                # a locally done issue whose Linear projection never
+                # caught up. A sibling key, not a replacement: the
+                # forward block above keeps its exact pre-existing
+                # shape for every caller already reading it.
+                linear_projection_report = asyncio.run(
+                    linear_reconciler.project_completed(project_key=args.project)
+                )
+                payload["linear_projection"] = linear_projection_report.as_dict()
             _print(
                 payload,
                 json_output=args.json,
                 human=("Reconciliation completed; admission remains closed."),
             )
+            if linear_report is not None and not args.json:
+                for outcome in linear_report.outcomes:
+                    print(
+                        f"{outcome.issue_id} {outcome.project_key} "
+                        f"{outcome.local_state} -> {outcome.action} "
+                        f"({outcome.linear_status}): {outcome.detail}"
+                    )
+                print(
+                    "Linear reconciliation: "
+                    f"{linear_report.completed} completed, "
+                    f"{linear_report.unchanged} unchanged, "
+                    f"{linear_report.unavailable} unavailable."
+                )
+            if linear_projection_report is not None and not args.json:
+                for outcome in linear_projection_report.outcomes:
+                    print(
+                        f"{outcome.issue_id} {outcome.project_key} "
+                        f"{outcome.local_state} <- {outcome.action} "
+                        f"({outcome.linear_status}): {outcome.detail}"
+                    )
+                print(
+                    "Linear projection: "
+                    f"{linear_projection_report.completed} completed, "
+                    f"{linear_projection_report.unchanged} unchanged, "
+                    f"{linear_projection_report.unavailable} unavailable, "
+                    f"{linear_projection_report.refused} refused."
+                )
             return 0 if result.completed else 1
 
         if args.command == "observe":
