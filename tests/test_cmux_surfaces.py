@@ -29,9 +29,11 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxBindingConflict,
     CmuxDeadLeadSweep,
     CmuxHibernationGate,
+    CmuxResidualSweep,
     CmuxSurfaceBindings,
     CmuxSurfaceReconciler,
     HibernationDecision,
+    ResidualSweepReport,
     classic_channel_command,
     live_claude_argv,
     managed_claude_worker_alive,
@@ -4562,3 +4564,295 @@ def test_an_anchor_remint_rolls_back_with_its_caller(
     assert after is not None
     assert after.anchor_id == before.anchor_id
     assert after.workspace_uuid == before.workspace_uuid
+
+
+# ---------------------------------------------------------------------------
+# INFRA-233: bounded per-tick sweep of RETIRED residual lead surfaces.
+# ---------------------------------------------------------------------------
+
+
+def _residual_sweep(
+    database: Database,
+    bindings: CmuxSurfaceBindings,
+    port: FakePort,
+    *,
+    max_per_tick: int = 3,
+) -> CmuxResidualSweep:
+    return CmuxResidualSweep(
+        bindings=bindings, port=port, database=database, max_per_tick=max_per_tick
+    )
+
+
+def _seed_rotated_residual(
+    bindings: CmuxSurfaceBindings,
+    *,
+    cell_id: str = "cell-demo",
+    residual_ref: CmuxSurfaceRef = LEAD,
+    active_ref: CmuxSurfaceRef = FRESH,
+    session_id: str = SESSION,
+    active_session_id: str = SESSION_2,
+) -> tuple[object, object]:
+    """A cell whose old workspace close was never confirmed, and whose
+    seat has since rotated to a genuinely different active binding --
+    the exact live defect: the retired surface has no active occupant
+    of its own and nothing will ever ``ensure()`` it again."""
+
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id=cell_id,
+        session_id=session_id,
+        profile_alias="max-a",
+        ref=residual_ref,
+        reason="session_rotated_close_uncertain",
+    )
+    active = bindings.bind_lead(
+        project_key="demo",
+        cell_id=cell_id,
+        session_id=active_session_id,
+        profile_alias="max-a",
+        ref=active_ref,
+    )
+    return residual, active
+
+
+@pytest.mark.asyncio
+async def test_residual_sweep_closes_a_retired_seat_after_rotation(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    residual, active = _seed_rotated_residual(bindings)
+    port = FakePort(live={LEAD, FRESH})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report.closed == (residual.binding_id,)
+    assert report.still_residual == ()
+    assert port.closed == [LEAD.workspace_uuid]
+    assert bindings.get(residual.binding_id).state == "closed"
+    # The new active seat is never touched: still active, and its
+    # workspace was never asked to close.
+    live = bindings.active_lead("cell-demo")
+    assert live is not None
+    assert live.binding_id == active.binding_id
+    assert live.state == "active"
+    assert FRESH in port.live
+    assert LEAD not in port.live
+
+
+@pytest.mark.asyncio
+async def test_residual_sweep_keeps_the_binding_residual_when_close_keeps_failing(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    residual, _active = _seed_rotated_residual(bindings)
+    port = FakePort(
+        live={LEAD, FRESH},
+        fail={"close_workspace": CmuxUnavailable("cmux command timed out")},
+    )
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report.closed == ()
+    assert report.still_residual == (
+        (residual.binding_id, "retired_surface_close_failed:1"),
+    )
+    held = bindings.get(residual.binding_id)
+    assert held.state == "residual"
+    # The tick returned normally; the failure never propagated.
+    assert port.closed == []
+
+    # A second failing tick advances the durable failure counter rather
+    # than repeating the first attempt's reason.
+    second_report = await _residual_sweep(database, bindings, port).tick()
+    assert second_report.still_residual == (
+        (residual.binding_id, "retired_surface_close_failed:2"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_residual_sweep_bounds_work_to_max_per_tick(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    first_residual, _first_active = _seed_rotated_residual(
+        bindings,
+        cell_id="cell-r1",
+        residual_ref=LEAD,
+        active_ref=FRESH,
+        session_id=SESSION,
+        active_session_id=SESSION_2,
+    )
+    second_residual, _second_active = _seed_rotated_residual(
+        bindings,
+        cell_id="cell-r2",
+        residual_ref=HARNESS,
+        active_ref=THIRD,
+        session_id=HARNESS_SESSION,
+        active_session_id=SESSION_2,
+    )
+    third_residual, _third_active = _seed_rotated_residual(
+        bindings,
+        cell_id="cell-r3",
+        residual_ref=NEWPROJ,
+        active_ref=ORCH,
+        session_id=NEW_PROJECT_SESSION,
+        active_session_id=SESSION_2,
+    )
+    port = FakePort(live={LEAD, FRESH, HARNESS, THIRD, NEWPROJ, ORCH})
+
+    report = await _residual_sweep(database, bindings, port, max_per_tick=2).tick()
+
+    assert len(report.closed) == 2
+    assert report.closed == (first_residual.binding_id, second_residual.binding_id)
+    # The third candidate was never even attempted this tick.
+    assert bindings.get(third_residual.binding_id).state == "residual"
+    assert third_residual.workspace_uuid not in port.closed
+
+
+@pytest.mark.asyncio
+async def test_residual_sweep_leaves_a_cells_only_current_seat_untouched(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """A residual binding with no active sibling, whose cell is still
+    live, may be an in-flight write-ahead activation the seater's own
+    ``ensure()`` will resolve -- the sweep must never race it."""
+
+    seed_cell(database)
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=SESSION,
+        profile_alias="max-a",
+        ref=LEAD,
+        reason="activation_pending",
+    )
+    port = FakePort(live={LEAD})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report == ResidualSweepReport()
+    assert bindings.get(residual.binding_id).state == "residual"
+    assert port.closed == []
+
+
+@pytest.mark.asyncio
+async def test_residual_sweep_retires_a_residual_whose_cell_is_gone(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """No active sibling AND no live project cell: the cell was retired
+    entirely and nothing will ever seat it again."""
+
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=SESSION,
+        profile_alias="max-a",
+        ref=LEAD,
+        reason="dead_worker_surface_missing_close_uncertain",
+    )
+    port = FakePort(live={LEAD})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report.closed == (residual.binding_id,)
+    assert bindings.get(residual.binding_id).state == "closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cell_state", ["starting", "active", "handoff_required", "paused"]
+)
+async def test_residual_sweep_never_closes_the_sole_seat_of_a_live_cell(
+    database: Database, bindings: CmuxSurfaceBindings, cell_state: str
+) -> None:
+    """Sol correction 39bb7195 (INFRA-233): every state the cell service
+    counts as occupancy protects a sole residual seat -- a starting cell's
+    write-ahead activation, a paused lead, or one mid-handoff still owns
+    its workspace. Only a distinct active sibling or a cell that has left
+    every live state makes the residual seat retired."""
+
+    seed_cell(database, state=cell_state)
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=SESSION,
+        profile_alias="max-a",
+        ref=LEAD,
+        reason="activation_pending",
+    )
+    port = FakePort(live={LEAD})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report == ResidualSweepReport()
+    assert bindings.get(residual.binding_id).state == "residual"
+    assert port.closed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cell_state", ["retired", "failed"])
+async def test_residual_sweep_retires_the_seat_of_a_terminal_cell(
+    database: Database, bindings: CmuxSurfaceBindings, cell_state: str
+) -> None:
+    """A cell that has left every live state (like an absent cell) has
+    genuinely retired its sole residual workspace."""
+
+    seed_cell(database, state=cell_state)
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=SESSION,
+        profile_alias="max-a",
+        ref=LEAD,
+        reason="dead_worker_surface_missing_close_uncertain",
+    )
+    port = FakePort(live={LEAD})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report.closed == (residual.binding_id,)
+    assert bindings.get(residual.binding_id).state == "closed"
+
+
+def test_residual_sweep_live_states_match_the_cell_service_vocabulary() -> None:
+    """The sweep restates the live-state tuple (cells.py imports this
+    module, so it cannot import it); pin the two equal so a new live
+    state can never silently make its sole seat sweepable."""
+
+    from hermes_orchestrator import cells as cells_module
+    from hermes_orchestrator import cmux_surfaces as surfaces_module
+
+    assert tuple(surfaces_module._LIVE_CELL_STATES) == tuple(
+        cells_module._ACTIVE_CELL_STATES
+    )
+
+
+def test_retired_surfaces_lists_residual_and_stale_lead_bindings(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    residual, active = _seed_rotated_residual(bindings)
+
+    active_binding = bindings.get(active.binding_id)
+    # ``replace`` returns the NEW successor generation (active); the
+    # PREDECESSOR retires to 'stale' at its own original binding_id.
+    new_active = bindings.replace(
+        active_binding.binding_id, THIRD, reason="test_stale_transition"
+    )
+    predecessor = bindings.get(active_binding.binding_id)
+    assert predecessor.state == "stale"
+
+    rows = {row.binding_id: row for row in bindings.retired_surfaces()}
+
+    assert residual.binding_id in rows
+    residual_row = rows[residual.binding_id]
+    assert residual_row.state == "residual"
+    assert residual_row.cell_id == "cell-demo"
+    assert residual_row.project_key == "demo"
+    assert residual_row.workspace_uuid == LEAD.workspace_uuid
+    assert residual_row.reason == "session_rotated_close_uncertain"
+    assert residual_row.updated_at == residual.updated_at
+
+    assert predecessor.binding_id in rows
+    stale_row = rows[predecessor.binding_id]
+    assert stale_row.state == "stale"
+    assert stale_row.reason == "test_stale_transition"
+
+    # The new active generation is neither residual nor stale.
+    assert new_active.binding_id not in rows

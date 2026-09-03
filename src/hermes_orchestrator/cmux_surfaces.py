@@ -262,6 +262,34 @@ class CmuxBinding:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RetiredSurface:
+    """One lead binding whose managed cmux surface is retired or
+    retiring -- durable classification for status reporting.
+
+    INFRA-233: 'residual' rows are exactly :class:`CmuxResidualSweep`'s
+    own candidates (an unconfirmed close still owning a workspace).
+    'stale' lead rows are listed too even though the sweep never
+    touches them: by the time :meth:`CmuxSurfaceBindings.replace` or
+    :meth:`CmuxSurfaceBindings.activate_residual` retires a generation
+    into 'stale', its exact workspace is already confirmed missing, and
+    ``_TRANSITION_SOURCES`` admits no further transition out of 'stale'
+    here -- there is nothing left to close. ``reason`` and
+    ``updated_at`` come from durable rows alone (the binding's own
+    ``updated_at`` and the most recent event it recorded, since the
+    state itself carries no dedicated reason column) -- no cmux
+    connection is opened to produce this.
+    """
+
+    binding_id: str
+    cell_id: str | None
+    project_key: str | None
+    workspace_uuid: str
+    state: str
+    reason: str | None
+    updated_at: str
+
+
 class ProfileDirectory(Protocol):
     """Resolve a profile alias to its exact CLAUDE_CONFIG_DIR."""
 
@@ -475,6 +503,59 @@ class CmuxSurfaceBindings:
         return self._transition(
             self.get(binding_id), "residual", event="residual", reason=reason
         )
+
+    def record_residual_reclaim_attempt(
+        self, binding_id: str, *, reason: str
+    ) -> CmuxBinding:
+        """Journal one more failed reclaim attempt against a binding
+        that is ALREADY residual, with no state transition.
+
+        INFRA-233: :meth:`mark_residual` goes through :meth:`_transition`,
+        whose same-state short-circuit (``if binding.state == state:
+        return binding``) makes a repeat call to the SAME target state a
+        correct no-op for every other caller -- but it means
+        ``mark_residual`` can never record a fresh classification for a
+        binding that is already residual, which is exactly what
+        :class:`CmuxResidualSweep` needs on every failed retry: a durable,
+        incrementing receipt that tells a transient miss from a stuck
+        one, without ever leaving the 'residual' state (there is nowhere
+        else for it to go until cmux confirms the close).
+        """
+
+        binding = self.get(binding_id)
+        if binding.state != "residual":
+            raise CmuxBindingConflict(
+                f"a {binding.state} binding cannot record a residual "
+                "reclaim attempt"
+            )
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE cmux_surface_bindings SET updated_at = ? "
+                "WHERE binding_id = ?",
+                (stamp, binding_id),
+            )
+            payload = _identity_payload(
+                role=binding.role,
+                project_key=binding.project_key,
+                cell_id=binding.cell_id,
+                session_id=binding.session_id,
+                profile_alias=binding.profile_alias,
+                ref=binding.ref,
+                generation=binding.generation,
+                lane_role=binding.lane_role,
+            )
+            payload["reason"] = reason
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="cmux_binding.residual",
+                    aggregate_type="cmux_binding",
+                    aggregate_id=binding_id,
+                    payload=payload,
+                ),
+            )
+        return self.get(binding_id)
 
     def record_residual(
         self,
@@ -764,6 +845,42 @@ class CmuxSurfaceBindings:
             (cell_id,),
         ).fetchall()
         return tuple(_row_to_binding(row) for row in rows)
+
+    def retired_surfaces(self) -> tuple[RetiredSurface, ...]:
+        """Residual and stale lead bindings, classified for status.
+
+        Reads durable rows only -- never opens cmux. See
+        :class:`RetiredSurface` for exactly what each state means and
+        why 'stale' is reported but never swept.
+        """
+
+        rows = self._database.execute(
+            "SELECT b.binding_id AS binding_id, b.cell_id AS cell_id, "
+            "b.project_key AS project_key, "
+            "b.workspace_uuid AS workspace_uuid, b.state AS state, "
+            "b.updated_at AS updated_at, "
+            "(SELECT json_extract(e.payload_json, '$.reason') FROM events e "
+            " WHERE e.aggregate_type = 'cmux_binding' "
+            " AND e.aggregate_id = b.binding_id "
+            " ORDER BY e.sequence DESC LIMIT 1) AS reason "
+            "FROM cmux_surface_bindings b "
+            "WHERE b.role = 'lead' AND b.state IN ('residual', 'stale') "
+            "ORDER BY b.updated_at ASC, b.rowid ASC"
+        ).fetchall()
+        return tuple(
+            RetiredSurface(
+                binding_id=str(row["binding_id"]),
+                cell_id=(None if row["cell_id"] is None else str(row["cell_id"])),
+                project_key=(
+                    None if row["project_key"] is None else str(row["project_key"])
+                ),
+                workspace_uuid=str(row["workspace_uuid"]),
+                state=str(row["state"]),
+                reason=(None if row["reason"] is None else str(row["reason"])),
+                updated_at=str(row["updated_at"]),
+            )
+            for row in rows
+        )
 
     def active_orchestrator(self) -> CmuxBinding | None:
         row = self._database.execute(
@@ -1813,6 +1930,183 @@ async def _resolve_residual_bindings(
             reclaimed.append(binding.binding_id)
 
 
+#: The bounded per-tick sweep of RESIDUAL lead surfaces defaults to
+#: closing at most this many per tick -- generous enough to drain a
+#: normal backlog quickly, small enough that one tick's cmux calls
+#: never dominate the maintenance cadence.
+_RESIDUAL_SWEEP_DEFAULT_MAX_PER_TICK = 3
+#: The binding-closure reason a swept retired surface carries once cmux
+#: confirms the close, so the journal distinguishes this sweep from the
+#: original rotation, retirement, or reconciliation event.
+_RESIDUAL_SWEEP_CLOSE_REASON = "retired_surface_swept"
+#: The residual reason prefix recorded when the sweep's own close
+#: attempt fails; the trailing counter is how many CONSECUTIVE sweep
+#: attempts have failed for this exact binding, so the journal shows
+#: whether a residue is transient or stuck.
+# The project-cell live-state vocabulary (mirrors ``cells._ACTIVE_CELL_STATES``;
+# cells.py imports this module, so the tuple is restated here and pinned equal
+# by tests/test_cmux_surfaces.py rather than imported).
+_LIVE_CELL_STATES: tuple[str, ...] = (
+    "starting",
+    "active",
+    "handoff_required",
+    "paused",
+)
+_RESIDUAL_SWEEP_FAIL_REASON_PREFIX = "retired_surface_close_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualSweepReport:
+    """The outcome of one bounded pass over retired residual seats."""
+
+    closed: tuple[str, ...] = ()
+    still_residual: tuple[tuple[str, str], ...] = ()
+
+
+class CmuxResidualSweep:
+    """Bounded per-tick cleanup of RETIRED managed lead surfaces.
+
+    INFRA-233 (observed live): after a Fable rotation whose old
+    workspace close cmux could not confirm, ``_retire_rotated_seat``
+    (:class:`CmuxLeadSeater`) correctly holds the seat 'residual' --
+    ownership evidence, still blocking hibernation -- but never retries
+    itself: ``active_lead(cell_id)`` no longer returns the retired row
+    once the rotation's replacement (or nothing) occupies the cell, so
+    nothing revisits it. Until this packet the ONLY reclaimers were
+    :meth:`CmuxSurfaceReconciler.reconcile` (once, at daemon startup)
+    or reseating the exact same cell (:meth:`CmuxLeadSeater.ensure`
+    resolves a cell's own residuals before creating its next seat) --
+    so a cell that never gets ensure()'d again (its project rotated
+    away, or a different cell now carries the active work) left its
+    retired workspace VISIBLE beside the active one indefinitely. This
+    is the per-tick sweep that closes that gap for RESIDUAL lead
+    bindings, the same way :class:`CmuxDeadLeadSweep` closes the
+    dead-worker gap.
+
+    Scope is 'residual' only -- never 'stale'. A 'stale' lead binding
+    is produced only by :meth:`CmuxSurfaceBindings.replace` (the
+    reconciler replacing a lead whose EXACT workspace is already
+    confirmed missing) or :meth:`CmuxSurfaceBindings.activate_residual`
+    (a write-ahead promotion retiring the generation it supersedes,
+    whose workspace close already ran) -- by construction its
+    workspace no longer exists to close, and ``_TRANSITION_SOURCES``
+    admits no closed/lost/residual transition FROM 'stale' in any
+    case. :meth:`CmuxSurfaceBindings.retired_surfaces` still reports
+    'stale' rows for classification; this sweep leaves them untouched.
+
+    A residual binding is swept only once its cell has genuinely moved
+    on: either a DIFFERENT lead binding is now active for the cell (a
+    later rotation succeeded) or the cell itself is no longer live (no
+    'active' ``project_cells`` row). A residual binding that is still
+    its cell's only or current seat -- e.g. an in-flight write-ahead
+    activation :meth:`CmuxLeadSeater.ensure` will resolve on its own --
+    is left completely untouched here; sweeping it would race the
+    seater. The cell's actual active binding (never itself 'residual')
+    is by definition never a candidate.
+
+    Every step fails closed: a denied or unreachable socket retires
+    nothing this tick (the next tick retries), and a close that cmux
+    cannot confirm keeps the row 'residual' with a new, durable
+    ``retired_surface_close_failed:<n>`` reason recorded via
+    :meth:`CmuxSurfaceBindings.record_residual_reclaim_attempt` -- never
+    raised into the tick.
+    """
+
+    def __init__(
+        self,
+        *,
+        bindings: CmuxSurfaceBindings,
+        port: CmuxControlPort,
+        database: Database,
+        now: Callable[[], datetime] | None = None,
+        max_per_tick: int = _RESIDUAL_SWEEP_DEFAULT_MAX_PER_TICK,
+    ) -> None:
+        self._bindings = bindings
+        self._port = port
+        self._database = database
+        self._now = now or (lambda: datetime.now(UTC))
+        self._max_per_tick = max_per_tick
+
+    async def tick(self) -> ResidualSweepReport:
+        """Close up to ``max_per_tick`` retired residual lead seats."""
+
+        try:
+            await self._port.ping()
+        except CmuxError:
+            # Denial or unavailability fails closed: nothing is swept
+            # until cmux is reachable again.
+            return ResidualSweepReport()
+        closed: list[str] = []
+        still_residual: list[tuple[str, str]] = []
+        attempted = 0
+        for binding in self._bindings.residual():
+            if attempted >= self._max_per_tick:
+                break
+            if binding.role != "lead" or not self._is_retired(binding):
+                continue
+            attempted += 1
+            try:
+                await self._port.close_workspace(binding.workspace_uuid)
+            except CmuxError:
+                reason = self._fail_reason(binding.binding_id)
+                self._bindings.record_residual_reclaim_attempt(
+                    binding.binding_id, reason=reason
+                )
+                still_residual.append((binding.binding_id, reason))
+                continue
+            self._bindings.mark_closed(
+                binding.binding_id, reason=_RESIDUAL_SWEEP_CLOSE_REASON
+            )
+            closed.append(binding.binding_id)
+        return ResidualSweepReport(
+            closed=tuple(closed), still_residual=tuple(still_residual)
+        )
+
+    def _is_retired(self, binding: CmuxBinding) -> bool:
+        """Whether ``binding``'s cell has genuinely moved on from it.
+
+        The cell's own active binding is never itself 'residual', so
+        this can never answer True for the seat currently in use --
+        that invariant is enforced structurally, not just checked here.
+        """
+
+        if binding.cell_id is None:
+            return False
+        active = self._bindings.active_lead(binding.cell_id)
+        if active is not None:
+            return active.binding_id != binding.binding_id
+        return not self._cell_is_live(binding.cell_id)
+
+    def _cell_is_live(self, cell_id: str) -> bool:
+        """Whether the logical cell still occupies any live state.
+
+        Sol correction 39bb7195 (INFRA-233): a cell is live in every
+        state ``ProjectCellService`` treats as occupancy -- ``starting``,
+        ``active``, ``handoff_required`` and ``paused`` -- not only
+        ``active``. A sole residual seat of a cell in any of those
+        states may be an in-flight activation or a paused/handing-off
+        lead whose workspace must survive; only a cell that has left
+        every live state (or is absent) has genuinely retired it.
+        """
+
+        placeholders = ", ".join("?" for _ in _LIVE_CELL_STATES)
+        row = self._database.execute(
+            "SELECT 1 FROM project_cells WHERE cell_id = ? "
+            f"AND state IN ({placeholders})",
+            (cell_id, *_LIVE_CELL_STATES),
+        ).fetchone()
+        return row is not None
+
+    def _fail_reason(self, binding_id: str) -> str:
+        count = self._database.scalar(
+            "SELECT count(*) FROM events WHERE aggregate_type = 'cmux_binding' "
+            "AND aggregate_id = ? "
+            "AND json_extract(payload_json, '$.reason') LIKE ?",
+            (binding_id, f"{_RESIDUAL_SWEEP_FAIL_REASON_PREFIX}:%"),
+        )
+        return f"{_RESIDUAL_SWEEP_FAIL_REASON_PREFIX}:{int(count or 0) + 1}"
+
+
 #: The project-cell state a dead lead's cell is retired FROM, and the
 #: state it is retired INTO. 'failed' is the vocabulary's existing
 #: non-occupying terminal (``ProjectCellService._fail_unconfirmed_start``
@@ -1903,6 +2197,15 @@ class CmuxDeadLeadSweep:
         # composition needs no wiring and tests need no live ``ps``.
         self._worker_alive = (
             worker_alive if worker_alive is not None else managed_claude_worker_alive
+        )
+        # INFRA-233: composed here, sharing this exact ``bindings`` and
+        # ``port``, so production wiring adds nothing new to construct
+        # or thread through -- wherever this sweep is already ticked, a
+        # missing cmux port disables the residual sweep exactly the way
+        # it already disables this one, and nowhere else needs to know
+        # this collaborator exists to reach it.
+        self.residual_sweep = CmuxResidualSweep(
+            bindings=bindings, port=port, database=database
         )
 
     async def tick(self) -> tuple[str, ...]:

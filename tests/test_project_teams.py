@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import sqlite3
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from hermes_orchestrator.project_teams import (
     ProjectTeamService,
     RetirementEvidenceRequired,
     SolModelMismatch,
+    StaleTeamGeneration,
     StaleTeamMember,
     TeamAdmissionRefused,
     TeamMemberMismatch,
@@ -1091,3 +1093,228 @@ def test_exact_owning_row_identities_bind_and_reach_ready(
     assert team.sol_model == SOL_MODEL
     assert team.sol_provider == SOL_PROVIDER
     assert "demo" in teams.ready_projects()
+
+
+# -- INFRA-233: refresh_fable_in / same-cell rebind on reconciliation -------
+
+
+class _RacingConnection:
+    """Wraps a live connection so the first statement matching
+    ``match_prefix`` first runs ``on_first_match`` (a competing write on
+    the SAME connection/transaction) before the real statement executes
+    -- deterministically simulating a CAS race without needing a second
+    connection or thread."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        match_prefix: str,
+        on_first_match: Callable[[sqlite3.Connection], None],
+    ) -> None:
+        self._connection = connection
+        self._match_prefix = match_prefix
+        self._on_first_match = on_first_match
+        self._matched = False
+
+    def execute(self, sql: str, parameters: tuple = ()) -> sqlite3.Cursor:
+        if not self._matched and sql.strip().startswith(self._match_prefix):
+            self._matched = True
+            self._on_first_match(self._connection)
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
+
+
+def test_refresh_fable_in_updates_session_and_profile_in_place(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+
+    with database.transaction() as connection:
+        result = teams.refresh_fable_in(
+            connection,
+            "demo",
+            cell_id="cell-1",
+            session_id="sess-fable-2",
+            profile_alias="max-b",
+        )
+
+    assert result is not None
+    assert result.fable_cell_id == "cell-1"
+    assert result.fable_session_id == "sess-fable-2"
+    assert result.fable_profile_alias == "max-b"
+    assert result.fable_generation == ready.fable_generation
+    assert result.generation == ready.generation
+    assert result.state == "ready"
+    assert result.sol_thread_id == ready.sol_thread_id
+    assert result.sol_model == SOL_MODEL
+    assert result.sol_provider == SOL_PROVIDER
+    assert teams.live_team("demo") == result
+
+
+def test_refresh_fable_wrapper_opens_its_own_transaction(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+
+    result = teams.refresh_fable(
+        "demo",
+        cell_id="cell-1",
+        session_id="sess-fable-2",
+        profile_alias="max-b",
+    )
+
+    assert result is not None
+    assert result.fable_session_id == "sess-fable-2"
+    assert result.fable_profile_alias == "max-b"
+    assert result.fable_generation == ready.fable_generation
+    assert result.state == "ready"
+
+
+def test_refresh_fable_in_returns_none_for_a_different_cell(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+
+    with database.transaction() as connection:
+        result = teams.refresh_fable_in(
+            connection,
+            "demo",
+            cell_id="cell-other",
+            session_id="sess-x",
+            profile_alias="max-b",
+        )
+
+    assert result is None
+    assert teams.live_team("demo") == ready
+
+
+def test_refresh_fable_in_is_a_noop_when_identical(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+
+    with database.transaction() as connection:
+        result = teams.refresh_fable_in(
+            connection,
+            "demo",
+            cell_id="cell-1",
+            session_id="sess-fable-1",
+            profile_alias="max-c",
+        )
+
+    assert result == ready
+    assert teams.live_team("demo") == ready
+
+
+def test_refresh_fable_in_refuses_a_stale_cas(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    """A row that changed underneath -- between refresh_fable_in's own
+    read and its CAS update -- refuses with no write, exactly like
+    every other CAS write in this module."""
+
+    ready = bind_ready(teams, database)
+
+    def race(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "UPDATE project_teams SET fable_session_id = 'sess-raced' "
+            "WHERE project_key = ? AND generation = ?",
+            ("demo", ready.generation),
+        )
+
+    with database.transaction() as connection:
+        racing = _RacingConnection(
+            connection, "UPDATE project_teams SET fable_session_id", race
+        )
+        with pytest.raises(StaleTeamGeneration):
+            teams.refresh_fable_in(
+                racing,
+                "demo",
+                cell_id="cell-1",
+                session_id="sess-fable-2",
+                profile_alias="max-b",
+            )
+
+
+def test_reconcile_existing_rebinds_same_cell_session_change(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    """INFRA-233 (the live defect): a same-cell session/profile change
+    -- e.g. a Fable lead rotation that keeps the SAME project_cells row
+    -- must rebind the ready team's Fable identity in place rather than
+    silently keeping the retired session/profile forever."""
+
+    ready = bind_ready(teams, database)
+    assert ready.fable_session_id == "sess-fable-1"
+    assert ready.fable_profile_alias == "max-c"
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET session_id = ?, profile_alias = ? "
+            "WHERE cell_id = ?",
+            ("sess-fable-2", "max-b", "cell-1"),
+        )
+
+    team = teams.reconcile_existing(
+        "demo",
+        repo_path="/repo/demo",
+        integration_branch="main",
+        cell=("cell-1", "sess-fable-2", "max-b"),
+        channel=("thread-1", 1, SOL_MODEL, SOL_PROVIDER),
+        channel_proven=True,
+    )
+
+    assert team is not None
+    assert team.fable_cell_id == "cell-1"
+    assert team.fable_session_id == "sess-fable-2"
+    assert team.fable_profile_alias == "max-b"
+    assert team.fable_generation == ready.fable_generation
+    assert team.generation == ready.generation
+    assert team.state == "ready"
+    assert team.sol_thread_id == ready.sol_thread_id
+    assert team.sol_model == SOL_MODEL
+    assert team.sol_provider == SOL_PROVIDER
+    assert teams.live_team("demo") == team
+
+
+def test_reconcile_existing_prefers_worker_bindings_over_project_cells(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    """INFRA-233: worker_bindings is the durable cell IDENTITY; when a
+    caller's observed ``project_cells`` tuple disagrees with the exact
+    active binding for that cell, the binding wins."""
+
+    bind_ready(teams, database)
+
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET session_id = ?, profile_alias = ? "
+            "WHERE cell_id = ?",
+            ("sess-fable-2", "max-b", "cell-1"),
+        )
+        connection.execute(
+            "INSERT INTO worker_bindings("
+            "binding_id, cell_id, generation, session_id, profile_alias, "
+            "state, bound_at) "
+            "VALUES (?, ?, ?, ?, ?, 'active', ?)",
+            ("wb-cell-1-2", "cell-1", 2, "sess-fable-2", "max-b", NOW_ISO),
+        )
+
+    # The caller observes a lagging project_cells snapshot naming the
+    # OLD session/profile -- the active worker_bindings row (the
+    # durable identity) must win regardless.
+    team = teams.reconcile_existing(
+        "demo",
+        repo_path="/repo/demo",
+        integration_branch="main",
+        cell=("cell-1", "sess-fable-1", "max-c"),
+        channel=("thread-1", 1, SOL_MODEL, SOL_PROVIDER),
+        channel_proven=True,
+    )
+
+    assert team is not None
+    assert team.fable_cell_id == "cell-1"
+    assert team.fable_session_id == "sess-fable-2"
+    assert team.fable_profile_alias == "max-b"

@@ -56,6 +56,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxDeadLeadSweep,
     CmuxHibernationDriver,
     CmuxLeadSeater,
+    CmuxResidualSweep,
     CmuxSurfaceReconciler,
     RegistryProfileDirectory,
     managed_claude_worker_alive,
@@ -995,6 +996,7 @@ async def _run_daemon(
     resource_freshness_minutes: int = 5,
     cmux_reconciler: CmuxSurfaceReconciler | None = None,
     cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None,
+    cmux_residual_sweep: CmuxResidualSweep | None = None,
     cmux_hibernation: CmuxHibernationDriver | None = None,
     dev_seat_recovery: DevSeatRecovery | None = None,
     lead_intake: LeadIntakeRouter | None = None,
@@ -1027,6 +1029,14 @@ async def _run_daemon(
             # every tick and retires ONLY an authoritatively absent
             # seat: an unreachable socket retires nothing.
             await cmux_dead_lead_sweep.tick()
+        if cmux_residual_sweep is not None:
+            # INFRA-233: a rotation whose old workspace close cmux could
+            # not confirm holds the seat 'residual' forever once its
+            # cell moves on and is never ensure()'d again -- the retired
+            # workspace stays visible until the daemon restarts. This
+            # re-attempts the close on every tick, bounded per tick,
+            # and never touches a cell's current seat.
+            await cmux_residual_sweep.tick()
         if dev_seat_recovery is not None:
             # INFRA-198: the dead-lead sweep above can retire a
             # development lane's only cell, but nothing else in the
@@ -1099,6 +1109,7 @@ async def _run_daemon(
             None
             if (
                 cmux_dead_lead_sweep is None
+                and cmux_residual_sweep is None
                 and dev_seat_recovery is None
                 and cmux_hibernation is None
                 and lead_intake is None
@@ -6377,6 +6388,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     ),
                     cmux_reconciler=runtime.cmux_reconciler,
                     cmux_dead_lead_sweep=runtime.cmux_dead_lead_sweep,
+                    cmux_residual_sweep=(
+                        None
+                        if runtime.cmux_dead_lead_sweep is None
+                        else runtime.cmux_dead_lead_sweep.residual_sweep
+                    ),
                     dev_seat_recovery=(
                         None
                         if runtime.cells is None
@@ -6846,6 +6862,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "status":
+            # INFRA-233: classification only, from durable rows -- this
+            # never opens a cmux connection, so status stays cheap and
+            # available even when cmux itself is unreachable or
+            # unconfigured (an empty list, exactly like no cmux port).
+            retired_surfaces = (
+                ()
+                if runtime.cmux_bindings is None
+                else runtime.cmux_bindings.retired_surfaces()
+            )
             payload = {
                 "mode": settings.policy.mode,
                 "admission_open": False,
@@ -6856,6 +6881,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 # observable — packet counts, tiers, child lifecycle,
                 # and the Fable-token share.
                 "delegation": runtime.service.status()["delegation"],
+                "cmux_retired_surfaces": [
+                    {
+                        "binding_id": surface.binding_id,
+                        "cell_id": surface.cell_id,
+                        "project_key": surface.project_key,
+                        "workspace_uuid": surface.workspace_uuid,
+                        "state": surface.state,
+                        "reason": surface.reason,
+                        "updated_at": surface.updated_at,
+                    }
+                    for surface in retired_surfaces
+                ],
             }
             _print(
                 payload,

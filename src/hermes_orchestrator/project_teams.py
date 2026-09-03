@@ -294,6 +294,99 @@ class ProjectTeamService:
                 )
         return self._team_at(project_key, expected_generation)
 
+    def refresh_fable_in(
+        self,
+        connection: sqlite3.Connection,
+        project_key: str,
+        *,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+    ) -> ProjectTeam | None:
+        """CAS-refresh the bound Fable member's session/profile in place.
+
+        INFRA-233: a lead rotation can keep the SAME ``project_cells``
+        row -- only its ``session_id``/``profile_alias`` change (a
+        same-cell account/session rotation) -- and that must rebind the
+        team's Fable identity in the exact SAME transaction as the rest
+        of the transfer, so this is always called from inside the
+        caller's own ``connection`` and never opens its own transaction:
+        a refusal here (``StaleTeamGeneration``) propagates out of the
+        caller's transaction and rolls back the whole rotation, rather
+        than leaving ``project_cells``/``worker_bindings`` pointing at a
+        new identity while ``project_teams`` still names the retired
+        one.
+
+        Returns ``None`` (no write) when there is no live team for
+        ``project_key``, or the live team's ``fable_cell_id`` is not
+        ``cell_id`` -- a DIFFERENT cell rotating in is
+        :meth:`rotate_fable`'s business, not this method's. Returns the
+        team unchanged (no write) when the session/profile already
+        match. Otherwise CAS-updates ``fable_session_id`` and
+        ``fable_profile_alias`` on the live row, leaving
+        ``fable_generation`` and ``state`` untouched -- this is the SAME
+        Fable member, only its underlying session/profile refreshed, so
+        a ready team stays ready.
+        """
+
+        row = connection.execute(
+            "SELECT * FROM project_teams WHERE project_key = ? "
+            "AND state NOT IN ('superseded', 'retired') "
+            "ORDER BY generation DESC LIMIT 1",
+            (project_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        team = self._record(row)
+        if team.fable_cell_id != cell_id:
+            return None
+        if (
+            team.fable_session_id == session_id
+            and team.fable_profile_alias == profile_alias
+        ):
+            return team
+        stamp = self._now().isoformat()
+        cursor = connection.execute(
+            "UPDATE project_teams SET fable_session_id = ?, "
+            "fable_profile_alias = ?, updated_at = ? "
+            "WHERE project_key = ? AND generation = ? AND fable_cell_id = ? "
+            "AND fable_session_id = ?",
+            (
+                session_id,
+                profile_alias,
+                stamp,
+                project_key,
+                team.generation,
+                cell_id,
+                team.fable_session_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise StaleTeamGeneration(
+                f"project team {project_key!r} generation {team.generation} "
+                "changed underneath refresh_fable_in"
+            )
+        return self._team_at(project_key, team.generation)
+
+    def refresh_fable(
+        self,
+        project_key: str,
+        *,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+    ) -> ProjectTeam | None:
+        """Standalone wrapper around :meth:`refresh_fable_in`."""
+
+        with self._database.transaction() as connection:
+            return self.refresh_fable_in(
+                connection,
+                project_key,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias=profile_alias,
+            )
+
     def bind_sol(
         self,
         project_key: str,
@@ -398,6 +491,13 @@ class ProjectTeamService:
 
         if cell is None and channel is None:
             return None
+        if cell is not None:
+            # INFRA-233: project_cells is kept byte-compatible with
+            # worker_bindings by cells.py's ``_finalize_transfer``, so
+            # in the common case these agree exactly -- but
+            # worker_bindings is the durable identity and the authority
+            # whenever they do not.
+            cell = self._observed_fable_cell(cell)
         team = self.reserve(
             project_key,
             repo_path=repo_path,
@@ -427,6 +527,24 @@ class ProjectTeamService:
                             team.fable_cell_id, cell_id
                         ),
                     )
+            elif team.fable_cell_id == cell_id and (
+                team.fable_session_id != session_id
+                or team.fable_profile_alias != profile_alias
+            ):
+                # The SAME cell is still the Fable member, but its
+                # session/profile changed underneath (a same-cell
+                # account/session rotation) -- rebind in place rather
+                # than silently keeping the stale identity (the live
+                # INFRA-233 defect).
+                team = (
+                    self.refresh_fable(
+                        project_key,
+                        cell_id=cell_id,
+                        session_id=session_id,
+                        profile_alias=profile_alias,
+                    )
+                    or team
+                )
             if team.fable_cell_id is None:
                 team = self.bind_fable(
                     project_key,
@@ -635,6 +753,36 @@ class ProjectTeamService:
             and reason.startswith("reconciliation observed live fable cell ")
             and reason.endswith(f" but the bound member is {bound_cell_id!r}")
         )
+
+    def _observed_fable_cell(
+        self, cell: tuple[str, str, str]
+    ) -> tuple[str, str, str]:
+        """Prefer the exact active ``worker_bindings`` identity for
+        ``cell_id`` over a caller-supplied session/profile, when a
+        binding exists and disagrees.
+
+        INFRA-233: ``cells.py``'s ``_finalize_transfer`` keeps
+        ``project_cells`` byte-compatible with ``worker_bindings`` on
+        every rotation, so in the ordinary case these agree exactly --
+        but ``worker_bindings`` (``WorkerBindings.active_for_cell``) is
+        the durable cell IDENTITY and the authority whenever a caller's
+        observed ``project_cells`` tuple disagrees with it (e.g. a
+        caller reading a stale snapshot).
+        """
+
+        cell_id = cell[0]
+        row = self._database.execute(
+            "SELECT session_id, profile_alias FROM worker_bindings "
+            "WHERE cell_id = ? AND state = 'active'",
+            (cell_id,),
+        ).fetchone()
+        if row is None:
+            return cell
+        bound_session = _opt_str(row["session_id"])
+        bound_profile = _opt_str(row["profile_alias"])
+        if bound_session is None or bound_profile is None:
+            return cell
+        return (cell_id, bound_session, bound_profile)
 
     def replace_sol(
         self,
