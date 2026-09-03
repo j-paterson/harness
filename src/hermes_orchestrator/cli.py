@@ -4784,9 +4784,8 @@ def _compose_lead_rotation(
     # the cell's own bound issue lane, and only an unassigned single-lane
     # caller still falls back to the canonical ``project.lead_cwd`` Sol
     # correction c5600e31 established for the seater/cell composition.
-    lead_worktree = _rotation_worktree(
-        database, project=project, project_key=project_key, cell_id=cell_id
-    )
+    # Resolve lazily: after a transfer commits, recovery only needs to seat
+    # the replacement and must not rediscover an implementation lane.
     return LeadRotation(
         database=database,
         handoffs=HandoffService(database),
@@ -4796,7 +4795,14 @@ def _compose_lead_rotation(
         # The gate calls this with the project key, not the cell id;
         # the exact worktree path is already resolved above, so the key
         # itself is accepted but unused.
-        worktree_state=lambda _project_key: _worktree_state(lead_worktree),
+        worktree_state=lambda _project_key: _worktree_state(
+            _rotation_worktree(
+                database,
+                project=project,
+                project_key=project_key,
+                cell_id=cell_id,
+            )
+        ),
         registration_wait_seconds=ROTATION_REGISTRATION_WAIT_SECONDS,
     )
 
@@ -4934,7 +4940,8 @@ def _pending_rotation_work(
     attempts = database.execute(
         "SELECT h.cell_id, c.project_key, h.handoff_id FROM handoffs AS h "
         "JOIN project_cells AS c ON c.cell_id = h.cell_id "
-        "WHERE EXISTS (SELECT 1 FROM events AS started "
+        "WHERE c.state IN ('starting', 'active', 'handoff_required', 'paused') "
+        "AND EXISTS (SELECT 1 FROM events AS started "
         "WHERE started.event_type = 'lead_rotation.attempt' "
         "AND started.aggregate_id = h.handoff_id) "
         "AND NOT EXISTS (SELECT 1 FROM events AS finished "
@@ -4956,7 +4963,8 @@ def _pending_rotation_work(
     awaiting = database.execute(
         "SELECT h.cell_id, c.project_key, h.handoff_id FROM handoffs AS h "
         "JOIN project_cells AS c ON c.cell_id = h.cell_id "
-        "WHERE h.state = 'submitted' AND h.rowid = ("
+        "WHERE c.state IN ('starting', 'active', 'handoff_required', 'paused') "
+        "AND h.state = 'submitted' AND h.rowid = ("
         "SELECT MAX(latest.rowid) FROM handoffs AS latest "
         "WHERE latest.cell_id = h.cell_id AND latest.state = 'submitted') "
         "AND EXISTS (SELECT 1 FROM events AS waiting "
