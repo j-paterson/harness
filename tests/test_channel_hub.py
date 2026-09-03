@@ -627,6 +627,46 @@ class TestDelivery:
         assert row["delivered_at"] is not None
         await sidecar.close()
 
+    async def test_non_work_ready_ack_does_not_settle_same_id_wake(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        capabilities: ChannelCapabilities,
+        hub: ChannelHub,
+    ) -> None:
+        seat(bindings)
+        seed_packets(database)
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE lead_corrections SET correction_id = ? "
+                "WHERE correction_id = ?",
+                (WAKE_ID, CORRECTION_ID),
+            )
+        sidecar = await registered_sidecar(hub, capabilities)
+        await hub.publish(
+            kind="HERMES_CORRECTION_READY",
+            packet_id=WAKE_ID,
+            cell_id="cell-demo",
+            session_id=SESSION,
+        )
+        event = await sidecar.receive()
+
+        await sidecar.send(
+            {
+                "op": "ack",
+                "event_id": event["event_id"],
+                "packet_id": WAKE_ID,
+                "session_id": SESSION,
+            }
+        )
+
+        assert (await sidecar.receive())["op"] == "ack_ok"
+        assert database.scalar(
+            "SELECT state FROM lead_terminal_wakes WHERE wake_id = ?",
+            (WAKE_ID,),
+        ) == "pending"
+        await sidecar.close()
+
     async def test_a_nudge_routes_committed_packets_to_the_channel(
         self,
         database: Database,

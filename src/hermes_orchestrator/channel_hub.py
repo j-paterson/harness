@@ -954,8 +954,18 @@ class ChannelHub:
                 wake = connection.execute(
                     "UPDATE lead_terminal_wakes SET state = 'delivered', "
                     "delivered_at = ? WHERE wake_id = ? AND session_id = ? "
-                    "AND state = 'pending'",
-                    (stamp, packet_id, session_id),
+                    "AND state = 'pending' AND EXISTS ("
+                    "SELECT 1 FROM channel_events WHERE event_id = ? "
+                    "AND packet_id = ? AND session_id = ? "
+                    "AND kind = 'HERMES_WORK_READY' AND state = 'acked')",
+                    (
+                        stamp,
+                        packet_id,
+                        session_id,
+                        event_id,
+                        packet_id,
+                        session_id,
+                    ),
                 )
                 if wake.rowcount == 1:
                     self._events.append(
