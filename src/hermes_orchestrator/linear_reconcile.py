@@ -20,6 +20,19 @@ Linear did not report, and never regresses a row that is already done.
 A transient read failure isolates exactly the one issue it happened to
 and never stops the pass; every other issue -- including ones in other
 projects -- is still reconciled in the same run.
+
+INFRA-230 (Sol d3b5c972) adds the other drift direction:
+:meth:`LinearQueueReconciler.project_completed` selects the admitted
+issues that are already locally ``done`` but whose Linear projection
+never caught up (the live INFRA-210 case: local ``done``, Linear still
+``In Progress``, Harness PR #40 merged and settled). It restores Linear
+to ``Done`` ONLY when durable, authoritative completion evidence exists
+-- a merged review row joined to a settled ``merge_settlements`` row --
+and drives that write through the same journaled, idempotent
+``LinearProjector.project`` path every other Linear mutation uses, keyed
+by an effect id derived from the settlement so a replay is a no-op. It
+never writes the local row: this pass only ever repairs Linear's own
+state to match a completion local state already proves.
 """
 
 from __future__ import annotations
@@ -30,9 +43,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from hermes_orchestrator.cells import LinearProjector
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.linear import LinearProjection
 from hermes_orchestrator.project_driver import TERMINAL_ISSUE_STATES
 from hermes_orchestrator.queue import _LINEAR_TERMINAL_STATUSES, QueueService
 from hermes_orchestrator.reconcile import LinearReadPort
@@ -86,6 +101,7 @@ class LinearReconcileReport:
     completed: int
     unchanged: int
     unavailable: int
+    refused: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -93,7 +109,27 @@ class LinearReconcileReport:
             "completed": self.completed,
             "unchanged": self.unchanged,
             "unavailable": self.unavailable,
+            "refused": self.refused,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionProof:
+    """Durable, authoritative evidence that an issue's work landed.
+
+    A merged review row joined to a settled ``merge_settlements`` row --
+    the exact pairing ``reviews.py`` already treats as proof a
+    completion is real (see its after-merge-intent reconstruction
+    query). This is the ONLY evidence :meth:`LinearQueueReconciler
+    .project_completed` will act on to restore a stale Linear
+    projection to ``Done``.
+    """
+
+    review_id: str
+    settlement_id: str
+    merge_sha: str
+    pr_number: int
+    repository: str
 
 
 def _utc_now() -> datetime:
@@ -124,6 +160,7 @@ class LinearQueueReconciler:
         leases: WorktreeLeases | None = None,
         now: Callable[[], datetime] | None = None,
         max_reads: int | None = None,
+        linear_writer: LinearProjector | None = None,
     ) -> None:
         self._database = database
         self._queue = queue
@@ -133,6 +170,7 @@ class LinearQueueReconciler:
         self._leases = leases
         self._now = now or _utc_now
         self._max_reads = max_reads
+        self._linear_writer = linear_writer
 
     def run(
         self,
@@ -286,6 +324,251 @@ class LinearQueueReconciler:
         )
         return self._database.execute(query, tuple(params)).fetchall()
 
+    async def project_completed(
+        self,
+        project_key: str | None = None,
+        *,
+        issue_ids: Sequence[str] | None = None,
+        max_reads: int | None = None,
+    ) -> LinearReconcileReport:
+        """Restore a Linear-stale locally-``done`` issue to Done.
+
+        The reverse of :meth:`run`: for every admitted issue already
+        locally ``done`` with durable settled-merge evidence
+        (:class:`CompletionProof`), read Linear once and, only when
+        Linear itself is not already terminal, project it to ``Done``
+        through ``linear_writer`` using the SAME journaled, idempotent
+        ``project`` path every other Linear mutation uses -- keyed by
+        an effect id derived from the settlement id so a replay is a
+        no-op and two reconcile runs never double-project. The local
+        ``admitted_issues`` row is NEVER written by this pass: local
+        state already proves the work is done, and this only ever
+        repairs Linear's own projection to match it. A failed read or
+        a failed write isolates exactly the one issue it happened to;
+        every other candidate -- including ones in other projects --
+        is still reconciled in the same call.
+        """
+
+        candidates = self._reverse_candidates(project_key, issue_ids)
+        outcomes: list[IssueReconcileOutcome] = []
+        completed = 0
+        unchanged = 0
+        unavailable = 0
+        refused = 0
+        reads_used = 0
+        budget = max_reads if max_reads is not None else self._max_reads
+
+        for row, proof in candidates:
+            issue_id = str(row["issue_id"])
+            row_project_key = str(row["project_key"])
+            local_state = str(row["state"])
+
+            if budget is not None and reads_used >= budget:
+                outcomes.append(
+                    IssueReconcileOutcome(
+                        issue_id=issue_id,
+                        project_key=row_project_key,
+                        local_state=local_state,
+                        linear_status=None,
+                        action="unchanged",
+                        detail="read budget exhausted",
+                    )
+                )
+                unchanged += 1
+                continue
+
+            try:
+                reads_used += 1
+                status = str(self._linear_reads.get_issue(issue_id).status)
+            except Exception as error:  # isolate this issue only
+                detail = f"{type(error).__name__}: {error}"
+                self._journal(
+                    "issue.linear_unavailable",
+                    issue_id=issue_id,
+                    payload={"project_key": row_project_key, "error": detail},
+                )
+                outcomes.append(
+                    IssueReconcileOutcome(
+                        issue_id=issue_id,
+                        project_key=row_project_key,
+                        local_state=local_state,
+                        linear_status=None,
+                        action="unavailable",
+                        detail=detail,
+                    )
+                )
+                unavailable += 1
+                continue
+
+            if status in _LINEAR_TERMINAL_STATUSES:
+                outcomes.append(
+                    IssueReconcileOutcome(
+                        issue_id=issue_id,
+                        project_key=row_project_key,
+                        local_state=local_state,
+                        linear_status=status,
+                        action="unchanged",
+                        detail=f"linear status {status!r} is already terminal",
+                    )
+                )
+                unchanged += 1
+                continue
+
+            if proof is None:
+                # Defensive only: ``_reverse_candidates`` already
+                # requires a proof to yield this row at all.
+                outcomes.append(
+                    IssueReconcileOutcome(
+                        issue_id=issue_id,
+                        project_key=row_project_key,
+                        local_state=local_state,
+                        linear_status=status,
+                        action="refused",
+                        detail="no settled merge proof",
+                    )
+                )
+                refused += 1
+                continue
+
+            if self._linear_writer is None:
+                outcomes.append(
+                    IssueReconcileOutcome(
+                        issue_id=issue_id,
+                        project_key=row_project_key,
+                        local_state=local_state,
+                        linear_status=status,
+                        action="refused",
+                        detail="no linear writer",
+                    )
+                )
+                refused += 1
+                continue
+
+            effect_id = f"linear:{issue_id}:merge-settled-done:{proof.settlement_id}"
+            try:
+                await self._linear_writer.project(
+                    issue_id,
+                    LinearProjection(status="Done", assignee_alias="operator"),
+                    effect_id=effect_id,
+                )
+            except Exception as error:  # isolate this issue only
+                detail = f"{type(error).__name__}: {error}"
+                self._journal(
+                    "issue.linear_unavailable",
+                    issue_id=issue_id,
+                    payload={"project_key": row_project_key, "error": detail},
+                )
+                outcomes.append(
+                    IssueReconcileOutcome(
+                        issue_id=issue_id,
+                        project_key=row_project_key,
+                        local_state=local_state,
+                        linear_status=status,
+                        action="unavailable",
+                        detail=detail,
+                    )
+                )
+                unavailable += 1
+                continue
+
+            self._journal(
+                "issue.linear_restored_done",
+                issue_id=issue_id,
+                payload={
+                    "project_key": row_project_key,
+                    "linear_status_before": status,
+                    "merge_sha": proof.merge_sha,
+                    "pr_number": proof.pr_number,
+                    "settlement_id": proof.settlement_id,
+                    "effect_id": effect_id,
+                },
+            )
+            outcomes.append(
+                IssueReconcileOutcome(
+                    issue_id=issue_id,
+                    project_key=row_project_key,
+                    local_state=local_state,
+                    linear_status=status,
+                    action="completed",
+                    detail=f"restored linear status {status!r} to Done",
+                )
+            )
+            completed += 1
+
+        return LinearReconcileReport(
+            outcomes=tuple(outcomes),
+            completed=completed,
+            unchanged=unchanged,
+            unavailable=unavailable,
+            refused=refused,
+        )
+
+    def _completion_proof(self, issue_id: str) -> CompletionProof | None:
+        """Durable, authoritative completion evidence for one issue.
+
+        Mirrors the exact proof query ``reviews.py`` already uses for
+        its after-merge-intent reconstruction: a merged review row
+        (with a merge sha) joined to its settled ``merge_settlements``
+        row (``settlement_id == review_id``), most-recent first.
+        """
+
+        row = self._database.execute(
+            "SELECT r.issue_id, r.review_id, r.merge_sha, r.pr_number, "
+            "r.repository, s.settlement_id "
+            "FROM reviews r JOIN merge_settlements s "
+            "  ON s.settlement_id = r.review_id "
+            "WHERE r.issue_id = ? AND r.state = 'merged' "
+            "  AND r.merge_sha IS NOT NULL AND s.state = 'settled' "
+            "ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1",
+            (issue_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CompletionProof(
+            review_id=str(row["review_id"]),
+            settlement_id=str(row["settlement_id"]),
+            merge_sha=str(row["merge_sha"]),
+            pr_number=int(row["pr_number"]),
+            repository=str(row["repository"]),
+        )
+
+    def _reverse_candidates(
+        self, project_key: str | None, issue_ids: Sequence[str] | None
+    ) -> list[tuple[Any, CompletionProof]]:
+        """Locally-``done`` admitted issues with durable completion proof.
+
+        Deliberately narrower than ``_candidates``: only ``'done'``
+        rows qualify (never ``'cancelled'`` -- there is no completion
+        to project for cancelled work), and a row without a settled
+        merge proof is excluded entirely rather than surfaced as an
+        outcome, exactly as ``run``'s own candidate query never reads a
+        row it has no business touching.
+        """
+
+        clauses = ["state = 'done'"]
+        params: list[Any] = []
+        if project_key is not None:
+            clauses.append("project_key = ?")
+            params.append(project_key)
+        if issue_ids is not None:
+            ids = list(issue_ids)
+            if not ids:
+                return []
+            clauses.append("issue_id IN ({})".format(",".join("?" for _ in ids)))
+            params.extend(ids)
+        query = (
+            "SELECT issue_id, project_key, state FROM admitted_issues "
+            "WHERE " + " AND ".join(clauses) + " "
+            "ORDER BY project_key ASC, admitted_at ASC, rowid ASC"
+        )
+        rows = self._database.execute(query, tuple(params)).fetchall()
+        candidates: list[tuple[Any, CompletionProof]] = []
+        for row in rows:
+            proof = self._completion_proof(str(row["issue_id"]))
+            if proof is not None:
+                candidates.append((row, proof))
+        return candidates
+
     def _release_leases(self, project_key: str, issue_id: str) -> None:
         """Release the issue's live worktree lease(s), fail-soft.
 
@@ -337,6 +620,7 @@ def build_linear_queue_reconciler(
     *,
     linear_reads: LinearReadPort,
     custodian: WorktreeCustodian | None = None,
+    linear_writer: LinearProjector | None = None,
 ) -> LinearQueueReconciler:
     """Construct a reconciler the same way the CLI wires ``QueueService``.
 
@@ -345,6 +629,9 @@ def build_linear_queue_reconciler(
     it needs no registered-project validation -- and always builds its
     own :class:`WorktreeLeases` so lease lookups work even when no
     custodian is supplied (in which case release is simply skipped).
+    ``linear_writer`` is optional and only needed to drive
+    :meth:`LinearQueueReconciler.project_completed`; omitting it leaves
+    that pass reporting ``refused`` rather than crashing.
     """
 
     events = EventStore(database)
@@ -357,4 +644,5 @@ def build_linear_queue_reconciler(
         events=events,
         custodian=custodian,
         leases=leases,
+        linear_writer=linear_writer,
     )

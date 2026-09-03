@@ -6963,6 +6963,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     )
                     return 1
             linear_report = None
+            linear_projection_report = None
             if args.linear:
                 # INFRA-230: a cheap, bounded, read-only-except-for-repair
                 # pass over stale local queue projections. This runs
@@ -6985,9 +6986,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     custodian=runtime.worktree_custodian,
                     leases=runtime.worktree_leases,
                     max_reads=args.max_reads,
+                    linear_writer=_LazyIdleLinearProjector(
+                        settings, database=database, queue=linear_queue
+                    ),
                 )
                 linear_report = linear_reconciler.run(project_key=args.project)
                 payload["linear"] = linear_report.as_dict()
+                # INFRA-230 (Sol d3b5c972): the other drift direction --
+                # a locally done issue whose Linear projection never
+                # caught up. A sibling key, not a replacement: the
+                # forward block above keeps its exact pre-existing
+                # shape for every caller already reading it.
+                linear_projection_report = asyncio.run(
+                    linear_reconciler.project_completed(project_key=args.project)
+                )
+                payload["linear_projection"] = linear_projection_report.as_dict()
             _print(
                 payload,
                 json_output=args.json,
@@ -7005,6 +7018,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     f"{linear_report.completed} completed, "
                     f"{linear_report.unchanged} unchanged, "
                     f"{linear_report.unavailable} unavailable."
+                )
+            if linear_projection_report is not None and not args.json:
+                for outcome in linear_projection_report.outcomes:
+                    print(
+                        f"{outcome.issue_id} {outcome.project_key} "
+                        f"{outcome.local_state} <- {outcome.action} "
+                        f"({outcome.linear_status}): {outcome.detail}"
+                    )
+                print(
+                    "Linear projection: "
+                    f"{linear_projection_report.completed} completed, "
+                    f"{linear_projection_report.unchanged} unchanged, "
+                    f"{linear_projection_report.unavailable} unavailable, "
+                    f"{linear_projection_report.refused} refused."
                 )
             return 0 if result.completed else 1
 
