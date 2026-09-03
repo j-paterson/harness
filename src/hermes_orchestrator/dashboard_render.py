@@ -17,6 +17,7 @@ from hermes_orchestrator.dashboard_sources import (
     CapacityFact,
     CodexFact,
     DashboardSnapshot,
+    DecisionInboxFact,
     IdleFact,
     LaneCellFact,
     ProfileLeaseFact,
@@ -27,6 +28,12 @@ from hermes_orchestrator.dashboard_sources import (
     UsageWindows,
     WorkerFact,
 )
+
+#: INFRA-224: urgency word shown on the Attention decision-inbox line,
+#: keyed by operator_decisions.urgency (0 critical .. 3 low). An
+#: unrecognized or missing value reads as "normal" rather than raising
+#: or showing a bare integer.
+_URGENCY_WORDS = {0: "critical", 1: "high", 2: "normal", 3: "low"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1172,6 +1179,9 @@ def _attention_text(snapshot: DashboardSnapshot, now: datetime) -> str:
         target = issue or snapshot.attention_control.project_key
         return f"confirm channel dialog for {target}"
 
+    if snapshot.decisions is not None and snapshot.decisions.pending > 0:
+        return _decision_inbox_text(snapshot.decisions)
+
     corrections = next(
         (
             task
@@ -1200,6 +1210,24 @@ def _attention_text(snapshot: DashboardSnapshot, now: datetime) -> str:
         return f"blocked: {blocked.issue_id}"
 
     return "nothing needs attention"
+
+
+def _decision_inbox_text(decisions: DecisionInboxFact) -> str:
+    """INFRA-224: "N pending" plus the top item, when there is one.
+
+    The question is emitted at full length here -- `_finalize`'s
+    `_fit_content` pass is what truncates the whole rendered line
+    (word-boundary, single trailing ellipsis) to the pane width, the
+    same as every other Attention line, so this never overflows and
+    never duplicates that truncation logic.
+    """
+
+    summary = f"decisions {decisions.pending} pending"
+    if decisions.next_issue_id is None:
+        return summary
+    urgency_word = _URGENCY_WORDS.get(decisions.next_urgency, "normal")
+    question = decisions.next_question or ""
+    return f"{summary} · next {decisions.next_issue_id} [{urgency_word}] {question}"
 
 
 # ---------------------------------------------------------------------------

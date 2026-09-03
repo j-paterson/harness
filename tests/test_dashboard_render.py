@@ -18,6 +18,7 @@ from hermes_orchestrator.dashboard_sources import (
     CodexFact,
     ControlAttentionFact,
     DashboardSnapshot,
+    DecisionInboxFact,
     IdleFact,
     LaneCellFact,
     ProfileLeaseFact,
@@ -382,6 +383,7 @@ def _frame_snapshot(
     tasks_observed_at: str | None = "2026-08-31T11:55:00+00:00",
     idle: tuple[IdleFact, ...] = (),
     lanes: tuple[LaneCellFact, ...] = (),
+    decisions: DecisionInboxFact | None = None,
 ) -> DashboardSnapshot:
     if capacity is None:
         capacity = tuple(_capacity_fact(alias) for alias in _ALIASES)
@@ -407,6 +409,7 @@ def _frame_snapshot(
         attention_control=attention_control,
         idle=idle,
         lanes=lanes,
+        decisions=decisions,
     )
 
 
@@ -637,6 +640,101 @@ def test_channel_blocked_attention_does_not_claim_there_is_a_dialog() -> None:
 
     assert "channel blocked: agent-orchestration" in joined
     assert "confirm channel dialog" not in joined
+
+
+def _decision_fact(
+    *,
+    pending: int = 2,
+    next_decision_id: str | None = "dec-1",
+    next_project_key: str | None = "proj",
+    next_issue_id: str | None = "INFRA-224",
+    next_urgency: int | None = 1,
+    next_question: str | None = "Approve external repo deletion?",
+    next_recorded_at: str | None = "2026-08-31T11:00:00+00:00",
+) -> DecisionInboxFact:
+    return DecisionInboxFact(
+        pending=pending,
+        next_decision_id=next_decision_id,
+        next_project_key=next_project_key,
+        next_issue_id=next_issue_id,
+        next_urgency=next_urgency,
+        next_question=next_question,
+        next_recorded_at=next_recorded_at,
+    )
+
+
+def test_pending_decisions_show_count_and_next_item_in_attention() -> None:
+    snapshot = _frame_snapshot(decisions=_decision_fact())
+
+    lines = render_frame(snapshot, width=80, height=20, now=_NOW)
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+
+    assert attention_line.strip() == (
+        "decisions 2 pending · next INFRA-224 [high] "
+        "Approve external repo deletion?"
+    )
+
+
+def test_zero_pending_decisions_leaves_attention_output_unchanged() -> None:
+    with_none = render_frame(
+        _frame_snapshot(decisions=None), width=80, height=20, now=_NOW
+    )
+    with_zero = render_frame(
+        _frame_snapshot(decisions=_decision_fact(pending=0)),
+        width=80,
+        height=20,
+        now=_NOW,
+    )
+    without_field = render_frame(_frame_snapshot(), width=80, height=20, now=_NOW)
+
+    assert with_none == without_field
+    assert with_zero == without_field
+
+
+def test_decisions_attention_line_ranks_below_red_pressure_and_capacity_alerts() -> (
+    None
+):
+    resource = _resource_fact(pressure="red")
+    snapshot = _frame_snapshot(resource=resource, decisions=_decision_fact())
+    lines = render_frame(snapshot, width=80, height=20, now=_NOW)
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+    assert "pressure" in attention_line
+    assert "decisions" not in attention_line
+
+
+def test_decisions_attention_line_ranks_above_corrections_required() -> None:
+    snapshot = _frame_snapshot(
+        tasks=(_task(review_state="corrections_required", pr_number=7),),
+        decisions=_decision_fact(),
+    )
+    lines = render_frame(snapshot, width=80, height=20, now=_NOW)
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+    assert attention_line.strip().startswith("decisions 2 pending")
+    assert "corrections" not in attention_line
+
+
+def test_long_decision_question_truncates_within_width() -> None:
+    long_question = "Approve " + "a very long external repo deletion " * 5 + "now?"
+    snapshot = _frame_snapshot(
+        decisions=_decision_fact(next_question=long_question)
+    )
+
+    lines = render_frame(snapshot, width=60, height=20, now=_NOW)
+
+    for line in lines:
+        assert len(line) == 60
+    attention_line = next(
+        line for index, line in enumerate(lines) if "Attention" in lines[index - 1]
+    )
+    assert attention_line.startswith("decisions 2 pending · next INFRA-224 [high]")
+    assert attention_line.rstrip().endswith("…")
+    assert long_question not in attention_line
 
 
 def test_last_tick_failure_and_ok_are_shown() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from hermes_orchestrator.dashboard_sources import (
     CodexStatusProvider,
     ControlAttentionProvider,
     DashboardSources,
+    DecisionInboxFact,
+    DecisionsProvider,
     IdleFact,
     ProfileUsage,
     ResourceFact,
@@ -1630,3 +1633,148 @@ async def test_collect_populates_batches_for_every_known_project_only(
     assert fact.objective == "chat-INFRA-30"
     assert fact.runnable == ("INFRA-30",)
     database.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-224: DecisionsProvider -- the global operator-decision inbox.
+# ---------------------------------------------------------------------------
+
+
+def _insert_decision(
+    connection,
+    *,
+    decision_id: str,
+    issue_id: str,
+    project_key: str,
+    status: str = "pending",
+    urgency: int = 2,
+    recorded_at: str,
+    question: str = "Approve?",
+) -> None:
+    connection.execute(
+        "INSERT INTO operator_decisions("
+        "decision_id, issue_id, project_key, cell_id, session_id, "
+        "actor, choice, status, recorded_at, question, urgency"
+        ") VALUES (?, ?, ?, 'cell-1', 'session-1', 'lead', 'raise', ?, "
+        "?, ?, ?)",
+        (decision_id, issue_id, project_key, status, recorded_at, question, urgency),
+    )
+
+
+def test_decisions_provider_counts_pending_across_projects_and_finds_most_urgent(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        # proj-a: normal urgency, earliest.
+        _insert_decision(
+            connection,
+            decision_id="dec-a",
+            issue_id="INFRA-1",
+            project_key="proj-a",
+            urgency=2,
+            recorded_at="2026-09-01T09:00:00+00:00",
+            question="Approve migration?",
+        )
+        # proj-b: high urgency, later than dec-a but should still win on
+        # urgency ASC.
+        _insert_decision(
+            connection,
+            decision_id="dec-b",
+            issue_id="INFRA-224",
+            project_key="proj-b",
+            urgency=1,
+            recorded_at="2026-09-01T10:00:00+00:00",
+            question="Approve external repo deletion?",
+        )
+        # proj-b: also high urgency but older than dec-b -- this is the
+        # one that must actually win (urgency ties broken by recorded_at).
+        _insert_decision(
+            connection,
+            decision_id="dec-c",
+            issue_id="INFRA-225",
+            project_key="proj-b",
+            urgency=1,
+            recorded_at="2026-09-01T08:00:00+00:00",
+            question="Approve rollback?",
+        )
+        # A resolved decision must never be counted or surfaced.
+        _insert_decision(
+            connection,
+            decision_id="dec-resolved",
+            issue_id="INFRA-2",
+            project_key="proj-a",
+            status="approved",
+            urgency=0,
+            recorded_at="2026-09-01T07:00:00+00:00",
+            question="Already handled",
+        )
+
+    fact = DecisionsProvider(database).collect()
+
+    assert fact.pending == 3
+    assert fact.next_decision_id == "dec-c"
+    assert fact.next_project_key == "proj-b"
+    assert fact.next_issue_id == "INFRA-225"
+    assert fact.next_urgency == 1
+    assert fact.next_question == "Approve rollback?"
+    assert fact.next_recorded_at == "2026-09-01T08:00:00+00:00"
+    database.close()
+
+
+def test_decisions_provider_reports_zero_when_nothing_pending() -> None:
+    class _RawConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters: tuple = ()) -> sqlite3.Cursor:
+            return self._connection.execute(sql, parameters)
+
+    raw = sqlite3.connect(":memory:")
+    raw.row_factory = sqlite3.Row
+    raw.executescript(
+        "CREATE TABLE operator_decisions ("
+        "decision_id TEXT PRIMARY KEY, issue_id TEXT, project_key TEXT, "
+        "cell_id TEXT, session_id TEXT, actor TEXT, choice TEXT, "
+        "status TEXT, recorded_at TEXT, question TEXT, urgency INTEGER"
+        ");"
+    )
+
+    fact = DecisionsProvider(_RawConnection(raw)).collect()
+
+    assert fact == DecisionInboxFact(
+        pending=0,
+        next_decision_id=None,
+        next_project_key=None,
+        next_issue_id=None,
+        next_urgency=None,
+        next_question=None,
+        next_recorded_at=None,
+    )
+    raw.close()
+
+
+def test_decisions_provider_degrades_to_zero_on_a_pre_0061_database() -> None:
+    """A database opened before migration 0061 lacks the inbox columns
+    entirely (and, here, even the base table); the mode=ro dashboard
+    connection never runs migrations, so this must degrade to an empty
+    inbox rather than raising sqlite3.OperationalError.
+    """
+
+    class _RawConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters: tuple = ()) -> sqlite3.Cursor:
+            return self._connection.execute(sql, parameters)
+
+    raw = sqlite3.connect(":memory:")
+    raw.row_factory = sqlite3.Row
+    # No operator_decisions table at all -- the sharpest form of "the
+    # inbox columns are missing".
+
+    fact = DecisionsProvider(_RawConnection(raw)).collect()
+
+    assert fact.pending == 0
+    assert fact.next_decision_id is None
+    raw.close()

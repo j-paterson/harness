@@ -19,7 +19,12 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.operator_decisions import (
+    URGENCY_CRITICAL,
+    URGENCY_LOW,
+    URGENCY_NORMAL,
+    DecisionOption,
     DecisionRefused,
+    DecisionRequest,
     OperatorDecisions,
 )
 from hermes_orchestrator.queue import QueueService
@@ -351,3 +356,205 @@ class TestCandidatePublicationGate:
             assert payload["decision_id"] == "receipt-dec"
             assert payload["status"] == "approved"
             assert payload["receipt_sha256"] == digest
+
+
+def authority_request(**overrides: object) -> DecisionRequest:
+    defaults: dict[str, object] = {
+        "issue_id": "INFRA-224",
+        "project_key": "demo",
+        "cell_id": "cell-1",
+        "session_id": "session-1",
+        "requesting_role": "lead",
+        "question": "Should we roll back the schema change?",
+        "authority_reason": "Irreversible data migration risk.",
+        "facts": ("Migration touched 40k rows.", "No backup taken."),
+        "options": (
+            DecisionOption(label="roll back", tradeoffs="loses new writes"),
+            DecisionOption(label="roll forward", tradeoffs="risk of corruption"),
+        ),
+        "recommendation": "roll back",
+        "delay_impact": "Blocks INFRA-224 until answered.",
+        "paused_scope": "issue:INFRA-224",
+    }
+    defaults.update(overrides)
+    return DecisionRequest(**defaults)  # type: ignore[arg-type]
+
+
+class TestDecisionInbox:
+    """INFRA-224: a global operator inbox across every project.
+
+    An authority-worthy question is durable, deduplicated, fully
+    contextual state; a routine reversible implementation choice must
+    never reach it at all.
+    """
+
+    def test_raise_request_creates_a_pending_row_with_full_context(
+        self, decisions: OperatorDecisions
+    ) -> None:
+        decision, created = decisions.raise_request(authority_request())
+
+        assert created is True
+        assert decision.status == "pending"
+        assert decision.issue_id == "INFRA-224"
+        assert decision.project_key == "demo"
+        assert decision.requesting_role == "lead"
+        assert decision.question == "Should we roll back the schema change?"
+        assert decision.authority_reason == "Irreversible data migration risk."
+        assert decision.facts == (
+            "Migration touched 40k rows.",
+            "No backup taken.",
+        )
+        assert decision.options == (
+            DecisionOption(label="roll back", tradeoffs="loses new writes"),
+            DecisionOption(label="roll forward", tradeoffs="risk of corruption"),
+        )
+        assert decision.recommendation == "roll back"
+        assert decision.delay_impact == "Blocks INFRA-224 until answered."
+        assert decision.paused_scope == "issue:INFRA-224"
+        assert decision.urgency == URGENCY_NORMAL
+        assert decision.category == "authority"
+        assert decision.request_key is not None
+        assert decision.answer is None
+        assert decision.next_action is None
+
+    def test_a_duplicate_raise_returns_the_same_decision_and_inserts_nothing(
+        self, database: Database, decisions: OperatorDecisions
+    ) -> None:
+        first, created_first = decisions.raise_request(authority_request())
+        second, created_second = decisions.raise_request(authority_request())
+
+        assert created_first is True
+        assert created_second is False
+        assert first == second
+        count = database.scalar(
+            "SELECT COUNT(*) FROM operator_decisions WHERE issue_id = ?",
+            ("INFRA-224",),
+        )
+        assert count == 1
+
+    def test_two_projects_raise_independent_decisions_ordered_by_urgency(
+        self, decisions: OperatorDecisions
+    ) -> None:
+        low, _ = decisions.raise_request(
+            authority_request(
+                project_key="alpha",
+                urgency=URGENCY_LOW,
+                question="Low urgency question?",
+            )
+        )
+        critical, _ = decisions.raise_request(
+            authority_request(
+                project_key="beta",
+                urgency=URGENCY_CRITICAL,
+                question="Critical urgency question?",
+            )
+        )
+
+        assert [d.decision_id for d in decisions.inbox()] == [
+            critical.decision_id,
+            low.decision_id,
+        ]
+        assert [d.decision_id for d in decisions.inbox("alpha")] == [low.decision_id]
+        assert [d.decision_id for d in decisions.inbox("beta")] == [
+            critical.decision_id
+        ]
+
+    def test_an_agent_owned_category_is_refused_and_inserts_nothing(
+        self, database: Database, decisions: OperatorDecisions
+    ) -> None:
+        with pytest.raises(DecisionRefused):
+            decisions.raise_request(authority_request(category="small_fix"))
+
+        assert database.scalar("SELECT COUNT(*) FROM operator_decisions") == 0
+
+    def test_resolve_records_answer_and_next_action_and_is_single_shot(
+        self, decisions: OperatorDecisions
+    ) -> None:
+        decision, _ = decisions.raise_request(authority_request())
+
+        resolved = decisions.resolve(
+            decision.decision_id,
+            status="approved",
+            answer="Roll back the migration.",
+            source_message="Operator: roll back.",
+            next_action="rollback_migration",
+        )
+
+        assert resolved.status == "approved"
+        assert resolved.answer == "Roll back the migration."
+        assert resolved.next_action == "rollback_migration"
+        assert resolved.applied_at is not None
+        assert decisions.pending_count() == 0
+
+        with pytest.raises(DecisionRefused):
+            decisions.resolve(
+                decision.decision_id,
+                status="rejected",
+                answer="Changed my mind.",
+                source_message="Operator: nope.",
+            )
+
+        assert decisions.get(decision.decision_id).status == "approved"
+
+    def test_resolve_refuses_a_blank_answer_without_mutation(
+        self, decisions: OperatorDecisions
+    ) -> None:
+        decision, _ = decisions.raise_request(authority_request())
+
+        with pytest.raises(DecisionRefused):
+            decisions.resolve(
+                decision.decision_id,
+                status="approved",
+                answer="   ",
+                source_message="Operator: roll back.",
+            )
+
+        assert decisions.get(decision.decision_id).status == "pending"
+
+    def test_pending_count_and_next_pending(
+        self, decisions: OperatorDecisions
+    ) -> None:
+        assert decisions.pending_count() == 0
+        assert decisions.next_pending() is None
+
+        low, _ = decisions.raise_request(
+            authority_request(urgency=URGENCY_LOW, question="Question one?")
+        )
+        critical, _ = decisions.raise_request(
+            authority_request(
+                project_key="alpha",
+                urgency=URGENCY_CRITICAL,
+                question="Question two?",
+            )
+        )
+
+        assert decisions.pending_count() == 2
+        assert decisions.pending_count("demo") == 1
+        assert decisions.pending_count("alpha") == 1
+        next_overall = decisions.next_pending()
+        assert next_overall is not None
+        assert next_overall.decision_id == critical.decision_id
+        next_demo = decisions.next_pending("demo")
+        assert next_demo is not None
+        assert next_demo.decision_id == low.decision_id
+
+    def test_legacy_rows_without_new_columns_still_load(
+        self, decisions: OperatorDecisions
+    ) -> None:
+        record_channel_pilot(decisions)
+
+        legacy = decisions.get("dec-1")
+
+        assert legacy.question is None
+        assert legacy.authority_reason is None
+        assert legacy.requesting_role is None
+        assert legacy.facts == ()
+        assert legacy.options == ()
+        assert legacy.recommendation is None
+        assert legacy.delay_impact is None
+        assert legacy.paused_scope is None
+        assert legacy.urgency == URGENCY_NORMAL
+        assert legacy.request_key is None
+        assert legacy.category is None
+        assert legacy.answer is None
+        assert legacy.next_action is None
