@@ -37,6 +37,10 @@ class FakeDesktopRouter:
         self.registered = False
         self.requests: list[dict[str, Any]] = []
         self.start_turn_error: str | None = None
+        self.snapshot: dict[str, Any] | None = {
+            "resumeState": "resumed",
+            "threadRuntimeStatus": {"type": "idle"},
+        }
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -56,12 +60,41 @@ class FakeDesktopRouter:
                 (length,) = struct.unpack("<I", header)
                 message = json.loads((await reader.readexactly(length)).decode())
                 self.requests.append(message)
+                if message.get("type") == "broadcast":
+                    reply = self._on_broadcast(message)
+                    if reply is not None:
+                        writer.write(_frame(reply))
+                        await writer.drain()
+                    continue
                 writer.write(_frame(self._respond(message)))
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
             writer.close()
+
+    def _on_broadcast(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        if message["method"] != "thread-stream-following-status-requested":
+            return None
+        assert message["version"] == 1
+        if self.snapshot is None:
+            return None
+        return {
+            "type": "broadcast",
+            "method": "thread-stream-state-changed",
+            "sourceClientId": OWNER,
+            "targetClientIds": [message["sourceClientId"]],
+            "version": 11,
+            "params": {
+                "conversationId": message["params"]["conversationId"],
+                "hostId": "local",
+                "change": {
+                    "type": "snapshot",
+                    "revision": 7,
+                    "conversationState": self.snapshot,
+                },
+            },
+        }
 
     def _respond(self, message: dict[str, Any]) -> dict[str, Any]:
         request_id = message["requestId"]
@@ -264,3 +297,39 @@ async def test_client_rejects_a_bad_frame(socket_path: Path) -> None:
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_thread_activity_is_proven_by_the_owner_snapshot(
+    socket_path: Path,
+) -> None:
+    # Sol correction 32f98837: ownership alone proves nothing. The owning
+    # window's live snapshot decides: idle -> inactive, an in-progress
+    # last turn (or active runtime) -> active, no snapshot -> unknown.
+    router = FakeDesktopRouter(socket_path)
+    router.registered = True
+    await router.start()
+    try:
+        starter = OwnerTurnStarter(socket_path, timeout=3.0)
+        idle = await starter.thread_activity(THREAD)
+        assert (idle.owner_client_id, idle.active) == (OWNER, False)
+
+        router.snapshot = {
+            "resumeState": "resumed",
+            "turns": [{"turnId": "t1", "status": "inProgress"}],
+        }
+        assert (await starter.thread_activity(THREAD)).active is True
+        router.snapshot = {"resumeState": "resumed", "threadRuntimeStatus": {"type": "active"}}
+        assert (await starter.thread_activity(THREAD)).active is True
+        router.snapshot = None
+        assert (await starter.thread_activity(THREAD)).active is None
+        methods = [m["method"] for m in router.requests]
+        assert "thread-stream-following-status-requested" in methods
+        following = [
+            m["params"]["following"]
+            for m in router.requests
+            if m["method"] == "thread-stream-following-changed"
+        ]
+        assert following[:2] == [True, False]
+    finally:
+        await router.stop()

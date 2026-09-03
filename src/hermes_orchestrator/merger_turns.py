@@ -1362,6 +1362,19 @@ class MergerTurnService:
         ):
             return None
         owner_start = getattr(self._delivery, "_owner_start", None)
+        activity = getattr(owner_start, "thread_activity", None)
+        if callable(activity):
+            # Owner path, Sol correction 32f98837: ownership alone proves
+            # nothing (a window owns the thread while its turn runs, too).
+            # The owning window's live snapshot must prove the exact
+            # thread has no turn in progress; no snapshot fails closed.
+            try:
+                probe = await activity(channel.thread_id)
+            except Exception:
+                return None
+            if probe.owner_client_id is None or probe.active is not False:
+                return None
+            return event, state, channel
         discover = getattr(owner_start, "discover_owner", None)
         if callable(discover):
             # Owner path (INFRA-223, operator direction 2026-09-03): the

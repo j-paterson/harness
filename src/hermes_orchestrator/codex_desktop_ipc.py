@@ -34,6 +34,13 @@ REQUEST_VERSIONS = {
     "thread-follower-start-turn": 2,
 }
 
+#: Broadcast versions (the desktop drops mismatched versions silently).
+BROADCAST_VERSIONS = {
+    "thread-stream-following-changed": 1,
+    "thread-stream-following-status-requested": 1,
+    "thread-stream-state-changed": 11,
+}
+
 _MAX_FRAME = 256 * 1024 * 1024
 
 
@@ -154,6 +161,87 @@ class DesktopIpcClient:
             )
         return response.result
 
+    async def request_stream_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        owner_client_id: str,
+        host_id: str = LOCAL_HOST_ID,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Ask the OWNER for its live conversation state snapshot.
+
+        Mirrors the desktop's own follower handshake: announce following,
+        request the following status, and read the owner's targeted
+        ``thread-stream-state-changed`` snapshot broadcast (patches are
+        skipped until a snapshot arrives). Returns ``conversationState``
+        or ``None`` when no snapshot arrives in time -- callers fail
+        closed on ``None``. Following is withdrawn before returning.
+        """
+
+        wait = self._timeout if timeout is None else timeout
+        params = {"conversationId": conversation_id, "hostId": host_id}
+        await self._broadcast(
+            "thread-stream-following-changed",
+            {**params, "following": True},
+            target_client_ids=[owner_client_id],
+        )
+        try:
+            await self._broadcast("thread-stream-following-status-requested", params)
+            deadline = asyncio.get_running_loop().time() + wait
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return None
+                try:
+                    frame = await asyncio.wait_for(self._read_frame(), remaining)
+                except (TimeoutError, DesktopIpcUnavailable):
+                    return None
+                if frame.get("type") != "broadcast":
+                    continue
+                if frame.get("method") != "thread-stream-state-changed":
+                    continue
+                inner = frame.get("params") or {}
+                if inner.get("conversationId") != conversation_id:
+                    continue
+                change = inner.get("change") or {}
+                if change.get("type") != "snapshot":
+                    continue
+                state = change.get("conversationState")
+                return state if isinstance(state, dict) else None
+        finally:
+            with_suppress = self._broadcast(
+                "thread-stream-following-changed",
+                {**params, "following": False},
+                target_client_ids=[owner_client_id],
+            )
+            try:
+                await with_suppress
+            except Exception:
+                pass
+
+    async def _broadcast(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        target_client_ids: list[str] | None = None,
+    ) -> None:
+        if self._writer is None:
+            raise DesktopIpcUnavailable("desktop IPC client is not connected")
+        message: dict[str, Any] = {
+            "type": "broadcast",
+            "method": method,
+            "sourceClientId": self.client_id,
+            "params": params,
+            "version": BROADCAST_VERSIONS.get(method, 1),
+        }
+        if target_client_ids is not None:
+            message["targetClientIds"] = target_client_ids
+        payload = json.dumps(message).encode("utf-8")
+        self._writer.write(struct.pack("<I", len(payload)) + payload)
+        await self._writer.drain()
+
     async def _request(
         self,
         method: str,
@@ -219,6 +307,36 @@ class DesktopIpcClient:
         return frame
 
 
+def conversation_is_active(state: dict[str, Any]) -> bool:
+    """The desktop's own activity rule for a conversation snapshot: a
+    thread awaiting resume is active iff its runtime status is active;
+    otherwise a thread with no turns is active iff it is resuming, and a
+    thread with turns is active iff its last turn is ``inProgress``."""
+
+    resume_state = state.get("resumeState")
+    turns = state.get("turns")
+    if not isinstance(turns, list):
+        turns = []
+    runtime = state.get("threadRuntimeStatus")
+    runtime_type = runtime.get("type") if isinstance(runtime, dict) else None
+    if resume_state == "needs_resume":
+        return runtime_type == "active"
+    if isinstance(runtime_type, str) and not turns:
+        # Live snapshots carry the runtime status without the turn list
+        # (observed 2026-09-03: ``{'type': 'idle'}``); it is authoritative.
+        return runtime_type != "idle"
+    if not turns:
+        return resume_state == "resuming"
+    last = turns[-1]
+    return isinstance(last, dict) and last.get("status") == "inProgress"
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadActivity:
+    owner_client_id: str | None
+    active: bool | None  # None: no authoritative snapshot -> fail closed
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerStartOutcome:
     started: bool
@@ -276,6 +394,33 @@ class OwnerTurnStarter:
             return owner
         except DesktopIpcUnavailable:
             return None
+        finally:
+            await client.close()
+
+    async def thread_activity(self, thread_id: str) -> ThreadActivity:
+        """Owner-routed activity proof (Sol 32f98837): the owning window's
+        live snapshot decides whether the exact thread has a turn in
+        progress. Owner existence alone proves nothing; no snapshot means
+        ``active=None`` and callers fail closed."""
+
+        client = self._client_factory()
+        try:
+            await client.connect()
+            owner = await client.discover_owner(thread_id, host_id=self._host_id)
+            if owner is None:
+                owner = await self._register_and_rediscover(client, thread_id)
+            if owner is None:
+                return ThreadActivity(owner_client_id=None, active=None)
+            state = await client.request_stream_snapshot(
+                thread_id, owner_client_id=owner, host_id=self._host_id
+            )
+            if state is None:
+                return ThreadActivity(owner_client_id=owner, active=None)
+            return ThreadActivity(
+                owner_client_id=owner, active=conversation_is_active(state)
+            )
+        except DesktopIpcUnavailable:
+            return ThreadActivity(owner_client_id=None, active=None)
         finally:
             await client.close()
 

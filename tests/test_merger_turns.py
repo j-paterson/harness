@@ -3188,12 +3188,16 @@ async def test_owner_path_proves_legacy_eligibility_without_any_app_server(
     # adapter present, a legacy delivered wake is recovered when a desktop
     # window owns the thread -- proven over the IPC socket -- and the turn
     # is started by that owner; no thread/read or thread/resume happens.
-    from hermes_orchestrator.codex_desktop_ipc import OwnerStartOutcome
+    from hermes_orchestrator.codex_desktop_ipc import OwnerStartOutcome, ThreadActivity
 
     class _Owner:
-        def __init__(self, owner: str | None) -> None:
+        def __init__(self, owner: str | None, active: bool | None = False) -> None:
             self.owner = owner
+            self.active = active
             self.starts: list[tuple[str, str]] = []
+
+        async def thread_activity(self, thread_id: str) -> ThreadActivity:
+            return ThreadActivity(owner_client_id=self.owner, active=self.active)
 
         async def discover_owner(self, thread_id: str) -> str | None:
             return self.owner
@@ -3215,8 +3219,19 @@ async def test_owner_path_proves_legacy_eligibility_without_any_app_server(
     flow.delivery._owner_start = _Owner(owner=None)
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
     assert _wake_states(flow)[event_id] == "delivered"
+    # Sol 32f98837: the exact owned turn is ACTIVE -> untouched, no start.
+    running = _Owner(owner="window-1", active=True)
+    flow.delivery._owner_start = running
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert running.starts == []
+    assert _wake_states(flow)[event_id] == "delivered"
+    # No authoritative snapshot -> fail closed, no start.
+    unknown = _Owner(owner="window-1", active=None)
+    flow.delivery._owner_start = unknown
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert unknown.starts == []
 
-    owner = _Owner(owner="window-1")
+    owner = _Owner(owner="window-1", active=False)
     flow.delivery._owner_start = owner
     results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18")
 
@@ -3229,3 +3244,7 @@ async def test_owner_path_proves_legacy_eligibility_without_any_app_server(
         "thread/queue/start"
     ) == queue_starts_before
     assert _wake_states(flow)[event_id] == "delivered"
+    # Idempotent: the started turn is now active on the owner -> no-op.
+    owner.active = True
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert len(owner.starts) == 1
