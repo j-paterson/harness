@@ -1917,6 +1917,139 @@ def test_cross_project_source_requires_bound_prompt_not_live_process(
     )
 
 
+# --------------------------------------------------------------------
+# Cross-project source + Hermes-selected profile switch, together
+# (ran live 2026-09-03, no unit test): INFRA-187's cross-project
+# widening and Sol correction 531484d2's ``_selected_replacement``
+# proof are independent rules that compose on the very same ``adopt``
+# call. ``_selected_replacement`` is checked against the ADOPTING
+# cell's own seat, never the (possibly cross-project) source cell's,
+# so the durable-selection proof must be seated for the adopting cell.
+# --------------------------------------------------------------------
+
+
+def test_adopt_carries_cross_project_trust_to_the_hermes_selected_replacement_profile(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """The source cell's proven anchor lives in a different project than
+    the adopting cell (INFRA-187 widening) AND the adopting cell's
+    durable seat selected a different profile than the predecessor's
+    (Sol correction 531484d2). Both are honored together: the anchor
+    carries the predecessor's content, prompt, and launch template
+    forward verbatim under the Hermes-selected profile, the source
+    anchor is untouched, and the adopted event payload records both the
+    cross-project source and the durable selection evidence."""
+
+    package_root, entry_path = package
+    _seed_cell(database, CELL, state="active", lane_role="development")
+    _seed_cell(
+        database,
+        NEW_PROJECT_CELL,
+        state="active",
+        lane_role="development",
+        project_key=NEW_PROJECT,
+        session_id=SESSION_2,
+    )
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    # The durable selection proof must be seated for the ADOPTING cell
+    # — _selected_replacement never looks at the source cell's seat.
+    seat = _seat_replacement(database, cell_id=NEW_PROJECT_CELL)
+
+    adopted = anchors.adopt(
+        source_cell_id=CELL,
+        cell_id=NEW_PROJECT_CELL,
+        profile_alias=SELECTED_PROFILE,
+        entry_path=entry_path,
+        package_root=package_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        session_id=SESSION_2,
+    )
+
+    assert adopted.cell_id == NEW_PROJECT_CELL
+    assert adopted.state == "active"
+    assert anchors.active_for_cell(NEW_PROJECT_CELL) == adopted
+    assert adopted.profile_alias == SELECTED_PROFILE
+    assert adopted.launch_argv_template == proven.launch_argv_template
+    assert adopted.launch_argv_template == tuple(_argv())
+    assert adopted.prompt_pattern == proven.prompt_pattern
+    assert adopted.entry_sha256 == proven.entry_sha256
+    # The source anchor is never retired — adoption copies, never
+    # rotates — even when it crosses a project boundary.
+    assert anchors.get(proven.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == proven
+
+    payload = json.loads(
+        str(
+            database.execute(
+                "SELECT payload_json FROM events "
+                "WHERE aggregate_type = 'channel_trust_anchor' "
+                "AND aggregate_id = ?",
+                (adopted.anchor_id,),
+            ).fetchone()["payload_json"]
+        )
+    )
+    assert payload["profile_alias"] == SELECTED_PROFILE
+    assert payload["predecessor_profile_alias"] == PROFILE
+    assert payload["selected_binding_id"] == seat.binding_id
+    intent_row = database.execute(
+        "SELECT intent_id FROM cmux_activation_intents WHERE binding_id = ?",
+        (seat.binding_id,),
+    ).fetchone()
+    assert payload["selected_intent_id"] == str(intent_row["intent_id"])
+    assert payload["source_cell_id"] == CELL
+    assert payload["source_project_key"] == "demo"
+
+
+def test_adopt_refuses_a_cross_project_profile_the_durable_seat_did_not_select(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """Same cross-project source, but no durable Hermes selection was
+    ever seated for the adopting cell's seat. Cross-project widening
+    (INFRA-187) never loosens the same-cell profile-switch proof (Sol
+    correction 531484d2): the switch refuses with zero mutation exactly
+    as a same-project one would, and the source anchor is untouched."""
+
+    package_root, entry_path = package
+    _seed_cell(database, CELL, state="active", lane_role="development")
+    _seed_cell(
+        database,
+        NEW_PROJECT_CELL,
+        state="active",
+        lane_role="development",
+        project_key=NEW_PROJECT,
+        session_id=SESSION_2,
+    )
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    before = _anchor_rows(database)
+
+    with pytest.raises(TrustRefused, match="Hermes-selected replacement binding"):
+        anchors.adopt(
+            source_cell_id=CELL,
+            cell_id=NEW_PROJECT_CELL,
+            profile_alias=SELECTED_PROFILE,
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(NEW_PROJECT_CELL) is None
+    assert anchors.get(proven.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == proven
+    assert _anchor_event_types(database) == ["channel_trust_anchor.captured"]
+
+
 def test_gate_still_refuses_anchor_present_for_a_cell_with_no_anchor(
     database: Database,
     events: EventStore,

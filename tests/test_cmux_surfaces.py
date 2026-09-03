@@ -2518,6 +2518,96 @@ class TestChannelTrustLifecycle:
         assert anchors.active_for_cell("cell-demo").anchor_id == source.anchor_id
 
     @pytest.mark.asyncio
+    async def test_adopt_refused_receipt_lists_every_attempted_source_cell(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """Every candidate ``proven_source_cells`` names is genuinely
+        tried in order -- the receipt must therefore account for each
+        one, not just the first. Both the same-project and the
+        cross-project candidate here carry a stale (legacy shell-split)
+        launch argv template, so both refuse, and the single
+        ``channel.adopt_refused`` receipt must list both attempted
+        cells, same project first."""
+
+        seed_cell(database)
+        seed_harness_cell(database)
+        seed_new_project_cell(database)
+        entry = trust_package(tmp_path)
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        demo_source = anchors.capture(
+            cell_id="cell-demo",
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            channel_entry="server:hermes-control",
+            launch_argv_template=[*CHANNEL_ARGV, "--legacy-extra-flag"],
+            workspace_uuid=LEAD.workspace_uuid,
+            surface_uuid=LEAD.surface_uuid,
+            session_id=SESSION,
+            prompt_pattern=APPROVED_PROMPT_PATTERN,
+        )
+        newproj_source_argv = [
+            "claude",
+            "--session-id",
+            NEW_PROJECT_SESSION,
+            SKIP_PERMISSIONS_FLAG,
+            "--mcp-config",
+            f"/state/channels/{NEW_PROJECT_SESSION}.mcp.json",
+            "--dangerously-load-development-channels",
+            "server:hermes-control",
+            "--legacy-extra-flag",
+        ]
+        newproj_source = anchors.capture(
+            cell_id="cell-newproj",
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            channel_entry="server:hermes-control",
+            launch_argv_template=newproj_source_argv,
+            workspace_uuid=NEWPROJ.workspace_uuid,
+            surface_uuid=NEWPROJ.surface_uuid,
+            session_id=NEW_PROJECT_SESSION,
+            prompt_pattern=APPROVED_PROMPT_PATTERN,
+        )
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_harness_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert port.confirmed == []
+        assert verdict is not None
+        assert verdict.confirmed is False
+        assert control_operation_kinds(database) == [
+            "channel.adopt_refused",
+            "channel.approval_required",
+        ]
+        rows = database.execute(
+            "SELECT reason, result_json FROM control_operations "
+            "WHERE kind = 'channel.adopt_refused'"
+        ).fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        assert "ADOPT REFUSED" in str(row["reason"])
+        result = json.loads(str(row["result_json"]))
+        assert result["source_cell_ids"] == ["cell-demo", "cell-newproj"]
+        # Nothing was minted for the anchorless cell, and both attempted
+        # candidates' anchors are untouched.
+        assert anchors.active_for_cell("cell-harness") is None
+        assert (
+            anchors.active_for_cell("cell-demo").anchor_id
+            == demo_source.anchor_id
+        )
+        assert (
+            anchors.active_for_cell("cell-newproj").anchor_id
+            == newproj_source.anchor_id
+        )
+
+    @pytest.mark.asyncio
     async def test_a_new_project_cell_adopts_another_projects_proven_anchor(
         self,
         database: Database,
@@ -2722,6 +2812,133 @@ class TestChannelTrustLifecycle:
         assert payload["predecessor_profile_alias"] == "max-a"
         assert payload["selected_binding_id"] == binding.binding_id
         assert payload["selected_intent_id"] == intent.intent_id
+
+    @pytest.mark.asyncio
+    async def test_anchorless_cell_adopts_cross_project_trust_onto_the_selected_profile(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """Live evidence (2026-09-03 05:30:45Z, cell 83b52ed1, project
+        agent-orchestration): the same-project candidate was an anchor
+        on a FAILED cell whose ``launch_argv_template`` was captured
+        before argv normalization -- shell-split and unable to ever
+        match -- so ``adopt`` refused it on argv shape. The next
+        candidate, tried automatically because no source is special-
+        cased, was an active anchor of ANOTHER project on a compatible
+        template, profile max-a. The seat being confirmed was durably
+        seated on a DIFFERENT profile, max-b, via Hermes's own
+        write-ahead intent path. Adoption must skip the stale
+        same-project anchor, cross the project boundary for the
+        compatible one, and still honor the seat's durably selected
+        profile -- all in a single automatic pass with no manual dialog
+        click."""
+
+        seed_cell(database, state="failed")
+        seed_harness_cell(database)
+        seed_new_project_cell(database)
+        entry = trust_package(tmp_path)
+        anchors = ChannelTrustAnchors(database, events=EventStore(database))
+        # Same-project candidate: a proven anchor on a FAILED cell whose
+        # argv was captured before normalization -- can never match.
+        anchors.capture(
+            cell_id="cell-demo",
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            channel_entry="server:hermes-control",
+            launch_argv_template=[*CHANNEL_ARGV, "--legacy-extra-flag"],
+            workspace_uuid=LEAD.workspace_uuid,
+            surface_uuid=LEAD.surface_uuid,
+            session_id=SESSION,
+            prompt_pattern=APPROVED_PROMPT_PATTERN,
+        )
+        # Cross-project candidate: an active cell of another project
+        # with a compatible template on the predecessor's profile.
+        source_argv = [
+            "claude",
+            "--session-id",
+            NEW_PROJECT_SESSION,
+            SKIP_PERMISSIONS_FLAG,
+            "--mcp-config",
+            f"/state/channels/{NEW_PROJECT_SESSION}.mcp.json",
+            "--dangerously-load-development-channels",
+            "server:hermes-control",
+        ]
+        source = anchors.capture(
+            cell_id="cell-newproj",
+            profile_alias="max-a",
+            entry_path=entry,
+            package_root=entry.parents[2],
+            channel_entry="server:hermes-control",
+            launch_argv_template=source_argv,
+            workspace_uuid=NEWPROJ.workspace_uuid,
+            surface_uuid=NEWPROJ.surface_uuid,
+            session_id=NEW_PROJECT_SESSION,
+            prompt_pattern=APPROVED_PROMPT_PATTERN,
+        )
+        # The seat under confirmation: an anchorless cell of the first
+        # project, durably seated on profile max-b exactly as
+        # production seats a Hermes-selected replacement.
+        intent = bindings.record_intent(
+            project_key="demo",
+            cell_id="cell-harness",
+            session_id=HARNESS_SESSION,
+            profile_alias="max-b",
+        )
+        residual = bindings.bind_intent(intent.intent_id, ref=HARNESS)
+        binding = bindings.activate_residual(residual.binding_id)
+        live_argv = [
+            "claude",
+            "--session-id",
+            HARNESS_SESSION,
+            SKIP_PERMISSIONS_FLAG,
+            "--mcp-config",
+            f"/state/channels/{HARNESS_SESSION}.mcp.json",
+            "--dangerously-load-development-channels",
+            "server:hermes-control",
+        ]
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        confirmer = trust_confirmer(
+            database, port, entry, control=control, argv=live_argv
+        )
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert port.confirmed == [HARNESS]
+        assert control_operation_kinds(database) == [
+            "channel.confirm_claimed",
+            "channel.auto_confirmed",
+        ]
+        adopted = anchors.active_for_cell("cell-harness")
+        assert adopted is not None
+        assert adopted.profile_alias == "max-b"
+        assert adopted.launch_argv_template == source.launch_argv_template
+        # Both attempted candidates' own anchors are untouched.
+        stale = anchors.active_for_cell("cell-demo")
+        assert stale is not None
+        still_source = anchors.active_for_cell("cell-newproj")
+        assert still_source is not None
+        assert still_source.anchor_id == source.anchor_id
+        payload = json.loads(
+            str(
+                database.execute(
+                    "SELECT payload_json FROM events "
+                    "WHERE aggregate_type = 'channel_trust_anchor' "
+                    "AND aggregate_id = ?",
+                    (adopted.anchor_id,),
+                ).fetchone()["payload_json"]
+            )
+        )
+        assert payload["predecessor_profile_alias"] == "max-a"
+        assert payload["selected_binding_id"] == binding.binding_id
+        assert payload["selected_intent_id"] == intent.intent_id
+        assert payload["source_cell_id"] == "cell-newproj"
+        assert payload["source_project_key"] == "harness-lab"
 
     @pytest.mark.asyncio
     async def test_a_profile_no_durable_selection_names_sends_zero_keys(
