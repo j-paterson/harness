@@ -4755,6 +4755,75 @@ async def test_residual_sweep_retires_a_residual_whose_cell_is_gone(
     assert bindings.get(residual.binding_id).state == "closed"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cell_state", ["starting", "active", "handoff_required", "paused"]
+)
+async def test_residual_sweep_never_closes_the_sole_seat_of_a_live_cell(
+    database: Database, bindings: CmuxSurfaceBindings, cell_state: str
+) -> None:
+    """Sol correction 39bb7195 (INFRA-233): every state the cell service
+    counts as occupancy protects a sole residual seat -- a starting cell's
+    write-ahead activation, a paused lead, or one mid-handoff still owns
+    its workspace. Only a distinct active sibling or a cell that has left
+    every live state makes the residual seat retired."""
+
+    seed_cell(database, state=cell_state)
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=SESSION,
+        profile_alias="max-a",
+        ref=LEAD,
+        reason="activation_pending",
+    )
+    port = FakePort(live={LEAD})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report == ResidualSweepReport()
+    assert bindings.get(residual.binding_id).state == "residual"
+    assert port.closed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cell_state", ["retired", "failed"])
+async def test_residual_sweep_retires_the_seat_of_a_terminal_cell(
+    database: Database, bindings: CmuxSurfaceBindings, cell_state: str
+) -> None:
+    """A cell that has left every live state (like an absent cell) has
+    genuinely retired its sole residual workspace."""
+
+    seed_cell(database, state=cell_state)
+    residual = bindings.record_residual(
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id=SESSION,
+        profile_alias="max-a",
+        ref=LEAD,
+        reason="dead_worker_surface_missing_close_uncertain",
+    )
+    port = FakePort(live={LEAD})
+
+    report = await _residual_sweep(database, bindings, port).tick()
+
+    assert report.closed == (residual.binding_id,)
+    assert bindings.get(residual.binding_id).state == "closed"
+
+
+def test_residual_sweep_live_states_match_the_cell_service_vocabulary() -> None:
+    """The sweep restates the live-state tuple (cells.py imports this
+    module, so it cannot import it); pin the two equal so a new live
+    state can never silently make its sole seat sweepable."""
+
+    from hermes_orchestrator import cells as cells_module
+    from hermes_orchestrator import cmux_surfaces as surfaces_module
+
+    assert tuple(surfaces_module._LIVE_CELL_STATES) == tuple(
+        cells_module._ACTIVE_CELL_STATES
+    )
+
+
 def test_retired_surfaces_lists_residual_and_stale_lead_bindings(
     database: Database, bindings: CmuxSurfaceBindings
 ) -> None:

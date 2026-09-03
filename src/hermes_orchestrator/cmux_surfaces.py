@@ -1943,6 +1943,15 @@ _RESIDUAL_SWEEP_CLOSE_REASON = "retired_surface_swept"
 #: attempt fails; the trailing counter is how many CONSECUTIVE sweep
 #: attempts have failed for this exact binding, so the journal shows
 #: whether a residue is transient or stuck.
+# The project-cell live-state vocabulary (mirrors ``cells._ACTIVE_CELL_STATES``;
+# cells.py imports this module, so the tuple is restated here and pinned equal
+# by tests/test_cmux_surfaces.py rather than imported).
+_LIVE_CELL_STATES: tuple[str, ...] = (
+    "starting",
+    "active",
+    "handoff_required",
+    "paused",
+)
 _RESIDUAL_SWEEP_FAIL_REASON_PREFIX = "retired_surface_close_failed"
 
 
@@ -2066,12 +2075,25 @@ class CmuxResidualSweep:
         active = self._bindings.active_lead(binding.cell_id)
         if active is not None:
             return active.binding_id != binding.binding_id
-        return not self._cell_is_active(binding.cell_id)
+        return not self._cell_is_live(binding.cell_id)
 
-    def _cell_is_active(self, cell_id: str) -> bool:
+    def _cell_is_live(self, cell_id: str) -> bool:
+        """Whether the logical cell still occupies any live state.
+
+        Sol correction 39bb7195 (INFRA-233): a cell is live in every
+        state ``ProjectCellService`` treats as occupancy -- ``starting``,
+        ``active``, ``handoff_required`` and ``paused`` -- not only
+        ``active``. A sole residual seat of a cell in any of those
+        states may be an in-flight activation or a paused/handing-off
+        lead whose workspace must survive; only a cell that has left
+        every live state (or is absent) has genuinely retired it.
+        """
+
+        placeholders = ", ".join("?" for _ in _LIVE_CELL_STATES)
         row = self._database.execute(
-            "SELECT 1 FROM project_cells WHERE cell_id = ? AND state = 'active'",
-            (cell_id,),
+            "SELECT 1 FROM project_cells WHERE cell_id = ? "
+            f"AND state IN ({placeholders})",
+            (cell_id, *_LIVE_CELL_STATES),
         ).fetchone()
         return row is not None
 
