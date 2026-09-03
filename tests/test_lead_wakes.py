@@ -534,6 +534,48 @@ def test_an_idle_seat_with_runnable_work_wakes_exactly_once(
     assert wake_events(database, "lead_wake.committed") == ["wake-1"]
 
 
+def test_work_ready_wake_lists_every_runnable_issue_up_to_headroom(
+    database: Database,
+) -> None:
+    """INFRA-215: an idle seat with more admitted runnable work than one
+    lane can hold is told about EVERY issue safe to pick up right now,
+    capped at the development-lane headroom -- not merely the first
+    runnable issue it finds."""
+
+    seed_work_ready(database, issue_id="INFRA-211")
+    now = WAKE_NOW.isoformat()
+    with database.transaction() as connection:
+        # Six more queued, dependency-ready issues -- seven runnable in
+        # total together with INFRA-211 above.
+        for index in range(212, 218):
+            connection.execute(
+                "INSERT INTO admitted_issues(issue_id, project_key, "
+                "priority, state, instruction_id, dependency_ready, "
+                "overlap_risk, admitted_at, updated_at) VALUES "
+                "(?, 'demo', 1, 'queued', ?, 1, 0, ?, ?)",
+                (f"INFRA-{index}", f"chat-{index}", now, now),
+            )
+        # One issue already occupying a development lane: headroom is
+        # therefore 6 - 1 = 5, strictly less than the 7 runnable issues.
+        connection.execute(
+            "INSERT INTO admitted_issues(issue_id, project_key, "
+            "priority, state, instruction_id, dependency_ready, "
+            "overlap_risk, admitted_at, updated_at) VALUES "
+            "('INFRA-200', 'demo', 1, 'in_development', 'chat-200', 1, 0, "
+            "?, ?)",
+            (now, now),
+        )
+    wakes = build_wakes(database)
+
+    wake = wakes.commit_work_ready("demo", freshness_minutes=5)
+
+    assert wake is not None
+    assert wake.kind == "work_ready"
+    expected = ("INFRA-211", "INFRA-212", "INFRA-213", "INFRA-214", "INFRA-215")
+    assert wake.issue_id == expected[0]
+    assert tuple(wake.turn_key.removeprefix("work-ready:").split(",")) == expected
+
+
 def _start_a_child(database: Database) -> None:
     with database.transaction() as connection:
         connection.execute(

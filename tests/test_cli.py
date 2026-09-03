@@ -700,8 +700,14 @@ def test_subagent_gate_admits_through_the_packet_ledger_when_wired(
         }
     ]
 
-    # A marker with no admission wired into this process allows through.
-    assert subagent_gate(freeze_dir, payload, admission=None) == (0, "")
+    # INFRA-215: a marker with no admission wired into this process (and
+    # no admission_factory to build one) is refused, not let through --
+    # letting a marked launch bypass the ledger is the exact live defect
+    # (nine planned packets, eight simultaneously "started" children).
+    code, message = subagent_gate(freeze_dir, payload, admission=None)
+    assert code == 2
+    assert "admission" in message
+    assert packet_id in message
 
     # The freeze marker still takes priority over admission entirely.
     (freeze_dir / "s-1.frozen").write_text("rotation_pending: 90%\n")
@@ -709,6 +715,146 @@ def test_subagent_gate_admits_through_the_packet_ledger_when_wired(
     code, message = subagent_gate(freeze_dir, payload, admission=never_consulted)
     assert code == 2 and "frozen" in message
     assert never_consulted.calls == []
+
+
+def test_subagent_gate_reserves_a_marked_packet_from_the_state_database(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-215: the ``subagent-gate`` CLI command builds a real
+    ``PacketAdmission`` from the durable state database, so a marked
+    launch actually reserves its packet end-to-end -- fixing the live
+    defect where classic seats never reached ``PacketAdmission.admit``
+    and packets stayed ``planned`` while ``lead_children`` recorded the
+    child as started."""
+
+    import io
+    import json as _json
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.subagent_packets import SubagentPackets
+
+    repo_root, state_dir = configured_repo
+    freeze_dir = state_dir / "freezes"
+    freeze_dir.mkdir(parents=True)
+    session_id = "22222222-3333-4444-8555-666666666666"
+    cell_id = "cell-infra-215"
+    stamp = "2026-08-30T12:00:00+00:00"
+
+    database = Database.open(state_dir / "state.db")
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at) VALUES (?, 'demo', 'active', 'max-a', ?, ?, ?)",
+            (cell_id, session_id, stamp, stamp),
+        )
+    packets = SubagentPackets(database, events=EventStore(database))
+    packet = packets.create(
+        issue_id="INFRA-215",
+        project_key="demo",
+        cell_id=cell_id,
+        session_id=session_id,
+        generation=1,
+        model_tier="sonnet",
+        effort="medium",
+        allowed_files=("src/hermes_orchestrator/foo.py",),
+        worktree=str(repo_root),
+        red_test="tests/test_foo.py::test_red",
+        verification=("uv run pytest tests/test_foo.py -q",),
+        invariants="never touch bar.py",
+        resource_note="single worker",
+    )
+    database.close()
+
+    payload = _json.dumps(
+        {
+            "session_id": session_id,
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_infra_215",
+            "tool_input": {
+                "description": f"packet:{packet.packet_id} implement the red test",
+                "model": "sonnet",
+                "effort": "medium",
+            },
+        }
+    )
+
+    stdin = sys.stdin
+    sys.stdin = io.StringIO(payload)
+    try:
+        exit_code = main(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--state-dir",
+                str(state_dir),
+                "subagent-gate",
+                "--freeze-dir",
+                str(freeze_dir),
+            ]
+        )
+    finally:
+        sys.stdin = stdin
+
+    assert exit_code == 0
+
+    verification = Database.open(state_dir / "state.db")
+    try:
+        row = verification.execute(
+            "SELECT state FROM subagent_packets WHERE packet_id = ?",
+            (packet.packet_id,),
+        ).fetchone()
+        assert str(row["state"]) == "reserved"
+    finally:
+        verification.close()
+
+
+def test_subagent_gate_without_marker_keeps_freeze_only_behavior(
+    tmp_path: Path,
+) -> None:
+    """An Agent launch with no ``packet:<hex>`` marker never even
+    attempts to build a ``PacketAdmission`` or open the state database
+    -- ``--repo-root`` here carries no ``config/projects.yaml`` at all,
+    and the command still succeeds exactly as it always did."""
+
+    import io
+    import json as _json
+
+    freeze_dir = tmp_path / "freezes"
+    freeze_dir.mkdir()
+    bogus_repo_root = tmp_path / "no-config-here"
+    bogus_repo_root.mkdir()
+    state_dir = tmp_path / "state"
+    payload = _json.dumps(
+        {
+            "session_id": "s-unmarked",
+            "tool_name": "Agent",
+            "tool_input": {"description": "no packet marker in this description"},
+        }
+    )
+
+    stdin = sys.stdin
+    sys.stdin = io.StringIO(payload)
+    try:
+        exit_code = main(
+            [
+                "--repo-root",
+                str(bogus_repo_root),
+                "--state-dir",
+                str(state_dir),
+                "subagent-gate",
+                "--freeze-dir",
+                str(freeze_dir),
+            ]
+        )
+    finally:
+        sys.stdin = stdin
+
+    assert exit_code == 0
+    # No database was ever created -- proof the lazy admission factory
+    # was never invoked for an unmarked launch.
+    assert not (state_dir / "state.db").exists()
 
 
 def test_hermes_stall_cycle_through_the_cli(tmp_path: Path) -> None:
@@ -4027,6 +4173,13 @@ def test_hooks_install_binds_every_event_to_the_stable_launcher(
         "SubagentStart": [
             f"{launcher} --repo-root {repo_root} "
             f"--state-dir {state_dir} child-start"
+        ],
+        # INFRA-215: the PreToolUse gate reserves marked packets and
+        # enforces the six-child cap at the Agent launch boundary.
+        "PreToolUse": [
+            f"{launcher} --repo-root {repo_root} "
+            f"--state-dir {state_dir} subagent-gate --freeze-dir "
+            f"{state_dir / 'freezes'}"
         ],
     }
     for directory in directories:

@@ -143,6 +143,79 @@ def test_reserve_is_exactly_once(
     assert events_of(database, "subagent_packet.reserved") == [packet.packet_id]
 
 
+def test_reserve_counts_only_reserved_rows_for_the_cell(
+    packets: SubagentPackets,
+) -> None:
+    """INFRA-215: active_children() -- the scope reserve() enforces the
+    six-child cap against -- counts only rows truly ``reserved`` for
+    the one cell asked about. A ``planned`` row (never reserved), and
+    every terminal/returned state a settled or reviewed packet can
+    reach (``returned``, ``accepted``, ``failed``, ``rejected``), do
+    not count; nor does another cell's ``reserved`` row."""
+
+    reserved_packet = create(packets, issue_id="INFRA-215-reserved")
+    packets.reserve(
+        reserved_packet.packet_id, session_id=SESSION_A, tool_use_id="r-reserved"
+    )
+
+    create(packets, issue_id="INFRA-215-planned")  # left planned
+
+    returned_packet = create(packets, issue_id="INFRA-215-returned")
+    packets.reserve(
+        returned_packet.packet_id, session_id=SESSION_A, tool_use_id="r-returned"
+    )
+    packets.settle(
+        returned_packet.packet_id, outcome="completed", tool_use_id="r-returned"
+    )
+
+    accepted_packet = create(packets, issue_id="INFRA-215-accepted")
+    packets.reserve(
+        accepted_packet.packet_id, session_id=SESSION_A, tool_use_id="r-accepted"
+    )
+    packets.settle(
+        accepted_packet.packet_id, outcome="completed", tool_use_id="r-accepted"
+    )
+    packets.accept(accepted_packet.packet_id, evidence={"diff": "ok"})
+
+    failed_packet = create(packets, issue_id="INFRA-215-failed")
+    packets.reserve(
+        failed_packet.packet_id, session_id=SESSION_A, tool_use_id="r-failed"
+    )
+    packets.settle(failed_packet.packet_id, outcome="failed", tool_use_id="r-failed")
+
+    rejected_packet = create(packets, issue_id="INFRA-215-rejected")
+    packets.reserve(
+        rejected_packet.packet_id, session_id=SESSION_A, tool_use_id="r-rejected"
+    )
+    packets.reject(rejected_packet.packet_id, reason="scope drift")
+
+    assert packets.active_children("cell-demo") == 1
+
+    other_cell_packet = packets.create(
+        issue_id="INFRA-215-other-cell",
+        project_key="demo",
+        cell_id="cell-other",
+        session_id=SESSION_B,
+        generation=1,
+        model_tier="sonnet",
+        effort="medium",
+        allowed_files=("src/hermes_orchestrator/other.py",),
+        worktree="/work/other",
+        red_test="tests/test_foo.py::test_red",
+        verification=("uv run pytest tests/test_foo.py -q",),
+        invariants="never touch bar.py",
+        resource_note="single worker",
+    )
+    packets.reserve(
+        other_cell_packet.packet_id, session_id=SESSION_B, tool_use_id="r-other-cell"
+    )
+
+    # Neither cell's count is disturbed by the other's reserved row.
+    assert packets.active_children("cell-demo") == 1
+    assert packets.active_children("cell-other") == 1
+    assert packets.active_children("cell-does-not-exist") == 0
+
+
 def test_reserve_refuses_incomplete_dependencies_then_succeeds(
     packets: SubagentPackets,
 ) -> None:

@@ -153,6 +153,7 @@ def make_advance(
     spawn: FakeSpawn | None = None,
     git: FakeGit | None = None,
     ancestry: FakeAncestry | None = None,
+    replenish: Any = None,
 ) -> PostMergeAdvance:
     return PostMergeAdvance(
         database=database,
@@ -166,6 +167,7 @@ def make_advance(
         ancestry=ancestry if ancestry is not None else FakeAncestry(),
         uv_binary="/usr/bin/uv",
         spawn=spawn if spawn is not None else FakeSpawn(),
+        replenish=replenish,
     )
 
 
@@ -473,6 +475,90 @@ def test_on_merged_non_self_host_flips_dependencies_without_intent(
     )
 
     assert database.scalar("SELECT count(*) FROM activation_applies") == 0
+    assert queue.get("ENG-9").dependency_ready is True
+
+
+def test_merge_reconciliation_replenishes_immediately(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """INFRA-215: once a merge reconciliation flips a successor's
+    dependency ready, the injected replenishment hook fires immediately
+    with that exact project -- the same live boundary the daemon's
+    per-tick sweep otherwise only reaches on its next pass."""
+
+    queue = QueueService(
+        database=database, events=events, registered_projects={"plain"}
+    )
+    queue.admit(
+        _request("ENG-9", "chat-9", project_key="plain", dependency_ready=False)
+    )
+    queue.transition("ENG-9", IssueState.BLOCKED, actor="op", reason="dep")
+
+    calls: list[str] = []
+    advance = make_advance(
+        database,
+        events,
+        projects={"plain": PLAIN},
+        queue=queue,
+        tmp_path=tmp_path,
+        replenish=calls.append,
+    )
+
+    advance.on_merged(
+        project_key="plain",
+        issue_id="ENG-8",
+        review_id="review:plain:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
+    assert calls == ["plain"]
+    assert queue.get("ENG-9").dependency_ready is True
+
+    # Idempotent: replaying the identical merge advances nothing new,
+    # so it never re-fires the hook either.
+    advance.on_merged(
+        project_key="plain",
+        issue_id="ENG-8",
+        review_id="review:plain:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+    assert calls == ["plain"]
+
+
+def test_merge_reconciliation_replenish_failure_is_swallowed(
+    database: Database, events: EventStore, tmp_path: Path
+) -> None:
+    """A replenish hook that raises never surfaces into the merge
+    advance path -- the durable dependency-ready flip already landed
+    and the daemon's own per-tick sweep repairs the missed signal."""
+
+    queue = QueueService(
+        database=database, events=events, registered_projects={"plain"}
+    )
+    queue.admit(
+        _request("ENG-9", "chat-9", project_key="plain", dependency_ready=False)
+    )
+    queue.transition("ENG-9", IssueState.BLOCKED, actor="op", reason="dep")
+
+    def _explode(project_key: str) -> None:
+        raise RuntimeError("boom")
+
+    advance = make_advance(
+        database,
+        events,
+        projects={"plain": PLAIN},
+        queue=queue,
+        tmp_path=tmp_path,
+        replenish=_explode,
+    )
+
+    advance.on_merged(
+        project_key="plain",
+        issue_id="ENG-8",
+        review_id="review:plain:evt-1",
+        merge_sha=MERGE_SHA,
+    )
+
     assert queue.get("ENG-9").dependency_ready is True
 
 

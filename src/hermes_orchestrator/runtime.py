@@ -6,6 +6,7 @@ import fcntl
 import os
 import shutil
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TextIO
@@ -67,6 +68,7 @@ from hermes_orchestrator.github import (
 from hermes_orchestrator.handoffs import HandoffService
 from hermes_orchestrator.keychain import Keychain
 from hermes_orchestrator.lead_assignments import LeadAssignments
+from hermes_orchestrator.lead_children import LeadChildTracker
 from hermes_orchestrator.lead_intake import (
     LeadIntakeRouter,
     LeadIntakeTransport,
@@ -218,6 +220,10 @@ class Runtime:
     resets: ScheduledResets | None = None
     reconciliation: ReconciliationReport | None = None
     lead_wakes: LeadTerminalWakes | None = None
+    # INFRA-215: exposed so any caller that settles a child directly
+    # (rather than through a hook-scoped instance) shares the same
+    # immediate work-ready replenishment wiring as ``post_merge``.
+    lead_children: LeadChildTracker | None = None
     cmux_bindings: CmuxSurfaceBindings | None = None
     cmux_reconciler: CmuxSurfaceReconciler | None = None
     cmux_dead_lead_sweep: CmuxDeadLeadSweep | None = None
@@ -597,6 +603,25 @@ def open_runtime(
         subagent_packets = SubagentPackets(database, events=events)
         cmux_bindings = CmuxSurfaceBindings(database=database, events=events)
         queue = QueueService(database, events, settings.projects)
+
+        def _replenish_work_ready(project_key: str) -> None:
+            # INFRA-215: the SAME call the daemon's ``_maintenance``
+            # tick makes per project (``cli._maintenance``'s
+            # ``wakes.commit_work_ready`` loop), invoked immediately by
+            # whichever durable event just made the project's next
+            # eligible transition possible -- a merge reconciliation's
+            # successor release, or a child settling. Idempotent
+            # through ``commit_work_ready``'s own turn-identity dedup;
+            # never raises into its caller.
+            with suppress(Exception):
+                lead_wakes.commit_work_ready(
+                    project_key,
+                    freshness_minutes=settings.policy.resource_sample_freshness_minutes,
+                )
+
+        lead_children = LeadChildTracker(
+            database, control=control_operations, replenish=_replenish_work_ready
+        )
         worktree_git = WorktreeGit()
         worktree_leases = WorktreeLeases(database, events)
         custodian = WorktreeCustodian(worktree_leases, processes, worktree_git)
@@ -806,6 +831,7 @@ def open_runtime(
                 repo_root=settings.repo_root,
                 state_dir=settings.state_dir,
                 registry=processes,
+                replenish=_replenish_work_ready,
             )
             merge_flow.reviews.on_merged = post_merge.on_merged
             # INFRA-198: attached the same way, so post-merge settlement
@@ -1168,6 +1194,7 @@ def open_runtime(
             resets=resets,
             reconciliation=reconciliation,
             lead_wakes=lead_wakes,
+            lead_children=lead_children,
             cmux_bindings=cmux_bindings,
             cmux_reconciler=cmux_reconciler,
             cmux_dead_lead_sweep=cmux_dead_lead_sweep,

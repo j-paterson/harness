@@ -92,6 +92,7 @@ from hermes_orchestrator.hermes_tools import HermesCommandService
 from hermes_orchestrator.issue_targeting import (
     IssueTargetingRefused,
     acknowledge_target,
+    target_harness_followup,
     target_issue,
 )
 from hermes_orchestrator.keychain import Keychain, KeychainWriteError
@@ -216,6 +217,12 @@ def _parser() -> argparse.ArgumentParser:
     target_issue_cmd.add_argument("--cell", required=True)
     target_issue_cmd.add_argument("--session", required=True)
     target_issue_cmd.add_argument("--instruction", required=True)
+    # INFRA-215: ``harness`` attaches ONE explicitly admitted follow-up to
+    # a harness-bound lead lane-preservingly (same cell/session/profile,
+    # no second seat) through ``target_harness_followup``.
+    target_issue_cmd.add_argument(
+        "--lane", choices=("development", "harness"), default="development"
+    )
     target_issue_cmd.add_argument("--json", action="store_true")
 
     target_issue_ack_cmd = commands.add_parser(
@@ -2746,17 +2753,30 @@ def subagent_gate(
     payload: str,
     *,
     admission: PacketAdmission | None = None,
+    admission_factory: Callable[[], PacketAdmission] | None = None,
 ) -> tuple[int, str]:
     """PreToolUse hook: block Agent tool use while the session is frozen,
-    and — once a packet marker is present and packet admission is wired
-    into this process — gate the launch through the durable packet ledger.
+    and — once a packet marker is present — gate the launch through the
+    durable packet ledger.
 
     Exit 2 blocks the tool call in Claude Code and returns the message to
     the lead; exit 0 allows it. Malformed input never blocks silently: it
     fails closed with exit 2 only when a freeze marker cannot be ruled out.
-    A launch with no ``packet:<hex>`` marker in its description/name, or
-    one wired into a process that has no ``admission`` service, keeps the
-    prior freeze-only behavior unchanged.
+    A launch with no ``packet:<hex>`` marker in its description/name keeps
+    freeze-only behavior unchanged, and ``admission_factory`` (built lazily,
+    only once the freeze check has already passed and a marker is found —
+    so an ordinary unmarked launch never even touches the state database)
+    is never invoked for it.
+
+    INFRA-215 (live six-child cap failure): a marked launch that reaches
+    this point with no admission service available — ``admission`` is
+    ``None`` and either no ``admission_factory`` was given or building one
+    raised — is refused (exit 2) rather than let through. Silently
+    allowing a marked launch to bypass the ledger is the exact defect
+    that let nine planned packets start as eight simultaneous children
+    against a limit of six: the packet never left ``planned`` while the
+    lead recorded it started. ``admission=None`` is no longer a
+    freeze-only opt-out for a marked launch.
     """
 
     try:
@@ -2784,8 +2804,21 @@ def subagent_gate(
             ):
                 packet_id = match.group(1)
                 break
-    if packet_id is None or admission is None:
+    if packet_id is None:
         return 0, ""
+    if admission is None and admission_factory is not None:
+        try:
+            admission = admission_factory()
+        except Exception as error:  # fail closed: a marked launch must not slip through
+            return 2, (
+                "subagent gate: packet admission is unavailable "
+                f"(packet:{packet_id}); refusing the launch: {error}"
+            )
+    if admission is None:
+        return 2, (
+            "subagent gate: packet admission is not wired into this "
+            f"process (packet:{packet_id}); refusing the launch"
+        )
 
     tool_use_id = document.get("tool_use_id")
     requested_model = str(tool_input.get("model") or "")
@@ -3508,6 +3541,14 @@ def _hooks_install(args: argparse.Namespace, settings: Settings) -> int:
             stop=f"{base} intake-poll",
             subagent_stop=f"{base} child-stop",
             child_start=f"{base} child-start",
+            # INFRA-215 (six-child cap): the PreToolUse gate is what
+            # reserves a marked packet and enforces the active-child
+            # limit at the Agent launch boundary; without it classic
+            # seats left every packet ``planned`` while children ran.
+            subagent_gate=(
+                f"{base} subagent-gate --freeze-dir "
+                f"{settings.state_dir / 'freezes'}"
+            ),
         ),
     )
     reports = installer.install()
@@ -5054,7 +5095,23 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     args = _parser().parse_args(arguments)
     if args.command == "subagent-gate":
-        code, message = subagent_gate(args.freeze_dir, sys.stdin.read())
+        def _admission_factory() -> PacketAdmission:
+            # Built lazily -- only once subagent_gate has already ruled
+            # out the freeze marker and found a packet:<hex> marker --
+            # so an ordinary unmarked Agent launch never touches the
+            # state database at all, exactly like before INFRA-215.
+            gate_settings = load_settings(args.repo_root, args.state_dir)
+            database = Database.open(gate_settings.state_dir / "state.db")
+            return PacketAdmission(
+                database,
+                packets=SubagentPackets(database, events=EventStore(database)),
+                tiers=configured_model_tiers(),
+                freeze_dir=args.freeze_dir,
+            )
+
+        code, message = subagent_gate(
+            args.freeze_dir, sys.stdin.read(), admission_factory=_admission_factory
+        )
         if message:
             print(message, file=sys.stderr)
         return code
@@ -5979,8 +6036,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if args.command == "target-issue":
             events = EventStore(database)
             assignments = LeadAssignments(database, events=events)
+            targeting = (
+                target_harness_followup
+                if getattr(args, "lane", "development") == "harness"
+                else target_issue
+            )
             try:
-                result = target_issue(
+                result = targeting(
                     database,
                     events=events,
                     assignments=assignments,

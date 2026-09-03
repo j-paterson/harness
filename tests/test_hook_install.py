@@ -3,6 +3,7 @@ Sol correction 032cd4a5)."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -17,6 +18,18 @@ COMMANDS = HookCommandSet(
     stop="uv run hermes-orchestrator intake-poll",
     subagent_stop="uv run hermes-orchestrator child-stop",
     child_start="uv run hermes-orchestrator child-start",
+)
+
+# INFRA-215: the fourth, optional hook -- PreToolUse on the exact
+# "Agent" matcher, running subagent-gate -- that gates every subagent
+# launch through the durable packet ledger. Kept as a separate constant
+# (rather than folded into COMMANDS) so every test that does not care
+# about it keeps exercising the plain three-hook default unchanged.
+COMMANDS_WITH_GATE = dataclasses.replace(
+    COMMANDS,
+    subagent_gate=(
+        "uv run hermes-orchestrator subagent-gate --freeze-dir /var/hermes/freezes"
+    ),
 )
 
 
@@ -41,9 +54,13 @@ def bindings_for(
     ]
 
 
-def test_a_fresh_profile_gets_all_three_exact_bindings(
+def test_a_fresh_profile_with_no_gate_command_gets_only_three_bindings(
     tmp_path: Path,
 ) -> None:
+    """``subagent_gate`` defaults to ``None``: a caller that has not
+    wired a real gate command (it needs a ``--freeze-dir``, unlike the
+    other three) keeps installing exactly the prior three hooks."""
+
     config_dir = tmp_path / "max-a"
     config_dir.mkdir()
 
@@ -58,6 +75,69 @@ def test_a_fresh_profile_gets_all_three_exact_bindings(
     ]
     assert bindings_for(settings, "SubagentStart") == [
         ("*", COMMANDS.child_start)
+    ]
+    assert "PreToolUse" not in settings.get("hooks", {})
+
+
+def test_a_fresh_profile_gets_all_four_exact_bindings(
+    tmp_path: Path,
+) -> None:
+    """INFRA-215: with a real gate command wired, a fresh classic
+    profile installs all four hooks -- including the PreToolUse hook,
+    matched exactly on ``Agent``, that runs ``subagent-gate``. Without
+    it, classic seats never reach ``PacketAdmission.admit`` and packets
+    never leave ``planned`` -- the observed live six-child cap
+    failure."""
+
+    config_dir = tmp_path / "max-a4"
+    config_dir.mkdir()
+
+    [report] = HookInstaller(
+        profiles={"max-a4": config_dir}, commands=COMMANDS_WITH_GATE
+    ).install()
+
+    assert report.installed == (
+        "Stop",
+        "SubagentStop",
+        "SubagentStart",
+        "PreToolUse",
+    )
+    assert report.repaired == ()
+    settings = read_settings(config_dir)
+    assert bindings_for(settings, "Stop") == [("*", COMMANDS_WITH_GATE.stop)]
+    assert bindings_for(settings, "SubagentStop") == [
+        ("*", COMMANDS_WITH_GATE.subagent_stop)
+    ]
+    assert bindings_for(settings, "SubagentStart") == [
+        ("*", COMMANDS_WITH_GATE.child_start)
+    ]
+    assert bindings_for(settings, "PreToolUse") == [
+        ("Agent", COMMANDS_WITH_GATE.subagent_gate)
+    ]
+
+
+def test_the_subagent_gate_hook_reinstalls_idempotently(
+    tmp_path: Path,
+) -> None:
+    """A second install with the same gate command changes nothing and
+    never duplicates the PreToolUse binding."""
+
+    config_dir = tmp_path / "max-a5"
+    config_dir.mkdir()
+    gated_installer = HookInstaller(
+        profiles={"max-a5": config_dir}, commands=COMMANDS_WITH_GATE
+    )
+
+    first = gated_installer.install()[0]
+    second = gated_installer.install()[0]
+
+    assert first.changed
+    assert not second.changed
+    settings = read_settings(config_dir)
+    for event in ("Stop", "SubagentStop", "SubagentStart", "PreToolUse"):
+        assert len(bindings_for(settings, event)) == 1
+    assert bindings_for(settings, "PreToolUse") == [
+        ("Agent", COMMANDS_WITH_GATE.subagent_gate)
     ]
 
 

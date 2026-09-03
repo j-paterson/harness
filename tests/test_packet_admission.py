@@ -12,7 +12,11 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.model_tiers import ModelTier, load_model_tiers
 from hermes_orchestrator.packet_admission import AdmissionDecision, PacketAdmission
-from hermes_orchestrator.subagent_packets import SubagentPacket, SubagentPackets
+from hermes_orchestrator.subagent_packets import (
+    MAX_ACTIVE_CHILDREN,
+    SubagentPacket,
+    SubagentPackets,
+)
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 SESSION = "11111111-2222-4333-8444-555555555555"
@@ -370,6 +374,145 @@ def test_admit_reserves_the_packet_on_success(
         (packet.packet_id,),
     ).fetchone()
     assert str(row["tool_use_id"]) == TOOL_USE_A
+
+
+def test_seventh_reservation_is_refused_while_six_are_active(
+    database: Database, packets: SubagentPackets, admission: PacketAdmission
+) -> None:
+    """INFRA-215: the project contract permits at most six actively
+    executing children for one project lead. A seventh valid,
+    non-conflicting packet is refused at the launch boundary and stays
+    ``planned`` -- never counted as started -- until capacity is
+    released by a settlement, at which point it reserves cleanly."""
+
+    seed_active_cell(database)
+    six = [
+        create_packet(
+            packets,
+            issue_id=f"INFRA-215-{index}",
+            allowed_files=(f"src/hermes_orchestrator/six_{index}.py",),
+            worktree=f"/work/six-{index}",
+        )
+        for index in range(MAX_ACTIVE_CHILDREN)
+    ]
+    for index, packet in enumerate(six):
+        decision = admission.admit(
+            session_id=SESSION,
+            packet_id=packet.packet_id,
+            model="sonnet",
+            effort="high",
+            tool_use_id=f"tool-six-{index}",
+        )
+        assert decision.allowed is True
+
+    assert packets.active_children(CELL_ID) == MAX_ACTIVE_CHILDREN
+
+    seventh = create_packet(
+        packets,
+        issue_id="INFRA-215-seventh",
+        allowed_files=("src/hermes_orchestrator/seventh.py",),
+        worktree="/work/seventh",
+    )
+    decision = admission.admit(
+        session_id=SESSION,
+        packet_id=seventh.packet_id,
+        model="sonnet",
+        effort="high",
+        tool_use_id="tool-seventh",
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == f"active child limit reached ({MAX_ACTIVE_CHILDREN})"
+    assert packets.get(seventh.packet_id).state == "planned"
+    assert packets.active_children(CELL_ID) == MAX_ACTIVE_CHILDREN
+
+    # Settling one of the six releases exactly one slot of capacity.
+    packets.settle(six[0].packet_id, outcome="completed", tool_use_id="tool-six-0")
+    assert packets.active_children(CELL_ID) == MAX_ACTIVE_CHILDREN - 1
+
+    decision = admission.admit(
+        session_id=SESSION,
+        packet_id=seventh.packet_id,
+        model="sonnet",
+        effort="high",
+        tool_use_id="tool-seventh",
+    )
+    assert decision.allowed is True
+    assert packets.get(seventh.packet_id).state == "reserved"
+    assert packets.active_children(CELL_ID) == MAX_ACTIVE_CHILDREN
+
+
+def test_active_count_never_exceeds_six_during_three_issue_wave(
+    database: Database, packets: SubagentPackets, admission: PacketAdmission
+) -> None:
+    """Acceptance evidence for INFRA-215's live scenario: three issues
+    admitted into nine bounded implementation packets for one project
+    lead. Every packet is eventually admitted, but the durable
+    ``reserved`` count for the cell never exceeds six at any point
+    during the wave -- proving truly executing children are
+    distinguished from queued (``planned``) Agent calls."""
+
+    seed_active_cell(database)
+    all_ids = [
+        create_packet(
+            packets,
+            issue_id=f"INFRA-215-issue-{issue}",
+            allowed_files=(f"src/hermes_orchestrator/w{issue}_{slot}.py",),
+            worktree=f"/work/issue-{issue}/{slot}",
+        ).packet_id
+        for issue in range(3)
+        for slot in range(3)
+    ]
+    assert len(all_ids) == 9
+
+    planned = list(all_ids)
+    reserved: list[str] = []
+    tool_use_of: dict[str, str] = {}
+    settled: set[str] = set()
+    max_active_at_once = 0
+    counter = 0
+
+    def admit_every_planned_packet() -> None:
+        nonlocal counter, max_active_at_once
+        for packet_id in list(planned):
+            counter += 1
+            tool_use_id = f"tool-{counter}"
+            decision = admission.admit(
+                session_id=SESSION,
+                packet_id=packet_id,
+                model="sonnet",
+                effort="high",
+                tool_use_id=tool_use_id,
+            )
+            max_active_at_once = max(
+                max_active_at_once, packets.active_children(CELL_ID)
+            )
+            if decision.allowed:
+                planned.remove(packet_id)
+                reserved.append(packet_id)
+                tool_use_of[packet_id] = tool_use_id
+
+    # First pass over the whole wave: exactly six of the nine reserve;
+    # the remaining three valid packets are refused and stay
+    # planned/queued rather than being counted as started.
+    admit_every_planned_packet()
+    assert len(reserved) == MAX_ACTIVE_CHILDREN
+    assert len(planned) == 9 - MAX_ACTIVE_CHILDREN
+    assert packets.active_children(CELL_ID) == MAX_ACTIVE_CHILDREN
+
+    # Drain the wave: settle whatever is reserved, freeing capacity,
+    # and retry the queued packets, until every packet has executed.
+    while planned or reserved:
+        if reserved:
+            packet_id = reserved.pop(0)
+            packets.settle(
+                packet_id, outcome="completed", tool_use_id=tool_use_of[packet_id]
+            )
+            settled.add(packet_id)
+        admit_every_planned_packet()
+
+    assert settled == set(all_ids)
+    assert max_active_at_once == MAX_ACTIVE_CHILDREN
 
 
 def test_admit_is_exactly_once_on_double_admission(

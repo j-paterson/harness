@@ -106,6 +106,7 @@ class PostMergeAdvance:
         spawn: Spawn | None = None,
         now: Callable[[], datetime] | None = None,
         ids: Callable[[], str] | None = None,
+        replenish: Callable[[str], None] | None = None,
     ) -> None:
         self.database = database
         self.events = events
@@ -122,6 +123,12 @@ class PostMergeAdvance:
         self.spawn: Spawn = spawn or asyncio.create_subprocess_exec
         self._now = now or (lambda: datetime.now(UTC))
         self._ids = ids or (lambda: uuid.uuid4().hex)
+        # INFRA-215: an injectable immediate-replenishment hook, called
+        # right after a successor's dependency flips ready. ``None`` is
+        # the ordinary non-live/observe shape -- the daemon's per-tick
+        # ``commit_work_ready`` sweep still discovers the same runnable
+        # work, just not immediately.
+        self.replenish = replenish
 
     # -- fast path (optional) ---------------------------------------------
 
@@ -268,6 +275,12 @@ class PostMergeAdvance:
         ``QueueService.mark_dependency_ready`` is independently
         idempotent, but the guard here also keeps the durable
         ``merge.advanced`` event from ever being journaled twice.
+
+        INFRA-215: once readiness is durably marked, :attr:`replenish`
+        (when wired) is called immediately so a project with runnable
+        work and an idle seat does not wait for the next maintenance
+        tick to be told. It never raises into this method -- a failure
+        here is repaired by the daemon's own per-tick sweep.
         """
 
         existing = self.database.execute(
@@ -290,6 +303,15 @@ class PostMergeAdvance:
                     payload={"project_key": project_key, "reason": reason},
                 ),
             )
+        if self.replenish is not None:
+            try:
+                self.replenish(project_key)
+            except Exception as error:
+                print(
+                    "post-merge advance: immediate replenish failed for "
+                    f"{project_key!r}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
 
     def _advance_verified_successor(self, apply_id: str) -> None:
         """Release a self-host merge's successor once its activation verifies.

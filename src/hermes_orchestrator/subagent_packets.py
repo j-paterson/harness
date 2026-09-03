@@ -33,6 +33,16 @@ from hermes_orchestrator.events import EventInput, EventStore
 
 PACKET_MODEL_TIERS = ("haiku", "sonnet", "fable")
 
+# INFRA-215 (live six-child cap failure): the project contract permits
+# at most this many actively executing Fable children for one project
+# lead at a time. Enforced at the launch boundary -- inside reserve()'s
+# own transaction, immediately before the planned -> reserved CAS -- so
+# a durable "reserved" row can never outnumber the cap even under
+# concurrent PreToolUse gate invocations racing the same sqlite
+# transaction lock. Additional valid packets simply stay planned and
+# reserve as soon as capacity is released by a settlement.
+MAX_ACTIVE_CHILDREN = 6
+
 _SETTLEMENT_OUTCOMES = ("completed", "failed", "capped")
 
 _ABSENT_BLOB = "absent"
@@ -206,6 +216,29 @@ class SubagentPackets:
             )
         return self.get(packet_id)
 
+    def active_children(self, cell_id: str) -> int:
+        """The count of packets currently ``reserved`` -- i.e. durably,
+        actively executing, as opposed to merely ``planned`` -- for
+        this cell. This is the exact scope :meth:`reserve` enforces the
+        ``MAX_ACTIVE_CHILDREN`` cap against: a packet binds one
+        ``cell_id`` for its whole lifetime, and one project lead owns
+        exactly one active cell at a time (session rotation keeps the
+        same cell), so counting by ``cell_id`` -- rather than
+        ``session_id``, which changes across a lead rotation -- is what
+        durably tracks "how many children this project lead currently
+        has actively executing" across a handoff. Every other state
+        (``planned``, ``returned``, ``accepted``, ``failed``,
+        ``rejected``) is deliberately excluded: only ``reserved`` is a
+        truly executing child.
+        """
+
+        row = self._database.execute(
+            "SELECT COUNT(*) AS active FROM subagent_packets "
+            "WHERE cell_id = ? AND state = 'reserved'",
+            (cell_id,),
+        ).fetchone()
+        return int(row["active"])
+
     def reserve(
         self, packet_id: str, *, session_id: str, tool_use_id: str
     ) -> SubagentPacket:
@@ -214,16 +247,21 @@ class SubagentPackets:
         Refuses an unknown packet, a foreign ``session_id`` (one other
         than the packet's bound session), a packet already reserved
         (or otherwise not ``planned``), a ``depends_on`` entry that is
-        not yet ``accepted``, or a pre-work measurement of its
-        ``allowed_files`` that raises (an unreadable worktree) — in
-        every refusal case the row is left completely untouched.
+        not yet ``accepted``, a pre-work measurement of its
+        ``allowed_files`` that raises (an unreadable worktree), or --
+        INFRA-215 -- the packet's cell already having
+        ``MAX_ACTIVE_CHILDREN`` packets ``reserved`` — in every refusal
+        case the row is left completely untouched, still ``planned``,
+        and free to reserve later once capacity is released by a
+        settlement.
         """
 
         stamp = self._now().isoformat()
         with self._database.transaction() as connection:
             row = connection.execute(
-                "SELECT session_id, depends_on_json, allowed_files_json, "
-                "worktree FROM subagent_packets WHERE packet_id = ?",
+                "SELECT session_id, cell_id, depends_on_json, "
+                "allowed_files_json, worktree FROM subagent_packets "
+                "WHERE packet_id = ?",
                 (packet_id,),
             ).fetchone()
             if row is None:
@@ -231,6 +269,22 @@ class SubagentPackets:
             if str(row["session_id"]) != session_id:
                 raise PacketRefused(
                     f"packet {packet_id!r} is bound to a different session"
+                )
+            cell_id = str(row["cell_id"])
+            # The count and the CAS below run inside the same
+            # transaction, on the one connection sqlite already
+            # serializes writers through, so a concurrent reserve()
+            # against the same cell can never both observe headroom
+            # and both commit -- the durable active count can never
+            # exceed the cap.
+            active = connection.execute(
+                "SELECT COUNT(*) AS active FROM subagent_packets "
+                "WHERE cell_id = ? AND state = 'reserved'",
+                (cell_id,),
+            ).fetchone()["active"]
+            if int(active) >= MAX_ACTIVE_CHILDREN:
+                raise PacketRefused(
+                    f"active child limit reached ({MAX_ACTIVE_CHILDREN})"
                 )
             for dependency_id in json.loads(str(row["depends_on_json"])):
                 dependency = connection.execute(

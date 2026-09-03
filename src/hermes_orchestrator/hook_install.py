@@ -17,6 +17,12 @@ directory, fsynced, moved over settings.json with its permissions
 preserved, and the directory is fsynced — an interruption at any point
 leaves the original file complete and parseable. Running the installer
 twice is a no-op.
+
+INFRA-215: when its ``HookCommandSet`` carries a ``subagent_gate``
+command, the same single sweep also installs the real PreToolUse hook,
+matched exactly on ``Agent``, that runs ``subagent-gate`` -- the launch
+boundary gate a classic profile needs to ever reach
+``PacketAdmission.admit`` at all.
 """
 
 from __future__ import annotations
@@ -31,22 +37,39 @@ from pathlib import Path
 
 @dataclass(frozen=True, slots=True)
 class HookCommandSet:
-    """The exact hook command per lifecycle event."""
+    """The exact hook command per lifecycle event.
+
+    ``subagent_gate`` (INFRA-215) is the PreToolUse-on-``Agent`` hook
+    that runs ``subagent-gate`` and gates every subagent launch through
+    the durable packet ledger. It is optional and defaults to ``None``
+    so a caller that has not yet wired its real command (which needs a
+    ``--freeze-dir``, unlike the other three) keeps installing exactly
+    the prior three hooks; when it is supplied, the fourth hook installs
+    and re-installs idempotently exactly like the others. Its absence
+    from a classic profile's settings.json was the root cause of the
+    live six-child cap failure: without it, classic seats never reached
+    ``PacketAdmission.admit`` and packets never left ``planned`` while
+    ``lead_children`` recorded them started.
+    """
 
     stop: str
     subagent_stop: str
     child_start: str
+    subagent_gate: str | None = None
 
 
 # (settings event, exact matcher, HookCommandSet attribute).
 # Child starts install on SubagentStart — the lifecycle event that
 # shares its agent_id namespace with SubagentStop — never on
 # PreToolUse, whose tool_use_id identifies the invocation, not the
-# spawned agent lifecycle.
+# spawned agent lifecycle. The subagent-gate hook is the deliberate
+# exception: it binds to PreToolUse under the exact "Agent" matcher
+# because it must run BEFORE the launch it may refuse, not after.
 _HOOK_SPECS: tuple[tuple[str, str, str], ...] = (
     ("Stop", "*", "stop"),
     ("SubagentStop", "*", "subagent_stop"),
     ("SubagentStart", "*", "child_start"),
+    ("PreToolUse", "Agent", "subagent_gate"),
 )
 
 # INFRA-204: superseded Hermes hook shells. A profile that still
@@ -152,6 +175,7 @@ class HookInstaller:
         home_events = {
             getattr(self._commands, attribute): event
             for event, _matcher, attribute in _HOOK_SPECS
+            if getattr(self._commands, attribute) is not None
         }
         crossed: set[str] = set()
         retired: list[str] = []
@@ -194,6 +218,12 @@ class HookInstaller:
                 hooks.pop(event_name, None)
         for event, matcher, attribute in _HOOK_SPECS:
             command = getattr(self._commands, attribute)
+            if command is None:
+                # Not wired into this HookCommandSet (e.g. subagent_gate
+                # left at its default) -- leave this event section
+                # entirely untouched, exactly as before this hook spec
+                # existed.
+                continue
             entries = hooks.setdefault(event, [])
             if not isinstance(entries, list):
                 raise ValueError(

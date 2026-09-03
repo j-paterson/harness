@@ -10,6 +10,7 @@ import pytest
 from hermes_orchestrator.codex_rpc import CodexRateLimits
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_sources import (
+    BatchProvider,
     CapacityProvider,
     ClaudeUsageCacheProvider,
     CodexStatusProvider,
@@ -247,12 +248,13 @@ def _insert_issue(
     state: str,
     updated_at: str,
     dependency_ready: int = 1,
+    instruction_id: str | None = None,
 ) -> None:
     connection.execute(
         "INSERT INTO admitted_issues("
         "issue_id, project_key, priority, state, admitted_at, updated_at, "
-        "dependency_ready"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "dependency_ready, instruction_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             issue_id,
             project_key,
@@ -261,6 +263,7 @@ def _insert_issue(
             updated_at,
             updated_at,
             dependency_ready,
+            instruction_id,
         ),
     )
 
@@ -1499,4 +1502,131 @@ async def test_cache_change_between_ticks_updates_only_that_profile(
     # max-b now has fresh windows; max-a's are unchanged.
     assert second_by_alias["max-b"].windows.fable_used == 3
     assert second_by_alias["max-a"].windows.fable_used == 12
+    database.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-215 (reopened): BatchProvider -- project_driver.batch_status,
+# reshaped into a fact per project.
+# ---------------------------------------------------------------------------
+
+
+def test_batch_fact_is_derived_from_batch_status(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    with database.transaction() as connection:
+        # proj-a: one runnable issue, one in development -- not complete.
+        _insert_issue(
+            connection,
+            issue_id="INFRA-10",
+            project_key="proj-a",
+            priority=1,
+            state="queued",
+            updated_at="2026-09-01T10:00:00+00:00",
+            instruction_id="chat-INFRA-10",
+        )
+        _insert_issue(
+            connection,
+            issue_id="INFRA-11",
+            project_key="proj-a",
+            priority=2,
+            state="in_development",
+            updated_at="2026-09-01T10:05:00+00:00",
+            instruction_id="chat-INFRA-11",
+        )
+        # proj-b: a single, already-done issue -- complete.
+        _insert_issue(
+            connection,
+            issue_id="INFRA-20",
+            project_key="proj-b",
+            priority=1,
+            state="done",
+            updated_at="2026-09-01T09:00:00+00:00",
+            instruction_id="chat-INFRA-20",
+        )
+        # A candidate for an issue that was never admitted: it must bump
+        # proj-a's pending count (pending_candidates is project-wide,
+        # per project_driver) but never appear in any per-issue field
+        # (objective/active/runnable) of either project's batch fact.
+        connection.execute(
+            "INSERT INTO wake_deliveries(project_key, event_id, status, "
+            "issue_id, candidate_sha, base_sha, branch, manifest_path, "
+            "manifest_digest, manifest_device, manifest_inode, "
+            "manifest_size, manifest_mtime_ns, manifest_mode, state, "
+            "created_at, updated_at) VALUES ('proj-a', 'ev-1', 'open', "
+            "'GHOST-1', ?, 'base', 'main', '/tmp/manifest', 'digest', 0, "
+            "0, 0, 0, 0, 'pending', ?, ?)",
+            (
+                "c" * 40,
+                "2026-09-01T10:00:00+00:00",
+                "2026-09-01T10:00:00+00:00",
+            ),
+        )
+
+    facts = {
+        fact.project_key: fact
+        for fact in BatchProvider(database).batches(("proj-a", "proj-b"), now=now)
+    }
+
+    proj_a = facts["proj-a"]
+    assert proj_a.objective == "chat-INFRA-10, chat-INFRA-11"
+    assert proj_a.admitted_total == 2
+    assert proj_a.terminal_total == 0
+    assert proj_a.active == (("INFRA-10", "queued"), ("INFRA-11", "in_development"))
+    assert proj_a.runnable == ("INFRA-10",)
+    assert proj_a.pending == "candidates=1 corrections=0 merges=0 leases=0"
+    assert proj_a.next_action == "replenish:INFRA-10"
+    assert proj_a.blocker is None
+    assert proj_a.complete is False
+    assert "GHOST-1" not in proj_a.objective
+    assert "GHOST-1" not in proj_a.runnable
+    assert all(issue_id != "GHOST-1" for issue_id, _ in proj_a.active)
+
+    proj_b = facts["proj-b"]
+    assert proj_b.objective == "chat-INFRA-20"
+    assert proj_b.admitted_total == 1
+    assert proj_b.terminal_total == 1
+    assert proj_b.active == ()
+    assert proj_b.runnable == ()
+    assert proj_b.pending == "candidates=0 corrections=0 merges=0 leases=0"
+    assert proj_b.next_action == "complete"
+    assert proj_b.blocker is None
+    assert proj_b.complete is True
+
+    database.close()
+
+
+@pytest.mark.asyncio
+async def test_collect_populates_batches_for_every_known_project_only(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-30",
+            project_key="proj-x",
+            priority=1,
+            state="queued",
+            updated_at="2026-09-01T10:00:00+00:00",
+            instruction_id="chat-INFRA-30",
+        )
+        _insert_cell(
+            connection,
+            cell_id="cell-x",
+            project_key="proj-x",
+            state="active",
+            profile_alias="max-a",
+            session_id="session-x",
+        )
+
+    sources = DashboardSources(database=database, registry=_registry(tmp_path))
+    snapshot = await sources.collect(now)
+
+    project_keys = {fact.project_key for fact in snapshot.batches}
+    assert project_keys == {"proj-x"}
+    fact = snapshot.batches[0]
+    assert fact.objective == "chat-INFRA-30"
+    assert fact.runnable == ("INFRA-30",)
     database.close()

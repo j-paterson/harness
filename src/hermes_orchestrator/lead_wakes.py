@@ -330,21 +330,30 @@ class LeadTerminalWakes:
         (:func:`cells.admission_priority_ceiling`, the ONE shared
         budget the daemon dispatch path and the Stop-hook idle
         dispatcher already run, and which fails closed on a missing,
-        stale, or red sample); an admitted issue genuinely runnable
-        (``queued`` AND ``dependency_ready``) that is NOT already bound
-        to a live ``worktree_leases`` row — a bound lane is work
-        already in progress, not work to dispatch again; and the
-        canonical :func:`cells.development_lane_saturated` bound.
+        stale, or red sample); and at least one admitted issue genuinely
+        runnable by :func:`project_driver.replenishment_targets` --
+        ``queued``, ``dependency_ready``, not already bound to a live
+        ``worktree_leases`` row (a bound lane is work already in
+        progress, not work to dispatch again), and within the canonical
+        development-lane headroom (:data:`cells.MAX_DEVELOPMENT_ISSUE_LANES`
+        minus the project's occupying issues).
+
+        INFRA-215: wakes with EVERY such runnable issue up to headroom,
+        not merely the first -- every other wake kind fires because a
+        turn ENDED, so this is the one live boundary that tells an idle
+        seat everything safe to pick up right now, and a lead that
+        completes several issues per turn needs the whole set, not a
+        wake per issue. The durable ``issue_id`` column is unchanged
+        (schema untouched) and keeps the first target; the reason and
+        turn key carry the full set.
 
         The turn key is the runnable SET, never a clock, so an
         unchanged condition re-commits nothing however often this
         runs; a changed set is a new condition and wakes once more.
         """
 
-        from hermes_orchestrator.cells import (
-            admission_priority_ceiling,
-            development_lane_saturated,
-        )
+        from hermes_orchestrator.cells import admission_priority_ceiling
+        from hermes_orchestrator.project_driver import replenishment_targets
 
         cell = self._database.execute(
             "SELECT cell_id, session_id, profile_alias FROM project_cells "
@@ -362,23 +371,10 @@ class LeadTerminalWakes:
         )
         if ceiling is None:
             return None
-        runnable = [
-            str(row["issue_id"])
-            for row in self._database.execute(
-                "SELECT issue_id FROM admitted_issues WHERE project_key = ? "
-                "AND state = 'queued' AND dependency_ready = 1 "
-                "AND priority <= ? AND issue_id NOT IN ("
-                "SELECT issue_id FROM worktree_leases "
-                "WHERE project_key = ? AND state != 'reclaimed') "
-                "ORDER BY issue_id",
-                (project_key, ceiling, project_key),
-            ).fetchall()
-        ]
+        runnable = replenishment_targets(
+            self._database, project_key, priority_ceiling=ceiling
+        )
         if not runnable:
-            return None
-        if development_lane_saturated(
-            self._database, project_key=project_key, issue_id=runnable[0]
-        ):
             return None
         return self.commit(
             TerminalWakeInput(
@@ -389,7 +385,10 @@ class LeadTerminalWakes:
                 profile_alias=str(cell["profile_alias"]),
                 turn_key="work-ready:" + ",".join(runnable),
                 kind="work_ready",
-                reason=f"{len(runnable)} admitted issue(s) runnable now",
+                reason=(
+                    f"{len(runnable)} admitted issue(s) runnable now: "
+                    + ", ".join(runnable)
+                ),
             )
         )
 
