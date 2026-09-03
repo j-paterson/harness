@@ -3023,6 +3023,35 @@ class TestChannelTrustLifecycle:
         assert control_operation_kinds(database) == []
 
     @pytest.mark.asyncio
+    async def test_registered_session_skips_confirmation_watch(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        seed_cell(database)
+        entry = trust_package(tmp_path)
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen="no dialog")
+        binding = bind_demo_lead(bindings)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO channel_registrations("
+                "registration_id, project_key, cell_id, session_id, "
+                "profile_alias, generation, state, connected_at"
+                ") VALUES ('registration-demo', 'demo', 'cell-demo', ?, "
+                "'max-a', 1, 'active', ?)",
+                (SESSION, NOW.isoformat()),
+            )
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is None
+        assert port.screen_reads == 0
+        assert port.confirmed == []
+
+    @pytest.mark.asyncio
     async def test_claim_failure_sends_zero_keys(
         self,
         database: Database,
@@ -3144,7 +3173,7 @@ class TestChannelTrustLifecycle:
         assert port.confirmed == []
 
     @pytest.mark.asyncio
-    async def test_the_trigger_fires_once_per_new_channel_binding(
+    async def test_the_trigger_retries_a_reused_pending_channel_binding(
         self, database: Database, bindings: CmuxSurfaceBindings
     ) -> None:
         port = FakePort(next_refs=[LEAD])
@@ -3169,10 +3198,13 @@ class TestChannelTrustLifecycle:
             ),
         )
 
-        # One trigger, carrying the exact newly created binding; the
-        # reuse path never re-triggers.
+        # Recovery reuses the exact binding and retries its bounded trust
+        # transition; the real confirmer returns immediately once registered.
         assert second.binding_id == first.binding_id
-        assert [b.binding_id for b in trigger.calls] == [first.binding_id]
+        assert [b.binding_id for b in trigger.calls] == [
+            first.binding_id,
+            first.binding_id,
+        ]
 
     @pytest.mark.asyncio
     async def test_a_trigger_failure_never_breaks_the_seat(

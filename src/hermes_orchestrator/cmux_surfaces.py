@@ -2345,6 +2345,12 @@ class ChannelTrustConfirmer:
         if binding.cell_id is None or binding.session_id is None:
             return None
         session_id = str(binding.session_id)
+        if self._database.execute(
+            "SELECT 1 FROM channel_registrations "
+            "WHERE session_id = ? AND state = 'active' LIMIT 1",
+            (session_id,),
+        ).fetchone() is not None:
+            return None
         ref = binding.ref
         # Bounded watch, mirroring the CLI's pattern: the dialog either
         # appears within the window or this trigger does nothing at all.
@@ -2669,6 +2675,17 @@ class CmuxLeadSeater:
         if existing is not None:
             if existing.session_id == session_id:
                 await self._show_issue(existing, issue_id)
+                if (
+                    classic_command is not None
+                    and self._channel_launch is not None
+                    and self._channel_trust is not None
+                ):
+                    # A prior activation may have bound the pane before its
+                    # trust check could confirm. Recovery reuses the pane and
+                    # retries that bounded transition; registered sessions
+                    # return immediately in ChannelTrustConfirmer.
+                    with suppress(Exception):
+                        await self._channel_trust.confirm_seat(existing)
                 return existing
             # The cell rotated to a new session: the old seat's exact
             # workspace is closed and its binding retired before any
