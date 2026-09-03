@@ -5960,6 +5960,54 @@ def test_channel_trust_confirm_exit_codes_fail_closed(
         assert payload["first_failure"] == first_failure
 
 
+def test_channel_trust_confirm_recovers_an_anchorless_managed_seat(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-shot retry uses the same adoption path as a fresh launch."""
+
+    import hermes_orchestrator.channel_trust as channel_trust_module
+    import hermes_orchestrator.cli as cli_module
+
+    _repo_root, state_dir = configured_repo
+    _write_cmux_config(_repo_root)
+    _bind_rotate_lead_cell(state_dir, cell_id="cell-demo")
+    monkeypatch.setattr(
+        channel_trust_module.ChannelTrustAnchors,
+        "active_for_cell",
+        lambda self, cell_id: None,
+    )
+
+    calls: list[str] = []
+
+    async def _confirm(self: object, binding: Any) -> object:
+        calls.append(str(binding.cell_id))
+        return channel_trust_module.TrustVerdict(
+            confirmed=True,
+            anchor_id="adopted-anchor",
+            receipt_operation_id="confirm-1",
+        )
+
+    monkeypatch.setattr(
+        cli_module.ChannelTrustConfirmer, "confirm_seat", _confirm
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "channel-trust-confirm",
+            "--cell",
+            "cell-demo",
+            "--wait-seconds",
+            "1",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["cell-demo"]
+    assert json.loads(result.stdout)["confirmed"] is True
+
+
 # Sol correction a06cbce0: prompt capture validates exactly one
 # DISPLAYED Channels entry inside the confirmation dialog, ignoring an
 # echoed shell launch command that legitimately repeats the channel
