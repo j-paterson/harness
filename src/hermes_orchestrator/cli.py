@@ -2187,6 +2187,75 @@ def _active_cell_for_issue(database: Database, issue_id: str) -> tuple[str, str,
     )
 
 
+def _issue_lane_for_decision(
+    database: Database, issue_id: str
+) -> tuple[str, str, str]:
+    """Resolve the exact ``(cell_id, session_id, project_key)`` an
+    operator decision for ``issue_id`` must be bound to and eventually
+    wake.
+
+    Sol correction 4feb88e8 (INFRA-224 acceptance 4): a project may
+    have more than one active lane cell (development and harness), so
+    ``_active_cell_for_issue``'s "the active cell for this project"
+    lookup can hand a decision -- and its later ``decision_resolved``
+    wake -- to a sibling lane that has nothing to do with the issue.
+    The issue's own live ``lead_assignments`` row is the authoritative,
+    issue-scoped binding; this refuses closed rather than ever
+    selecting an arbitrary active project cell.
+    """
+
+    issue_row = database.execute(
+        "SELECT project_key FROM admitted_issues WHERE issue_id = ?",
+        (issue_id,),
+    ).fetchone()
+    if issue_row is None:
+        raise ValueError(f"no active cell owns issue {issue_id!r}")
+    issue_project_key = str(issue_row["project_key"])
+
+    assignment_rows = database.execute(
+        "SELECT cell_id, session_id, project_key FROM lead_assignments "
+        "WHERE issue_id = ? AND state != 'superseded'",
+        (issue_id,),
+    ).fetchall()
+    if not assignment_rows:
+        raise ValueError(f"no live lead assignment binds issue {issue_id!r}")
+    bindings = {
+        (str(row["cell_id"]), str(row["session_id"])) for row in assignment_rows
+    }
+    if len(bindings) > 1:
+        raise ValueError(
+            f"ambiguous live lead assignment for issue {issue_id!r}: "
+            f"{len(bindings)} distinct cell/session bindings are live"
+        )
+    assignment_row = assignment_rows[0]
+    cell_id = str(assignment_row["cell_id"])
+    session_id = str(assignment_row["session_id"])
+    assignment_project_key = str(assignment_row["project_key"])
+    if assignment_project_key != issue_project_key:
+        raise ValueError(
+            f"lead assignment for issue {issue_id!r} names project "
+            f"{assignment_project_key!r}, which does not match issue "
+            f"project {issue_project_key!r}"
+        )
+    cell_row = database.execute(
+        "SELECT session_id FROM project_cells "
+        "WHERE cell_id = ? AND state = 'active'",
+        (cell_id,),
+    ).fetchone()
+    if cell_row is None:
+        raise ValueError(
+            f"lead assignment for issue {issue_id!r} names cell "
+            f"{cell_id!r}, which is not an active cell"
+        )
+    if str(cell_row["session_id"]) != session_id:
+        raise ValueError(
+            f"lead assignment for issue {issue_id!r} names session "
+            f"{session_id!r}, but cell {cell_id!r} is now running "
+            f"session {cell_row['session_id']!r}"
+        )
+    return cell_id, session_id, issue_project_key
+
+
 def _decision_inbox(runtime: Runtime) -> DecisionInbox:
     """Build a :class:`DecisionInbox` over the runtime's shared state.
 
@@ -2363,7 +2432,7 @@ def _hermes_handlers(
         }
 
     def raise_operator_decision(command: Any) -> dict[str, Any]:
-        cell_id, session_id, project_key = _active_cell_for_issue(
+        cell_id, session_id, project_key = _issue_lane_for_decision(
             runtime.database, command.issue_id
         )
         inbox = _decision_inbox(runtime)

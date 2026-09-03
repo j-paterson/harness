@@ -1488,9 +1488,16 @@ def _seed_admitted_issue_with_active_cell(
 
     INFRA-224: ``session_id`` must be a real UUID string -- a resolved
     decision's wake commit parses it with ``UUID(str(...))``.
+
+    Sol correction 4feb88e8: ``raise_operator_decision`` now resolves
+    its lane from the issue's own live ``lead_assignments`` binding
+    rather than "the" active project cell, so this also publishes that
+    exact binding for the seeded cell/session.
     """
 
     from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.lead_assignments import LeadAssignments
 
     now = "2026-08-28T00:00:00+00:00"
     database = Database.open(database_path)
@@ -1508,6 +1515,18 @@ def _seed_admitted_issue_with_active_cell(
                 "dependency_ready, overlap_risk, admitted_at, updated_at"
                 ") VALUES (?, ?, 1, 'queued', ?, 1, 0, ?, ?)",
                 (issue_id, project_key, f"instr-{issue_id}", now, now),
+            )
+        assignments = LeadAssignments(database, events=EventStore(database))
+        with database.transaction() as connection:
+            assignments.publish_in(
+                connection,
+                project_key=project_key,
+                issue_id=issue_id,
+                cell_id=cell_id,
+                session_id=session_id,
+                profile_alias=profile_alias,
+                instruction_id=f"instr-{issue_id}",
+                queue_transition="queued->in_development",
             )
     finally:
         database.close()
@@ -1790,6 +1809,314 @@ def test_hermes_command_pending_operator_decisions_orders_across_projects(
     )
     scoped_state = json.loads(scoped.stdout)["state"]
     assert [item["decision_id"] for item in scoped_state["decisions"]] == [first_id]
+
+
+def test_raise_operator_decision_binds_to_exact_issue_lane_when_project_has_multiple_active_cells(  # noqa: E501
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """Sol correction 4feb88e8 (INFRA-224 acceptance 4): a project with
+    TWO active lane cells (development and harness) must never let
+    ``raise_operator_decision`` fall back to "the" active project cell
+    -- the issue's own live lead assignment names the exact lane, even
+    when that lane is not the first active cell for the project."""
+
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    state_dir.mkdir(exist_ok=True)
+    now = "2026-08-28T00:00:00+00:00"
+    dev_session = "11111111-1111-4111-8111-111111111111"
+    harness_session = "22222222-2222-4222-8222-222222222222"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "lane_role, created_at, updated_at) VALUES "
+                "('cell-dev', 'demo', 'active', 'max-a', ?, 'development', "
+                "?, ?)",
+                (dev_session, now, now),
+            )
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "lane_role, created_at, updated_at) VALUES "
+                "('cell-harness', 'demo', 'active', 'max-b', ?, 'harness', "
+                "?, ?)",
+                (harness_session, now, now),
+            )
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at"
+                ") VALUES ('ENG-9', 'demo', 1, 'queued', 'instr-ENG-9', 1, "
+                "0, ?, ?)",
+                (now, now),
+            )
+            connection.execute(
+                "INSERT INTO lead_assignments("
+                "assignment_id, schema_version, project_key, issue_id, "
+                "cell_id, session_id, profile_alias, instruction_id, "
+                "queue_transition, state, created_at, updated_at, "
+                "acknowledged_at) VALUES "
+                "('asn-1', 1, 'demo', 'ENG-9', 'cell-harness', ?, 'max-b', "
+                "'instr-ENG-9', 'queued->in_development', 'acknowledged', "
+                "?, ?, ?)",
+                (harness_session, now, now, now),
+            )
+    finally:
+        database.close()
+
+    raise_payload = _decision_raise_payload("ENG-9")
+    raised = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(raise_payload),
+        ]
+    )
+    assert raised.exit_code == 0, raised.output
+    raised_state = json.loads(raised.stdout)["state"]
+    decision_id = raised_state["decision_id"]
+    assert decision_id
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        row = database.execute(
+            "SELECT cell_id, session_id FROM operator_decisions "
+            "WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+    finally:
+        database.close()
+    assert row is not None
+    assert str(row["cell_id"]) == "cell-harness"
+    assert str(row["session_id"]) == harness_session
+
+    applied = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "apply_operator_decision",
+                    "decision_id": decision_id,
+                    "status": "approved",
+                    "source_message": "go with the alias",
+                    "answer": "keep the alias for one release",
+                    "next_action": "resume the migration packet",
+                }
+            ),
+        ]
+    )
+    assert applied.exit_code == 0, applied.output
+    applied_state = json.loads(applied.stdout)["state"]
+    assert applied_state["woke"] is True
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        wake_rows = database.execute(
+            "SELECT cell_id, session_id FROM lead_terminal_wakes "
+            "WHERE kind = 'decision_resolved'"
+        ).fetchall()
+    finally:
+        database.close()
+    assert len(wake_rows) == 1
+    assert str(wake_rows[0]["cell_id"]) == "cell-harness"
+    assert str(wake_rows[0]["session_id"]) == harness_session
+    assert not any(str(row["cell_id"]) == "cell-dev" for row in wake_rows)
+
+
+def test_raise_operator_decision_refuses_missing_or_ambiguous_live_assignment(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """Sol correction 4feb88e8: with no live, unambiguous, currently-
+    active lead assignment for the issue, ``raise_operator_decision``
+    must refuse closed rather than ever guessing an arbitrary active
+    project cell -- and must never persist an ``operator_decisions``
+    row while refusing."""
+
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    state_dir.mkdir(exist_ok=True)
+    now = "2026-08-28T00:00:00+00:00"
+
+    def admit_issue(connection: Any, issue_id: str, project_key: str) -> None:
+        connection.execute(
+            "INSERT INTO admitted_issues("
+            "issue_id, project_key, priority, state, instruction_id, "
+            "dependency_ready, overlap_risk, admitted_at, updated_at"
+            ") VALUES (?, ?, 1, 'queued', ?, 1, 0, ?, ?)",
+            (issue_id, project_key, f"instr-{issue_id}", now, now),
+        )
+
+    def insert_cell(
+        connection: Any,
+        cell_id: str,
+        project_key: str,
+        session_id: str,
+        *,
+        state: str = "active",
+        lane_role: str = "development",
+    ) -> None:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "lane_role, created_at, updated_at) VALUES "
+            "(?, ?, ?, 'max-a', ?, ?, ?, ?)",
+            (cell_id, project_key, state, session_id, lane_role, now, now),
+        )
+
+    def insert_assignment(
+        connection: Any,
+        assignment_id: str,
+        project_key: str,
+        issue_id: str,
+        cell_id: str,
+        session_id: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO lead_assignments("
+            "assignment_id, schema_version, project_key, issue_id, "
+            "cell_id, session_id, profile_alias, instruction_id, "
+            "queue_transition, state, created_at, updated_at, "
+            "acknowledged_at) VALUES (?, 1, ?, ?, ?, ?, 'max-a', ?, "
+            "'queued->in_development', 'acknowledged', ?, ?, ?)",
+            (
+                assignment_id,
+                project_key,
+                issue_id,
+                cell_id,
+                session_id,
+                f"instr-{issue_id}",
+                now,
+                now,
+                now,
+            ),
+        )
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            # (a) an admitted issue with an active cell but NO live
+            # lead assignment at all.
+            insert_cell(
+                connection,
+                "cell-a",
+                "proj-a",
+                "11111111-1111-4111-8111-111111111111",
+            )
+            admit_issue(connection, "ENG-A", "proj-a")
+
+            # (b) two live assignments binding the same issue to two
+            # different cells/sessions -- ambiguous ownership.
+            insert_cell(
+                connection,
+                "cell-b1",
+                "proj-b",
+                "22222222-2222-4222-8222-222222222222",
+            )
+            insert_cell(
+                connection,
+                "cell-b2",
+                "proj-b",
+                "33333333-3333-4333-8333-333333333333",
+                lane_role="harness",
+            )
+            admit_issue(connection, "ENG-B", "proj-b")
+            insert_assignment(
+                connection,
+                "asn-b1",
+                "proj-b",
+                "ENG-B",
+                "cell-b1",
+                "22222222-2222-4222-8222-222222222222",
+            )
+            insert_assignment(
+                connection,
+                "asn-b2",
+                "proj-b",
+                "ENG-B",
+                "cell-b2",
+                "33333333-3333-4333-8333-333333333333",
+            )
+
+            # (c1) a live assignment whose named cell is no longer
+            # active (retired).
+            insert_cell(
+                connection,
+                "cell-c1",
+                "proj-c1",
+                "44444444-4444-4444-8444-444444444444",
+                state="retired",
+            )
+            admit_issue(connection, "ENG-C1", "proj-c1")
+            insert_assignment(
+                connection,
+                "asn-c1",
+                "proj-c1",
+                "ENG-C1",
+                "cell-c1",
+                "44444444-4444-4444-8444-444444444444",
+            )
+
+            # (c2) a live assignment whose session no longer matches
+            # the cell's current session (the cell rotated seats).
+            insert_cell(
+                connection,
+                "cell-c2",
+                "proj-c2",
+                "55555555-5555-4555-8555-555555555555",
+            )
+            admit_issue(connection, "ENG-C2", "proj-c2")
+            insert_assignment(
+                connection,
+                "asn-c2",
+                "proj-c2",
+                "ENG-C2",
+                "cell-c2",
+                "66666666-6666-4666-8666-666666666666",
+            )
+    finally:
+        database.close()
+
+    cases = (
+        ("ENG-A", "no live lead assignment"),
+        ("ENG-B", "ambiguous"),
+        ("ENG-C1", "not an active cell"),
+        ("ENG-C2", "now running"),
+    )
+    for issue_id, expected_snippet in cases:
+        payload = _decision_raise_payload(
+            issue_id, question=f"decision for {issue_id}"
+        )
+        result = invoke(
+            [
+                *base_arguments(configured_repo),
+                "hermes-command",
+                "--json",
+                json.dumps(payload),
+            ]
+        )
+        assert result.exit_code == 0, result.output
+        result_state = json.loads(result.stdout)
+        assert result_state["code"] == "rejected", (issue_id, result_state)
+        assert expected_snippet in str(result_state["state"]["reason"]), (
+            issue_id,
+            result_state,
+        )
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        count = int(database.scalar("SELECT count(*) FROM operator_decisions"))
+    finally:
+        database.close()
+    assert count == 0
 
 
 def test_hermes_command_record_direct_exception_creates_accepted_packet(
