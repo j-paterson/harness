@@ -1619,6 +1619,55 @@ async def test_stale_settled_wake_is_reconciled_before_selection(
 
 
 @pytest.mark.asyncio
+async def test_pending_merged_descendant_retires_itself_and_stale_parent(
+    flow: ProductionShapedFlow,
+) -> None:
+    """A recovered merge clears both queue rows without another review."""
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_B, pr_number=14)
+    newer = await flow.emitter.emit(
+        "demo", "ENG-9", verification=(("t", "ok"),)
+    )
+    settled = await flow.turns.submit_review(
+        "demo",
+        **_submission(
+            newer.event.event_id,
+            "ENG-9",
+            SHA_B,
+            flow.verdict(SHA_B, branch, 14),
+        ),
+    )
+    assert settled.kind == "merged"
+
+    older_at = flow.clock - timedelta(minutes=5)
+    newer_at = flow.clock.isoformat()
+    flow.database.execute(
+        "UPDATE wake_deliveries SET state = 'pending', created_at = ?, "
+        "updated_at = ? WHERE event_id = ?",
+        (newer_at, newer_at, newer.event.event_id),
+    )
+    _insert_wake(
+        flow,
+        event_id="evt-old",
+        issue_id="ENG-9",
+        sha=SHA_A,
+        state="delivered",
+        created_at=older_at,
+    )
+    flow.git.ancestor[(SHA_A, SHA_B)] = True
+
+    assert flow.turns.outstanding_wake("demo") is None
+    rows = flow.database.execute(
+        "SELECT event_id, state FROM wake_deliveries ORDER BY created_at"
+    ).fetchall()
+    assert [(row["event_id"], row["state"]) for row in rows] == [
+        ("evt-old", "completed"),
+        (newer.event.event_id, "completed"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_partially_settled_wake_is_never_reconciled(
     flow: ProductionShapedFlow,
 ) -> None:

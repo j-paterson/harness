@@ -465,6 +465,19 @@ class MergerTurnService:
         ``MergerSession.review_active`` see it as no longer live.
         """
 
+        # A crash or manual recovery can leave an already-settled candidate
+        # in the delivery queue.  Retire it before asking which review is
+        # current; sending it to Sol again cannot change the proven merge.
+        pending = self._database.execute(
+            "SELECT status, issue_id, candidate_sha, base_sha, "
+            "manifest_path, event_id, manifest_digest FROM wake_deliveries "
+            "WHERE project_key = ? AND state = 'pending' "
+            "ORDER BY created_at ASC, rowid ASC",
+            (project_key,),
+        ).fetchall()
+        for row in pending:
+            self._reconcile_settled_wake(project_key, "pending", row)
+
         for state in ("admitted", "delivered"):
             rows = self._database.execute(
                 "SELECT status, issue_id, candidate_sha, base_sha, "
@@ -658,10 +671,20 @@ class MergerTurnService:
         if anchor is None:
             return False
         newer_rows = self._database.execute(
-            "SELECT candidate_sha FROM wake_deliveries WHERE project_key = ? "
-            "AND issue_id = ? AND state IN ('admitted', 'delivered') "
-            "AND event_id != ? "
-            "AND (created_at > ? OR (created_at = ? AND rowid > ?)) "
+            "SELECT candidate_sha FROM wake_deliveries AS newer "
+            "WHERE newer.project_key = ? AND newer.issue_id = ? "
+            "AND newer.event_id != ? AND (newer.created_at > ? "
+            "OR (newer.created_at = ? AND newer.rowid > ?)) "
+            "AND (newer.state IN ('admitted', 'delivered') OR EXISTS "
+            "(SELECT 1 FROM reviews AS reviewed "
+            "JOIN merge_settlements AS settled "
+            "ON settled.project_key = reviewed.project_key "
+            "AND settled.event_id = reviewed.event_id "
+            "AND settled.candidate_sha = reviewed.reviewed_sha "
+            "WHERE reviewed.project_key = newer.project_key "
+            "AND reviewed.event_id = newer.event_id "
+            "AND reviewed.reviewed_sha = newer.candidate_sha "
+            "AND reviewed.state = 'merged' AND settled.state = 'settled')) "
             "ORDER BY created_at ASC, rowid ASC",
             (
                 project_key,
