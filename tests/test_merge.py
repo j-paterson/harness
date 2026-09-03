@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from hermes_orchestrator.config import ProjectConfig
-from hermes_orchestrator.git import GitError
+from hermes_orchestrator.git import AmbiguousHunkError, GitError
 from hermes_orchestrator.github import (
     DiscoveredPull,
     GitHubError,
@@ -539,6 +539,21 @@ def test_merge_approved_proves_advanced_base_patch_equivalence(
     assert outcome.applied_tree_sha == TREE
     assert outcome.merge_tree_sha == TREE
     assert outcome.changed_paths == CANDIDATE_PATHS
+
+
+def test_merge_approved_accepts_ambiguous_patch_after_exact_github_merge(
+    github: FakeGitHub,
+) -> None:
+    git = _advanced_base_git(
+        apply_to_tree_error=AmbiguousHunkError("duplicate preimage")
+    )
+    executor = IntegrationMerge(projects=PROJECTS, github=github, git=git)
+
+    outcome = executor.merge_approved(
+        "demo", approved_verdict(), effect_id="e-1", base_sha=BASE
+    )
+
+    assert outcome.relation == "exact_binding_ambiguous_patch"
 
 
 def test_patch_equivalence_rejects_tree_mismatch(
