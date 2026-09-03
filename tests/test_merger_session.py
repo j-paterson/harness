@@ -228,12 +228,20 @@ async def test_startup_surfaces_stalled_wakes_without_retrying_them(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_opens_on_a_delivered_wake_and_is_idempotent(
+async def test_a_delivered_wake_never_keeps_the_helper_attached(
     database: Database,
 ) -> None:
+    """INFRA-223 superseding correction (generation-130 ownership
+    recurrence): the daemon-owned app-server helper is strictly bounded.
+    Startup opens once, recovers, and releases even though a wake is
+    outstanding; a later reconcile for that delivered wake opens nothing,
+    so the Codex app stays the visible owner of the idle Sol task and
+    the explicit retry's own bounded control path can prove it idle."""
+
     events = EventStore(database)
     rpc = FakeRpc()
     turns = FakeTurns()
+    turns.outstanding["demo"] = ("evt-1", "delivered")
     session = MergerSession(
         _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
         ("demo",),
@@ -241,42 +249,12 @@ async def test_reconcile_opens_on_a_delivered_wake_and_is_idempotent(
         database=database,
     )
     await session.startup()
-    assert (rpc.start_calls, rpc.close_calls) == (1, 1)
+    assert (rpc.start_calls, rpc.close_calls, session.is_open) == (1, 1, False)
 
-    turns.outstanding["demo"] = ("evt-1", "delivered")
     await session.reconcile("wake_delivered")
+    await session.reconcile("maintenance")
 
-    assert rpc.start_calls == 2
-    assert session.is_open is True
-
-    # Idempotent: the same reconcile call again opens nothing new.
-    await session.reconcile("wake_delivered_again")
-    assert rpc.start_calls == 2
-    assert session.is_open is True
-
-    await session.release("test_teardown")
-
-
-@pytest.mark.asyncio
-async def test_reconcile_releases_once_work_settles(database: Database) -> None:
-    events = EventStore(database)
-    rpc = FakeRpc()
-    turns = FakeTurns()
-    session = MergerSession(
-        _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
-        ("demo",),
-        events=events,
-        database=database,
-    )
-    turns.outstanding["demo"] = ("evt-1", "delivered")
-    await session.reconcile("wake_delivered")
-    assert (rpc.start_calls, session.is_open) == (1, True)
-
-    turns.outstanding["demo"] = None
-    await session.reconcile("settled")
-
-    assert rpc.close_calls == 1
-    assert session.is_open is False
+    assert (rpc.start_calls, rpc.close_calls, session.is_open) == (1, 1, False)
     assert _event_kinds(events) == [
         "merger.session_opened",
         "merger.session_released",
@@ -567,19 +545,16 @@ async def test_release_frees_the_real_codex_app_server_process_lease(
 
 
 @pytest.mark.asyncio
-async def test_reconcile_reopens_after_the_connection_ended_on_its_own() -> None:
+async def test_reconcile_releases_a_dead_connection_and_never_reopens() -> None:
     """A dead App Server connection must not leave the session stuck open:
-    the listener has finished on its own, so reconcile releases (freeing
-    the lease) and, with review work still active, reopens a fresh
-    connection instead of waiting on a dead one forever."""
+    reconcile releases the lease. It never reopens on its own -- review
+    work outstanding is not a reason to hold the Sol transcript."""
 
     rpc = FakeRpc()
     flow = _flow(rpc=rpc, merger=FakeMerger(), turns=FakeTurns(), reviews=FakeReviews())
     session = MergerSession(flow, ("demo",), is_review_active=lambda: True)
     assert await session.open("test")
     assert session.is_open
-    # The child dies: the notification stream ends without any close()
-    # call, so the listener task completes while _open stays True.
     await rpc._queue.put(_CLOSED)
     await _wait_until(
         lambda: session._listener is not None and session._listener.done()
@@ -587,9 +562,33 @@ async def test_reconcile_reopens_after_the_connection_ended_on_its_own() -> None
 
     await session.reconcile("maintenance")
 
-    assert session.is_open
+    assert not session.is_open
     assert rpc.close_calls == 1
-    assert rpc.start_calls == 2
+    assert rpc.start_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_releases_an_open_helper_even_when_review_status_fails(
+) -> None:
+    """Sol correction a79e9e29: an unrelated review-status failure can
+    never retain the Sol transcript lease -- the open helper is released
+    exactly once and never reopened."""
+
+    def _boom() -> bool:
+        raise RuntimeError("status query unavailable")
+
+    rpc = FakeRpc()
+    flow = _flow(rpc=rpc, merger=FakeMerger(), turns=FakeTurns(), reviews=FakeReviews())
+    session = MergerSession(flow, ("demo",), is_review_active=_boom)
+    assert await session.open("test")
+    assert session.is_open
+
+    await session.reconcile("maintenance")
+    await session.reconcile("maintenance")
+
+    assert not session.is_open
+    assert rpc.close_calls == 1
+    assert rpc.start_calls == 1
 
 
 @pytest.fixture

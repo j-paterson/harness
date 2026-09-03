@@ -159,11 +159,9 @@ class MergerSession:
         inside the listener task.
         """
 
-        try:
-            active = self.review_active()
-        except Exception as error:
-            print(f"merger session review check failed: {error}", file=sys.stderr)
-            return
+        # Sol correction a79e9e29: reconcile is release-only, so nothing
+        # about review status is consulted here -- an open helper is
+        # released regardless of whether a status lookup would succeed.
         try:
             if (
                 self._open
@@ -177,9 +175,14 @@ class MergerSession:
                 # still-active review reopens a fresh connection below
                 # instead of staying stuck on a dead one.
                 await self.release("connection_ended")
-            if active and not self._open:
-                await self.open(reason)
-            elif self._open and not active:
+            # INFRA-223 (generation-130 ownership recurrence, superseding
+            # correction): the daemon never keeps a persistent helper
+            # attached to the Sol transcript. Outstanding review work is
+            # NOT a reason to open -- a delivered wake is Sol's to review
+            # in the Codex app, which must remain the visible owner of the
+            # idle task. The only bounded open is ``startup`` (recover,
+            # then release); every other boundary only ever releases.
+            if self._open:
                 await self.release(reason)
         except Exception as error:
             print(f"merger session reconcile failed: {error}", file=sys.stderr)
@@ -194,9 +197,14 @@ class MergerSession:
 
         opened = await self.open("startup_recovery")
         if opened:
-            await self.flow.reviews.resume_settlements()
-            await self.flow.turns.recover_outstanding(self._projects)
-            self._surface_stalled_wakes()
+            try:
+                await self.flow.reviews.resume_settlements()
+                await self.flow.turns.recover_outstanding(self._projects)
+                self._surface_stalled_wakes()
+            finally:
+                # Bounded: release the transcript as soon as the recovery
+                # action is done, whether or not review work is outstanding.
+                await self.release("startup_recovery_complete")
         await self.reconcile("startup")
 
     def _surface_stalled_wakes(self) -> None:
