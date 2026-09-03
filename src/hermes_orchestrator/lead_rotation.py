@@ -273,6 +273,30 @@ class LeadRotation:
                 ),
             )
 
+        replacement_from_handoff = (
+            str(handoff.replacement_session_id)
+            if handoff.replacement_session_id is not None
+            else None
+        )
+        transfer_already_committed = (
+            handoff.state == "acknowledged"
+            and replacement_from_handoff is not None
+            and replacement_from_handoff == incumbent_session
+        )
+        if transfer_already_committed and self._attempt_open(handoff_id):
+            # The writer transfer and its clean-worktree precondition already
+            # committed. Recovery now owns only seating the recorded session;
+            # re-deriving an issue worktree can neither make that safer nor
+            # undo it, and coordinator cells legitimately have several lanes.
+            return await self._seat(
+                cell_id=cell_id,
+                handoff_id=handoff_id,
+                project_key=project_key,
+                replacement_session=incumbent_session,
+                profile_alias=incumbent_profile,
+                claim_token=None,
+            )
+
         worktree = self._worktree_state(project_key)
         if worktree.dirty:
             return self._blocked(
@@ -329,16 +353,6 @@ class LeadRotation:
                     stale_evidence=stale_evidence,
                 )
 
-        replacement_from_handoff = (
-            str(handoff.replacement_session_id)
-            if handoff.replacement_session_id is not None
-            else None
-        )
-        transfer_already_committed = (
-            handoff.state == "acknowledged"
-            and replacement_from_handoff is not None
-            and replacement_from_handoff == incumbent_session
-        )
         if transfer_already_committed:
             # cells.rotate()'s transactional transfer already committed
             # on a prior pass: the durable cell session/profile ARE this
@@ -364,22 +378,14 @@ class LeadRotation:
             # journals its awaiting marker, so the one Hermes-owned
             # rotate invocation resumes automatically on the submission
             # (Sol 52d15493).
-            if not self._attempt_open(handoff_id):
-                return self._request_fresh_handoff(
-                    cell_id=cell_id,
-                    consumed_handoff_id=handoff_id,
-                    project_key=project_key,
-                    incumbent_session=incumbent_session,
-                    incumbent_profile=incumbent_profile,
-                    worktree=worktree,
-                )
-            # Post-transfer recovery holds no claim token: the claim
-            # guards only the pre-transfer window, every phase from here
-            # on is idempotent, and duplicate completion is excluded by
-            # the atomic ``_journal_completed`` CAS instead.
-            replacement_session = incumbent_session
-            profile_alias = incumbent_profile
-            claim_token: str | None = None
+            return self._request_fresh_handoff(
+                cell_id=cell_id,
+                consumed_handoff_id=handoff_id,
+                project_key=project_key,
+                incumbent_session=incumbent_session,
+                incumbent_profile=incumbent_profile,
+                worktree=worktree,
+            )
         else:
             # Sol 524a38ed finding 3: the claim is acquired atomically,
             # BEFORE cells.rotate or any runner/seat launch, so two

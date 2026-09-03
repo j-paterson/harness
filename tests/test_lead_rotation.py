@@ -1568,6 +1568,9 @@ async def test_concurrent_post_transfer_recovery_completes_exactly_once(
     gate = asyncio.Event()
     parked = {"count": 0}
 
+    def unexpected_worktree_probe(project_key: str) -> WorktreeState:
+        raise AssertionError("post-transfer recovery must not inspect a worktree")
+
     async def parked_sleep(seconds: float) -> None:
         parked["count"] += 1
         await gate.wait()
@@ -1579,7 +1582,7 @@ async def test_concurrent_post_transfer_recovery_completes_exactly_once(
             cells=cells,
             bindings=bindings,
             seater=seat,
-            worktree_state=lambda project_key: make_worktree_state(),
+            worktree_state=unexpected_worktree_probe,
             registration_wait_seconds=5,
             sleep=parked_sleep,
         )
