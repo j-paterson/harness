@@ -76,7 +76,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 60
+    assert json.loads(result.stdout)["schema_version"] == 61
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -1473,6 +1473,323 @@ def test_hermes_command_create_accept_reject_packet_lifecycle(
     no_cell_payload = json.loads(no_cell.stdout)
     assert no_cell_payload["code"] == "rejected"
     assert "no active cell" in str(no_cell_payload["state"]["reason"])
+
+
+def _seed_admitted_issue_with_active_cell(
+    database_path: Path,
+    *,
+    issue_id: str,
+    project_key: str = "demo",
+    cell_id: str = "cell-1",
+    session_id: str = "11111111-1111-4111-8111-111111111111",
+    profile_alias: str = "max-a",
+) -> None:
+    """Seed one admitted issue owned by exactly one active cell.
+
+    INFRA-224: ``session_id`` must be a real UUID string -- a resolved
+    decision's wake commit parses it with ``UUID(str(...))``.
+    """
+
+    from hermes_orchestrator.db import Database
+
+    now = "2026-08-28T00:00:00+00:00"
+    database = Database.open(database_path)
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?, ?)",
+                (cell_id, project_key, profile_alias, session_id, now, now),
+            )
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at"
+                ") VALUES (?, ?, 1, 'queued', ?, 1, 0, ?, ?)",
+                (issue_id, project_key, f"instr-{issue_id}", now, now),
+            )
+    finally:
+        database.close()
+
+
+def _decision_raise_payload(issue_id: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "intent": "raise_operator_decision",
+        "issue_id": issue_id,
+        "requesting_role": "lead",
+        "question": "Rename the public API or keep the deprecated alias?",
+        "authority_reason": "breaks a documented external contract",
+        "facts": ["three external callers use the old name"],
+        "options": [
+            {"label": "rename", "tradeoffs": "breaks callers immediately"},
+            {"label": "alias", "tradeoffs": "carries dead code forward"},
+        ],
+        "recommendation": "keep the alias for one release",
+        "delay_impact": "blocks the migration packet",
+        "paused_scope": "the migration packet",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_hermes_command_operator_decision_inbox_lifecycle(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-224 end-to-end: raise -> list -> inspect -> resolve.
+
+    Covers the acceptance criteria: Hermes chat can list, inspect, and
+    resolve decisions one at a time; resolving wakes only the bound
+    lane exactly once and the inbox advances; a duplicate raise never
+    creates a second decision, and a duplicate resolve never commits a
+    second wake.
+    """
+
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    state_dir.mkdir(exist_ok=True)
+    _seed_admitted_issue_with_active_cell(state_dir / "state.db", issue_id="ENG-9")
+
+    raise_payload = _decision_raise_payload("ENG-9")
+
+    raised = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(raise_payload),
+        ]
+    )
+    assert raised.exit_code == 0, raised.output
+    raised_state = json.loads(raised.stdout)["state"]
+    assert raised_state["created"] is True
+    assert raised_state["pending"] == 1
+    decision_id = raised_state["decision_id"]
+    assert decision_id
+
+    duplicate = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(raise_payload),
+        ]
+    )
+    duplicate_state = json.loads(duplicate.stdout)["state"]
+    assert duplicate_state["created"] is False
+    assert duplicate_state["decision_id"] == decision_id
+    assert duplicate_state["pending"] == 1
+
+    listed = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "pending_operator_decisions"}),
+        ]
+    )
+    listed_state = json.loads(listed.stdout)["state"]
+    assert [item["decision_id"] for item in listed_state["decisions"]] == [
+        decision_id
+    ]
+    assert listed_state["decisions"][0]["issue_id"] == "ENG-9"
+
+    nxt = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "next_operator_decision"}),
+        ]
+    )
+    next_state = json.loads(nxt.stdout)["state"]
+    assert next_state["pending"] == 1
+    decision = next_state["decision"]
+    assert decision["decision_id"] == decision_id
+    assert decision["question"] == raise_payload["question"]
+    assert decision["authority_reason"] == raise_payload["authority_reason"]
+    assert decision["facts"] == raise_payload["facts"]
+    assert decision["options"] == raise_payload["options"]
+    assert decision["recommendation"] == raise_payload["recommendation"]
+    assert decision["delay_impact"] == raise_payload["delay_impact"]
+    assert decision["paused_scope"] == raise_payload["paused_scope"]
+
+    applied = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "apply_operator_decision",
+                    "decision_id": decision_id,
+                    "status": "approved",
+                    "source_message": "go with the alias",
+                    "answer": "keep the alias for one release",
+                    "next_action": "resume the migration packet",
+                }
+            ),
+        ]
+    )
+    assert applied.exit_code == 0, applied.output
+    applied_state = json.loads(applied.stdout)["state"]
+    assert applied_state["status"] == "approved"
+    assert applied_state["woke"] is True
+    assert applied_state["wake_id"]
+    assert applied_state["next"] is None
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        wake_count = int(
+            database.scalar(
+                "SELECT count(*) FROM lead_terminal_wakes "
+                "WHERE kind = 'decision_resolved'"
+            )
+        )
+    finally:
+        database.close()
+    assert wake_count == 1
+
+    after_resolve = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "pending_operator_decisions"}),
+        ]
+    )
+    assert json.loads(after_resolve.stdout)["state"]["decisions"] == []
+
+    replay = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {
+                    "intent": "apply_operator_decision",
+                    "decision_id": decision_id,
+                    "status": "approved",
+                    "source_message": "go with the alias again",
+                    "answer": "keep the alias for one release",
+                }
+            ),
+        ]
+    )
+    assert json.loads(replay.stdout)["code"] == "rejected"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        wake_count_after_replay = int(
+            database.scalar(
+                "SELECT count(*) FROM lead_terminal_wakes "
+                "WHERE kind = 'decision_resolved'"
+            )
+        )
+    finally:
+        database.close()
+    assert wake_count_after_replay == 1
+
+
+def test_hermes_command_raise_operator_decision_refuses_agent_owned_category(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    state_dir.mkdir(exist_ok=True)
+    _seed_admitted_issue_with_active_cell(state_dir / "state.db", issue_id="ENG-9")
+
+    payload = _decision_raise_payload(
+        "ENG-9",
+        question="retry the flaky test or skip it?",
+        category="small_fix",
+    )
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(payload),
+        ]
+    )
+    assert result.exit_code == 0, result.output
+    result_state = json.loads(result.stdout)
+    assert result_state["code"] == "rejected"
+    assert "agent-owned" in str(result_state["state"]["reason"])
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        count = int(database.scalar("SELECT count(*) FROM operator_decisions"))
+    finally:
+        database.close()
+    assert count == 0
+
+
+def test_hermes_command_pending_operator_decisions_orders_across_projects(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    _repo_root, state_dir = configured_repo
+    state_dir.mkdir(exist_ok=True)
+    _seed_admitted_issue_with_active_cell(
+        state_dir / "state.db",
+        issue_id="ENG-1",
+        project_key="demo",
+        cell_id="cell-a",
+        session_id="11111111-1111-4111-8111-111111111111",
+    )
+    _seed_admitted_issue_with_active_cell(
+        state_dir / "state.db",
+        issue_id="OTHER-1",
+        project_key="other",
+        cell_id="cell-b",
+        session_id="22222222-2222-4222-8222-222222222222",
+    )
+
+    def raise_for(issue_id: str, urgency: int) -> str:
+        payload = _decision_raise_payload(
+            issue_id, question=f"decision for {issue_id}", urgency=urgency
+        )
+        result = invoke(
+            [
+                *base_arguments(configured_repo),
+                "hermes-command",
+                "--json",
+                json.dumps(payload),
+            ]
+        )
+        return str(json.loads(result.stdout)["state"]["decision_id"])
+
+    first_id = raise_for("ENG-1", 2)
+    second_id = raise_for("OTHER-1", 0)
+
+    listed = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "pending_operator_decisions"}),
+        ]
+    )
+    listed_state = json.loads(listed.stdout)["state"]
+    assert [item["decision_id"] for item in listed_state["decisions"]] == [
+        second_id,
+        first_id,
+    ]
+
+    scoped = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps(
+                {"intent": "pending_operator_decisions", "project_key": "demo"}
+            ),
+        ]
+    )
+    scoped_state = json.loads(scoped.stdout)["state"]
+    assert [item["decision_id"] for item in scoped_state["decisions"]] == [first_id]
 
 
 def test_hermes_command_record_direct_exception_creates_accepted_packet(

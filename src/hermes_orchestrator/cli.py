@@ -67,6 +67,7 @@ from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_pane import FramePane
 from hermes_orchestrator.dashboard_refresh import DashboardRefreshAction
 from hermes_orchestrator.db import Database
+from hermes_orchestrator.decision_inbox import DecisionInbox
 from hermes_orchestrator.deploy import lifecycle
 from hermes_orchestrator.deploy.launchd import standard_inventory
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
@@ -125,7 +126,9 @@ from hermes_orchestrator.migration_gate import (
     render_handoff,
 )
 from hermes_orchestrator.operator_decisions import (
+    DecisionOption,
     DecisionRefused,
+    DecisionRequest,
     OperatorDecisions,
 )
 from hermes_orchestrator.orchestrator_workspace import (
@@ -2184,6 +2187,27 @@ def _active_cell_for_issue(database: Database, issue_id: str) -> tuple[str, str,
     )
 
 
+def _decision_inbox(runtime: Runtime) -> DecisionInbox:
+    """Build a :class:`DecisionInbox` over the runtime's shared state.
+
+    INFRA-224: composes the same primitives every other hermes-command
+    handler already builds fresh per call (``OperatorDecisions`` and
+    ``EventStore``) with the runtime's single ``LeadTerminalWakes``
+    instance -- the same one ``pending_wakes``/``ack_wake``/
+    ``continue_work`` use -- so a decision resolution wakes through the
+    exact same outbox every other terminal wake does.
+    """
+
+    if runtime.lead_wakes is None:
+        raise ValueError("lead terminal wakes are unavailable")
+    return DecisionInbox(
+        runtime.database,
+        decisions=OperatorDecisions(runtime.database),
+        wakes=runtime.lead_wakes,
+        events=EventStore(runtime.database),
+    )
+
+
 def _packet_payload(packet: Any) -> dict[str, Any]:
     return dict(dataclasses.asdict(packet))
 
@@ -2289,6 +2313,39 @@ def _hermes_handlers(
         return runtime.lead_wakes.mark_delivered(command.wake_id).as_dict()
 
     def apply_operator_decision(command: Any) -> dict[str, Any]:
+        # INFRA-224: an ``answer`` routes through the global inbox so
+        # the bound lane wakes exactly once and the caller learns what
+        # to work next; its absence keeps the original apply() path
+        # byte-for-byte unchanged for backward compatibility.
+        if command.answer is not None:
+            inbox = _decision_inbox(runtime)
+            try:
+                result = inbox.resolve(
+                    command.decision_id,
+                    status=command.status,
+                    answer=command.answer,
+                    source_message=command.source_message,
+                    next_action=command.next_action,
+                )
+            except DecisionRefused as error:
+                raise ValueError(str(error)) from error
+            next_decision = result.next
+            return {
+                "decision_id": result.decision.decision_id,
+                "issue_id": result.decision.issue_id,
+                "status": result.decision.status,
+                "applied_at": result.decision.applied_at,
+                "woke": result.woke,
+                "wake_id": result.wake_id,
+                "next": (
+                    None
+                    if next_decision is None
+                    else {
+                        "decision_id": next_decision.decision_id,
+                        "summary": inbox.summary(next_decision),
+                    }
+                ),
+            }
         decisions = OperatorDecisions(runtime.database)
         try:
             decision = decisions.apply(
@@ -2303,6 +2360,91 @@ def _hermes_handlers(
             "issue_id": decision.issue_id,
             "status": decision.status,
             "applied_at": decision.applied_at,
+        }
+
+    def raise_operator_decision(command: Any) -> dict[str, Any]:
+        cell_id, session_id, project_key = _active_cell_for_issue(
+            runtime.database, command.issue_id
+        )
+        inbox = _decision_inbox(runtime)
+        request = DecisionRequest(
+            issue_id=command.issue_id,
+            project_key=project_key,
+            cell_id=cell_id,
+            session_id=session_id,
+            requesting_role=command.requesting_role,
+            question=command.question,
+            authority_reason=command.authority_reason,
+            facts=tuple(command.facts),
+            options=tuple(
+                DecisionOption(label=option.label, tradeoffs=option.tradeoffs)
+                for option in command.options
+            ),
+            recommendation=command.recommendation,
+            delay_impact=command.delay_impact,
+            paused_scope=command.paused_scope,
+            urgency=command.urgency,
+            category=command.category,
+            request_key=command.request_key,
+        )
+        try:
+            decision, created = inbox.raise_request(request)
+        except DecisionRefused as error:
+            raise ValueError(str(error)) from error
+        return {
+            "decision_id": decision.decision_id,
+            "created": created,
+            "pending": inbox.count(),
+            "summary": inbox.summary(decision),
+        }
+
+    def pending_operator_decisions(command: Any) -> dict[str, Any]:
+        inbox = _decision_inbox(runtime)
+        return {
+            "decisions": [
+                {
+                    "decision_id": item.decision_id,
+                    "project_key": item.project_key,
+                    "issue_id": item.issue_id,
+                    "urgency": item.urgency,
+                    "category": item.category,
+                    "question": item.question,
+                    "requesting_role": item.requesting_role,
+                    "recorded_at": item.recorded_at,
+                    "summary": inbox.summary(item),
+                }
+                for item in inbox.list(command.project_key)
+            ]
+        }
+
+    def next_operator_decision(command: Any) -> dict[str, Any]:
+        inbox = _decision_inbox(runtime)
+        decision = inbox.next(command.project_key)
+        if decision is None:
+            return {"decision": None, "pending": 0}
+        return {
+            "decision": {
+                "decision_id": decision.decision_id,
+                "project_key": decision.project_key,
+                "issue_id": decision.issue_id,
+                "cell_id": decision.cell_id,
+                "session_id": decision.session_id,
+                "requesting_role": decision.requesting_role,
+                "question": decision.question,
+                "authority_reason": decision.authority_reason,
+                "facts": list(decision.facts),
+                "options": [
+                    {"label": option.label, "tradeoffs": option.tradeoffs}
+                    for option in decision.options
+                ],
+                "recommendation": decision.recommendation,
+                "delay_impact": decision.delay_impact,
+                "paused_scope": decision.paused_scope,
+                "urgency": decision.urgency,
+                "category": decision.category,
+                "recorded_at": decision.recorded_at,
+            },
+            "pending": inbox.count(command.project_key),
         }
 
     def request_cleanup(command: Any) -> dict[str, Any]:
@@ -2723,6 +2865,9 @@ def _hermes_handlers(
         "pending_wakes": pending_wakes,
         "ack_wake": ack_wake,
         "apply_operator_decision": apply_operator_decision,
+        "raise_operator_decision": raise_operator_decision,
+        "pending_operator_decisions": pending_operator_decisions,
+        "next_operator_decision": next_operator_decision,
         "qa_reject": qa_reject,
         "report_stall": report_stall,
         "approve_playbook": approve_playbook,
