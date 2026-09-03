@@ -1217,7 +1217,7 @@ async def test_replacement_without_channel_registration_blocks_until_it_lands(
     assert second.ok is True
     assert second.phase == "complete"
     assert second.binding_id == first.binding_id
-    assert len(seater.calls) == calls_after_first
+    assert len(seater.calls) == calls_after_first + 1
     assert runner.start_count == start_count_after_first
 
 
@@ -1611,9 +1611,13 @@ async def test_concurrent_post_transfer_recovery_completes_exactly_once(
     assert lost.phase == "completed_elsewhere"
     assert "concurrent recovery call" in (lost.failure or "")
     assert rotation_event_count(database, "lead_rotation.completed") == 1
-    # No duplicate side effects: one seat activation total, no new
-    # runner launches, one transactional transfer.
-    assert len(seater_a.calls) + len(seater_b.calls) == 1
+    # Both recovery calls pass through the idempotent seat owner so a pending
+    # channel confirmation can retry; neither creates another binding.
+    assert len(seater_a.calls) + len(seater_b.calls) == 2
+    assert database.scalar(
+        "SELECT COUNT(*) FROM cmux_surface_bindings "
+        "WHERE cell_id = 'cell-demo' AND state = 'active'"
+    ) == 1
     assert runner.start_count == start_count_after_transfer
     assert database.scalar(
         "SELECT COUNT(*) FROM events WHERE event_type = 'project_cell.rotated'"
