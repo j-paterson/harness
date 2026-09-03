@@ -2393,8 +2393,11 @@ def _install_fake_lead_rotation(
         def __init__(self, **kwargs: object) -> None:
             calls.append(kwargs)
 
-        async def rotate(self, cell_id: str) -> _FakeRotationReport:
+        async def rotate(
+            self, cell_id: str, *, rearm_delivered_handoff: bool = False
+        ) -> _FakeRotationReport:
             assert cell_id == report.cell_id
+            assert rearm_delivered_handoff is True
             return report
 
     fake_module = types.ModuleType("hermes_orchestrator.lead_rotation")
