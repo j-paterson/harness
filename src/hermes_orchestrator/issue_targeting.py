@@ -95,6 +95,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
+from hermes_orchestrator.work_claims import WorkClaims
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
 _ADMITTED_STATES = (IssueState.QUEUED.value, IssueState.BLOCKED.value)
@@ -133,6 +134,7 @@ def target_issue(
     session_id: str,
     instruction: str,
     known_projects: Collection[str],
+    claims: WorkClaims | None = None,
 ) -> TargetIssueResult:
     """Publish one assignment packet for an admitted issue — publication
     only; the transition itself happens at :func:`acknowledge_target`.
@@ -142,6 +144,15 @@ def target_issue(
     opens it); a single failed predicate raises
     :class:`IssueTargetingRefused` and the whole transaction rolls
     back — zero durable writes.
+
+    INFRA-222: the named cell's DEVELOPMENT work claim opens in this
+    exact transaction, alongside the packet publish. Every eligibility
+    predicate above (dependency readiness, capacity, the cell's live
+    identity, its active lease) has already passed by the time the
+    publish and the claim open, so the claim is never opened for a
+    target that publication itself would refuse. ``WorkClaims.open_in``
+    is idempotent, so a re-published (idempotent) target never
+    duplicates the live claim either.
     """
 
     if not instruction.strip():
@@ -257,6 +268,22 @@ def target_issue(
                     },
                 ),
             )
+        # INFRA-222: the named cell's DEVELOPMENT work claim, opened in
+        # this same transaction regardless of whether ``published`` is
+        # a fresh packet or the idempotent no-op/reconciled case below
+        # -- every predicate above already proved this cell legitimately
+        # owns this issue's development work either way, and
+        # ``open_in`` is itself idempotent.
+        work_claims = (
+            claims if claims is not None else WorkClaims(database, events=events)
+        )
+        work_claims.open_in(
+            connection,
+            project_key=project_key,
+            issue_id=issue_id,
+            cell_id=cell_id,
+            role=DEVELOPMENT_LANE,
+        )
 
     if published is not None:
         return TargetIssueResult(assignment=published, idempotent=False)
@@ -287,6 +314,7 @@ def target_harness_followup(
     session_id: str,
     instruction: str,
     known_projects: Collection[str],
+    claims: WorkClaims | None = None,
 ) -> TargetIssueResult:
     """Attach one explicitly admitted, dependency-ready project issue to
     a lead already durably bound to a HARNESS-lane primary assignment
@@ -479,6 +507,22 @@ def target_harness_followup(
                 "activated as a harness follow-up"
             )
 
+        # INFRA-222: the harness cell's work claim for THIS follow-up
+        # issue, opened in the very same transaction that publishes the
+        # packet and transitions the issue -- the durable ownership
+        # record survives whatever the follow-up's own delivery packet
+        # later does (confirmed, superseded, replayed).
+        work_claims = (
+            claims if claims is not None else WorkClaims(database, events=events)
+        )
+        work_claims.open_in(
+            connection,
+            project_key=project_key,
+            issue_id=issue_id,
+            cell_id=cell_id,
+            role=HARNESS_LANE,
+        )
+
         events.append(
             connection,
             EventInput(
@@ -518,6 +562,7 @@ async def acknowledge_target(
     assignments: LeadAssignments,
     assignment_id: str,
     session_id: str,
+    claims: WorkClaims | None = None,
 ) -> TargetAckResult:
     """Consume the exact-session ACK for one published targeting packet
     and advance the target — ATOMICALLY: the confirmation and the
@@ -636,6 +681,13 @@ async def acknowledge_target(
             connection, assignment_id, session_id=str(session_id)
         )
 
+    # INFRA-222: the development work claim opens inside the canonical
+    # activation transaction below (``cells._activate_issue_body``),
+    # which is where the confirmation is consumed and the issue
+    # transitions. A caller-supplied ``claims`` is threaded straight
+    # through; otherwise one is constructed here from the same
+    # ``database``/``events`` the activation itself uses.
+    work_claims = claims if claims is not None else WorkClaims(database, events=events)
     activated, _ = await activate_admitted_issue(
         database=database,
         events=events,
@@ -649,6 +701,7 @@ async def acknowledge_target(
         guard=confirmation_is_exact,
         on_eligible=consume_confirmation,
         projection_key=assignment_id,
+        claims=work_claims,
     )
     # ``activated`` is now one answer for both writes: the transition
     # and the consume shared a single commit.

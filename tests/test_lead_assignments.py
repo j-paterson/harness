@@ -42,13 +42,14 @@ def publish(
     *,
     issue_id: str = "INFRA-1",
     session_id: str = SESSION_A,
+    cell_id: str = "cell-demo",
 ) -> LeadAssignment | None:
     with database.transaction() as connection:
         return assignments.publish_in(
             connection,
             project_key="demo",
             issue_id=issue_id,
-            cell_id="cell-demo",
+            cell_id=cell_id,
             session_id=session_id,
             profile_alias="max-c",
             instruction_id="chat-1",
@@ -94,6 +95,9 @@ def test_republishing_the_same_binding_is_a_durable_noop(
 def test_redispatch_supersedes_a_stale_session(
     assignments: LeadAssignments, database: Database
 ) -> None:
+    # Both publishes target the same cell (the default "cell-demo"), so
+    # this is a worker rotation/replacement on that one cell -- still
+    # superseded under the INFRA-222 cell-scoped rule.
     stale = publish(assignments, database, session_id=SESSION_A)
     fresh = publish(assignments, database, session_id=SESSION_B)
 
@@ -103,6 +107,43 @@ def test_redispatch_supersedes_a_stale_session(
     assert assignments.pending_for_session(SESSION_A) == ()
     [pending] = assignments.pending_for_session(SESSION_B)
     assert pending.assignment_id == fresh.assignment_id
+
+
+def test_publish_never_supersedes_a_different_cells_live_assignment(
+    assignments: LeadAssignments, database: Database
+) -> None:
+    """INFRA-222: a development cell and a harness cell can each hold
+    a live assignment for the same issue at once. Publishing a newer
+    packet to the development cell must supersede only the prior
+    delivery to that exact (issue, cell) target -- never the harness
+    cell's still-legitimate live row, even though both share the same
+    issue_id (the defect the live INFRA-198 dual-lane rotation proof
+    surfaced)."""
+
+    harness = publish(
+        assignments,
+        database,
+        cell_id="cell-harness",
+        session_id=SESSION_B,
+    )
+    dev_first = publish(
+        assignments,
+        database,
+        cell_id="cell-dev",
+        session_id=SESSION_A,
+    )
+    dev_second = publish(
+        assignments,
+        database,
+        cell_id="cell-dev",
+        session_id="99999999-0000-4000-8000-000000000000",
+    )
+
+    assert harness is not None and dev_first is not None
+    assert dev_second is not None
+    assert assignments.get(harness.assignment_id).state == "published"
+    assert assignments.get(dev_first.assignment_id).state == "superseded"
+    assert assignments.get(dev_second.assignment_id).state == "published"
 
 
 def test_acknowledge_binds_the_exact_session_exactly_once(

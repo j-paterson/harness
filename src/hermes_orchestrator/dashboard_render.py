@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from hermes_orchestrator.dashboard_sources import (
     BatchFact,
     CapacityFact,
+    ClaimFact,
     CodexFact,
     DashboardSnapshot,
     DecisionInboxFact,
@@ -67,6 +68,42 @@ def render_dashboard(
     return tuple(_fit(line, width) for line in lines)
 
 
+def _short_id(value: str, length: int = 8) -> str:
+    """Truncate a durable id for compact display -- never re-derived,
+    never mistaken for the full id (callers keep the full value on the
+    fact itself for anything that needs it)."""
+
+    return value[:length]
+
+
+def _claims_text(claims: tuple[ClaimFact, ...]) -> str:
+    """Render work claims as ``role:issue_id[/child_lane]`` -- INFRA-222
+    ownership shape only, never ``work_claims.state``."""
+
+    if not claims:
+        return "none"
+    parts = []
+    for claim in claims:
+        label = f"{claim.role}:{claim.issue_id}"
+        if claim.child_lane:
+            label = f"{label}/{claim.child_lane}"
+        parts.append(label)
+    return ",".join(parts)
+
+
+def _binding_text(lane: LaneCellFact) -> str:
+    """Render this cell's active worker binding -- INFRA-222 worker
+    identity (profile, generation, short session id), never any
+    delivery-packet vocabulary."""
+
+    if lane.binding_profile is None or lane.binding_generation is None:
+        return "none"
+    return (
+        f"{lane.binding_profile} gen{lane.binding_generation} "
+        f"{_short_id(lane.session_id)}"
+    )
+
+
 def _lane_line(lane: LaneCellFact) -> str:
     """One lead-cell row: lane role, this lane's own issues, and state.
 
@@ -76,12 +113,20 @@ def _lane_line(lane: LaneCellFact) -> str:
     The full contract display (subagents, head/event, resource
     pressure, blockers, never cross-attributed) lives in
     ``render_frame``'s Lanes section below.
+
+    INFRA-222: ``claims``/``worker`` are the minimal extension onto
+    this line for the new ownership/identity facts -- cell work claims
+    (role, issue, child lane) and the cell's active worker binding
+    (profile, generation, short session id), never a
+    ``work_claims``/``lead_assignments`` delivery state.
     """
 
     issue_text = ",".join(lane.issue_ids) if lane.issue_ids else "-"
     return (
         f"lane     {lane.project_key}/{lane.lane_role:<11} "
-        f"issue {issue_text:<12} {lane.state}"
+        f"issue {issue_text:<12} {lane.state} "
+        f"cell {_short_id(lane.cell_id)} claims {_claims_text(lane.claims)} "
+        f"worker {_binding_text(lane)}"
     )
 
 
@@ -1108,11 +1153,16 @@ def _lane_row(
         ",".join(lane.blocked_issue_ids) if lane.blocked_issue_ids else "none"
     )
 
+    # INFRA-222: minimal extension -- this cell's own work claims and
+    # its active worker binding, appended after the existing fields so
+    # every prior substring assertion on this row keeps matching.
     return (
         f"{lane.project_key}/{lane.lane_role:<11} {lane.state:<17} "
         f"issues {issues_text}  kids {subagents_text}  "
         f"head {head_text}  pressure {pressure_text}  "
-        f"blockers {blockers_text}"
+        f"blockers {blockers_text}  "
+        f"cell {_short_id(lane.cell_id)}  claims {_claims_text(lane.claims)}  "
+        f"worker {_binding_text(lane)}"
     )
 
 

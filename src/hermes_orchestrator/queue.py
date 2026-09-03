@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState, QueuedIssue
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.work_claims import WorkClaims
 
 
 class AdmissionDenied(ValueError):
@@ -40,11 +41,19 @@ class QueueService:
         events: EventStore,
         registered_projects: Iterable[str],
         now: Callable[[], datetime] = _utc_now,
+        claims: WorkClaims | None = None,
     ) -> None:
         self._database = database
         self._events = events
         self._registered_projects = frozenset(registered_projects)
         self._now = now
+        # INFRA-222: a caller may hand in a shared instance; otherwise
+        # one is constructed lazily here, so every existing
+        # zero-``claims`` composition (production and tests alike)
+        # keeps working with no call-site change required.
+        self._claims = (
+            claims if claims is not None else WorkClaims(database, events=events)
+        )
 
     def admit(self, request: AdmissionRequest) -> QueuedIssue:
         """Admit one explicitly supplied issue, idempotently."""
@@ -282,6 +291,15 @@ class QueueService:
                         },
                     ),
                 )
+                # INFRA-222: explicit issue completion closes every
+                # active work claim for this issue -- development,
+                # harness, and review alike -- in the SAME transaction
+                # as the DONE transition. This is an explicit ownership
+                # event, never a side effect of any lead_assignments
+                # packet lifecycle.
+                self._claims.close_for_issue_in(
+                    connection, issue_id=issue_id, reason="issue.completed"
+                )
         return self.get(issue_id)
 
     def transition(
@@ -367,6 +385,17 @@ class QueueService:
                     },
                 ),
             )
+            if state is IssueState.DONE:
+                # INFRA-222: the review-flow completion path (Sol's
+                # merge settlement transitions land here through
+                # ``transition``/``transition_if``) is exactly as much
+                # an explicit issue-completion event as the operator's
+                # ``complete`` -- every active work claim closes in the
+                # SAME transaction as this DONE transition, never as a
+                # side effect of a delivery packet's own lifecycle.
+                self._claims.close_for_issue_in(
+                    connection, issue_id=issue_id, reason="issue.completed"
+                )
         return self.get(issue_id)
 
     def mark_dependency_ready(

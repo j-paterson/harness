@@ -22,12 +22,15 @@ from hermes_orchestrator.merge_flow import (
 )
 from hermes_orchestrator.merger_turns import (
     CodexThreadReports,
+    MergerTurnService,
     SubmissionRejected,
     _settlement_ready_verdict_json,
 )
 from hermes_orchestrator.verdicts import IDLE_TERMINAL_REPORT
+from hermes_orchestrator.worktrees import WorktreeLeaseInput, WorktreeLeases
 from tests.integration.test_fable_ready_acceptance import (
     BASE,
+    NOW,
     SHA_A,
     SHA_B,
     SHA_C,
@@ -3297,3 +3300,176 @@ async def test_owner_path_proves_legacy_eligibility_without_any_app_server(
     owner.active = True
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
     assert len(owner.starts) == 1
+
+
+# --- INFRA-222: sol -> fable worktree-lease writer return on rework --------
+
+
+def _turns_with_lease_transfer(
+    flow: ProductionShapedFlow, leases: WorktreeLeases
+) -> MergerTurnService:
+    """A second ``MergerTurnService`` over the SAME flow collaborators,
+    differing only in carrying the INFRA-222 lease-transfer port -- the
+    production shape's own ``new_turns`` factory lives outside this
+    module's edit boundary, so this mirrors it exactly rather than
+    monkeypatching a private attribute onto ``flow.turns``.
+    """
+
+    return MergerTurnService(
+        database=flow.database,
+        projects=flow.projects,
+        merger=flow.merger,
+        admission=flow.admission,
+        reviews=flow.reviews,
+        reports=CodexThreadReports(flow.rpc),
+        github=flow.github,
+        lead=flow.outbox,
+        window=flow.window,
+        manifest_root=flow.manifest_root,
+        now=lambda: NOW,
+        delivery=flow.delivery,
+        lease_transfer=leases,
+    )
+
+
+def _register_and_hand_over_to_sol(
+    leases: WorktreeLeases,
+    *,
+    tmp_path: Path,
+    issue_id: str,
+    branch: str,
+    sha: str,
+) -> str:
+    """Simulate the INFRA-222 fable -> sol hand-over (tested in
+    ``test_emission.py``) so these tests can start from a sol-owned
+    lease without wiring the emitter's own ``lease_transfer`` port.
+    """
+
+    lane_path = tmp_path / f"lane-{issue_id.lower()}"
+    lane_path.mkdir()
+    lease = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id=issue_id,
+            repo_path=str(tmp_path / "repo"),
+            path=str(lane_path),
+            branch=branch,
+            remote="origin",
+        )
+    )
+    leases.transfer_writer(
+        lease.lease_id,
+        expected_writer_role="fable",
+        expected_writer_ref=None,
+        to_writer_role="sol",
+        to_writer_ref="thr_legacy:1",
+        observed_head=sha,
+        tree_clean=True,
+        submitted_candidate_sha=sha,
+    )
+    return lease.lease_id
+
+
+@pytest.mark.asyncio
+async def test_rework_required_returns_writer_to_fable_and_bumps_generation(
+    flow: ProductionShapedFlow, tmp_path: Path
+) -> None:
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+
+    leases = WorktreeLeases(flow.database, flow.events)
+    lease_id = _register_and_hand_over_to_sol(
+        leases, tmp_path=tmp_path, issue_id="ENG-9", branch=branch, sha=SHA_A
+    )
+    assert leases.get(lease_id).writer_generation == 2
+
+    turns = _turns_with_lease_transfer(flow, leases)
+    outcome = await flow.submit(
+        "ENG-9",
+        emitted.event.event_id,
+        SHA_A,
+        flow.verdict(SHA_A, branch, 14, defect=True),
+        turns=turns,
+    )
+
+    assert outcome.kind == "corrections_required", outcome
+    updated = leases.get(lease_id)
+    assert updated.writer_role == "fable"
+    assert updated.writer_ref is None
+    assert updated.writer_generation == 3
+    # The unchanged-return rule: the candidate sha is untouched by rework.
+    assert updated.submitted_candidate_sha == SHA_A
+
+
+@pytest.mark.asyncio
+async def test_accept_leaves_sol_as_the_writer(
+    flow: ProductionShapedFlow, tmp_path: Path
+) -> None:
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+
+    leases = WorktreeLeases(flow.database, flow.events)
+    lease_id = _register_and_hand_over_to_sol(
+        leases, tmp_path=tmp_path, issue_id="ENG-9", branch=branch, sha=SHA_A
+    )
+
+    turns = _turns_with_lease_transfer(flow, leases)
+    outcome = await flow.submit(
+        "ENG-9",
+        emitted.event.event_id,
+        SHA_A,
+        flow.verdict(SHA_A, branch, 14),
+        turns=turns,
+    )
+
+    assert outcome.kind == "merged", outcome
+    updated = leases.get(lease_id)
+    # ACCEPT (and ACCEPT_WITH_REVIEWER_FIX): sol stays the sole writer
+    # until the existing post-merge reclaim path releases it -- no new
+    # cleanup here, and no writer-return attempt at all.
+    assert updated.writer_role == "sol"
+    assert updated.writer_generation == 2
+
+
+@pytest.mark.asyncio
+async def test_refused_writer_return_on_rework_keeps_the_verdict_persisted(
+    flow: ProductionShapedFlow,
+) -> None:
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+
+    # No lease is ever registered for ENG-9: the writer-return's own
+    # ``resolve_lane`` call has nothing to resolve and refuses.
+    leases = WorktreeLeases(flow.database, flow.events)
+    turns = _turns_with_lease_transfer(flow, leases)
+
+    outcome = await flow.submit(
+        "ENG-9",
+        emitted.event.event_id,
+        SHA_A,
+        flow.verdict(SHA_A, branch, 14, defect=True),
+        turns=turns,
+    )
+
+    assert outcome.kind == "corrections_required", outcome
+    assert "writer return to fable was refused" in outcome.reason
+
+    # The durably persisted verdict is completely unaffected by the
+    # refused, best-effort writer return.
+    row = flow.database.execute(
+        "SELECT state FROM submitted_verdicts WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()
+    assert row["state"] == "settled"
+
+    journaled = flow.database.execute(
+        "SELECT payload_json FROM events "
+        "WHERE event_type = 'worktree_lease.writer_return_refused'"
+    ).fetchall()
+    assert len(journaled) == 1
+    payload = json.loads(journaled[0]["payload_json"])
+    assert payload["issue_id"] == "ENG-9"
+    assert payload["candidate_sha"] == SHA_A

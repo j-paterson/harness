@@ -9,6 +9,7 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import AdmissionRequest, IssueState
 from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.queue import AdmissionDenied, IdempotencyConflict, QueueService
+from hermes_orchestrator.work_claims import WorkClaims
 
 
 class MutableClock:
@@ -168,6 +169,54 @@ def test_complete_is_idempotent(
     assert database.scalar(
         "SELECT count(*) FROM events WHERE event_type = 'issue.completed'"
     ) == 1
+
+
+def test_complete_closes_every_active_work_claim_and_leaves_others_alone(
+    queue_service: QueueService,
+    database: Database,
+) -> None:
+    """INFRA-222: explicit issue completion is an ownership event -- it
+    closes every active work claim for the completed issue, regardless
+    of role, in the SAME transaction as the DONE transition, and never
+    touches a claim belonging to a different issue."""
+
+    events = EventStore(database)
+    claims = WorkClaims(database, events=events)
+    queue_service.admit(request("ENG-7", "chat-123"))
+    queue_service.admit(request("ENG-8", "chat-124"))
+    development = claims.open(
+        project_key="demo",
+        issue_id="ENG-7",
+        cell_id="cell-dev",
+        role="development",
+    )
+    harness = claims.open(
+        project_key="demo",
+        issue_id="ENG-7",
+        cell_id="cell-harness",
+        role="harness",
+    )
+    other_issue = claims.open(
+        project_key="demo",
+        issue_id="ENG-8",
+        cell_id="cell-dev",
+        role="development",
+    )
+
+    queue_service.complete(
+        "ENG-7",
+        reason="linear_completed",
+        evidence="https://linear.example/ENG-7",
+    )
+
+    closed_development = claims.get(development.claim_id)
+    closed_harness = claims.get(harness.claim_id)
+    assert closed_development.state == "closed"
+    assert closed_development.closed_reason == "issue.completed"
+    assert closed_harness.state == "closed"
+    assert closed_harness.closed_reason == "issue.completed"
+    assert claims.active_for_issue("ENG-7") == []
+    assert claims.get(other_issue.claim_id).state == "active"
 
 
 def test_concurrent_complete_appends_one_event(tmp_path: Path) -> None:
@@ -532,6 +581,36 @@ def test_transition_to_and_from_post_merge_acceptance(
         '{"from":"post_merge_acceptance","reason":"acceptance satisfied",'
         '"to":"done"}',
     ]
+
+
+def test_transition_to_done_closes_active_work_claims(
+    queue_service: QueueService, database: Database
+) -> None:
+    """INFRA-222: the review-flow completion path (merge settlement's
+    ``transition``/``transition_if`` into DONE) closes active work
+    claims exactly like the operator's explicit ``complete`` -- it is
+    every bit as much an issue-completion event, never merely a packet
+    lifecycle side effect."""
+
+    events = EventStore(database)
+    claims = WorkClaims(database, events=events)
+    queue_service.admit(request("ENG-7", "chat-123"))
+    claim = claims.open(
+        project_key="demo",
+        issue_id="ENG-7",
+        cell_id="cell-dev",
+        role="development",
+    )
+
+    queue_service.transition(
+        "ENG-7",
+        IssueState.DONE,
+        actor="codex_merger",
+        reason="acceptance satisfied",
+    )
+
+    assert claims.get(claim.claim_id).state == "closed"
+    assert claims.get(claim.claim_id).closed_reason == "issue.completed"
 
 
 def test_list_ranked_excludes_post_merge_acceptance(

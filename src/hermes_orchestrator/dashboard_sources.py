@@ -271,6 +271,22 @@ class DecisionInboxFact:
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimFact:
+    """One durable INFRA-222 work claim, as exposed to the dashboard.
+
+    Deliberately carries only ownership shape -- which issue, which
+    role, which child lane, and when the claim opened -- never
+    ``work_claims.state`` or anything from ``lead_assignments``. The
+    dashboard shows workflow state, not packet-delivery state.
+    """
+
+    issue_id: str
+    role: str
+    child_lane: str
+    opened_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class LaneCellFact:
     """One lead cell's lane row (INFRA-219 L2, corrected under R4).
 
@@ -281,15 +297,27 @@ class LaneCellFact:
     development lane running MULTIPLE concurrent issues (bounded by
     ``cells.MAX_DEVELOPMENT_ISSUE_LANES``) only ever showed one.
 
-    ``issue_ids``/``blocked_issue_ids`` are instead resolved through
-    ``lead_assignments``, which IS durably lane-scoped: dispatch
-    (``cells._dispatch_locked``) only ever publishes an assignment
-    packet for a non-harness dispatch, bound to the exact ``cell_id``
-    of the lane doing the work. Joining ``admitted_issues`` to the
-    live (non-superseded) assignment for THIS cell_id therefore
-    attributes every issue to the one lane that actually holds it: a
-    harness row's cell_id never has a live assignment, so it resolves
-    to no issues at all -- never the project's development issue(s).
+    ``issue_ids``/``blocked_issue_ids`` were originally resolved through
+    ``lead_assignments`` alone; INFRA-222 moves the primary source to
+    ``work_claims`` -- durable cell OWNERSHIP that survives any number
+    of superseded/re-published assignment packets -- joined to this
+    cell's ``cell_id`` and to non-terminal ``admitted_issues``. A cell
+    with no active claims (a pre-backfill database, most likely) falls
+    back to the original live (non-superseded) ``lead_assignments``
+    join so nothing regresses before a backfill has run. Either way, a
+    harness row with no assignment/claim of its own resolves to no
+    issues at all -- never the project's development issue(s).
+
+    ``claims`` carries the resolved work claims themselves (issue,
+    role, child lane, opened_at) for cells populated from
+    ``work_claims`` -- empty when the cell fell back to
+    ``lead_assignments``. ``binding_profile``/``binding_generation``
+    are this cell's active ``worker_bindings`` row: the durable worker
+    identity, independent of ``project_cells``' own mutable
+    ``profile_alias``/``session_id`` columns. None of these fields
+    ever carry ``work_claims.state`` or any ``lead_assignments``
+    field -- packet-delivery vocabulary never leaks into a workflow
+    fact.
 
     ``subagents_total``/``subagents_completed`` come from
     ``lead_children`` keyed by this lane's own ``session_id`` -- each
@@ -315,6 +343,9 @@ class LaneCellFact:
     blocked_issue_ids: tuple[str, ...]
     subagents_total: int
     subagents_completed: int
+    claims: tuple[ClaimFact, ...] = ()
+    binding_generation: int | None = None
+    binding_profile: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +511,27 @@ def _operator_state(raw: str) -> str:
     return raw.capitalize()
 
 
+def _rows_or_missing_table(
+    database: Database, sql: str, parameters: tuple[object, ...] = ()
+) -> list[sqlite3.Row]:
+    """Run a read, degrading to no rows when the table does not exist yet.
+
+    INFRA-222: the ``dashboard`` CLI opens its connection ``mode=ro``
+    with no migrations applied (see ``_ReadOnlyDashboardDatabase``), so
+    a database captured before migration 0062 landed genuinely lacks
+    ``work_claims``/``worker_bindings`` -- that is not a bug to raise
+    on, it is a database the dashboard must still render against by
+    falling back to the pre-INFRA-222 sources.
+    """
+
+    try:
+        return database.execute(sql, parameters).fetchall()
+    except sqlite3.OperationalError as error:
+        if "no such table" in str(error):
+            return []
+        raise
+
+
 class TaskProvider:
     """Read admitted issues, joined to their lead, children, and Sol state.
 
@@ -590,7 +642,25 @@ class TaskProvider:
         return leads
 
     def _issue_leads(self) -> dict[str, tuple[str | None, str | None]]:
-        """Resolve ownership from each issue's current lane assignment.
+        """Resolve ownership from each issue's owning cell (INFRA-222).
+
+        ``work_claims``/``worker_bindings`` are the primary source --
+        durable cell ownership and worker identity that survive any
+        number of superseded/re-published ``lead_assignments``
+        packets. Issues with no active claim (or a database from
+        before the backfill ran) fall back to the original
+        ``lead_assignments`` join; claims take precedence per issue
+        when both resolve an entry.
+        """
+
+        leads = dict(self._issue_leads_from_assignments())
+        leads.update(self._issue_leads_from_claims())
+        return leads
+
+    def _issue_leads_from_assignments(
+        self,
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """The pre-INFRA-222 resolution, kept as the fallback source.
 
         A project may have development and harness cells concurrently, so
         project-level ownership is only a fallback for pre-assignment rows.
@@ -620,21 +690,66 @@ class TaskProvider:
             )
         return leads
 
+    def _issue_leads_from_claims(
+        self,
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """Resolve ownership from each issue's active work claim.
+
+        Degrades to no rows (never an exception) when ``work_claims``
+        or ``worker_bindings`` do not exist yet -- see
+        ``_rows_or_missing_table``.
+        """
+
+        placeholders = ",".join("?" for _ in _ACTIVE_CELL_STATES)
+        rows = _rows_or_missing_table(
+            self._database,
+            "SELECT wc.issue_id AS issue_id, wb.profile_alias AS "
+            "profile_alias, wb.session_id AS session_id "
+            "FROM work_claims wc "
+            "JOIN project_cells pc ON pc.cell_id = wc.cell_id "
+            "JOIN worker_bindings wb "
+            "ON wb.cell_id = wc.cell_id AND wb.state = 'active' "
+            f"WHERE wc.state = 'active' AND pc.state IN ({placeholders}) "
+            "ORDER BY wc.updated_at DESC",
+            _ACTIVE_CELL_STATES,
+        )
+        leads: dict[str, tuple[str | None, str | None]] = {}
+        for row in rows:
+            issue_id = str(row["issue_id"])
+            if issue_id in leads:
+                continue
+            leads[issue_id] = (
+                str(row["profile_alias"])
+                if row["profile_alias"] is not None
+                else None,
+                str(row["session_id"])
+                if row["session_id"] is not None
+                else None,
+            )
+        return leads
+
     def lane_cells(self) -> tuple[LaneCellFact, ...]:
         """One row per live lead cell, development and harness alike
         (INFRA-219 L2; issue attribution corrected under R4, Sol
-        correction 110ed759 -- see ``LaneCellFact``).
+        correction 110ed759; ownership source replaced under INFRA-222
+        -- see ``LaneCellFact``).
 
-        ``issue_ids`` is every currently in-flight or blocked
-        admitted issue whose live (non-superseded) ``lead_assignments``
-        row is bound to THIS cell's ``cell_id`` -- never a
-        project-wide guess. Harness cells never publish an assignment
+        ``issue_ids``/``claims`` are primarily resolved through
+        ``work_claims``: every active claim on THIS cell's ``cell_id``
+        whose issue is non-terminal, never a project-wide guess and
+        never affected by a superseded/re-published assignment packet.
+        A cell with no active claims at all falls back to the original
+        live (non-superseded) ``lead_assignments`` join, so a database
+        from before the INFRA-222 backfill ran still renders exactly
+        as it did before. Harness cells never publish an assignment
         (``cells._dispatch_locked`` skips it whenever the dispatch is
-        a harness one), so a harness row's ``issue_ids`` is always
-        empty by construction, not by a name/state filter that could
-        rot out of sync. ``blocked_issue_ids`` is the subset of those
-        issues sitting in a blocked/failed/stalled state -- this
-        lane's own blockers, never another lane's.
+        a harness one) and rarely hold a claim either, so a harness
+        row's ``issue_ids`` is typically empty by construction.
+        ``blocked_issue_ids`` is the subset of those issues sitting in
+        a blocked/failed/stalled state -- this lane's own blockers,
+        never another lane's. ``binding_profile``/``binding_generation``
+        come from this cell's active ``worker_bindings`` row, when one
+        exists.
         """
 
         rows = self._database.execute(
@@ -643,6 +758,43 @@ class TaskProvider:
             "ORDER BY project_key, lane_role",
             _ACTIVE_CELL_STATES,
         ).fetchall()
+
+        terminal_placeholders = ",".join("?" for _ in TERMINAL_ISSUE_STATES)
+        claim_rows = _rows_or_missing_table(
+            self._database,
+            "SELECT wc.cell_id AS cell_id, wc.issue_id AS issue_id, "
+            "wc.role AS role, wc.child_lane AS child_lane, "
+            "wc.opened_at AS opened_at, ai.state AS issue_state "
+            "FROM work_claims wc "
+            "JOIN admitted_issues ai ON ai.issue_id = wc.issue_id "
+            f"WHERE wc.state = 'active' AND ai.state NOT IN "
+            f"({terminal_placeholders}) "
+            "ORDER BY wc.cell_id, wc.opened_at ASC, wc.rowid ASC",
+            tuple(TERMINAL_ISSUE_STATES),
+        )
+        claims_by_cell: dict[str, list[ClaimFact]] = {}
+        issues_by_cell_claims: dict[str, list[str]] = {}
+        blocked_by_cell_claims: dict[str, list[str]] = {}
+        for claim_row in claim_rows:
+            cell_id = str(claim_row["cell_id"])
+            issue_id = str(claim_row["issue_id"])
+            claims_by_cell.setdefault(cell_id, []).append(
+                ClaimFact(
+                    issue_id=issue_id,
+                    role=str(claim_row["role"]),
+                    child_lane=str(claim_row["child_lane"]),
+                    opened_at=str(claim_row["opened_at"]),
+                )
+            )
+            issues_by_cell_claims.setdefault(cell_id, []).append(issue_id)
+            if str(claim_row["issue_state"]) in _BLOCKED_STATES:
+                blocked_by_cell_claims.setdefault(cell_id, []).append(
+                    issue_id
+                )
+
+        # Fallback source (pre-INFRA-222 behavior) for any cell with no
+        # active work claim at all -- e.g. a database from before the
+        # backfill migration ran.
         issue_rows = self._database.execute(
             "SELECT ai.issue_id AS issue_id, ai.state AS issue_state, "
             "la.cell_id AS cell_id "
@@ -652,37 +804,70 @@ class TaskProvider:
             "('in_development', 'review', 'blocked', 'failed', 'stalled') "
             "ORDER BY ai.issue_id",
         ).fetchall()
-        issues_by_cell: dict[str, list[str]] = {}
-        blocked_by_cell: dict[str, list[str]] = {}
+        issues_by_cell_fallback: dict[str, list[str]] = {}
+        blocked_by_cell_fallback: dict[str, list[str]] = {}
         for issue_row in issue_rows:
             cell_id = str(issue_row["cell_id"])
             issue_id = str(issue_row["issue_id"])
-            issues_by_cell.setdefault(cell_id, []).append(issue_id)
+            issues_by_cell_fallback.setdefault(cell_id, []).append(issue_id)
             if str(issue_row["issue_state"]) in _BLOCKED_STATES:
-                blocked_by_cell.setdefault(cell_id, []).append(issue_id)
+                blocked_by_cell_fallback.setdefault(cell_id, []).append(
+                    issue_id
+                )
+
+        bindings_by_cell: dict[str, tuple[int, str]] = {}
+        for binding_row in _rows_or_missing_table(
+            self._database,
+            "SELECT cell_id, generation, profile_alias "
+            "FROM worker_bindings WHERE state = 'active'",
+        ):
+            bindings_by_cell[str(binding_row["cell_id"])] = (
+                int(binding_row["generation"]),
+                str(binding_row["profile_alias"]),
+            )
 
         subagents_by_session = self._children_by_session()
 
-        return tuple(
-            LaneCellFact(
-                project_key=str(row["project_key"]),
-                lane_role=str(row["lane_role"]),
-                cell_id=str(row["cell_id"]),
-                session_id=str(row["session_id"]),
-                state=str(row["state"]),
-                issue_ids=tuple(issues_by_cell.get(str(row["cell_id"]), ())),
-                blocked_issue_ids=tuple(
-                    blocked_by_cell.get(str(row["cell_id"]), ())
-                ),
-                subagents_total=subagents_by_session.get(
-                    str(row["session_id"]), (0, 0)
-                )[0],
-                subagents_completed=subagents_by_session.get(
-                    str(row["session_id"]), (0, 0)
-                )[1],
+        facts = []
+        for row in rows:
+            cell_id = str(row["cell_id"])
+            if cell_id in claims_by_cell:
+                issue_ids = tuple(
+                    dict.fromkeys(issues_by_cell_claims.get(cell_id, ()))
+                )
+                blocked_issue_ids = tuple(
+                    dict.fromkeys(blocked_by_cell_claims.get(cell_id, ()))
+                )
+            else:
+                issue_ids = tuple(issues_by_cell_fallback.get(cell_id, ()))
+                blocked_issue_ids = tuple(
+                    blocked_by_cell_fallback.get(cell_id, ())
+                )
+            generation, profile_alias = bindings_by_cell.get(
+                cell_id, (None, None)
             )
-            for row in rows
-        )
+            session_id = str(row["session_id"])
+            facts.append(
+                LaneCellFact(
+                    project_key=str(row["project_key"]),
+                    lane_role=str(row["lane_role"]),
+                    cell_id=cell_id,
+                    session_id=session_id,
+                    state=str(row["state"]),
+                    issue_ids=issue_ids,
+                    blocked_issue_ids=blocked_issue_ids,
+                    claims=tuple(claims_by_cell.get(cell_id, ())),
+                    binding_generation=generation,
+                    binding_profile=profile_alias,
+                    subagents_total=subagents_by_session.get(
+                        session_id, (0, 0)
+                    )[0],
+                    subagents_completed=subagents_by_session.get(
+                        session_id, (0, 0)
+                    )[1],
+                )
+            )
+        return tuple(facts)
 
     def _latest_reviews(self) -> dict[str, tuple[int, str]]:
         rows = self._database.execute(

@@ -110,22 +110,30 @@ class LeadAssignments:
     ) -> LeadAssignment | None:
         """Publish one packet inside the caller's dispatch transaction.
 
-        Any live assignment for the same issue bound to a different
-        (stale) session is superseded first. For this exact issue and
-        session, an UNCONSUMED ``published`` packet makes the dispatch
-        a durable no-op (retries never duplicate the live contract),
-        while an already-acknowledged packet was consumed by a
-        completed delivery: a fresh dispatch epoch supersedes it and
-        publishes a new packet, so a requeued issue wakes the idle
-        lead again.
+        Supersession is scoped to the exact delivery target -- the
+        same ``(issue_id, cell_id)`` pair -- never to the issue alone.
+        INFRA-222: the same issue can simultaneously hold distinct
+        development, harness, and review cell assignments (each cell
+        its own lead_assignments lineage); a newer publish to one
+        cell must never invalidate another cell's live delivery or
+        its underlying work claim. A live row for the same issue and
+        cell bound to a different (stale) session -- a worker
+        rotation or replacement on that same cell -- is superseded
+        first; a live row for the same issue on a *different* cell is
+        left untouched. For this exact issue, cell, and session, an
+        UNCONSUMED ``published`` packet makes the dispatch a durable
+        no-op (retries never duplicate the live contract), while an
+        already-acknowledged packet was consumed by a completed
+        delivery: a fresh dispatch epoch supersedes it and publishes a
+        new packet, so a requeued issue wakes the idle lead again.
         """
 
         stamp = self._now().isoformat()
         stale = connection.execute(
             "UPDATE lead_assignments SET state = 'superseded', "
-            "updated_at = ? WHERE issue_id = ? AND session_id != ? "
-            "AND state != 'superseded'",
-            (stamp, issue_id, session_id),
+            "updated_at = ? WHERE issue_id = ? AND cell_id = ? "
+            "AND session_id != ? AND state != 'superseded'",
+            (stamp, issue_id, cell_id, session_id),
         )
         if stale.rowcount:
             self._events.append(
