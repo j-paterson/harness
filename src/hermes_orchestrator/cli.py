@@ -179,6 +179,7 @@ from hermes_orchestrator.stalls import (
 )
 from hermes_orchestrator.subagent_packets import SubagentPackets
 from hermes_orchestrator.supervisor import Supervisor
+from hermes_orchestrator.work_claims import WorkClaims
 from hermes_orchestrator.worktrees import WorktreeLeases
 
 
@@ -2805,11 +2806,33 @@ def _hermes_handlers(
         cell_id = str(cell["cell_id"])
         session_id = str(cell["session_id"])
         profile_alias = str(cell["profile_alias"])
-        assigned = runtime.database.execute(
-            "SELECT 1 FROM lead_assignments WHERE issue_id = ? "
-            "AND session_id = ? AND state != 'superseded' LIMIT 1",
-            (command.issue_id, session_id),
-        ).fetchone()
+        # INFRA-222: ownership, not delivery state, decides whether the
+        # bound seat is working this issue. A cell with any work_claims
+        # row at all (the backfill runs for every live cell) must have
+        # an ACTIVE claim naming this exact issue -- a superseded,
+        # replayed, or deduplicated lead_assignments packet never
+        # changes or loses that. Only a cell with no claims row
+        # whatsoever (pre-backfill safety) falls back to the old
+        # delivery-ledger check.
+        has_claim_row = (
+            runtime.database.execute(
+                "SELECT 1 FROM work_claims WHERE cell_id = ? LIMIT 1",
+                (cell_id,),
+            ).fetchone()
+            is not None
+        )
+        if has_claim_row:
+            assigned = runtime.database.execute(
+                "SELECT 1 FROM work_claims WHERE cell_id = ? "
+                "AND issue_id = ? AND state = 'active' LIMIT 1",
+                (cell_id, command.issue_id),
+            ).fetchone()
+        else:
+            assigned = runtime.database.execute(
+                "SELECT 1 FROM lead_assignments WHERE issue_id = ? "
+                "AND session_id = ? AND state != 'superseded' LIMIT 1",
+                (command.issue_id, session_id),
+            ).fetchone()
         if assigned is None:
             raise ValueError(
                 f"issue {command.issue_id!r} is not assigned to the bound "
@@ -4864,39 +4887,55 @@ def _seat_lane(
 ) -> ResolvedLane | None:
     """The ONE live worktree lease bound to this exact seat's own issue.
 
-    INFRA-198: the seat, not the project, names the tree. The cell's
-    latest lead assignment for its exact ``cell_id`` + ``session_id``
-    identifies the issue it is actually working, and that issue's single
-    active worktree lease identifies the checkout — the coordinator's
-    ``project.lead_cwd`` is frequently detached and frequently dirtied
-    by unrelated work, so it describes no lane in particular.
+    INFRA-222: identity comes from the cell's durable work claim, never
+    from delivery state. ``WorkClaims.current_for_cell`` -- the newest
+    active (issue, role) ownership record for this exact ``cell_id`` --
+    identifies the issue it is actually working, scoped to the cell's
+    own ``lane_role`` when that is known so another lane's claim on the
+    same cell id (there is none today, but the scoping costs nothing)
+    never qualifies. That issue's single active worktree lease then
+    identifies the checkout — the coordinator's ``project.lead_cwd`` is
+    frequently detached and frequently dirtied by unrelated work, so it
+    describes no lane in particular.
 
-    The assignment row's ``state`` is deliberately NOT filtered.
-    Supersession is per-ISSUE, not per-cell: a later assignment of the
-    same issue to a DIFFERENT cell marks this row ``superseded`` while
-    saying nothing about whether THIS cell is still bound and working,
-    so excluding superseded rows discards the one durable fact
-    identifying the seat. Freshness for the seat comes from the ordering
-    instead, which guarantees a newer assignment for this same
-    cell/session wins. Scoping to cell_id AND session_id is also what
-    keeps another cell's lease from ever qualifying here.
+    A claim survives exactly what a ``lead_assignments`` row does not:
+    confirmation, completion, supersession, replay, or deduplication of
+    whatever packet delivered it. The ``lead_assignments`` query below
+    only runs as a pre-backfill safety net, for a cell with no work
+    claim at all yet. Its own ``state`` is deliberately NOT filtered:
+    supersession is per-ISSUE, not per-cell, so a later assignment of
+    the same issue to a DIFFERENT cell marks this row ``superseded``
+    while saying nothing about whether THIS cell is still bound and
+    working; freshness for the seat comes from the ordering instead,
+    and scoping to cell_id AND session_id keeps another cell's lease
+    from ever qualifying here.
 
-    Returns ``None`` when no assignment names this exact cell and
-    session — the genuinely unassigned caller. Raises
-    :class:`_SeatLaneUnresolved` when the seat IS assigned but its issue
-    binds zero or several live lanes: an unresolvable lane fails closed
-    rather than silently falling back to some other checkout.
+    Returns ``None`` when neither a claim nor an assignment names this
+    seat — the genuinely unassigned caller. Raises
+    :class:`_SeatLaneUnresolved` when the seat IS working an issue but
+    that issue binds zero or several live lanes: an unresolvable lane
+    fails closed rather than silently falling back to some other
+    checkout.
     """
 
-    assignment = database.execute(
-        "SELECT issue_id FROM lead_assignments "
-        "WHERE cell_id = ? AND session_id = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        (cell_id, session_id),
+    cell_row = database.execute(
+        "SELECT lane_role FROM project_cells WHERE cell_id = ?", (cell_id,)
     ).fetchone()
-    if assignment is None:
-        return None
-    issue_id = str(assignment["issue_id"])
+    role = None if cell_row is None else str(cell_row["lane_role"])
+    claims = WorkClaims(database, events=EventStore(database))
+    claim = claims.current_for_cell(cell_id, role=role)
+    if claim is not None:
+        issue_id = claim.issue_id
+    else:
+        assignment = database.execute(
+            "SELECT issue_id FROM lead_assignments "
+            "WHERE cell_id = ? AND session_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (cell_id, session_id),
+        ).fetchone()
+        if assignment is None:
+            return None
+        issue_id = str(assignment["issue_id"])
     # ``resolve_lane`` is the codebase's fail-closed reader for "this
     # issue's ONE active worktree lease": zero leases and several leases
     # both refuse rather than guess, and it is scoped to the project and

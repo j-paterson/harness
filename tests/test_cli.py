@@ -76,7 +76,7 @@ def test_init_creates_runtime_database(configured_repo: tuple[Path, Path]) -> No
 
     assert result.exit_code == 0
     assert (state_dir / "state.db").exists()
-    assert json.loads(result.stdout)["schema_version"] == 61
+    assert json.loads(result.stdout)["schema_version"] == 63
 
 
 def test_observe_rejects_watch_interval_below_five_seconds(
@@ -2633,6 +2633,72 @@ def test_continue_work_refuses_when_issue_not_assigned_to_the_seat(
     _seed_continue_work_seat(runtime, assign_issue_id=None)
     handler = _continue_work_handler(runtime, tmp_path)
 
+    with pytest.raises(ValueError, match="not assigned to the bound"):
+        handler(_continue_work_command())
+
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM lead_terminal_wakes"
+        )
+        == 0
+    )
+
+
+def test_continue_work_succeeds_with_an_active_claim_despite_a_superseded_assignment(
+    tmp_path: Path,
+) -> None:
+    """INFRA-222: ownership comes from the durable work claim, not from
+    the delivery ledger. The seat's only ``lead_assignments`` row for
+    this issue is ``superseded`` -- the shape a replayed or
+    re-published packet leaves behind -- yet an active work claim for
+    the exact same (cell, issue) still authorizes ``continue_work``."""
+
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.work_claims import WorkClaims
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime, assign_issue_id=None)
+    now = datetime.now(UTC).isoformat()
+    with runtime.database.transaction() as connection:  # type: ignore[attr-defined]
+        connection.execute(
+            "INSERT INTO lead_assignments("
+            "assignment_id, schema_version, project_key, issue_id, "
+            "cell_id, session_id, profile_alias, instruction_id, "
+            "queue_transition, state, created_at, updated_at) VALUES "
+            "('asn-1', 1, 'demo', 'ENG-9', 'cell-1', ?, 'max-a', "
+            "'instr-1', 'dispatch', 'superseded', ?, ?)",
+            (_CONTINUE_WORK_SESSION, now, now),
+        )
+    WorkClaims(runtime.database, events=EventStore(runtime.database)).open(  # type: ignore[attr-defined]
+        project_key="demo", issue_id="ENG-9", cell_id="cell-1", role="development"
+    )
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    result = handler(_continue_work_command())
+
+    assert result["kind"] == "work_ready"
+    assert result["issue_id"] == "ENG-9"
+    assert result["cell_id"] == "cell-1"
+
+
+def test_continue_work_refuses_when_neither_claim_nor_assignment_exists(
+    tmp_path: Path,
+) -> None:
+    """The pre-backfill safety net still fails closed: a cell with no
+    work claim at all and no live assignment authorizes nothing."""
+
+    runtime = _runtime_like(tmp_path)
+    _admit(runtime, "ENG-9", "in_development")
+    _seed_continue_work_seat(runtime, assign_issue_id=None)
+    handler = _continue_work_handler(runtime, tmp_path)
+
+    assert (
+        runtime.database.scalar(  # type: ignore[attr-defined]
+            "SELECT count(*) FROM work_claims"
+        )
+        == 0
+    )
     with pytest.raises(ValueError, match="not assigned to the bound"):
         handler(_continue_work_command())
 
@@ -7685,6 +7751,116 @@ def _seed_worktree_lease(
         database.close()
 
 
+def _seed_work_claim(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    cell_id: str = "cell-demo",
+    role: str = "development",
+) -> None:
+    """Open one active INFRA-222 work claim binding ``cell_id`` to
+    ``issue_id`` -- the durable ownership record that survives whatever
+    a delivery packet's own lifecycle is doing."""
+
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+    from hermes_orchestrator.work_claims import WorkClaims
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        WorkClaims(database, events=EventStore(database)).open(
+            project_key="demo", issue_id=issue_id, cell_id=cell_id, role=role
+        )
+    finally:
+        database.close()
+
+
+def test_seat_lane_resolves_the_issue_from_an_active_claim_over_a_superseded_assignment(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-222: the newest ``lead_assignments`` row for this exact
+    cell/session is superseded and names a DIFFERENT issue than the one
+    the cell's durable work claim says it owns -- the shape a
+    superseded-then-replayed delivery packet leaves behind. Identity
+    must come from the claim, never from the delivery ledger, even
+    though a live worktree lease exists for BOTH issues (so a wrong
+    resolution would still "succeed" rather than raising)."""
+
+    from hermes_orchestrator.cli import _seat_lane
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-212")
+    _seed_work_claim(state_dir, issue_id="INFRA-215")
+    claimed_lane = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=claimed_lane,
+        branch="feature/infra-215-lane",
+    )
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-212",
+        path=repo_root / "lane-212",
+        branch="feature/infra-212-lane",
+    )
+    database = Database.open(state_dir / "state.db")
+    database.execute(
+        "UPDATE lead_assignments SET state = 'superseded' "
+        "WHERE issue_id = 'INFRA-212'"
+    )
+
+    lane = _seat_lane(
+        database=database,
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    assert lane is not None
+    assert lane.issue_id == "INFRA-215"
+    assert lane.path == claimed_lane
+
+
+def test_seat_lane_falls_back_to_the_assignment_when_no_claim_exists(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """Pre-backfill safety: a cell with no ``work_claims`` row at all
+    yet is still resolved from its live ``lead_assignments`` row,
+    exactly as before INFRA-222."""
+
+    from hermes_orchestrator.cli import _seat_lane
+    from hermes_orchestrator.db import Database
+
+    repo_root, state_dir = configured_repo
+    _seed_rotation_cell_state(state_dir)
+    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
+    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
+    lane_path = repo_root / "lane-215"
+    _seed_worktree_lease(
+        state_dir,
+        issue_id="INFRA-215",
+        path=lane_path,
+        branch="feature/infra-215-lane",
+    )
+    database = Database.open(state_dir / "state.db")
+    assert database.scalar("SELECT count(*) FROM work_claims") == 0
+
+    lane = _seat_lane(
+        database=database,
+        project_key="demo",
+        cell_id="cell-demo",
+        session_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    assert lane is not None
+    assert lane.issue_id == "INFRA-215"
+    assert lane.path == lane_path
+
+
 def _install_detached_coordinator_probe(
     monkeypatch: pytest.MonkeyPatch, lanes: dict[Path, str]
 ) -> list[str]:
@@ -7784,14 +7960,14 @@ def test_submit_handoff_derives_issue_and_branch_from_the_seat(
     assert "issue INFRA-215 is in_development" in document["status"]
 
 
-def test_submit_handoff_derives_the_seat_whose_assignment_was_superseded(
+def test_submit_handoff_keeps_the_seat_when_another_cell_takes_the_same_issue(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real dual-lane sequence: the harness cell takes its issue, and
-    the SAME issue is then assigned to a different cell, which marks the
-    harness row ``superseded``. Supersession is per-ISSUE, so it says
-    nothing about whether the harness cell is still bound and working --
-    that cell must still derive its issue and its leased branch."""
+    the SAME issue is then assigned to a different cell. INFRA-222 scopes
+    supersession to the exact ``(issue_id, cell_id)`` target, so the other
+    cell's publish leaves the harness row untouched, and the harness cell
+    still derives its issue and its leased branch."""
 
     from hermes_orchestrator.db import Database
 
@@ -7801,8 +7977,8 @@ def test_submit_handoff_derives_the_seat_whose_assignment_was_superseded(
     _seed_rotation_cell_state(state_dir)
     _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
     _seed_lead_assignment(state_dir, issue_id="INFRA-215")
-    # The other lane later takes the same issue: per-issue supersession
-    # rewrites the bound harness seat's row without unbinding the seat.
+    # The other lane later takes the same issue: supersession is scoped
+    # to the exact (issue, cell) target, so this seat's row survives.
     _seed_lead_assignment(
         state_dir,
         issue_id="INFRA-215",
@@ -7822,12 +7998,13 @@ def test_submit_handoff_derives_the_seat_whose_assignment_was_superseded(
     )
     database = Database.open(state_dir / "state.db")
     try:
-        # Precondition: the sequence really did supersede the seat's row.
+        # INFRA-222: the other cell's publish never invalidates this
+        # cell's delivery row; it stays the live published packet.
         assert (
             database.scalar(
                 "SELECT state FROM lead_assignments WHERE cell_id = 'cell-demo'"
             )
-            == "superseded"
+            == "published"
         )
     finally:
         database.close()
