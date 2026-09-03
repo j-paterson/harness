@@ -319,7 +319,10 @@ async def test_thread_activity_is_proven_by_the_owner_snapshot(
             "turns": [{"turnId": "t1", "status": "inProgress"}],
         }
         assert (await starter.thread_activity(THREAD)).active is True
-        router.snapshot = {"resumeState": "resumed", "threadRuntimeStatus": {"type": "active"}}
+        router.snapshot = {
+            "resumeState": "resumed",
+            "threadRuntimeStatus": {"type": "active"},
+        }
         assert (await starter.thread_activity(THREAD)).active is True
         router.snapshot = None
         assert (await starter.thread_activity(THREAD)).active is None

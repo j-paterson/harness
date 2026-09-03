@@ -20,6 +20,7 @@ import contextlib
 import json
 import struct
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -210,15 +211,12 @@ class DesktopIpcClient:
                 state = change.get("conversationState")
                 return state if isinstance(state, dict) else None
         finally:
-            with_suppress = self._broadcast(
-                "thread-stream-following-changed",
-                {**params, "following": False},
-                target_client_ids=[owner_client_id],
-            )
-            try:
-                await with_suppress
-            except Exception:
-                pass
+            with suppress(Exception):
+                await self._broadcast(
+                    "thread-stream-following-changed",
+                    {**params, "following": False},
+                    target_client_ids=[owner_client_id],
+                )
 
     async def _broadcast(
         self,
