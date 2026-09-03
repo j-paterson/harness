@@ -516,11 +516,30 @@ class OwnerTurnStarter:
             await asyncio.sleep(0.5)
 
 
-async def open_thread_in_desktop(thread_id: str) -> None:
-    """Ask the Codex desktop app to open (and thereby own) ``thread_id``
-    in the background: ``open -g codex://threads/<id>`` (macOS)."""
+async def open_thread_in_desktop(
+    thread_id: str, *, process_factory: Any = asyncio.create_subprocess_exec
+) -> None:
+    """Open ``thread_id`` in its own Codex window, then let IPC prove ownership.
 
-    process = await asyncio.create_subprocess_exec(
+    A ``codex://threads`` deep link only navigates the app's current primary
+    window.  An unowned second-project Merger therefore needs Codex's built-in
+    ``New Window`` action first; the caller's bounded owner rediscovery remains
+    the authoritative proof that the intended thread actually attached.
+    """
+
+    script = """tell application "System Events"
+  tell first application process whose bundle identifier is "com.openai.codex"
+    click menu item "New Window" of menu "File" of menu bar 1
+  end tell
+end tell
+delay 0.5
+"""
+    process = await process_factory("/usr/bin/osascript", "-e", script)
+    code = await asyncio.wait_for(process.wait(), 10.0)
+    if code != 0:
+        raise DesktopIpcUnavailable(f"new Codex window exited with {code}")
+
+    process = await process_factory(
         "/usr/bin/open", "-g", f"codex://threads/{thread_id}"
     )
     code = await asyncio.wait_for(process.wait(), 10.0)

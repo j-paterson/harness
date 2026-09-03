@@ -16,6 +16,7 @@ from hermes_orchestrator.codex_desktop_ipc import (
     DesktopIpcUnavailable,
     OwnerTurnStarter,
     desktop_ipc_socket,
+    open_thread_in_desktop,
 )
 
 THREAD = "01a06486-514c-7dd3-8a7c-26e7069486b2"
@@ -323,6 +324,44 @@ async def test_owner_starter_reports_a_missing_socket(socket_path: Path) -> None
 
 def test_desktop_ipc_socket_is_none_when_absent(socket_path: Path) -> None:
     assert desktop_ipc_socket(str(socket_path)) is None
+
+
+@pytest.mark.asyncio
+async def test_open_thread_creates_a_dedicated_codex_window_before_deep_linking(
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class Process:
+        async def wait(self) -> int:
+            return 0
+
+    async def spawn(*argv: str) -> Process:
+        calls.append(argv)
+        return Process()
+
+    await open_thread_in_desktop(THREAD, process_factory=spawn)
+
+    assert calls[0][0:2] == ("/usr/bin/osascript", "-e")
+    assert 'menu item "New Window"' in calls[0][2]
+    assert calls[1] == ("/usr/bin/open", "-g", f"codex://threads/{THREAD}")
+
+
+@pytest.mark.asyncio
+async def test_open_thread_does_not_navigate_when_new_window_creation_fails() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class Process:
+        async def wait(self) -> int:
+            return 1
+
+    async def spawn(*argv: str) -> Process:
+        calls.append(argv)
+        return Process()
+
+    with pytest.raises(DesktopIpcUnavailable, match="new Codex window"):
+        await open_thread_in_desktop(THREAD, process_factory=spawn)
+
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
