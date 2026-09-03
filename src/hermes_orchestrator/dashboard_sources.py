@@ -9,6 +9,7 @@ recorded fact instead of an exception. Nothing here calls a model.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -246,6 +247,30 @@ class ControlAttentionFact:
 
 
 @dataclass(frozen=True, slots=True)
+class DecisionInboxFact:
+    """The global operator-decision inbox (INFRA-224): count and top item.
+
+    ``pending`` counts every pending row across all projects; the
+    ``next_*`` fields describe the single highest-priority one (urgency
+    ascending, then oldest first, then rowid -- the same order
+    ``OperatorDecisions.inbox`` uses), or are all ``None`` when nothing
+    is pending. Read straight off ``operator_decisions`` by
+    :class:`DecisionsProvider` rather than through
+    :class:`~hermes_orchestrator.operator_decisions.OperatorDecisions`,
+    so this works unmodified against the dashboard's mode=ro
+    connection (opened without migrations).
+    """
+
+    pending: int
+    next_decision_id: str | None
+    next_project_key: str | None
+    next_issue_id: str | None
+    next_urgency: int | None
+    next_question: str | None
+    next_recorded_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class LaneCellFact:
     """One lead cell's lane row (INFRA-219 L2, corrected under R4).
 
@@ -334,6 +359,7 @@ class DashboardSnapshot:
     idle: tuple[IdleFact, ...] = ()
     lanes: tuple[LaneCellFact, ...] = ()
     batches: tuple[BatchFact, ...] = ()
+    decisions: DecisionInboxFact | None = None
 
 
 class UsageAggregator:
@@ -1112,6 +1138,73 @@ class ControlAttentionProvider:
         )
 
 
+_NO_PENDING_DECISIONS = DecisionInboxFact(
+    pending=0,
+    next_decision_id=None,
+    next_project_key=None,
+    next_issue_id=None,
+    next_urgency=None,
+    next_question=None,
+    next_recorded_at=None,
+)
+
+
+class DecisionsProvider:
+    """Read the global operator-decision inbox (INFRA-224).
+
+    Plain SQL over ``operator_decisions`` -- mirroring
+    :class:`ControlAttentionProvider` rather than going through
+    :class:`~hermes_orchestrator.operator_decisions.OperatorDecisions`
+    -- so this works unmodified against the dashboard's read-only,
+    migration-free connection. A database opened before migration 0061
+    landed the inbox columns (or, in a test double, lacks the table
+    entirely) raises ``sqlite3.OperationalError`` on either query;
+    that is caught here and reported as zero pending rather than
+    surfacing to the dashboard loop.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def collect(self) -> DecisionInboxFact:
+        try:
+            pending = int(
+                self._database.execute(
+                    "SELECT COUNT(*) FROM operator_decisions "
+                    "WHERE status = 'pending'"
+                ).fetchone()[0]
+            )
+            row = self._database.execute(
+                "SELECT decision_id, project_key, issue_id, urgency, "
+                "question, recorded_at FROM operator_decisions "
+                "WHERE status = 'pending' "
+                "ORDER BY urgency ASC, recorded_at ASC, rowid ASC LIMIT 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return _NO_PENDING_DECISIONS
+        if row is None:
+            return DecisionInboxFact(
+                pending=pending,
+                next_decision_id=None,
+                next_project_key=None,
+                next_issue_id=None,
+                next_urgency=None,
+                next_question=None,
+                next_recorded_at=None,
+            )
+        urgency = row["urgency"]
+        question = row["question"]
+        return DecisionInboxFact(
+            pending=pending,
+            next_decision_id=str(row["decision_id"]),
+            next_project_key=str(row["project_key"]),
+            next_issue_id=str(row["issue_id"]),
+            next_urgency=None if urgency is None else int(urgency),
+            next_question=None if question is None else str(question),
+            next_recorded_at=str(row["recorded_at"]),
+        )
+
+
 class BatchProvider:
     """Compose ``project_driver.batch_status`` into one fact per project.
 
@@ -1204,6 +1297,7 @@ class DashboardSources:
         self._transitions = TransitionProvider(database)
         self._control_attention = ControlAttentionProvider(database)
         self._batches = BatchProvider(database)
+        self._decisions = DecisionsProvider(database)
 
     async def collect(self, now: datetime) -> DashboardSnapshot:
         """Read durable state and return this tick's frozen facts."""
@@ -1259,4 +1353,5 @@ class DashboardSources:
             idle=idle,
             lanes=lanes,
             batches=self._batches.batches(project_keys, now=now),
+            decisions=self._decisions.collect(),
         )

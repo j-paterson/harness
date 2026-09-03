@@ -68,11 +68,31 @@ uv run hermes-orchestrator hermes-command --json \
   '{"intent":"queue_issue","issue_id":"ENG-7","project_key":"PROJECT_ALIAS","priority":2,"operator_instruction_id":"CHAT_INSTRUCTION_ID"}'
 ```
 
-The boundary accepts only `queue_issue`, `status`, `pause`, `resume`, `retry`, `reprioritize`, `approve_handoff`, `qa_reject`, `pending_corrections`, `fetch_correction`, `ack_correction`, `pending_wakes`, and `ack_wake`. It has no command for discovering or claiming Linear work.
+The boundary accepts only `queue_issue`, `status`, `pause`, `resume`, `retry`, `reprioritize`, `approve_handoff`, `qa_reject`, `pending_corrections`, `fetch_correction`, `ack_correction`, `pending_wakes`, `ack_wake`, `raise_operator_decision`, `pending_operator_decisions`, `next_operator_decision`, and `apply_operator_decision`. It has no command for discovering or claiming Linear work.
 
 A correction is confirmable only on proof that its whole record was read. `fetch_correction` is the supported intake: it returns the complete durable record — every packet with every field, untruncated — plus `declared_count` (the number of packets durably stored) and `payload_sha256` (SHA-256 over the one canonical serialization of those packets, `canonical_packets_json`), and it fails closed on a malformed stored payload rather than returning a partial document. `ack_correction` requires `observed_count` and `payload_sha256` and refuses unless both match the durable metadata exactly, so a lead who read three of four findings cannot produce the right count and a lead who read a truncated or altered payload cannot produce the right digest. A refusal is fail-closed with zero durable writes: the correction stays `pending` and retryable after a complete fetch, and the error names the mismatch without reprinting the payload. Display may still shorten what it shows; only the validated fetch may inform a confirmation or a rework delegation.
 
 A lead turn's terminal boundary — completed, provider capped, blocked, or handoff required — commits exactly one deduplicated, metadata-only wake row. When `config/hermes.yaml` supplies a `wake_command`, the daemon pushes each committed wake directly to that consumer command with the wake's JSON on stdin and `wake_id` as the idempotency key, acknowledging the row only after the command exits zero; a rejecting, failing, or hanging consumer leaves the row pending and the supervisor interval is the retry backoff. `pending_wakes`/`ack_wake` remain the operational fallback surface — Hermes never polls lead progress. Every terminal boundary — including a turn that finds its issue already completed — journals identity-complete durable evidence at the transition, and daemon startup deterministically reconstructs any wake lost between that evidence and the outbox insert into the same deduplicated identity, bounded by a migration-recorded floor so upgraded databases never manufacture historical wakes.
+
+## Operator decision inbox
+
+A durable, cross-project queue of authority-worthy questions an agent may not decide alone: a reversible in-scope implementation choice never enters it. Raising a request always resolves `cell_id`, `session_id`, and `project_key` server-side from the issue's own active cell — a caller can never bind a request to a foreign or stale lane — and refuses closed, with zero mutation, when the category is one of the agent-owned routine choices (`lead_vs_child_routing`, `retry_or_resume`, `focused_test_selection`, `small_fix`, `branch_alignment`) or when any required field is blank. A duplicate raise for the same issue, category, and question (modulo whitespace/case) returns the existing pending decision with `created: false` instead of a second row. Resolving a decision commits exactly one `decision_resolved` wake to the exact bound lane and the response reports what to work next.
+
+```bash
+uv run hermes-orchestrator hermes-command --json \
+  '{"intent":"raise_operator_decision","issue_id":"ENG-7","requesting_role":"lead","question":"Rename the public API or keep the deprecated alias?","authority_reason":"breaks a documented external contract","facts":["three external callers use the old name"],"options":[{"label":"rename","tradeoffs":"breaks callers immediately"},{"label":"alias","tradeoffs":"carries dead code forward"}],"recommendation":"keep the alias for one release","delay_impact":"blocks the migration packet","paused_scope":"the migration packet"}'
+
+uv run hermes-orchestrator hermes-command --json \
+  '{"intent":"pending_operator_decisions","project_key":"PROJECT_ALIAS"}'
+
+uv run hermes-orchestrator hermes-command --json \
+  '{"intent":"next_operator_decision"}'
+
+uv run hermes-orchestrator hermes-command --json \
+  '{"intent":"apply_operator_decision","decision_id":"DECISION_ID","status":"approved","source_message":"go with the alias","answer":"keep the alias for one release","next_action":"resume the migration packet"}'
+```
+
+`pending_operator_decisions` lists sanitized summaries ordered most-urgent-then-oldest-first across every project (or one, with `project_key`); `next_operator_decision` returns the single highest-priority pending request with its full context — facts, options, recommendation, delay impact, paused scope, and authority reason — plus how many are pending, or `{"decision": null, "pending": 0}` when the inbox is empty. `apply_operator_decision`'s `answer`/`next_action` fields are optional: supplying `answer` resolves through the inbox (recording the answer, waking the bound lane exactly once, and reporting `woke` and the `next` pending decision); omitting it keeps the original single-issue apply path unchanged. The dashboard's attention line shows `decisions N pending · next ...` whenever any are outstanding.
 
 ## cmux terminal visibility
 

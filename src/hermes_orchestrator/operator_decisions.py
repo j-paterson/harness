@@ -13,8 +13,12 @@ exact SHA-256 bound.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
+import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from hermes_orchestrator.db import Database
@@ -34,9 +38,87 @@ _REQUIRED_RECEIPT_FIELDS = (
     "source_message",
 )
 
+#: Urgency scale for the global operator-decision inbox. Lower sorts
+#: first: a critical question is worked before a normal one even if it
+#: was raised later.
+URGENCY_CRITICAL = 0
+URGENCY_HIGH = 1
+URGENCY_NORMAL = 2
+URGENCY_LOW = 3
+
+#: INFRA-224: routine, reversible implementation choices an agent must
+#: make on its own -- these can never enter the operator inbox. Their
+#: presence on a DecisionRequest.category always refuses raise_request
+#: with zero mutation, regardless of how the request is otherwise
+#: shaped.
+AGENT_OWNED_CATEGORIES = frozenset(
+    {
+        "lead_vs_child_routing",
+        "retry_or_resume",
+        "focused_test_selection",
+        "small_fix",
+        "branch_alignment",
+    }
+)
+
 
 class DecisionRefused(RuntimeError):
     """The command may not resolve any decision; nothing changed."""
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionOption:
+    """One choice offered to the operator, with its tradeoffs."""
+
+    label: str
+    tradeoffs: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionRequest:
+    """An agent's request for an operator's authority-worthy decision.
+
+    Carries the full context an operator needs to decide without
+    reopening a session: the question, why it exceeds agent authority,
+    the facts and options on the table, a recommendation, and what is
+    paused while the operator decides.
+    """
+
+    issue_id: str
+    project_key: str
+    cell_id: str
+    session_id: str
+    requesting_role: str
+    question: str
+    authority_reason: str
+    facts: tuple[str, ...]
+    options: tuple[DecisionOption, ...]
+    recommendation: str
+    delay_impact: str
+    paused_scope: str
+    urgency: int = URGENCY_NORMAL
+    category: str = "authority"
+    request_key: str | None = None
+
+    def derive_request_key(self) -> str:
+        """A deterministic dedup key for this request.
+
+        Two raises for the same project, issue, and category that ask
+        the same question (modulo whitespace and case) collide on
+        this key, so raise_request treats the second as the same
+        outstanding request rather than a new one.
+        """
+
+        normalized_question = " ".join(self.question.split()).lower()
+        digest_input = "\x1f".join(
+            (self.project_key, self.issue_id, self.category, normalized_question)
+        )
+        return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+
+    def effective_request_key(self) -> str:
+        """The request_key to dedup on: explicit if given, else derived."""
+
+        return self.request_key or self.derive_request_key()
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +135,19 @@ class OperatorDecision:
     source_message: str | None
     recorded_at: str
     applied_at: str | None
+    question: str | None = None
+    authority_reason: str | None = None
+    requesting_role: str | None = None
+    facts: tuple[str, ...] = field(default_factory=tuple)
+    options: tuple[DecisionOption, ...] = field(default_factory=tuple)
+    recommendation: str | None = None
+    delay_impact: str | None = None
+    paused_scope: str | None = None
+    urgency: int = URGENCY_NORMAL
+    request_key: str | None = None
+    category: str | None = None
+    answer: str | None = None
+    next_action: str | None = None
 
 
 class OperatorDecisions:
@@ -113,6 +208,52 @@ class OperatorDecisions:
         mutation.
         """
 
+        return self._resolve_pending(
+            decision_id=decision_id,
+            status=status,
+            source_message=source_message,
+            actor=actor,
+        )
+
+    def resolve(
+        self,
+        decision_id: str,
+        *,
+        status: str,
+        answer: str,
+        source_message: str,
+        next_action: str | None = None,
+        actor: str = "operator",
+    ) -> OperatorDecision:
+        """Resolve one exact pending inbox request, recording the answer.
+
+        Reuses apply()'s compare-and-swap discipline unchanged --
+        pending only, exactly once, operator actor only, fail-closed
+        on any blank -- and additionally stores the operator's answer
+        and next action in the same UPDATE.
+        """
+
+        if not str(answer).strip():
+            raise DecisionRefused("a blank answer can never resolve a decision")
+        return self._resolve_pending(
+            decision_id=decision_id,
+            status=status,
+            source_message=source_message,
+            actor=actor,
+            answer=answer,
+            next_action=next_action,
+        )
+
+    def _resolve_pending(
+        self,
+        *,
+        decision_id: str,
+        status: str,
+        source_message: str,
+        actor: str,
+        answer: str | None = None,
+        next_action: str | None = None,
+    ) -> OperatorDecision:
         if not str(decision_id).strip():
             raise DecisionRefused(
                 "a decision command requires the exact pending decision id"
@@ -129,15 +270,154 @@ class OperatorDecisions:
         with self._database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE operator_decisions SET status = ?, "
-                "source_message = ?, applied_at = ? "
+                "source_message = ?, applied_at = ?, answer = ?, next_action = ? "
                 "WHERE decision_id = ? AND status = 'pending'",
-                (status, source_message, stamp, decision_id),
+                (status, source_message, stamp, answer, next_action, decision_id),
             )
             if cursor.rowcount != 1:
                 raise DecisionRefused(
                     "no pending decision carries this id; nothing changed"
                 )
         return self.get(decision_id)
+
+    def raise_request(self, request: DecisionRequest) -> tuple[OperatorDecision, bool]:
+        """Raise an operator-authority request into the global inbox.
+
+        Refuses with zero mutation when the category is agent-owned
+        (a routine reversible implementation choice must never reach
+        the operator) or when any required field is blank. Dedupes by
+        request_key: a pending row already carrying the same key is
+        returned unchanged with ``created=False`` instead of a second
+        row being inserted -- including under a concurrent duplicate
+        insert racing on the partial unique index.
+        """
+
+        if request.category in AGENT_OWNED_CATEGORIES:
+            raise DecisionRefused(
+                f"{request.category} is an agent-owned routine choice; "
+                "it may not enter the operator inbox"
+            )
+        required = {
+            "question": request.question,
+            "authority_reason": request.authority_reason,
+            "requesting_role": request.requesting_role,
+            "recommendation": request.recommendation,
+            "delay_impact": request.delay_impact,
+            "paused_scope": request.paused_scope,
+        }
+        missing = [name for name, value in required.items() if not str(value).strip()]
+        if missing:
+            raise DecisionRefused(
+                "an operator decision request requires: " + ", ".join(missing)
+            )
+        if not request.options:
+            raise DecisionRefused(
+                "an operator decision request requires at least one option"
+            )
+
+        request_key = request.effective_request_key()
+        existing = self._pending_by_request_key(request_key)
+        if existing is not None:
+            return existing, False
+
+        decision_id = str(uuid.uuid4())
+        stamp = self._now().isoformat()
+        facts_json = json.dumps(list(request.facts))
+        options_json = json.dumps(
+            [
+                {"label": option.label, "tradeoffs": option.tradeoffs}
+                for option in request.options
+            ]
+        )
+        try:
+            with self._database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO operator_decisions("
+                    "decision_id, issue_id, project_key, cell_id, session_id, "
+                    "actor, choice, status, recorded_at, question, "
+                    "authority_reason, requesting_role, facts_json, "
+                    "options_json, recommendation, delay_impact, paused_scope, "
+                    "urgency, request_key, category"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        decision_id,
+                        request.issue_id,
+                        request.project_key,
+                        request.cell_id,
+                        request.session_id,
+                        request.requesting_role,
+                        request.recommendation,
+                        stamp,
+                        request.question,
+                        request.authority_reason,
+                        request.requesting_role,
+                        facts_json,
+                        options_json,
+                        request.recommendation,
+                        request.delay_impact,
+                        request.paused_scope,
+                        request.urgency,
+                        request_key,
+                        request.category,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            existing = self._pending_by_request_key(request_key)
+            if existing is not None:
+                return existing, False
+            raise
+        return self.get(decision_id), True
+
+    def inbox(self, project_key: str | None = None) -> list[OperatorDecision]:
+        """Pending requests across all projects, or one project.
+
+        Ordered urgency ascending, then oldest first -- the order an
+        operator should work them in.
+        """
+
+        if project_key is None:
+            rows = self._database.execute(
+                "SELECT * FROM operator_decisions WHERE status = 'pending' "
+                "ORDER BY urgency ASC, recorded_at ASC, rowid ASC"
+            ).fetchall()
+        else:
+            rows = self._database.execute(
+                "SELECT * FROM operator_decisions "
+                "WHERE status = 'pending' AND project_key = ? "
+                "ORDER BY urgency ASC, recorded_at ASC, rowid ASC",
+                (project_key,),
+            ).fetchall()
+        return [_row_to_decision(row) for row in rows]
+
+    def next_pending(self, project_key: str | None = None) -> OperatorDecision | None:
+        """The single highest-priority pending request, if any."""
+
+        inbox = self.inbox(project_key)
+        return inbox[0] if inbox else None
+
+    def pending_count(self, project_key: str | None = None) -> int:
+        """How many requests are presently pending."""
+
+        if project_key is None:
+            value = self._database.scalar(
+                "SELECT COUNT(*) FROM operator_decisions WHERE status = 'pending'"
+            )
+        else:
+            value = self._database.scalar(
+                "SELECT COUNT(*) FROM operator_decisions "
+                "WHERE status = 'pending' AND project_key = ?",
+                (project_key,),
+            )
+        return int(value)  # type: ignore[arg-type]
+
+    def _pending_by_request_key(self, request_key: str) -> OperatorDecision | None:
+        row = self._database.execute(
+            "SELECT * FROM operator_decisions "
+            "WHERE request_key = ? AND status = 'pending'",
+            (request_key,),
+        ).fetchone()
+        return None if row is None else _row_to_decision(row)
 
     def import_receipt(self, receipt: dict, *, receipt_sha256: str) -> OperatorDecision:
         """Import one recorded operator receipt, idempotently.
@@ -224,6 +504,18 @@ def _row_to_decision(row: object) -> OperatorDecision:
         value = row[key]  # type: ignore[index]
         return None if value is None else str(value)
 
+    def json_list(key: str) -> list[object]:
+        raw = row[key]  # type: ignore[index]
+        return [] if not raw else json.loads(raw)
+
+    facts = tuple(str(item) for item in json_list("facts_json"))
+    options = tuple(
+        DecisionOption(label=str(item["label"]), tradeoffs=str(item["tradeoffs"]))
+        for item in json_list("options_json")
+    )
+    urgency_value = row["urgency"]  # type: ignore[index]
+    urgency = URGENCY_NORMAL if urgency_value is None else int(urgency_value)
+
     return OperatorDecision(
         decision_id=text("decision_id"),
         issue_id=text("issue_id"),
@@ -237,4 +529,17 @@ def _row_to_decision(row: object) -> OperatorDecision:
         source_message=optional("source_message"),
         recorded_at=text("recorded_at"),
         applied_at=optional("applied_at"),
+        question=optional("question"),
+        authority_reason=optional("authority_reason"),
+        requesting_role=optional("requesting_role"),
+        facts=facts,
+        options=options,
+        recommendation=optional("recommendation"),
+        delay_impact=optional("delay_impact"),
+        paused_scope=optional("paused_scope"),
+        urgency=urgency,
+        request_key=optional("request_key"),
+        category=optional("category"),
+        answer=optional("answer"),
+        next_action=optional("next_action"),
     )

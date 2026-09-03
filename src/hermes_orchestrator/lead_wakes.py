@@ -8,6 +8,12 @@ that identity. Subscribers receive the wake in-process only after the
 durable commit; rows still pending at startup are replayed for delivery
 exactly once. Rows carry orchestration metadata only, never prompts or
 responses.
+
+INFRA-224: a resolved operator decision is also a terminal boundary for
+whichever lane paused on it, so ``decision_resolved`` joins the same
+outbox and the same exactly-once dedup index; see
+:mod:`hermes_orchestrator.decision_inbox` for how it is committed and
+reconciled.
 """
 
 from __future__ import annotations
@@ -38,6 +44,15 @@ WAKE_KINDS = frozenset(
         # committed because a turn ended; none can tell an idle seat the
         # queue still holds safe admitted work.
         "work_ready",
+        # INFRA-224: an operator resolved a pending decision -- the exact
+        # waiting lane (project_key, cell_id, session_id) must wake once
+        # and resume from the named next action. Unlike the kinds above,
+        # this one is never derived by LeadWakeReconciler from a
+        # project_cell/checkpoint_safety evidence event: a resolved row
+        # in ``operator_decisions`` IS the durable proof a wake is owed,
+        # so hermes_orchestrator.decision_inbox.DecisionInbox.reconcile()
+        # rebuilds any missing wake straight from that table instead.
+        "decision_resolved",
     }
 )
 
@@ -554,6 +569,12 @@ class LeadWakeReconciler:
     (journaled before the outbox schema existed) is never resurrected, and
     evidence whose session no longer matches the cell is skipped: rotating
     past a boundary proves its consumer saw it.
+
+    INFRA-224: ``decision_resolved`` wakes are NOT covered here. A
+    resolved ``operator_decisions`` row is itself the durable proof a
+    wake is owed, so ``hermes_orchestrator.decision_inbox.DecisionInbox
+    .reconcile()`` rebuilds any missing one directly from that table
+    instead of from a journaled evidence event.
     """
 
     def __init__(

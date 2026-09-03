@@ -254,13 +254,62 @@ class ApplyOperatorDecisionCommand(_Command):
 
     Every field is schema-enforced nonempty: a blank message, hook
     firing, or replayed transcript cannot parse into this command and
-    therefore cannot mutate decision state.
+    therefore cannot mutate decision state. INFRA-224: an optional
+    ``answer`` routes resolution through the global inbox (recording
+    the operator's answer and waking the bound lane exactly once);
+    when ``answer`` is absent this keeps the original
+    ``OperatorDecisions.apply`` path unchanged.
     """
 
     intent: Literal["apply_operator_decision"]
     decision_id: NonEmptyText
     status: Literal["approved", "rejected"]
     source_message: NonEmptyText
+    answer: NonEmptyText | None = None
+    next_action: NonEmptyText | None = None
+
+
+class DecisionOptionPayload(BaseModel):
+    """One choice offered to the operator, with its tradeoffs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: NonEmptyText
+    tradeoffs: NonEmptyText
+
+
+class RaiseOperatorDecisionCommand(_Command):
+    """Raise one authority-worthy request into the global operator inbox.
+
+    INFRA-224: ``cell_id``, ``session_id``, and ``project_key`` are
+    never caller-supplied -- they are resolved server-side from the
+    issue's own active cell, so a request can never be bound to a
+    foreign or stale lane.
+    """
+
+    intent: Literal["raise_operator_decision"]
+    issue_id: NonEmptyText
+    requesting_role: NonEmptyText
+    question: NonEmptyText
+    authority_reason: NonEmptyText
+    facts: list[NonEmptyText] = Field(default_factory=list)
+    options: list[DecisionOptionPayload] = Field(min_length=1)
+    recommendation: NonEmptyText
+    delay_impact: NonEmptyText
+    paused_scope: NonEmptyText
+    urgency: int = Field(default=2, ge=0, le=3)
+    category: NonEmptyText = "authority"
+    request_key: str | None = None
+
+
+class PendingOperatorDecisionsCommand(_Command):
+    intent: Literal["pending_operator_decisions"]
+    project_key: NonEmptyText | None = None
+
+
+class NextOperatorDecisionCommand(_Command):
+    intent: Literal["next_operator_decision"]
+    project_key: NonEmptyText | None = None
 
 
 HermesCommand = Annotated[
@@ -285,6 +334,9 @@ HermesCommand = Annotated[
     | PendingWakesCommand
     | AckWakeCommand
     | ApplyOperatorDecisionCommand
+    | RaiseOperatorDecisionCommand
+    | PendingOperatorDecisionsCommand
+    | NextOperatorDecisionCommand
     | CreatePacketCommand
     | AcceptPacketCommand
     | RejectPacketCommand
@@ -321,6 +373,9 @@ _ALLOWED_INTENTS = frozenset(
         "pending_wakes",
         "ack_wake",
         "apply_operator_decision",
+        "raise_operator_decision",
+        "pending_operator_decisions",
+        "next_operator_decision",
         "create_packet",
         "accept_packet",
         "reject_packet",

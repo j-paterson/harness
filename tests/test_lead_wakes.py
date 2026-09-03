@@ -102,6 +102,48 @@ def test_commit_rejects_an_unknown_kind(database: Database) -> None:
         wakes.commit(completed_turn(kind="celebrated"))
 
 
+def test_decision_resolved_is_an_accepted_kind(database: Database) -> None:
+    """INFRA-224: an operator resolution is a terminal boundary for
+    whichever lane paused on it, so ``decision_resolved`` is a WAKE_KINDS
+    member accepted by ``commit`` like every other terminal kind."""
+
+    wakes = build_wakes(database)
+
+    wake = wakes.commit(
+        completed_turn(
+            kind="decision_resolved",
+            turn_key="decision:dec-1",
+            reason="decision dec-1 resolved approved: go ahead (next: resume)",
+        )
+    )
+
+    assert wake.kind == "decision_resolved"
+    assert wake.state == "pending"
+    assert len(wakes.pending("demo")) == 1
+
+
+def test_decision_resolved_commit_dedups_on_the_same_turn_key(
+    database: Database,
+) -> None:
+    wakes = build_wakes(database)
+
+    first = wakes.commit(
+        completed_turn(kind="decision_resolved", turn_key="decision:dec-1")
+    )
+    duplicate = wakes.commit(
+        completed_turn(
+            kind="decision_resolved",
+            turn_key="decision:dec-1",
+            reason="a second, differently worded resolution attempt",
+        )
+    )
+
+    assert first.wake_id == duplicate.wake_id
+    assert duplicate.reason == first.reason
+    assert len(wakes.pending("demo")) == 1
+    assert wake_events(database, "lead_wake.committed") == [first.wake_id]
+
+
 def test_commit_signals_each_new_wake_exactly_once(database: Database) -> None:
     wakes = build_wakes(database)
     delivered: list[TerminalWake] = []

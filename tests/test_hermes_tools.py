@@ -845,3 +845,214 @@ def test_queue_issue_on_active_issue_still_denied(database: Database) -> None:
 
     assert result.code == "admission_denied"
     assert result.state == {"reason": "issue ENG-9 is already admitted"}
+
+
+def _raise_decision_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "intent": "raise_operator_decision",
+        "issue_id": "ENG-9",
+        "requesting_role": "lead",
+        "question": "Rename the public API or keep the deprecated alias?",
+        "authority_reason": "breaks a documented external contract",
+        "facts": ["three external callers use the old name"],
+        "options": [
+            {"label": "rename", "tradeoffs": "breaks callers immediately"},
+            {"label": "alias", "tradeoffs": "carries dead code forward"},
+        ],
+        "recommendation": "keep the alias for one release",
+        "delay_impact": "blocks the migration packet",
+        "paused_scope": "the migration packet",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_raise_operator_decision_is_strict_and_routed(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def raised(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"decision_id": "dec-1", "created": True, "pending": 1, "summary": "s"}
+
+    service = HermesCommandService(
+        queue, handlers={"raise_operator_decision": raised}
+    )
+
+    result = service.execute(_raise_decision_payload())
+    assert result.code == "accepted"
+    assert result.state == {
+        "decision_id": "dec-1",
+        "created": True,
+        "pending": 1,
+        "summary": "s",
+    }
+    assert seen[0].urgency == 2
+    assert seen[0].category == "authority"
+    assert seen[0].request_key is None
+    assert seen[0].facts == ["three external callers use the old name"]
+    assert seen[0].options[0].label == "rename"
+
+    with_overrides = service.execute(
+        _raise_decision_payload(urgency=0, category="authority", request_key="k-1")
+    )
+    assert with_overrides.code == "accepted"
+    assert seen[1].urgency == 0
+    assert seen[1].request_key == "k-1"
+
+
+def test_raise_operator_decision_refuses_malformed_payloads(
+    database: Database,
+) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    service = HermesCommandService(
+        queue, handlers={"raise_operator_decision": lambda c: {}}
+    )
+
+    urgency_too_high = service.execute(_raise_decision_payload(urgency=4))
+    assert urgency_too_high.code == "invalid_command"
+
+    urgency_negative = service.execute(_raise_decision_payload(urgency=-1))
+    assert urgency_negative.code == "invalid_command"
+
+    empty_options = service.execute(_raise_decision_payload(options=[]))
+    assert empty_options.code == "invalid_command"
+
+    blank_question = service.execute(_raise_decision_payload(question="   "))
+    assert blank_question.code == "invalid_command"
+
+    blank_option_label = service.execute(
+        _raise_decision_payload(options=[{"label": "  ", "tradeoffs": "x"}])
+    )
+    assert blank_option_label.code == "invalid_command"
+
+    extra_field = service.execute(_raise_decision_payload(unexpected="nope"))
+    assert extra_field.code == "invalid_command"
+
+
+def test_pending_and_next_operator_decisions_are_strict_and_routed(
+    database: Database,
+) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    calls: list[tuple[str, object]] = []
+
+    def pending(command: object) -> dict[str, object]:
+        calls.append(("pending", command))
+        return {"decisions": []}
+
+    def nxt(command: object) -> dict[str, object]:
+        calls.append(("next", command))
+        return {"decision": None, "pending": 0}
+
+    service = HermesCommandService(
+        queue,
+        handlers={
+            "pending_operator_decisions": pending,
+            "next_operator_decision": nxt,
+        },
+    )
+
+    pending_result = service.execute({"intent": "pending_operator_decisions"})
+    assert pending_result.code == "accepted"
+    assert pending_result.state == {"decisions": []}
+    assert calls[0][1].project_key is None
+
+    scoped = service.execute(
+        {"intent": "pending_operator_decisions", "project_key": "demo"}
+    )
+    assert scoped.code == "accepted"
+    assert calls[1][1].project_key == "demo"
+
+    next_result = service.execute({"intent": "next_operator_decision"})
+    assert next_result.code == "accepted"
+    assert next_result.state == {"decision": None, "pending": 0}
+    assert calls[2][1].project_key is None
+
+    invalid = service.execute(
+        {"intent": "pending_operator_decisions", "unexpected": "nope"}
+    )
+    assert invalid.code == "invalid_command"
+
+
+def test_operator_decision_intents_without_handlers_are_unavailable(
+    command_service: HermesCommandService,
+) -> None:
+    for intent, payload in (
+        ("raise_operator_decision", _raise_decision_payload()),
+        ("pending_operator_decisions", {}),
+        ("next_operator_decision", {}),
+    ):
+        result = command_service.execute({**payload, "intent": intent})
+        assert result.code == "intent_unavailable", intent
+
+
+def test_supports_reflects_operator_decision_intents(database: Database) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    bare = HermesCommandService(queue)
+    assert not bare.supports("raise_operator_decision")
+    assert not bare.supports("pending_operator_decisions")
+    assert not bare.supports("next_operator_decision")
+
+    wired = HermesCommandService(
+        queue,
+        handlers={
+            "raise_operator_decision": lambda c: {},
+            "pending_operator_decisions": lambda c: {},
+            "next_operator_decision": lambda c: {},
+        },
+    )
+    assert wired.supports("raise_operator_decision")
+    assert wired.supports("pending_operator_decisions")
+    assert wired.supports("next_operator_decision")
+
+
+def test_apply_operator_decision_answer_and_next_action_are_optional_but_strict(
+    database: Database,
+) -> None:
+    queue = QueueService(database, EventStore(database), {"demo"})
+    seen: list[object] = []
+
+    def applied(command: object) -> dict[str, object]:
+        seen.append(command)
+        return {"decision_id": command.decision_id, "status": command.status}
+
+    service = HermesCommandService(
+        queue, handlers={"apply_operator_decision": applied}
+    )
+
+    legacy = service.execute(
+        {
+            "intent": "apply_operator_decision",
+            "decision_id": "dec-1",
+            "status": "approved",
+            "source_message": "go ahead",
+        }
+    )
+    assert legacy.code == "accepted"
+    assert seen[0].answer is None
+    assert seen[0].next_action is None
+
+    with_answer = service.execute(
+        {
+            "intent": "apply_operator_decision",
+            "decision_id": "dec-1",
+            "status": "approved",
+            "source_message": "go ahead",
+            "answer": "use the alias",
+            "next_action": "resume the migration packet",
+        }
+    )
+    assert with_answer.code == "accepted"
+    assert seen[1].answer == "use the alias"
+    assert seen[1].next_action == "resume the migration packet"
+
+    blank_answer = service.execute(
+        {
+            "intent": "apply_operator_decision",
+            "decision_id": "dec-1",
+            "status": "approved",
+            "source_message": "go ahead",
+            "answer": "   ",
+        }
+    )
+    assert blank_answer.code == "invalid_command"
