@@ -79,15 +79,22 @@ class FakeTurns:
     def __init__(self) -> None:
         self.outstanding: dict[str, object | None] = {}
         self.pending: dict[str, bool] = {}
+        self.stalled: dict[str, tuple[object, ...]] = {}
         self.recover_calls: list[tuple[str, ...]] = []
         self.settle_calls: list[tuple[tuple[str, ...], str]] = []
         self.on_settle_idle: Callable[[str], None] | None = None
+        self.notification_calls: list[RpcNotification] = []
+        self.notification_result: object | None = None
+        self.on_notification_hook: Callable[[RpcNotification], None] | None = None
 
     def outstanding_wake(self, project_key: str) -> object | None:
         return self.outstanding.get(project_key)
 
     def has_pending_submission(self, project_key: str) -> bool:
         return self.pending.get(project_key, False)
+
+    def stalled_wakes(self, project_key: str) -> tuple[object, ...]:
+        return self.stalled.get(project_key, ())
 
     async def recover_outstanding(
         self, projects: Sequence[str]
@@ -102,8 +109,11 @@ class FakeTurns:
         if self.on_settle_idle is not None:
             self.on_settle_idle(thread_id)
 
-    async def on_notification(self, notification: RpcNotification) -> None:
-        return None
+    async def on_notification(self, notification: RpcNotification) -> object | None:
+        self.notification_calls.append(notification)
+        if self.on_notification_hook is not None:
+            self.on_notification_hook(notification)
+        return self.notification_result
 
 
 class FakeReviews:
@@ -170,6 +180,49 @@ async def test_startup_with_no_work_opens_recovers_and_releases_once(
     assert merger.ensure_calls == ["demo"]
     assert _event_kinds(events) == [
         "merger.session_opened",
+        "merger.session_released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_surfaces_stalled_wakes_without_retrying_them(
+    database: Database,
+) -> None:
+    # Sol correction 538f1b4e: the startup boundary must never infer a
+    # verdict or blindly requeue a stalled wake -- it only journals that
+    # one is outstanding, durable, and waiting on the operator's
+    # explicit retry command.
+    events = EventStore(database)
+    rpc = FakeRpc()
+    merger = FakeMerger()
+    turns = FakeTurns()
+    turns.stalled["demo"] = (SimpleNamespace(event_id="evt-stalled-1"),)
+    reviews = FakeReviews()
+    session = MergerSession(
+        _flow(rpc=rpc, merger=merger, turns=turns, reviews=reviews),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+
+    await session.startup()
+
+    # Never touched: no state read/written on the fake beyond the listing.
+    assert turns.outstanding.get("demo") is None
+    assert turns.recover_calls == [("demo",)]
+    surfaced = [
+        record
+        for record in events.list_after(0)
+        if record.event_type == "merger.stalled_wakes_outstanding"
+    ]
+    assert len(surfaced) == 1
+    assert surfaced[0].payload == {
+        "project_key": "demo",
+        "event_ids": ["evt-stalled-1"],
+    }
+    assert _event_kinds(events) == [
+        "merger.session_opened",
+        "merger.stalled_wakes_outstanding",
         "merger.session_released",
     ]
 
@@ -274,6 +327,94 @@ async def test_terminal_idle_notification_releases_without_deadlock(
         "merger.session_opened",
         "merger.session_released",
     ]
+
+
+@pytest.mark.asyncio
+async def test_stalled_turn_notification_reconciles_and_releases(
+    database: Database,
+) -> None:
+    # INFRA-223 recurrence: MergerTurnService.on_notification itself
+    # marks an unverdicted completed/interrupted turn's wake 'stalled'
+    # and returns a TurnOutcome naming it. The default listener must ACT
+    # on that outcome instead of discarding it, by reconciling
+    # immediately — the same shape as the terminal-idle branch above —
+    # so review_active() re-evaluates to false and release() runs right
+    # away instead of leaving the bounded helper attached to the now
+    # idle task until some later, unrelated boundary happens to
+    # reconcile.
+    events = EventStore(database)
+    rpc = FakeRpc()
+    turns = FakeTurns()
+    turns.outstanding["demo"] = ("evt-1", "delivered")
+
+    def stall(notification: RpcNotification) -> None:
+        # The wake is durably stalled: nothing is outstanding anymore.
+        turns.outstanding["demo"] = None
+
+    turns.on_notification_hook = stall
+    turns.notification_result = SimpleNamespace(kind="stalled")
+    session = MergerSession(
+        _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+
+    opened = await session.open("wake_delivered")
+    assert opened is True
+    assert session.is_open is True
+
+    await rpc.push(
+        RpcNotification(method="turn/completed", params={"threadId": "thr-1"})
+    )
+
+    await _wait_until(lambda: not session.is_open)
+
+    assert rpc.close_calls == 1
+    assert len(turns.notification_calls) == 1
+    assert turns.notification_calls[0].method == "turn/completed"
+    assert _event_kinds(events) == [
+        "merger.session_opened",
+        "merger.session_released",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_non_stalled_notification_outcome_does_not_force_a_reconcile(
+    database: Database,
+) -> None:
+    # A non-'stalled' outcome (e.g. a genuine settlement, or the
+    # non-settling 'awaiting_submission' observation) must not itself
+    # force a reconcile beyond what review_active() already reports —
+    # only 'stalled' gets that special treatment.
+    events = EventStore(database)
+    rpc = FakeRpc()
+    turns = FakeTurns()
+    turns.outstanding["demo"] = ("evt-1", "delivered")
+    turns.notification_result = SimpleNamespace(kind="awaiting_submission")
+    session = MergerSession(
+        _flow(rpc=rpc, merger=FakeMerger(), turns=turns, reviews=FakeReviews()),
+        ("demo",),
+        events=events,
+        database=database,
+    )
+
+    opened = await session.open("wake_delivered")
+    assert opened is True
+
+    await rpc.push(
+        RpcNotification(method="turn/completed", params={"threadId": "thr-1"})
+    )
+
+    await _wait_until(lambda: len(turns.notification_calls) == 1)
+    # Give the listener a moment to (not) act further; work is still
+    # outstanding per FakeTurns, so the session must stay open.
+    await asyncio.sleep(0.02)
+
+    assert session.is_open is True
+    assert rpc.close_calls == 0
+
+    await session.release("test_teardown")
 
 
 @pytest.mark.asyncio

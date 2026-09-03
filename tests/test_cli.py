@@ -218,6 +218,112 @@ def test_hermes_command_retry_refuses_a_non_retryable_issue(
     assert payload["state"] == {"reason": "retry_not_applicable"}
 
 
+def test_hermes_command_retry_redelivers_a_stalled_wake(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    # Sol correction 538f1b4e: the SAME operator "retry" hermes-command
+    # is the one supported live retry of a Merger wake stalled without a
+    # structured verdict -- no new intent, no new schema. This seeds one
+    # 'stalled' wake_deliveries row directly (a full production Merger
+    # turn is exercised end to end in tests/test_merger_turns.py) and
+    # proves the CLI wiring: the retry reports the exact event as
+    # retried, and a second retry of the same, now-unstalled, issue
+    # reports nothing retried.
+    from hermes_orchestrator.db import Database
+
+    request = json.dumps(
+        {
+            "intent": "queue_issue",
+            "issue_id": "ENG-9",
+            "project_key": "demo",
+            "priority": 1,
+            "operator_instruction_id": "chat-9",
+        }
+    )
+    assert invoke(
+        [*base_arguments(configured_repo), "hermes-command", "--json", request]
+    ).exit_code == 0
+
+    _, state_dir = configured_repo
+    stamp = datetime.now(UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO wake_deliveries("
+                "project_key, event_id, status, issue_id, candidate_sha, "
+                "base_sha, branch, manifest_path, manifest_digest, "
+                "manifest_device, manifest_inode, manifest_size, "
+                "manifest_mtime_ns, manifest_mode, state, thread_id, "
+                "generation, claim_token, claim_expires_at, attempts, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "NULL, NULL, NULL, NULL, 0, ?, ?)",
+                (
+                    "demo",
+                    "evt-cli-stalled-1",
+                    "FABLE_READY",
+                    "ENG-9",
+                    "a" * 40,
+                    "b" * 40,
+                    "ENG-9-branch",
+                    str(state_dir / "manifests" / "missing.json"),
+                    "c" * 64,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "stalled",
+                    stamp,
+                    stamp,
+                ),
+            )
+    finally:
+        database.close()
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "retry", "issue_id": "ENG-9"}),
+        ]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["code"] == "accepted"
+    assert payload["state"] == {
+        "retried": ["evt-cli-stalled-1"],
+        "delivered": [],
+    }
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        row = database.execute(
+            "SELECT state FROM wake_deliveries WHERE event_id = ?",
+            ("evt-cli-stalled-1",),
+        ).fetchone()
+        assert str(row["state"]) == "pending"
+    finally:
+        database.close()
+
+    second = invoke(
+        [
+            *base_arguments(configured_repo),
+            "hermes-command",
+            "--json",
+            json.dumps({"intent": "retry", "issue_id": "ENG-9"}),
+        ]
+    )
+
+    assert second.exit_code == 0
+    second_payload = json.loads(second.stdout)
+    assert second_payload["code"] == "rejected"
+    assert "evt-cli-stalled-1" not in json.dumps(second_payload["state"])
+
+
 def _seed_done_issue(
     configured_repo: tuple[Path, Path], issue_id: str = "ENG-9"
 ) -> None:

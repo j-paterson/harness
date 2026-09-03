@@ -1555,15 +1555,17 @@ async def test_resumed_sol_thread_reapplies_the_ponytail_guard_binding(
 
 
 def test_ponytail_guard_binds_nowhere_but_the_managed_sol_boundary() -> None:
-    """Operator correction c3f4aad5 required test 5 (binding side): only
-    the CodexMerger managed-Sol boundary references the guard, so no
-    other Codex session, launch surface, or agent lead is subject to
-    it."""
+    """Only managed-Sol launch boundaries reference the guard, so no other
+    Codex session, launch surface, or agent lead is subject to it."""
 
     import hermes_orchestrator
 
     package_root = Path(hermes_orchestrator.__file__).parent
-    binders = {"codex_merger.py", "codex_ponytail_guard.py"}
+    binders = {
+        "codex_merger.py",
+        "codex_ponytail_guard.py",
+        "codex_queue.py",
+    }
     for module in sorted(package_root.rglob("*.py")):
         if module.name in binders:
             continue

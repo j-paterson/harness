@@ -196,7 +196,48 @@ class MergerSession:
         if opened:
             await self.flow.reviews.resume_settlements()
             await self.flow.turns.recover_outstanding(self._projects)
+            self._surface_stalled_wakes()
         await self.reconcile("startup")
+
+    def _surface_stalled_wakes(self) -> None:
+        """Journal, but never auto-retry, any wake still ``'stalled'``.
+
+        Sol correction 538f1b4e: a wake stalled without a structured
+        verdict has exactly one supported live retry -- the explicit
+        operator command (``MergerTurnService.retry_stalled_wake`` /
+        ``retry_stalled_wakes_for_issue``, wired to the hermes-command
+        ``retry`` intent). This startup/intake recovery boundary must
+        never infer a verdict or blindly requeue one on the operator's
+        behalf: ``recover_outstanding`` above already never touches a
+        ``'stalled'`` row -- its release path (``release_next_candidate``)
+        only ever reads durably ``'pending'`` rows -- so nothing here
+        changes that. This only makes an already-durable stalled wake
+        VISIBLE at the one boundary that runs after every restart, so
+        it is never silently lost between a crash and an operator's
+        next look. Purely observational: read-only, never raises (a
+        listing failure is reported to stderr and skipped, matching
+        this method's other tolerant failure handling), and journals at
+        most once per project per boundary run.
+        """
+
+        for project_key in self._projects:
+            try:
+                stalled = self.flow.turns.stalled_wakes(project_key)
+            except Exception as error:
+                print(
+                    f"stalled wake listing failed for {project_key}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+            if not stalled:
+                continue
+            self._journal(
+                "merger.stalled_wakes_outstanding",
+                {
+                    "project_key": project_key,
+                    "event_ids": [event.event_id for event in stalled],
+                },
+            )
 
     async def shutdown(self) -> None:
         """Release unconditionally at daemon shutdown."""
@@ -217,6 +258,16 @@ class MergerSession:
         ``thread/status/changed`` (never inferring a verdict from the
         thread itself), then reconciles so the session releases the
         instant nothing is left outstanding.
+
+        INFRA-223 recurrence: ``flow.turns.on_notification`` can itself
+        mark a completed/interrupted turn's wake ``'stalled'`` when it
+        ended with no structured verdict, and returns a ``TurnOutcome``
+        naming that. This loop must ACT on that outcome, not merely
+        discard it: a ``'stalled'`` outcome reconciles immediately, the
+        same way the idle branch already does, so ``review_active()``
+        re-evaluates to false and ``release()`` runs right away instead
+        of leaving the bounded helper attached to the now-idle task
+        until some later, unrelated boundary happens to reconcile.
         """
 
         async for notification in self.flow.rpc.notifications():
@@ -228,7 +279,9 @@ class MergerSession:
                     await self.flow.turns.settle_idle_thread(self._projects, thread_id)
                     await self.reconcile("terminal_idle")
                 continue
-            await self.flow.turns.on_notification(notification)
+            outcome = await self.flow.turns.on_notification(notification)
+            if outcome is not None and outcome.kind == "stalled":
+                await self.reconcile("turn_stalled")
 
     def _journal(self, event_type: str, payload: dict[str, object]) -> None:
         if self._events is None or self._database is None:

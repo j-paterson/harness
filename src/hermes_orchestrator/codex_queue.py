@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from hermes_orchestrator.codex_merger import ReviewerChannel, WakeRegistration
+from hermes_orchestrator.codex_merger import (
+    SANDBOX_MODE,
+    ReviewerChannel,
+    WakeRegistration,
+)
+from hermes_orchestrator.codex_ponytail_guard import session_guard_config
 from hermes_orchestrator.manifests import (
     WAKE_STATUSES as WAKE_STATUSES,
 )
@@ -35,10 +40,21 @@ CANDIDATE_QUEUED = "candidate_queued"
 
 #: INFRA-223: the observed blocker was exactly this -- ``codex queue
 #: --thread`` persisted the envelope for the idle pinned Sol thread, but
-#: the queued turn never started. These are the two App Server methods the
+#: the queued turn never started. These are the App Server methods the
 #: bounded start below uses, and the only ones it is allowed to use.
 THREAD_QUEUE_LIST = "thread/queue/list"
 THREAD_QUEUE_START = "thread/queue/start"
+
+#: INFRA-223 recurrence (INFRA-227): starting the queued head is not
+#: enough on its own -- a recovered turn can still be resumed by Codex
+#: under a stale read-only/network-restricted sandbox. ``thread/resume``
+#: is the same recoverable configuration path the persistent Merger
+#: channel already uses (see ``codex_merger._load_persisted_thread``) to
+#: reapply the primary Sol task's required write/network/no-prompt
+#: policy, and it is sent on this same bounded connection immediately
+#: before ``thread/queue/start`` so the queued turn never runs outside
+#: that policy.
+THREAD_RESUME = "thread/resume"
 
 ProcessFactory = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
@@ -130,6 +146,29 @@ class QueueDeliveryResult:
     thread_id: str | None
     generation: int | None
     reason: str
+    #: INFRA-223 recurrence: whether the bounded queue/start below actually
+    #: reapplied the primary Sol task's write/network/no-prompt policy
+    #: (``thread/resume`` accepted) before the queued turn was started.
+    #: ``False`` on every path that never reached a queued head, including
+    #: when nothing needed starting.
+    policy_applied: bool = False
+    #: The sandbox mode carried by that ``thread/resume``, when attempted.
+    policy_sandbox: str | None = None
+    #: Outcome of the bounded resume-then-start attempt, when one was
+    #: made -- e.g. ``"started"`` or ``"policy_resume_failed: <detail>"``.
+    #: ``None`` when ``_start_queued_head`` was never invoked for this
+    #: delivery.
+    policy_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuePolicyStart:
+    """Outcome of one bounded resume-then-start attempt on a queue head."""
+
+    started: bool
+    policy_applied: bool
+    sandbox: str | None
+    reason: str
 
 
 class CodexQueueDelivery:
@@ -216,11 +255,14 @@ class CodexQueueDelivery:
                 generation=None,
                 reason="event_conflict",
             )
+        start_outcome: _QueuePolicyStart | None = None
         if (
             registration.state in ("delivered", "admitted")
             and registration.thread_id is not None
         ):
-            await self._start_queued_head(registration.thread_id, event.event_id)
+            start_outcome = await self._start_queued_head(
+                registration.thread_id, event.event_id
+            )
         if registration.state in ("delivered", "admitted", "completed"):
             return QueueDeliveryResult(
                 delivered=True,
@@ -228,6 +270,11 @@ class CodexQueueDelivery:
                 thread_id=None,
                 generation=None,
                 reason=f"duplicate_{registration.state}",
+                policy_applied=bool(
+                    start_outcome and start_outcome.policy_applied
+                ),
+                policy_sandbox=start_outcome.sandbox if start_outcome else None,
+                policy_reason=start_outcome.reason if start_outcome else None,
             )
         if registration.state == "queued":
             # INFRA-221: another candidate holds the reviewer with an
@@ -302,13 +349,18 @@ class CodexQueueDelivery:
                     # INFRA-223: `codex queue` exiting 0 only persisted the
                     # envelope onto the idle pinned thread. Start that exact
                     # queued head now, then let go of the thread again.
-                    await self._start_queued_head(thread_id, event.event_id)
+                    start_outcome = await self._start_queued_head(
+                        thread_id, event.event_id
+                    )
                     return QueueDeliveryResult(
                         delivered=True,
                         attempts=attempts,
                         thread_id=thread_id,
                         generation=generation,
                         reason="delivered",
+                        policy_applied=start_outcome.policy_applied,
+                        policy_sandbox=start_outcome.sandbox,
+                        policy_reason=start_outcome.reason,
                     )
                 reason = "redelivery_required"
             else:
@@ -334,29 +386,55 @@ class CodexQueueDelivery:
             reason=reason,
         )
 
-    async def _start_queued_head(self, thread_id: str, event_id: str) -> None:
+    async def _start_queued_head(
+        self, thread_id: str, event_id: str
+    ) -> _QueuePolicyStart:
         """Start the exact head just queued, then disconnect immediately.
 
         One bounded action, no state of its own: connect, list the thread
-        queue, start the head that provably carries this wake's event id,
-        disconnect. The connection is released in ``finally`` on every
-        path, so it can never stay attached to an idle Sol.
+        queue, reapply the primary Sol task's required write/network/
+        no-prompt policy via ``thread/resume`` on the head that provably
+        carries this wake's event id, then start it, disconnect. The
+        connection is released in ``finally`` on every path, so it can
+        never stay attached to an idle Sol.
 
-        Everything else fails closed and silent -- no connection wired, a
-        connection that will not start, an empty queue, a head that is not
-        this candidate's, an App Server that does not implement the two
-        methods (a refused call is signal enough), or any RPC error. In
-        each case nothing is started, nothing is written, and the caller
-        sees exactly today's behaviour.
+        INFRA-223 recurrence (INFRA-227): a recovered turn started by the
+        bounded head-start alone can still run under a stale read-only/
+        network-restricted sandbox, leaving Sol unable to create the PR or
+        submit an approved verdict. ``thread/resume`` -- the same
+        recoverable configuration path the persistent Merger channel
+        already uses -- is sent on this same short-lived connection right
+        before ``thread/queue/start`` so the queued turn is never started
+        outside the policy the primary Sol task requires. If that resume
+        fails, the turn is fail-closed: nothing is started.
+
+        Every other path fails closed and silent, exactly as before --
+        no connection wired, a connection that will not start, an empty
+        queue, a head that is not this candidate's, an App Server that
+        does not implement these methods (a refused call is signal
+        enough), or any other RPC error. In each case nothing is started,
+        nothing is written, and the caller sees exactly today's
+        behaviour, save for the reason now recorded in the returned
+        outcome.
         """
 
         factory = self._rpc_factory
         if factory is None:
-            return
+            return _QueuePolicyStart(
+                started=False,
+                policy_applied=False,
+                sandbox=None,
+                reason="no_rpc_factory",
+            )
         try:
             client = factory()
-        except Exception:
-            return
+        except Exception as exc:
+            return _QueuePolicyStart(
+                started=False,
+                policy_applied=False,
+                sandbox=None,
+                reason=f"rpc_connect_failed: {exc}",
+            )
         try:
             await client.start()
             listing = await client.request(
@@ -364,14 +442,50 @@ class CodexQueueDelivery:
             )
             item_id = _own_queue_head(listing, event_id)
             if item_id is None:
-                return
+                return _QueuePolicyStart(
+                    started=False,
+                    policy_applied=False,
+                    sandbox=None,
+                    reason="no_owned_head",
+                )
+            try:
+                await client.request(
+                    THREAD_RESUME,
+                    {
+                        "threadId": thread_id,
+                        "sandbox": SANDBOX_MODE,
+                        "approvalPolicy": "never",
+                        "config": session_guard_config(),
+                    },
+                    self._timeout,
+                )
+            except Exception as exc:
+                # Fail closed: never start a turn whose policy could not
+                # be reapplied.
+                return _QueuePolicyStart(
+                    started=False,
+                    policy_applied=False,
+                    sandbox=SANDBOX_MODE,
+                    reason=f"policy_resume_failed: {exc}",
+                )
             await client.request(
                 THREAD_QUEUE_START,
                 {"threadId": thread_id, "queueItemId": item_id},
                 self._timeout,
             )
-        except Exception:
-            return
+            return _QueuePolicyStart(
+                started=True,
+                policy_applied=True,
+                sandbox=SANDBOX_MODE,
+                reason="started",
+            )
+        except Exception as exc:
+            return _QueuePolicyStart(
+                started=False,
+                policy_applied=False,
+                sandbox=None,
+                reason=f"rpc_error: {exc}",
+            )
         finally:
             with suppress(Exception):
                 await client.close()

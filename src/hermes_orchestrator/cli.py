@@ -2634,8 +2634,52 @@ def _hermes_handlers(
         )
         return wake.as_dict()
 
+    base_retry = _retry_handler(runtime.queue)
+
+    def retry(command: Any) -> dict[str, Any]:
+        """Requeue an issue; also redeliver its stalled Merger wake(s).
+
+        Sol correction 538f1b4e: the supported live retry of a wake
+        stalled without a structured verdict is this SAME operator
+        ``retry`` command, not a new intent or schema -- ``RetryCommand``
+        stays ``{intent, issue_id}``. When the named issue has no
+        stalled wake this falls straight through to the existing
+        requeue handler, byte-for-byte unchanged. Only when it DOES have
+        one does this additionally call
+        ``MergerTurnService.retry_stalled_wakes_for_issue`` -- the same
+        merge-flow composition ``qa_reject``/``require_acceptance`` use
+        below -- through the exact production entry point, and reports
+        which event_ids were retried and which were actually delivered.
+
+        An issue_id with no ``admitted_issues`` row falls through
+        unchanged too (the base handler's own not-found/rejection
+        shape), so a nonexistent issue's error is exactly today's.
+        """
+
+        try:
+            project_key = runtime.queue.get(command.issue_id).project_key
+        except KeyError:
+            return base_retry(command)
+        turns = _open_merge_flow(settings, runtime).turns
+        stalled = [
+            event
+            for event in turns.stalled_wakes(project_key)
+            if event.issue_id == command.issue_id
+        ]
+        if not stalled:
+            return base_retry(command)
+        results = asyncio.run(
+            turns.retry_stalled_wakes_for_issue(project_key, command.issue_id)
+        )
+        return {
+            "retried": [result.event_id for result in results if result.retried],
+            "delivered": [
+                result.event_id for result in results if result.delivered
+            ],
+        }
+
     return {
-        "retry": _retry_handler(runtime.queue),
+        "retry": retry,
         "request_cleanup": request_cleanup,
         "continue_work": continue_work,
         "pending_corrections": pending_corrections,

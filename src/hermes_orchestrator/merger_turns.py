@@ -59,6 +59,18 @@ from hermes_orchestrator.verdicts import (
 
 TURN_COMPLETED_METHODS = frozenset({"turn/completed", "thread/turn/completed"})
 
+# INFRA-223 recurrence: the notifications that prove -- from the
+# notification itself, never from transcript text -- that a turn is no
+# longer active. A completed turn ended normally; an interrupted turn
+# was cut short (e.g. an operator- or system-issued ``turn/interrupt``
+# request). Both are equally definitive that nothing further will ever
+# arrive for that exact turn, so both are eligible to mark an
+# unverdicted outstanding wake ``stalled`` in ``handle_turn``.
+TURN_INTERRUPTED_METHODS = frozenset(
+    {"turn/interrupted", "thread/turn/interrupted"}
+)
+_TURN_ENDED_METHODS = TURN_COMPLETED_METHODS | TURN_INTERRUPTED_METHODS
+
 #: INFRA-200: the two additive keys :func:`~hermes_orchestrator.verdicts.
 #: normalize_verdict` merges into a parsed verdict's ``verdict_json`` --
 #: never part of the base envelope :func:`~hermes_orchestrator.verdicts.
@@ -245,6 +257,31 @@ class TurnOutcome:
     merge_sha: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RetryResult:
+    """Bounded result of one live retry of a single stalled wake.
+
+    Sol correction 538f1b4e: a supported retry must actually re-deliver
+    the exact wake through the existing queue path, not merely reset its
+    row. ``retried`` is true iff the CAS from ``'stalled'`` to
+    ``'pending'`` applied (idempotent -- a second call for the same wake
+    once it is no longer ``'stalled'`` returns ``retried=False`` with no
+    further write). ``delivered`` is true only when the SAME delivery
+    adapter :meth:`MergerTurnService.release_next_candidate` uses
+    actually rendered this exact wake into the reviewer thread; when the
+    reviewer is held by another candidate the CAS still applies (the
+    wake is durably queued again) but ``delivered`` is false and
+    ``reason`` names why, exactly mirroring the delivery adapter's own
+    ``reason`` for a queued release.
+    """
+
+    event_id: str
+    issue_id: str | None
+    retried: bool
+    delivered: bool
+    reason: str
+
+
 class SubmissionRejected(ValueError):
     """An explicit Sol submission that fails closed with no side effects."""
 
@@ -420,6 +457,12 @@ class MergerTurnService:
         the same terminal ``'completed'`` vocabulary written above, so
         the surviving newest wake for the issue surfaces in this same
         pass without a second call.
+
+        INFRA-223 recurrence: the scan below is deliberately limited to
+        exactly ``'admitted'``/``'delivered'`` and must stay that way --
+        a wake ``_mark_wake_stalled`` moved to ``'stalled'`` is NEVER
+        outstanding here, which is precisely what lets
+        ``MergerSession.review_active`` see it as no longer live.
         """
 
         for state in ("admitted", "delivered"):
@@ -844,9 +887,18 @@ class MergerTurnService:
     async def on_notification(
         self, notification: RpcNotification
     ) -> TurnOutcome | None:
-        """Handle a completed-turn notification for a known Merger thread."""
+        """Handle a completed/interrupted-turn notification for a known thread.
 
-        if notification.method not in TURN_COMPLETED_METHODS:
+        INFRA-223 recurrence: this is the ONLY caller that ever passes
+        ``turn_ended_thread_id`` to :meth:`handle_turn` -- the exact
+        ``threadId`` this completed/interrupted notification names, never
+        inferred any other way. That is what lets ``handle_turn`` decide,
+        from the notification alone, that a turn with no submitted
+        verdict has genuinely ended rather than merely being observed
+        mid-flight by recovery or an idle-thread resume.
+        """
+
+        if notification.method not in _TURN_ENDED_METHODS:
             return None
         thread_id = notification.params.get("threadId")
         if not isinstance(thread_id, str):
@@ -854,7 +906,9 @@ class MergerTurnService:
         for project_key in self._projects:
             channel = self._merger.read_channel(project_key)
             if channel is not None and channel.thread_id == thread_id:
-                return await self.handle_turn(project_key)
+                return await self.handle_turn(
+                    project_key, turn_ended_thread_id=thread_id
+                )
         return None
 
     async def recover_outstanding(
@@ -957,8 +1011,326 @@ class MergerTurnService:
                 event = wake_event_with_drift_hint(event, admitted.drift)
         return await self._delivery.deliver(project_key, event)
 
-    async def handle_turn(self, project_key: str) -> TurnOutcome:
-        """Reconcile the outstanding wake; settle only a submitted verdict."""
+    def _wake_binding_matches(
+        self,
+        project_key: str,
+        event_id: str,
+        *,
+        state: str,
+        thread_id: str,
+        generation: int,
+    ) -> bool:
+        """True iff this exact wake's OWN delivery binding is this turn's.
+
+        Read fresh from ``wake_deliveries`` itself, never from anything
+        cached: ``thread_id``/``generation`` on that row are written by
+        the very delivery/admission path that put the wake into
+        ``state`` -- ``record_wake_delivery_success`` for ``'delivered'``,
+        carried through unchanged by ``admit_wake`` into ``'admitted'``
+        -- so this proves the reviewer binding THIS wake was actually put
+        in front of, not merely whatever channel happens to be live now.
+        A wake bound to a different thread or an already-superseded
+        generation is never matched, so a stale completed-turn
+        notification for an old binding can never stall the CURRENT
+        wake, and vice versa.
+        """
+
+        row = self._database.execute(
+            "SELECT 1 FROM wake_deliveries WHERE project_key = ? "
+            "AND event_id = ? AND state = ? AND thread_id = ? "
+            "AND generation = ?",
+            (project_key, event_id, state, thread_id, generation),
+        ).fetchone()
+        return row is not None
+
+    def _mark_wake_stalled(
+        self,
+        project_key: str,
+        event: WakeEvent,
+        channel: ReviewerChannel,
+        state: str,
+    ) -> TurnOutcome:
+        """CAS the exact wake from ``state`` to ``'stalled'``; journal it.
+
+        INFRA-223 recurrence: "completion without a structured verdict
+        must release the bounded helper and surface one actionable retry
+        state. It must never leave the helper attached to an idle
+        task." This is that release: the CAS is conditioned on the
+        wake's own identity (``project_key``, ``event_id``), its prior
+        ``state`` (``'delivered'`` or ``'admitted'``, whichever
+        ``outstanding_wake`` read), and its own recorded
+        ``thread_id``/``generation`` -- so only the EXACT wake this
+        completed/interrupted turn belongs to is ever touched, never a
+        different wake or a wake whose turn is still active. Once
+        ``'stalled'``, ``outstanding_wake`` no longer returns this row
+        (its scan is limited to ``'admitted'``/``'delivered'``), so
+        ``MergerSession.review_active`` sees no outstanding work for it
+        and the App Server lease is released the moment nothing else
+        keeps the session open. No verdict is ever inferred: nothing
+        here reads the thread, and no ``reviews``/``submitted_verdicts``
+        row is created. Retryable, and only, via
+        :meth:`retry_stalled_wake`.
+
+        Fails closed to the ordinary non-settling ``'awaiting_submission'``
+        outcome if the CAS misses -- the row changed underneath this
+        call (a racing retry, or a settlement that reached it first) --
+        so nothing here ever overwrites what a concurrent winner already
+        wrote.
+        """
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET state = 'stalled', "
+                "updated_at = ? WHERE project_key = ? AND event_id = ? "
+                "AND state = ? AND thread_id = ? AND generation = ?",
+                (
+                    stamp,
+                    project_key,
+                    event.event_id,
+                    state,
+                    channel.thread_id,
+                    channel.generation,
+                ),
+            )
+            if cursor.rowcount == 1:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="merger.turn_stalled",
+                        aggregate_type="wake_delivery",
+                        aggregate_id=f"wake:{project_key}:{event.event_id}",
+                        correlation_id=event.event_id,
+                        actor="merger_turns",
+                        payload={
+                            "project_key": project_key,
+                            "issue_id": event.issue_id,
+                            "thread_id": channel.thread_id,
+                            "generation": channel.generation,
+                            "reason": (
+                                "turn completed without a structured verdict"
+                            ),
+                            "retry_hint": (
+                                "MergerTurnService.retry_stalled_wake"
+                                f"({project_key!r}, {event.event_id!r}) "
+                                "requeues this wake for redelivery"
+                            ),
+                        },
+                    ),
+                )
+        if cursor.rowcount != 1:
+            return TurnOutcome(
+                project_key, "awaiting_submission", event.event_id,
+                event.issue_id,
+                "no submitted verdict for the outstanding wake; "
+                "observation never infers one from the thread",
+            )
+        return TurnOutcome(
+            project_key, "stalled", event.event_id, event.issue_id,
+            "turn completed without a structured verdict; the bounded "
+            "helper is released and the wake is retryable via "
+            "retry_stalled_wake",
+        )
+
+    def stalled_wakes(self, project_key: str) -> tuple[WakeEvent, ...]:
+        """Read-only listing of every wake currently ``'stalled'``.
+
+        For a dashboard/CLI surface (wired separately): exposes the same
+        durable wake identity :meth:`outstanding_wake` reads, scoped to
+        the ``'stalled'`` state it deliberately never returns. Purely a
+        read: never mutates anything, never touches the reviewer thread.
+        """
+
+        rows = self._database.execute(
+            "SELECT status, issue_id, candidate_sha, base_sha, "
+            "manifest_path, event_id, manifest_digest FROM wake_deliveries "
+            "WHERE project_key = ? AND state = 'stalled' "
+            "ORDER BY created_at ASC, rowid ASC",
+            (project_key,),
+        ).fetchall()
+        return tuple(_row_to_event(row) for row in rows)
+
+    def _requeue_stalled_wake(
+        self, project_key: str, event_id: str
+    ) -> WakeEvent | None:
+        """CAS the exact ``'stalled'`` wake back to ``'pending'``.
+
+        Refuses -- returns ``None``, no side effect at all -- unless a
+        row for this exact ``project_key``/``event_id`` is currently
+        ``'stalled'``: a non-stalled row (already retried, already
+        superseded, still active, or never stalled) is never touched.
+        The reset mirrors exactly the stale-claim-to-``'pending'`` shape
+        the ordinary delivery path already uses elsewhere
+        (``CodexMerger.register_wake``'s ``stale_delivery`` branch):
+        ``claim_token``/``claim_expires_at`` cleared, the prior
+        ``thread_id``/``generation`` left in place until the next
+        successful delivery overwrites them. So the retried row is
+        picked up by the SAME queue delivery path
+        (``CodexMerger.register_wake`` -> ``release_or_queue`` ->
+        ``WakeDeliverer.deliver``) as any other queued candidate --
+        no new transport, no bespoke redelivery mechanism. Appends
+        ``merger.turn_retry_requested`` exactly once, only when the CAS
+        actually applies. Purely the durable half of
+        :meth:`retry_stalled_wake` -- callers that need the wake actually
+        redelivered use that method, not this one.
+        """
+
+        stamp = self._now().isoformat()
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT status, issue_id, candidate_sha, base_sha, "
+                "manifest_path, manifest_digest FROM wake_deliveries "
+                "WHERE project_key = ? AND event_id = ? AND state = 'stalled'",
+                (project_key, event_id),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET state = 'pending', "
+                "claim_token = NULL, claim_expires_at = NULL, "
+                "updated_at = ? WHERE project_key = ? AND event_id = ? "
+                "AND state = 'stalled'",
+                (stamp, project_key, event_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="merger.turn_retry_requested",
+                    aggregate_type="wake_delivery",
+                    aggregate_id=f"wake:{project_key}:{event_id}",
+                    correlation_id=event_id,
+                    actor="merger_turns",
+                    payload={
+                        "project_key": project_key,
+                        "issue_id": str(row["issue_id"]),
+                        "reason": (
+                            "operator-requested retry of a wake stalled "
+                            "without a structured verdict"
+                        ),
+                    },
+                ),
+            )
+        return WakeEvent(
+            status=str(row["status"]),
+            issue_id=str(row["issue_id"]),
+            candidate_sha=str(row["candidate_sha"]),
+            base_sha=str(row["base_sha"]),
+            manifest_path=str(row["manifest_path"]),
+            event_id=event_id,
+            manifest_digest=str(row["manifest_digest"]),
+        )
+
+    async def retry_stalled_wake(
+        self, project_key: str, event_id: str
+    ) -> RetryResult:
+        """The one supported live retry: CAS to ``'pending'`` then redeliver.
+
+        Sol correction 538f1b4e: a stalled turn's only supported retry
+        action must re-deliver the EXACT wake through the existing queue
+        path, without inference or a new protocol. This is that action,
+        and it is the production entry point both
+        :meth:`retry_stalled_wakes_for_issue` and the ``retry``
+        hermes-command operator handler call.
+
+        First runs :meth:`_requeue_stalled_wake` -- the unchanged,
+        already-tested CAS. When it refuses (the row is not currently
+        ``'stalled'``), this is a pure no-op: ``retried=False``,
+        ``delivered=False``, no second write, no second event -- calling
+        retry again for an already-retried or never-stalled wake is
+        idempotent by construction, not by a separate check.
+
+        When the CAS applies, the exact same wake is handed to
+        ``self._delivery`` -- the identical adapter
+        :meth:`release_next_candidate` calls, the one
+        :class:`WakeDeliverer` boundary in this service -- so redelivery
+        goes through no new transport. That adapter re-registers the
+        wake (a no-op against its own unchanged payload) and then either
+        claims and renders it into the reviewer thread, or leaves it
+        durably queued if another candidate currently holds the reviewer
+        (the same one-candidate-at-a-time rule
+        :meth:`release_next_candidate` honors) -- never a bespoke
+        redelivery mechanism, never a second in-thread message for an
+        already-outstanding candidate.
+        """
+
+        requeued = self._requeue_stalled_wake(project_key, event_id)
+        if requeued is None:
+            return RetryResult(
+                event_id=event_id,
+                issue_id=None,
+                retried=False,
+                delivered=False,
+                reason="not_stalled",
+            )
+        if self._delivery is None:
+            return RetryResult(
+                event_id=event_id,
+                issue_id=requeued.issue_id,
+                retried=True,
+                delivered=False,
+                reason="no_delivery_adapter",
+            )
+        result = await self._delivery.deliver(project_key, requeued)
+        delivered = bool(getattr(result, "delivered", False))
+        reason = getattr(result, "reason", None)
+        if not isinstance(reason, str) or not reason:
+            reason = "delivered" if delivered else "queued"
+        return RetryResult(
+            event_id=event_id,
+            issue_id=requeued.issue_id,
+            retried=True,
+            delivered=delivered,
+            reason=reason,
+        )
+
+    async def retry_stalled_wakes_for_issue(
+        self, project_key: str, issue_id: str
+    ) -> tuple[RetryResult, ...]:
+        """Retry every ``'stalled'`` wake bound to one issue; issue-scoped.
+
+        Reads the durable ``'stalled'`` listing once, filters to
+        ``issue_id``, then retries each match, oldest first, through
+        :meth:`retry_stalled_wake`. A stalled wake for a DIFFERENT issue
+        is never even read as a candidate, let alone touched. Usually
+        exactly one row -- an issue rarely has more than one stalled
+        wake at a time -- but never more than this issue's own.
+        """
+
+        targets = [
+            event.event_id
+            for event in self.stalled_wakes(project_key)
+            if event.issue_id == issue_id
+        ]
+        results = []
+        for target_event_id in targets:
+            results.append(
+                await self.retry_stalled_wake(project_key, target_event_id)
+            )
+        return tuple(results)
+
+    async def handle_turn(
+        self, project_key: str, *, turn_ended_thread_id: str | None = None
+    ) -> TurnOutcome:
+        """Reconcile the outstanding wake; settle only a submitted verdict.
+
+        ``turn_ended_thread_id`` is set ONLY by :meth:`on_notification`,
+        from a completed/interrupted turn notification's own
+        ``threadId`` -- never inferred from anything else, and never set
+        by :meth:`recover_outstanding`, :meth:`settle_idle_thread`, or
+        the duplicate-submission resume path in :meth:`submit_review`,
+        none of which can prove the turn itself has ended. When it is
+        set AND no submitted verdict exists for the outstanding wake,
+        :meth:`_wake_binding_matches` proves whether that wake's OWN
+        recorded delivery binding (its ``wake_deliveries.thread_id``/
+        ``generation``, written by the delivery/admission path that put
+        it in its current state) is exactly this ended turn's thread and
+        the channel's current generation; only then is it durably marked
+        ``'stalled'`` (INFRA-223 recurrence) instead of the
+        non-settling ``'awaiting_submission'`` observation staying
+        outstanding forever.
+        """
 
         project = self._projects.get(project_key)
         if project is None:
@@ -994,6 +1366,14 @@ class MergerTurnService:
         # verdict.
         submitted = self._pending_submission(project_key, event.event_id)
         if submitted is None:
+            if turn_ended_thread_id is not None and self._wake_binding_matches(
+                project_key,
+                event.event_id,
+                state=state,
+                thread_id=turn_ended_thread_id,
+                generation=channel.generation,
+            ):
+                return self._mark_wake_stalled(project_key, event, channel, state)
             return TurnOutcome(
                 project_key, "awaiting_submission", event.event_id,
                 event.issue_id,

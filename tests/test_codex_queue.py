@@ -13,7 +13,8 @@ from typing import Any
 
 import pytest
 
-from hermes_orchestrator.codex_merger import CodexMerger
+from hermes_orchestrator.codex_merger import SANDBOX_MODE, CodexMerger
+from hermes_orchestrator.codex_ponytail_guard import session_guard_config
 from hermes_orchestrator.codex_queue import (
     CANDIDATE_QUEUED,
     CODEX_QUEUE_BINARY,
@@ -1558,7 +1559,8 @@ async def test_a_queued_head_carrying_this_event_is_started_then_released(
 ) -> None:
     """The observed blocker, closed: `codex queue` persisted the envelope
     for the idle pinned thread but never started the turn. After a
-    successful delivery the exact queued head is listed, started, and the
+    successful delivery the exact queued head is listed, its primary Sol
+    policy reapplied via `thread/resume`, then started, and the
     connection is dropped immediately."""
 
     stored_channel(database)
@@ -1571,15 +1573,28 @@ async def test_a_queued_head_carrying_this_event_is_started_then_released(
     result = await delivery.deliver("demo", event)
 
     assert result.delivered is True
-    assert rpc.methods() == ["thread/queue/list", "thread/queue/start"]
+    assert rpc.methods() == [
+        "thread/queue/list",
+        "thread/resume",
+        "thread/queue/start",
+    ]
     assert rpc.requests[0][1] == {"threadId": "thr_stored"}
     assert rpc.requests[1][1] == {
+        "threadId": "thr_stored",
+        "sandbox": SANDBOX_MODE,
+        "approvalPolicy": "never",
+        "config": session_guard_config(),
+    }
+    assert rpc.requests[2][1] == {
         "threadId": "thr_stored",
         "queueItemId": "qi-1",
     }
     # Never left attached to an idle Sol.
     assert rpc.closed == 1
     assert delivered_event_ids(database) == ["evt-1"]
+    assert result.policy_applied is True
+    assert result.policy_sandbox == SANDBOX_MODE
+    assert result.policy_reason == "started"
 
 
 @pytest.mark.asyncio
@@ -1602,9 +1617,14 @@ async def test_an_existing_delivered_wake_retries_only_the_bounded_start(
         {"items": [{"id": "qi-1", "text": event.render(1)}]}
     )
     delivery = starting_delivery(merger, manifest_root, factory, rpc)
-    await delivery.deliver("demo", event)
+    result = await delivery.deliver("demo", event)
     assert len(factory.calls) == 1
-    assert rpc.methods() == ["thread/queue/list", "thread/queue/start"]
+    assert rpc.methods() == [
+        "thread/queue/list",
+        "thread/resume",
+        "thread/queue/start",
+    ]
+    assert result.policy_applied is True
 
 
 @pytest.mark.asyncio
@@ -1673,3 +1693,88 @@ async def test_an_unavailable_queue_surface_changes_nothing_and_raises_nothing(
     assert unreachable.requests == []
     assert unreachable.closed == 1
     assert delivered_event_ids(database) == ["evt-2"]
+
+
+@pytest.mark.asyncio
+async def test_bounded_queue_start_reapplies_the_primary_sol_policy(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """INFRA-227 recurrence: Hermes queued and started the exact visible
+    Sol task, but the recovered turn still ran under a stale read-only/
+    network-restricted sandbox. The bounded start must reapply the
+    primary Sol task's required write/network/no-prompt policy via
+    `thread/resume` on the same short-lived connection, in order,
+    before `thread/queue/start` -- and disconnect afterwards exactly as
+    before."""
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    rpc = FakeQueueRpc(
+        {"items": [{"id": "qi-1", "text": event.render(1)}]}
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, rpc)
+
+    result = await delivery.deliver("demo", event)
+
+    assert result.delivered is True
+    assert rpc.methods() == [
+        "thread/queue/list",
+        "thread/resume",
+        "thread/queue/start",
+    ]
+    assert rpc.requests[0] == (
+        "thread/queue/list",
+        {"threadId": "thr_stored"},
+    )
+    assert rpc.requests[1] == (
+        "thread/resume",
+        {
+            "threadId": "thr_stored",
+            "sandbox": SANDBOX_MODE,
+            "approvalPolicy": "never",
+            "config": session_guard_config(),
+        },
+    )
+    assert rpc.requests[2] == (
+        "thread/queue/start",
+        {"threadId": "thr_stored", "queueItemId": "qi-1"},
+    )
+    assert rpc.closed == 1
+    assert result.policy_applied is True
+    assert result.policy_sandbox == SANDBOX_MODE
+
+
+@pytest.mark.asyncio
+async def test_queue_start_is_skipped_when_policy_resume_fails(
+    merger: CodexMerger,
+    factory: FakeQueueProcessFactory,
+    database: Database,
+    manifest_root: Path,
+) -> None:
+    """A refused `thread/resume` means the primary Sol policy could not
+    be reapplied, so the queued turn must fail closed: no
+    `thread/queue/start` is ever sent, the delivery itself still
+    succeeds (the envelope is durably queued), and the outcome names the
+    resume failure so the re-run boundary can see it did not start under
+    policy."""
+
+    stored_channel(database)
+    event = wake_event(manifest_root)
+    rpc = FakeQueueRpc(
+        {"items": [{"id": "qi-1", "text": event.render(1)}]},
+        fail_on="thread/resume",
+    )
+    delivery = starting_delivery(merger, manifest_root, factory, rpc)
+
+    result = await delivery.deliver("demo", event)
+
+    assert result.delivered is True
+    assert rpc.methods() == ["thread/queue/list", "thread/resume"]
+    assert rpc.closed == 1
+    assert result.policy_applied is False
+    assert result.policy_reason is not None
+    assert "policy_resume_failed" in result.policy_reason
+    assert delivered_event_ids(database) == ["evt-1"]

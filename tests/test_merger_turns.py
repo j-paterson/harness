@@ -252,15 +252,398 @@ async def test_completed_report_without_submission_is_non_settling(
     assert flow.github.merge_calls == []
     assert "thread/read" not in flow.rpc.methods
 
-    # The turn-completed notification path is the same observation and
-    # stays non-settling and stable across repeats.
+    # INFRA-223 recurrence: the turn-completed NOTIFICATION path (unlike
+    # a direct handle_turn call with no notification) can prove the turn
+    # itself has ended, from the notification alone — never from the
+    # thread report above, which stays completely unread. With no
+    # submitted verdict for the exact outstanding wake, this durably
+    # marks it 'stalled' and releases it, instead of staying an
+    # observation the daemon holds the App Server open over forever.
     routed = await flow.turns.on_notification(
         RpcNotification("turn/completed", {"threadId": "thr_legacy"})
     )
-    assert routed is not None and routed.kind == "awaiting_submission"
-    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert routed is not None and routed.kind == "stalled"
+    assert routed.event_id == emitted.event.event_id
+    assert flow.turns.outstanding_wake("demo") is None
+    assert flow.database.scalar(
+        "SELECT state FROM wake_deliveries WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ) == "stalled"
     assert _submitted_rows(flow) == []
     assert flow.github.merge_calls == []
+    assert "thread/read" not in flow.rpc.methods
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_without_verdict_marks_wake_stalled_and_releases_helper(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 recurrence: a Sol turn that completes with no structured
+    # verdict (``submit_review`` never called) must not leave its wake
+    # 'delivered' forever, holding the bounded helper attached to an
+    # idle task. This proves the CAS + journaled event + outcome half of
+    # that fix; MergerSession's release of the App Server itself is
+    # proven separately in tests/test_merger_session.py.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+    existing = flow.events.list_after(0)
+    baseline = existing[-1].sequence if existing else 0
+
+    outcome = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+
+    assert outcome is not None
+    assert outcome.kind == "stalled"
+    assert outcome.event_id == emitted.event.event_id
+    assert outcome.issue_id == "ENG-9"
+    row = flow.database.execute(
+        "SELECT state, thread_id, generation FROM wake_deliveries "
+        "WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()
+    assert (row["state"], row["thread_id"], row["generation"]) == (
+        "stalled",
+        "thr_legacy",
+        1,
+    )
+    journaled = [
+        record
+        for record in flow.events.list_after(baseline)
+        if record.event_type == "merger.turn_stalled"
+    ]
+    assert len(journaled) == 1
+    payload = journaled[0].payload
+    assert payload["project_key"] == "demo"
+    assert payload["issue_id"] == "ENG-9"
+    assert payload["thread_id"] == "thr_legacy"
+    assert payload["reason"] == "turn completed without a structured verdict"
+    assert "retry_hint" in payload
+    # Never a verdict: no review, no submitted_verdicts row, and the
+    # thread was never even read.
+    assert _submitted_rows(flow) == []
+    assert _review_count(flow) == 0
+    assert "thread/read" not in flow.rpc.methods
+
+
+@pytest.mark.asyncio
+async def test_stalled_wake_is_not_outstanding(flow: ProductionShapedFlow) -> None:
+    # A 'stalled' wake must never surface as outstanding again — the
+    # scan MergerSession.review_active relies on is limited to exactly
+    # 'admitted'/'delivered', by construction, and this pins it.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+
+    outcome = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+
+    assert outcome is not None and outcome.kind == "stalled"
+    assert flow.turns.outstanding_wake("demo") is None
+    assert flow.turns.has_pending_submission("demo") is False
+    assert flow.turns.stalled_wakes("demo") == (emitted.event,)
+
+
+@pytest.mark.asyncio
+async def test_active_turn_is_never_marked_stalled(
+    flow: ProductionShapedFlow,
+) -> None:
+    # A wake whose turn is still active must never be stalled: neither a
+    # turn-started notification, nor a completed/interrupted notification
+    # for a DIFFERENT thread or generation, decides "no longer active"
+    # for THIS wake.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+
+    # An unrelated method name is not a turn-ended signal at all.
+    started = await flow.turns.on_notification(
+        RpcNotification("turn/started", {"threadId": "thr_legacy"})
+    )
+    assert started is None
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+    # A completed/interrupted notification for a DIFFERENT thread never
+    # matches this project's channel and is routed nowhere.
+    elsewhere = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_someone_else"})
+    )
+    assert elsewhere is None
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+
+    # A completed/interrupted notification for the RIGHT thread but a
+    # generation the wake was never bound to (a stale binding) must
+    # leave this exact wake untouched — its own recorded binding never
+    # matches, so it is not the "exact outstanding wake of that
+    # thread/generation" this notification names.
+    assert (
+        flow.turns._wake_binding_matches(
+            "demo",
+            emitted.event.event_id,
+            state="delivered",
+            thread_id="thr_legacy",
+            generation=99,
+        )
+        is False
+    )
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "UPDATE reviewer_channels SET generation = 99 "
+            "WHERE project_key = 'demo' AND thread_id = 'thr_legacy'"
+        )
+    stale_generation = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert stale_generation is not None
+    assert stale_generation.kind == "awaiting_submission"
+    row = flow.database.execute(
+        "SELECT state FROM wake_deliveries WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()
+    assert str(row["state"]) == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_requeue_stalled_wake_cas_is_exactly_once_and_refuses_non_stalled(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Pins the durable CAS half of retry_stalled_wake in isolation, via
+    # the private helper it is built on -- no delivery adapter involved.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+
+    # A non-stalled wake (still 'delivered') refuses.
+    assert flow.turns._requeue_stalled_wake("demo", emitted.event.event_id) is None
+
+    outcome = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert outcome is not None and outcome.kind == "stalled"
+    existing = flow.events.list_after(0)
+    baseline = existing[-1].sequence if existing else 0
+
+    retried = flow.turns._requeue_stalled_wake("demo", emitted.event.event_id)
+
+    assert retried == emitted.event
+    row = flow.database.execute(
+        "SELECT state, claim_token, claim_expires_at FROM wake_deliveries "
+        "WHERE event_id = ?",
+        (emitted.event.event_id,),
+    ).fetchone()
+    assert (row["state"], row["claim_token"], row["claim_expires_at"]) == (
+        "pending",
+        None,
+        None,
+    )
+    journaled = [
+        record
+        for record in flow.events.list_after(baseline)
+        if record.event_type == "merger.turn_retry_requested"
+    ]
+    assert len(journaled) == 1
+    assert journaled[0].payload["project_key"] == "demo"
+    assert journaled[0].payload["issue_id"] == "ENG-9"
+
+    # Refuses a second retry of the same, now-'pending', row.
+    assert flow.turns._requeue_stalled_wake("demo", emitted.event.event_id) is None
+    # And a wake that was never stalled at all.
+    assert flow.turns._requeue_stalled_wake("demo", "no-such-event") is None
+
+
+@pytest.mark.asyncio
+async def test_retry_stalled_wake_redelivers_through_the_production_entry_point(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol correction 538f1b4e: the supported live retry must actually
+    # re-deliver the exact wake through the existing queue path -- this
+    # exercises retry_stalled_wake end to end, through the SAME delivery
+    # adapter (flow.delivery / flow.processes) release_next_candidate
+    # uses, not merely a state reset.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    assert emitted.delivery.delivered is True
+    flow.report(flow.verdict(SHA_A, branch, 14))
+
+    outcome = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert outcome is not None and outcome.kind == "stalled"
+    assert _wake_states(flow)[emitted.event.event_id] == "stalled"
+    assert flow.processes.messages() == [emitted.event.render(1)]
+    existing = flow.events.list_after(0)
+    baseline = existing[-1].sequence if existing else 0
+
+    result = await flow.turns.retry_stalled_wake("demo", emitted.event.event_id)
+
+    assert result.event_id == emitted.event.event_id
+    assert result.issue_id == "ENG-9"
+    assert result.retried is True
+    assert result.delivered is True
+    # Re-delivered through the identical adapter: the exact same
+    # rendered envelope appears a second time, into the same thread.
+    assert flow.processes.messages() == [
+        emitted.event.render(1),
+        emitted.event.render(1),
+    ]
+    assert _wake_states(flow)[emitted.event.event_id] == "delivered"
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    journaled = [
+        record
+        for record in flow.events.list_after(baseline)
+        if record.event_type == "merger.turn_retry_requested"
+    ]
+    assert len(journaled) == 1
+
+    # Idempotent: a repeated retry of the now-'delivered' wake is a
+    # true no-op -- no second CAS, no second delivery.
+    second = await flow.turns.retry_stalled_wake("demo", emitted.event.event_id)
+    assert (second.retried, second.delivered) == (False, False)
+    assert second.reason == "not_stalled"
+    assert flow.processes.messages() == [
+        emitted.event.render(1),
+        emitted.event.render(1),
+    ]
+    assert [
+        record
+        for record in flow.events.list_after(baseline)
+        if record.event_type == "merger.turn_retry_requested"
+    ] == journaled
+
+    # And a wake that was never stalled at all.
+    never = await flow.turns.retry_stalled_wake("demo", "no-such-event")
+    assert (never.retried, never.delivered, never.reason) == (
+        False,
+        False,
+        "not_stalled",
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_is_issue_scoped(flow: ProductionShapedFlow) -> None:
+    # retry_stalled_wakes_for_issue touches only its own issue's stalled
+    # wake(s); a stalled wake for a DIFFERENT issue in the same project
+    # is left completely untouched.
+    await flow.merger.ensure_thread("demo")
+    branch_a = flow.stage("ENG-9", SHA_A, pr_number=14)
+    first = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch_a, 14))
+    first_stalled = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert first_stalled is not None and first_stalled.kind == "stalled"
+    assert flow.turns.outstanding_wake("demo") is None
+
+    # The reviewer is free again (a 'stalled' wake never holds it), so a
+    # second, different-issue candidate is delivered straight away.
+    branch_b = flow.stage("ENG-11", SHA_B, pr_number=16)
+    second = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+    assert second.delivery.delivered is True
+    flow.report(flow.verdict(SHA_B, branch_b, 16))
+    second_stalled = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert second_stalled is not None and second_stalled.kind == "stalled"
+
+    stalled_ids = {event.event_id for event in flow.turns.stalled_wakes("demo")}
+    assert stalled_ids == {first.event.event_id, second.event.event_id}
+
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-9")
+
+    assert [result.event_id for result in results] == [first.event.event_id]
+    assert results[0].retried is True
+    remaining_stalled = {
+        event.event_id for event in flow.turns.stalled_wakes("demo")
+    }
+    assert remaining_stalled == {second.event.event_id}
+    assert _wake_states(flow)[second.event.event_id] == "stalled"
+    assert _wake_states(flow)[first.event.event_id] != "stalled"
+
+
+@pytest.mark.asyncio
+async def test_retry_queued_while_channel_not_ready_is_picked_up_at_next_boundary(
+    flow: ProductionShapedFlow,
+) -> None:
+    # A retry issued while no reviewer channel is ready (e.g. an
+    # operator hermes-command with no live App Server session open)
+    # still durably requeues the exact wake; it is not lost. The next
+    # startup/intake recovery boundary -- recover_outstanding, exactly
+    # as MergerSession.startup runs it -- picks up that same pending
+    # wake through release_next_candidate and delivers it for real.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+    outcome = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+    assert outcome is not None and outcome.kind == "stalled"
+
+    # No live session open: the reviewer channel is not 'ready'.
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "UPDATE reviewer_channels SET state = 'pending' "
+            "WHERE project_key = 'demo'"
+        )
+
+    result = await flow.turns.retry_stalled_wake("demo", emitted.event.event_id)
+
+    assert result.retried is True
+    assert result.delivered is False
+    assert _wake_states(flow)[emitted.event.event_id] == "pending"
+    # Not redelivered yet -- the channel was not ready to receive it.
+    assert flow.processes.messages() == [emitted.event.render(1)]
+
+    # A live session opens (as MergerSession.open would before running
+    # startup recovery): the channel becomes ready again.
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "UPDATE reviewer_channels SET state = 'ready' "
+            "WHERE project_key = 'demo'"
+        )
+
+    # INFRA-221: nothing outstanding yet, so recover_outstanding takes
+    # the release_next_candidate branch for "demo" and appends no
+    # per-project outcome for it -- the release itself is the effect.
+    boundary_outcomes = await flow.turns.recover_outstanding(("demo",))
+
+    assert boundary_outcomes == ()
+    assert _wake_states(flow)[emitted.event.event_id] == "delivered"
+    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert flow.processes.messages() == [
+        emitted.event.render(1),
+        emitted.event.render(1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stalled_never_infers_a_verdict(flow: ProductionShapedFlow) -> None:
+    # Even an explicit, fully-approving report sitting on the thread must
+    # never become a review or a submitted_verdicts row once the turn
+    # that produced it ends without an explicit submit_review call.
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-9", SHA_A, pr_number=14)
+    emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
+    flow.report(flow.verdict(SHA_A, branch, 14))
+
+    outcome = await flow.turns.on_notification(
+        RpcNotification("turn/completed", {"threadId": "thr_legacy"})
+    )
+
+    assert outcome is not None
+    assert outcome.kind == "stalled"
+    assert outcome.event_id == emitted.event.event_id
+    assert _submitted_rows(flow) == []
+    assert _review_count(flow) == 0
+    assert flow.github.merge_calls == []
+    assert flow.outbox.pending("demo") == ()
     assert "thread/read" not in flow.rpc.methods
 
 
@@ -569,6 +952,15 @@ async def test_interleaved_opposing_submission_settles_exactly_once(
     # that window the stale approved report would settle after the
     # opposing verdict and the assertions below would catch the double
     # settlement.
+    #
+    # INFRA-223 recurrence: observing a turn-completed notification for
+    # the exact outstanding wake, with no submitted verdict, no longer
+    # waits forever for a possibly-never-arriving submission — it
+    # durably marks the wake 'stalled' (never a verdict) and releases
+    # it. That is a STRONGER form of "never settle from an inferred
+    # thread report", not a weaker one: a submission racing in afterward
+    # for that exact stalled event_id is refused outright, and only an
+    # explicit retry_stalled_wake can make it settleable again.
     await flow.merger.ensure_thread("demo")
     branch = flow.stage("ENG-9", SHA_A, pr_number=14)
     emitted = await flow.emitter.emit("demo", "ENG-9", verification=(("t", "ok"),))
@@ -593,24 +985,22 @@ async def test_interleaved_opposing_submission_settles_exactly_once(
         RpcNotification("turn/completed", {"threadId": "thr_legacy"})
     )
 
-    # Observation never opened the window: no report await, no trap.
-    assert observed is not None and observed.kind == "awaiting_submission"
+    # Observation never opened the window: no report await, no trap —
+    # and the wake is stalled, not silently left outstanding forever.
+    assert observed is not None and observed.kind == "stalled"
     assert fired == [] and "thread/read" not in flow.rpc.methods
-    assert flow.turns.outstanding_wake("demo") == (emitted.event, "delivered")
+    assert flow.turns.outstanding_wake("demo") is None
+    assert _submitted_rows(flow) == []
 
-    outcome = await flow.turns.submit_review(
-        "demo",
-        **_submission(emitted.event.event_id, "ENG-9", SHA_A, opposing),
-    )
-
-    assert outcome.kind == "corrections_required", outcome
-    assert _submitted_rows(flow) == [
-        (emitted.event.event_id, "settled", opposing)
-    ]
-    pending = flow.outbox.pending("demo")
-    assert len(pending) == 1 and pending[0].reviewed_sha == SHA_A
-    # Exactly one settlement: the opposing persisted document routed
-    # corrections; the thread's approved report never caused a merge.
+    # A submission for the now-stalled event is refused outright: no
+    # verdict — opposing or otherwise — can settle a stalled wake
+    # without an explicit retry_stalled_wake first.
+    with pytest.raises(SubmissionRejected):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(emitted.event.event_id, "ENG-9", SHA_A, opposing),
+        )
+    assert _submitted_rows(flow) == []
     assert flow.github.merge_calls == []
     assert "thread/read" not in flow.rpc.methods
 
