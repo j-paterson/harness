@@ -3084,7 +3084,10 @@ class _FakeRotationReport:
 
 
 def _install_fake_lead_rotation(
-    monkeypatch: pytest.MonkeyPatch, *, report: _FakeRotationReport
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    report: _FakeRotationReport,
+    probe_worktree: bool = False,
 ) -> list[dict[str, object]]:
     """Stub the CLI's lazily-imported rotation boundary.
 
@@ -3095,6 +3098,13 @@ def _install_fake_lead_rotation(
     LeadRotation``, which resolves it without touching the file on disk.
     Returns the list of constructor kwargs the CLI passed, for callers
     that want to assert on the collaborators it wired up.
+
+    With ``probe_worktree=True`` the fake's ``rotate()`` invokes the
+    composed ``worktree_state`` collaborator exactly as the real gate
+    would -- with the project key, DURING the command's lifetime. Sol
+    correction 1f5833d0 (INFRA-222): the closure now resolves the seat
+    lane through the CLI's database, so it can only be exercised before
+    ``invoke()`` returns and closes that database.
     """
 
     calls: list[dict[str, object]] = []
@@ -3102,12 +3112,20 @@ def _install_fake_lead_rotation(
     class _FakeLeadRotation:
         def __init__(self, **kwargs: object) -> None:
             calls.append(kwargs)
+            self._kwargs = kwargs
 
         async def rotate(
             self, cell_id: str, *, rearm_delivered_handoff: bool = False
         ) -> _FakeRotationReport:
             assert cell_id == report.cell_id
             assert rearm_delivered_handoff is True
+            if probe_worktree:
+                worktree_state = self._kwargs["worktree_state"]
+                assert callable(worktree_state)
+                # The real precondition gate passes the project key; the
+                # composed closure ignores it and measures the exact
+                # worktree it already resolved for this cell.
+                worktree_state("demo")
             return report
 
     fake_module = types.ModuleType("hermes_orchestrator.lead_rotation")
@@ -3356,7 +3374,9 @@ def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
         binding_id="binding-1",
         failure=None,
     )
-    calls = _install_fake_lead_rotation(monkeypatch, report=report)
+    calls = _install_fake_lead_rotation(
+        monkeypatch, report=report, probe_worktree=True
+    )
 
     result = invoke(
         [
@@ -3372,11 +3392,12 @@ def test_rotate_lead_probes_the_dedicated_lead_worktree_when_configured(
     )
 
     assert result.exit_code == 0
-    # The fake ``LeadRotation`` never calls ``worktree_state`` itself
-    # (it ignores its constructor kwargs), so the closure the CLI wired
-    # up is invoked here directly, exactly as the real gate would call
-    # it: with the project key, not the worktree path.
-    calls[0]["worktree_state"]("demo")
+    # The fake ``LeadRotation`` invoked the composed ``worktree_state``
+    # closure from inside ``rotate()`` -- during the command lifetime,
+    # while the CLI database the seat-lane derivation reads is still
+    # open -- exactly as the real gate calls it: with the project key,
+    # not the worktree path.
+    assert calls and "worktree_state" in calls[0]
     assert probed == [lead_worktree]
 
 
