@@ -4693,11 +4693,12 @@ def _rotation_worktree(
     lane is selected instead, by the same derivation ``_submit_handoff``
     uses (:func:`_seat_lane`).
 
-    The legacy ``project.lead_cwd`` probe is preserved for exactly one
-    case: a genuinely unassigned caller in a project with at most one
-    active issue. A cell with no durable row or no incumbent session
-    also keeps it — ``LeadRotation``'s own precondition is the boundary
-    that names those, and this selector must not pre-empt its message.
+    A project coordinator need not own one issue lane: it may coordinate
+    several independently leased worktrees. Such an unassigned seat is
+    measured against its own ``project.lead_cwd`` and never against an
+    arbitrary issue lane. A cell with no durable row or no incumbent
+    session also keeps that fallback — ``LeadRotation``'s own precondition
+    is the boundary that names those.
 
     Raises ``ValueError`` (which both call sites already surface as one
     actionable message) on zero, ambiguous, or mismatched identity.
@@ -4734,21 +4735,6 @@ def _rotation_worktree(
         ) from None
     if lane is not None:
         return lane.path
-    active = [
-        str(row["issue_id"])
-        for row in database.execute(
-            "SELECT issue_id FROM admitted_issues WHERE project_key = ? "
-            "AND state IN ('in_development', 'review') ORDER BY issue_id",
-            (project_key,),
-        ).fetchall()
-    ]
-    if len(active) > 1:
-        raise ValueError(
-            f"lead rotation refused: cell {cell_id!r} has no live lead "
-            f"assignment and project {project_key!r} has {len(active)} active "
-            f"issues ({', '.join(active)}), so the rotating seat's worktree "
-            "cannot be derived; assign the cell its issue before rotating"
-        )
     return project.lead_cwd
 
 

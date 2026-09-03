@@ -7887,16 +7887,12 @@ def test_rotate_lead_refuses_an_origin_mismatched_bound_seat_worktree(
         database.close()
 
 
-def test_rotate_lead_never_adopts_another_cells_lease(
+def test_rotate_unassigned_project_lead_uses_its_coordinator_checkout(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A clean, pushed lane belonging to some OTHER seat never stands in
-    for this one. Neither an assignment naming a different cell/session,
-    nor a lease bound to an issue this cell is not assigned, qualifies:
-    both fail closed naming exactly what was missing, and the tempting
-    clean lane is never probed."""
-
-    from hermes_orchestrator.db import Database
+    """A project coordinator may manage several issue lanes without owning
+    any one of them. Rotation therefore measures the coordinator checkout,
+    never another cell's issue lease, and proceeds past the precondition."""
 
     repo_root, state_dir = configured_repo
     _write_cmux_config(repo_root)
@@ -7918,39 +7914,19 @@ def test_rotate_lead_never_adopts_another_cells_lease(
     )
     _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
     probed = _install_seat_lane_probe(
-        monkeypatch, {other_lane: _lane_state()}
+        monkeypatch,
+        {
+            other_lane: _lane_state(),
+            repo_root: _lane_state(),
+        },
     )
 
     unassigned = _rotate_lead_for_demo_cell(configured_repo)
 
-    assert unassigned.exit_code == 1
-    message = json.loads(unassigned.stdout)["error"]
-    assert "cell 'cell-demo' has no live lead assignment" in message
-    assert "2 active issues (INFRA-212, INFRA-215)" in message
-    assert "assign the cell its issue before rotating" in message
-
-    # Now the cell IS assigned -- but to the issue whose lane nobody
-    # leased. The other cell's clean lease still never qualifies.
-    _seed_lead_assignment(state_dir, issue_id="INFRA-215")
-
-    mismatched = _rotate_lead_for_demo_cell(configured_repo)
-
-    assert mismatched.exit_code == 1
-    message = json.loads(mismatched.stdout)["error"]
-    assert "cell 'cell-demo' is assigned issue 'INFRA-215'" in message
-    assert "has no active worktree lease" in message
-    assert "leave exactly one active worktree lease for INFRA-215" in message
-    assert "and rotate again" in message
-
-    assert probed == []
-    database = Database.open(state_dir / "state.db")
-    try:
-        cell = database.execute(
-            "SELECT profile_alias FROM project_cells WHERE cell_id = 'cell-demo'"
-        ).fetchone()
-        assert str(cell["profile_alias"]) == "max-b"
-    finally:
-        database.close()
+    payload = json.loads(unassigned.stdout)
+    assert payload["phase"] != "precondition", payload
+    assert probed == [str(repo_root)]
+    assert str(other_lane) not in probed
 
 
 def test_rotate_lead_keeps_the_unassigned_single_lane_fallback(
