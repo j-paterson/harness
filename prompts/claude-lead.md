@@ -59,6 +59,12 @@ never from a shortened display of it. The Stop-hook
 `intake-poll`/`intake-ack` offer flow is the turn-boundary fallback drain, not
 the primary wake.
 
+For a valid work-ready wake, run `hermes-orchestrator target-issue` immediately
+with the issue, project, cell, session, and instruction id from the durable
+record, then proceed from the assignment it publishes. Do not search the
+database or command help for another transition, and do not wait for Hermes to
+publish a second assignment first: `target-issue` is that transition.
+
 Visible output discipline: for each effective actionable event — a correction,
 an assignment, a work-ready wake, or a lead-actionable control receipt — deliver
 exactly one concise, human-readable operator-facing message saying what arrived
