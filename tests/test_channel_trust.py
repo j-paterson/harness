@@ -1448,6 +1448,52 @@ def test_adopt_accepts_either_session_selector_before_the_uuid_slot(
     ]
 
 
+def test_adopt_accepts_identical_prompt_across_runtime_generations(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    """Activation changes the immutable runtime directory, not the
+    trusted launch composition when the prompt bytes are unchanged."""
+
+    package_root, entry_path = package
+    prompts: list[Path] = []
+    for sha in ("a" * 40, "b" * 40):
+        prompt = tmp_path / "runtimes" / sha / "prompts" / "claude-lead.md"
+        prompt.parent.mkdir(parents=True)
+        prompt.write_text("lead prompt\n", encoding="utf-8")
+        prompts.append(prompt)
+    template = [
+        *_argv()[:4],
+        "--append-system-prompt-file",
+        str(prompts[0]),
+        *_argv()[4:],
+    ]
+    adopting = [
+        *_argv(SESSION_2, CONFIG_PATH_2)[:4],
+        "--append-system-prompt-file",
+        str(prompts[1]),
+        *_argv(SESSION_2, CONFIG_PATH_2)[4:],
+    ]
+    _capture(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        launch_argv_template=template,
+    )
+
+    adopted = _adopt(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        launch_argv_template=adopting,
+    )
+
+    assert adopted.session_id == SESSION_2
+    assert adopted.launch_argv_template == tuple(template)
+
+
 # A launch line whose session selector is NOT the token before the
 # session UUID: ``--resume`` here consumes a plain word. Swapping it
 # for ``--session-id`` is exactly the flag substitution the bounded

@@ -344,11 +344,40 @@ def _channel_entry_appears_once(argv: Sequence[str]) -> bool:
     return sum(1 for token in argv if token == CHANNEL_ENTRY) == 1
 
 
+_RUNTIME_PROMPT_PATH = re.compile(
+    r"^(.+/runtimes/)[0-9a-f]{40}(/prompts/claude-lead\.md)$"
+)
+
+
+def _same_runtime_prompt(live_token: str, template_token: str) -> bool:
+    """Allow only an immutable runtime-generation swap for the same
+    byte-identical Claude lead prompt."""
+
+    live_match = _RUNTIME_PROMPT_PATH.fullmatch(live_token)
+    template_match = _RUNTIME_PROMPT_PATH.fullmatch(template_token)
+    if (
+        live_match is None
+        or template_match is None
+        or live_match.groups() != template_match.groups()
+    ):
+        return False
+    live = Path(live_token)
+    template = Path(template_token)
+    try:
+        return (
+            live.resolve() == live
+            and template.resolve() == template
+            and live.read_bytes() == template.read_bytes()
+        )
+    except OSError:
+        return False
+
+
 def _argv_matches_template(
     argv: Sequence[str], template: Sequence[str], *, session_id: str
 ) -> bool:
     """``argv`` must equal ``template`` token for token, except at
-    exactly three bounded slots:
+    exactly four bounded slots:
 
     * a session-UUID slot (any template token that parses as a UUID) —
       the live token must itself parse as a UUID equal to
@@ -370,6 +399,9 @@ def _argv_matches_template(
       UUID, so an arbitrary flag swap anywhere else in the argv still
       refuses, and the UUID slot itself is still checked against
       ``session_id`` on the next token.
+    * the immutable runtime generation in the ``claude-lead.md`` path,
+      only when both paths share the same runtime root and the prompt
+      bytes are identical.
 
     Every other difference — token count, order, any other flag,
     value, or path — refuses.
@@ -391,6 +423,8 @@ def _argv_matches_template(
                 return False
             if not live_token.endswith(f"/{session_id}.mcp.json"):
                 return False
+            continue
+        if _same_runtime_prompt(live_token, template_token):
             continue
         if (
             template_token in _SESSION_SELECTOR_FLAGS
@@ -640,9 +674,8 @@ class ChannelTrustAnchors:
         The operator-trusted launch composition is a CONTENT fact too
         (Sol correction f7f6471c): ``launch_argv_template`` — the
         replacement seat's live argv — must match the predecessor's
-        trusted template under exactly the two bounded substitutions
-        the gate itself permits (the session-UUID slot and the
-        session-scoped MCP config-path slot, both for ``session_id``).
+        trusted template under the gate's bounded identity substitutions
+        plus a byte-identical prompt path in a new immutable runtime.
         The successor persists the PREDECESSOR's template verbatim, so
         the trusted launch baseline never drifts across any number of
         rotations; any other argv difference is refused with zero
@@ -726,9 +759,8 @@ class ChannelTrustAnchors:
             raise TrustRefused(
                 "the replacement launch argv does not match the retiring "
                 f"anchor {predecessor.anchor_id!r}'s trusted launch "
-                "template (only the session UUID, the session-scoped "
-                "MCP config path, and the --resume/--session-id selector "
-                "immediately preceding that UUID may differ); this is a "
+                "template (only session identity or a byte-identical "
+                "prompt in a new immutable runtime may differ); this is a "
                 "new trust decision, not a rotation carry-forward"
             )
 
@@ -884,9 +916,9 @@ class ChannelTrustAnchors:
         manifest name/version, ``channel_entry``) and must equal the
         predecessor's exactly; the new seat's ``launch_argv_template``
         must match the predecessor's trusted template token for token
-        except at the two bounded substitutions the gate itself permits
-        (the session-UUID slot and the session-scoped MCP config-path
-        slot); and ``profile_alias`` must equal the predecessor's or be
+        except at the gate's bounded session substitutions or a
+        byte-identical prompt in a new immutable runtime; and
+        ``profile_alias`` must equal the predecessor's or be
         provably Hermes's own durable selection for this exact seat via
         :meth:`_selected_replacement`. Any difference is a genuinely new
         trust decision, refused with zero database mutation so the
@@ -948,7 +980,7 @@ class ChannelTrustAnchors:
         # Identical to rebind: profile and launch composition are never
         # adopted from caller input. The adopting seat's argv must equal
         # the trusted template token for token except at the existing
-        # bounded session-UUID and session-scoped MCP config-path slots
+        # bounded identity and immutable-runtime prompt slots
         # — otherwise drift would become the trusted baseline the gate
         # compares against. A different profile is honored only as
         # Hermes's own durable selection for this exact seat.
@@ -971,9 +1003,8 @@ class ChannelTrustAnchors:
             raise TrustRefused(
                 "the adopting launch argv does not match the proven "
                 f"anchor {predecessor.anchor_id!r}'s trusted launch "
-                "template (only the session UUID, the session-scoped "
-                "MCP config path, and the --resume/--session-id selector "
-                "immediately preceding that UUID may differ); this is a "
+                "template (only session identity or a byte-identical "
+                "prompt in a new immutable runtime may differ); this is a "
                 "new trust decision, not an adoption of proven trust"
             )
 
