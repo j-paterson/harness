@@ -60,6 +60,11 @@ def test_intake_handshake_semantics_present(prompt: str) -> None:
     assert "only the durable sqlite record is" in prompt
 
 
+def test_work_ready_names_the_existing_target_transition(prompt: str) -> None:
+    assert "run `hermes-orchestrator target-issue` immediately" in prompt
+    assert "do not search the database or command help" in prompt
+
+
 def test_fast_lane_delegation_and_evidence(prompt: str) -> None:
     assert "plans remain fable-owned" in prompt
     assert "smallest capable model" in prompt
