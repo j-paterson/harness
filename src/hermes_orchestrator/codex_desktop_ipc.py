@@ -527,13 +527,7 @@ async def open_thread_in_desktop(
     the authoritative proof that the intended thread actually attached.
     """
 
-    script = """tell application "System Events"
-  tell process "ChatGPT"
-    click menu item "New Window" of menu "File" of menu bar 1
-  end tell
-end tell
-delay 0.5
-"""
+    script = 'tell application id "com.openai.codex" to make new window\n'
     process = await process_factory("/usr/bin/osascript", "-e", script)
     code = await asyncio.wait_for(process.wait(), 10.0)
     if code != 0:
