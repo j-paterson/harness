@@ -52,6 +52,7 @@ from hermes_orchestrator.claude import (
 from hermes_orchestrator.cmux import CmuxCliAdapter, CmuxError
 from hermes_orchestrator.cmux_surfaces import (
     CHANNEL_ENTRY,
+    ChannelTrustConfirmer,
     CmuxDeadLeadSweep,
     CmuxHibernationDriver,
     CmuxLeadSeater,
@@ -5417,6 +5418,53 @@ def main(arguments: Sequence[str] | None = None) -> int:
             events = EventStore(database)
             anchors = ChannelTrustAnchors(database, events=events)
             anchor = anchors.active_for_cell(args.cell)
+            port = CmuxCliAdapter(
+                settings.cmux.cli,
+                base_env=os.environ,
+                password_source=cmux_password_source(Keychain()),
+            )
+            if anchor is None and not args.capture_prompt:
+                confirmer = ChannelTrustConfirmer(
+                    database=database,
+                    events=events,
+                    control=runtime.control_operations,
+                    port=port,
+                    entry_resolver=lambda: resolve_sidecar_entry(
+                        repo_root=settings.repo_root,
+                        state_dir=settings.state_dir,
+                    ),
+                    wait_seconds=args.wait_seconds,
+                )
+                verdict = asyncio.run(confirmer.confirm_seat(binding))
+                if verdict is None:
+                    _print(
+                        {"error": "dialog not visible within the wait window"},
+                        json_output=args.json,
+                        human=(
+                            "the hermes-control confirmation dialog did not "
+                            "appear within the wait window; nothing recorded."
+                        ),
+                    )
+                    return 1
+                payload = {
+                    "confirmed": verdict.confirmed,
+                    "receipt_operation_id": verdict.receipt_operation_id,
+                }
+                if not verdict.confirmed:
+                    payload["first_failure"] = verdict.first_failure
+                _print(
+                    payload,
+                    json_output=args.json,
+                    human=(
+                        "Channel confirmed automatically; receipt "
+                        f"{verdict.receipt_operation_id}."
+                        if verdict.confirmed
+                        else "CHANNEL CONFIRMATION REQUIRED "
+                        f"({verdict.first_failure}); receipt "
+                        f"{verdict.receipt_operation_id}."
+                    ),
+                )
+                return 0 if verdict.confirmed else 1
             if anchor is None:
                 _print(
                     {"error": "no active trust anchor for this cell"},
@@ -5424,11 +5472,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     human="no active trust anchor for this cell.",
                 )
                 return 1
-            port = CmuxCliAdapter(
-                settings.cmux.cli,
-                base_env=os.environ,
-                password_source=cmux_password_source(Keychain()),
-            )
             # Bounded watch: the dialog either appears within the
             # window or this invocation exits without any durable
             # trust receipt — a watcher timeout is an absent dialog,
