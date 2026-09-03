@@ -1448,21 +1448,20 @@ def test_adopt_accepts_either_session_selector_before_the_uuid_slot(
     ]
 
 
-def test_adopt_accepts_identical_prompt_across_runtime_generations(
+def test_adopt_accepts_managed_prompt_across_runtime_generations(
     database: Database,
     anchors: ChannelTrustAnchors,
     package: tuple[Path, Path],
     tmp_path: Path,
 ) -> None:
-    """Activation changes the immutable runtime directory, not the
-    trusted launch composition when the prompt bytes are unchanged."""
+    """The managed Fable prompt advances independently of plugin trust."""
 
     package_root, entry_path = package
     prompts: list[Path] = []
-    for sha in ("a" * 40, "b" * 40):
+    for index, sha in enumerate(("a" * 40, "b" * 40)):
         prompt = tmp_path / "runtimes" / sha / "prompts" / "claude-lead.md"
         prompt.parent.mkdir(parents=True)
-        prompt.write_text("lead prompt\n", encoding="utf-8")
+        prompt.write_text(f"lead prompt version {index}\n", encoding="utf-8")
         prompts.append(prompt)
     template = [
         *_argv()[:4],
