@@ -36,6 +36,7 @@ from hermes_orchestrator.linear import (
 )
 from hermes_orchestrator.operator_decisions import OperatorDecisions
 from hermes_orchestrator.profiles import CapacityObservation, ProfilePool
+from hermes_orchestrator.project_teams import ProjectTeamService
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import PacketRefused, SubagentPackets
 from hermes_orchestrator.work_claims import ClaimRefused, WorkClaims, WorkerBindings
@@ -1103,6 +1104,7 @@ class ProjectCellService:
         assignments: LeadAssignments | None = None,
         claims: WorkClaims | None = None,
         bindings: WorkerBindings | None = None,
+        teams: ProjectTeamService | None = None,
         packets: SubagentPackets | None = None,
         dispatch_freshness_minutes: int | None = None,
         lane_project_paths: Mapping[tuple[str, str], Path] | None = None,
@@ -1171,6 +1173,15 @@ class ProjectCellService:
             bindings
             if bindings is not None
             else WorkerBindings(database, events=events)
+        )
+        # INFRA-233: a same-cell lead rotation (session/profile change,
+        # same ``cells.cell_id``) must refresh the ready project team's
+        # Fable identity in the SAME transaction as the rest of the
+        # transfer (``_finalize_transfer``) -- default-constructed the
+        # same idiom as ``claims``/``bindings`` above so every existing
+        # zero-``teams`` composition keeps working unchanged.
+        self._teams = (
+            teams if teams is not None else ProjectTeamService(database, now=now)
         )
         self._packets = packets
         self._dispatch_freshness_minutes = dispatch_freshness_minutes
@@ -2308,6 +2319,25 @@ class ProjectCellService:
                     self._bindings.bind_in(
                         connection,
                         cell_id=current.cell_id,
+                        session_id=str(rotated.session_id),
+                        profile_alias=rotated.profile_alias,
+                    )
+                # INFRA-233 (the live agent-orchestration Fable rotation
+                # defect): a rotation keeps the SAME project_cells row --
+                # only session/profile change -- so the ready project
+                # team's Fable identity must be refreshed in this exact
+                # transaction too, or it keeps naming the just-retired
+                # session/profile forever. Harness-lane rotations never
+                # touch project_teams -- that coordinator only ever
+                # tracks the development lead. A refusal here (a stale
+                # team generation raced underneath) propagates out of
+                # this transaction verbatim, rolling back the whole
+                # transfer, exactly like a genuine ClaimRefused above.
+                if rotated.lane_role == DEVELOPMENT_LANE:
+                    self._teams.refresh_fable_in(
+                        connection,
+                        rotated.project_key,
+                        cell_id=rotated.cell_id,
                         session_id=str(rotated.session_id),
                         profile_alias=rotated.profile_alias,
                     )

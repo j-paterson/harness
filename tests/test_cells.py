@@ -42,6 +42,11 @@ from hermes_orchestrator.profiles import (
     ProfilePool,
     ProfileRegistry,
 )
+from hermes_orchestrator.project_teams import (
+    SOL_MODEL,
+    SOL_PROVIDER,
+    ProjectTeamService,
+)
 from hermes_orchestrator.queue import QueueService
 from hermes_orchestrator.subagent_packets import SubagentPacket
 from hermes_orchestrator.work_claims import WorkClaims
@@ -6945,3 +6950,298 @@ async def test_rotation_cwd_falls_back_to_the_lane_cwd_with_no_open_claim(
     )
 
     assert cell_service.rotation_cwd(cell) == tmp_path
+
+
+# -- INFRA-233: rotation refreshes the ready project team's Fable identity --
+
+
+def _seed_ready_channel(database: Database) -> None:
+    stamp = "2026-08-26T00:00:00+00:00"
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO reviewer_channels("
+            "project_key, thread_id, generation, state, integration_branch, "
+            "model, provider, model_verified_at, created_at, updated_at) "
+            "VALUES ('demo', 'thread-1', 1, 'ready', 'main', ?, ?, ?, ?, ?)",
+            (SOL_MODEL, SOL_PROVIDER, stamp, stamp, stamp),
+        )
+
+
+@pytest.mark.asyncio
+async def test_development_rotation_refreshes_the_ready_teams_fable_identity(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """INFRA-233 (the live agent-orchestration Fable rotation defect): a
+    lead rotation keeps the SAME ``project_cells``/``cell_id`` row --
+    only its session/profile change -- so the ready project team's
+    Fable identity must be rebound in the exact same transaction as the
+    rest of the transfer, never left naming the just-retired session."""
+
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    teams = ProjectTeamService(database, now=lambda: datetime(2026, 8, 26, tzinfo=UTC))
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        teams=teams,
+    )
+
+    admit(queue, "ENG-9")
+    dev = await service.dispatch("ENG-9")
+
+    _seed_ready_channel(database)
+    team = teams.reserve("demo", repo_path="/repo/demo", integration_branch="main")
+    team = teams.bind_fable(
+        "demo",
+        expected_generation=team.generation,
+        cell_id="cell-demo",
+        session_id=str(dev.session_id),
+        profile_alias=dev.profile_alias,
+    )
+    team = teams.bind_sol(
+        "demo",
+        expected_generation=team.generation,
+        thread_id="thread-1",
+        sol_generation=1,
+        model=SOL_MODEL,
+        provider=SOL_PROVIDER,
+    )
+    assert team.state == "ready"
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-demo", record.handoff_id)
+
+    # A default (no recorded handoff_required cause) rotation is an
+    # "account" rotation -- the replacement profile genuinely differs,
+    # proving the refresh (not merely an unchanged no-op) took effect.
+    assert rotated.profile_alias != dev.profile_alias
+    assert rotated.session_id != dev.session_id
+
+    refreshed = teams.live_team("demo")
+    assert refreshed is not None
+    assert refreshed.state == "ready"
+    assert refreshed.generation == team.generation
+    assert refreshed.fable_generation == team.fable_generation
+    assert refreshed.fable_cell_id == "cell-demo"
+    assert refreshed.fable_session_id == str(rotated.session_id)
+    assert refreshed.fable_profile_alias == rotated.profile_alias
+    assert refreshed.sol_thread_id == "thread-1"
+    assert refreshed.sol_model == SOL_MODEL
+    assert refreshed.sol_provider == SOL_PROVIDER
+
+
+class _RaisingTeams:
+    """A fake ``teams`` collaborator whose ``refresh_fable_in`` always
+    refuses -- proves a refusal there rolls back the WHOLE rotation
+    transaction (project_cells and worker_bindings included), exactly
+    like a genuine ``ClaimRefused`` from ``WorkerBindings.swap_in``."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str, str]] = []
+
+    def refresh_fable_in(
+        self,
+        connection: object,
+        project_key: str,
+        *,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+    ) -> None:
+        self.calls.append((project_key, cell_id, session_id, profile_alias))
+        raise RuntimeError("refresh refused")
+
+
+@pytest.mark.asyncio
+async def test_development_rotation_rolls_back_when_the_team_refresh_refuses(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    fake_teams = _RaisingTeams()
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        teams=fake_teams,  # type: ignore[arg-type]
+    )
+
+    admit(queue, "ENG-9")
+    dev = await service.dispatch("ENG-9")
+
+    from hermes_orchestrator.work_claims import WorkClaims, WorkerBindings
+
+    claims = WorkClaims(database, events=EventStore(database))
+    bindings = WorkerBindings(database, events=EventStore(database))
+    claim_before = claims.current_for_cell("cell-demo")
+    binding_before = bindings.active_for_cell("cell-demo")
+    cell_row_before = dict(
+        database.execute(
+            "SELECT state, profile_alias, session_id FROM project_cells "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+    )
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    with pytest.raises(RuntimeError, match="refresh refused"):
+        await service.rotate("cell-demo", record.handoff_id)
+
+    assert fake_teams.calls  # the refusal was actually reached
+    assert claims.current_for_cell("cell-demo") == claim_before
+    assert bindings.active_for_cell("cell-demo") == binding_before
+    cell_row_after = dict(
+        database.execute(
+            "SELECT state, profile_alias, session_id FROM project_cells "
+            "WHERE cell_id = 'cell-demo'"
+        ).fetchone()
+    )
+    assert cell_row_after == cell_row_before
+    assert cell_row_after["session_id"] == str(dev.session_id)
+
+
+@pytest.mark.asyncio
+async def test_harness_rotation_leaves_the_project_team_untouched(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """Harness-lane rotations must never touch project_teams -- that
+    coordinator only ever tracks the development lead."""
+
+    harness_cwd = tmp_path / "harness"
+    harness_cwd.mkdir()
+    sessions = iter([SESSION_ID, REPLACEMENT_SESSION])
+    cell_ids = iter(["cell-dev", "cell-harness"])
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    teams = ProjectTeamService(database, now=lambda: datetime(2026, 8, 26, tzinfo=UTC))
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        lane_project_paths={("demo", "harness"): harness_cwd},
+        session_ids=lambda: next(sessions),
+        cell_ids=lambda: next(cell_ids),
+        handoffs=handoffs,
+        replacement_session_ids=lambda: THIRD_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+        teams=teams,
+    )
+
+    admit(queue, "ENG-9")
+    dev = await service.dispatch("ENG-9")
+    admit(queue, "ENG-11")
+    harness = await service.dispatch(
+        "ENG-11", lane_role="harness", harness_run="run-1"
+    )
+    assert harness.status == "working"
+
+    _seed_ready_channel(database)
+    team = teams.reserve("demo", repo_path="/repo/demo", integration_branch="main")
+    team = teams.bind_fable(
+        "demo",
+        expected_generation=team.generation,
+        cell_id="cell-dev",
+        session_id=str(dev.session_id),
+        profile_alias=dev.profile_alias,
+    )
+    ready = teams.bind_sol(
+        "demo",
+        expected_generation=team.generation,
+        thread_id="thread-1",
+        sol_generation=1,
+        model=SOL_MODEL,
+        provider=SOL_PROVIDER,
+    )
+    assert ready.state == "ready"
+
+    record = handoffs.submit(_stub_handoff_document("cell-harness"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-harness", record.handoff_id)
+    assert rotated.lane_role == "harness"
+
+    unchanged = teams.live_team("demo")
+    assert unchanged == ready
+    assert unchanged.fable_cell_id == "cell-dev"
+    assert unchanged.fable_session_id == str(dev.session_id)
+    assert unchanged.fable_profile_alias == dev.profile_alias
+
+
+@pytest.mark.asyncio
+async def test_rotation_with_no_team_row_rotates_fine(
+    database: Database,
+    queue: QueueService,
+    profiles: ProfilePool,
+    linear: RecordingLinear,
+    tmp_path: Path,
+) -> None:
+    """A project that has never had a project team -- the default,
+    lazily-constructed ``ProjectTeamService`` composition -- rotates
+    exactly as before: ``refresh_fable_in`` finds no live row and is a
+    no-op."""
+
+    runner = RecordingRunner()
+    handoffs = HandoffService(database)
+    service = ProjectCellService(
+        database=database,
+        events=EventStore(database),
+        queue=queue,
+        profiles=profiles,
+        runner=runner,
+        linear=linear,
+        project_paths={"demo": tmp_path},
+        session_ids=lambda: SESSION_ID,
+        cell_ids=lambda: "cell-demo",
+        handoffs=handoffs,
+        replacement_session_ids=lambda: REPLACEMENT_SESSION,
+        now=lambda: datetime(2026, 8, 26, tzinfo=UTC),
+    )
+
+    admit(queue, "ENG-9")
+    await service.dispatch("ENG-9")
+
+    record = handoffs.submit(_stub_handoff_document("cell-demo"))
+    runner.emit_handoff_ack = True
+
+    rotated = await service.rotate("cell-demo", record.handoff_id)
+
+    assert rotated.session_id == REPLACEMENT_SESSION
+    assert ProjectTeamService(database).live_team("demo") is None
