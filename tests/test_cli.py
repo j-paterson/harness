@@ -6829,6 +6829,12 @@ def test_daemon_resumes_rotation_after_submit_handoff_returns(
             "provide only decisions, caveats/blockers, risks, "
             "and the exact next action" in reason
         )
+        stable_launcher = state_dir / "bin" / "hermes-orchestrator"
+        assert (
+            f"{stable_launcher} --repo-root {repo_root} "
+            f"--state-dir {state_dir} submit-handoff"
+        ) in reason
+        assert "uv run hermes-orchestrator" not in reason
         wake = database.execute(
             "SELECT kind, state FROM lead_terminal_wakes "
             "WHERE cell_id = 'cell-demo'"

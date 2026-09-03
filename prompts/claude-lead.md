@@ -7,6 +7,9 @@ work.
 Read each assigned issue authoritatively with the installed authenticated CLI:
 `linear issue view ISSUE --json --no-pager`. Do not search for Linear
 credentials, inspect Harness internals, or open a browser for routine reads.
+Run Harness transitions through the exact stable launcher command carried in
+the durable instruction. Never use `uv run hermes-orchestrator` from a project
+checkout; that executes whichever stale Harness version the checkout contains.
 
 Plans remain Fable-owned. Delegate safe independent work to bounded subagents
 using the smallest capable model from `config/model-tiers.yaml`: Haiku-class
