@@ -3018,3 +3018,35 @@ async def test_issue_scoped_retry_never_transitions_a_wake_with_a_submission(
 
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-13") == ()
     assert _wake_states(flow)[event_id] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_issue_scoped_retry_loads_a_not_loaded_thread_before_proving_idle(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 generation-129 recurrence: the operator's retry runs in a
+    # fresh App Server process that reports the pinned task notLoaded.
+    # The exact persisted thread is loaded through ensure_thread (a
+    # thread/resume, never a turn) and its idle status re-read; only then
+    # is the legacy wake recovered once.
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-14", SHA_A, pr_number=19)
+    emitted = await flow.emitter.emit("demo", "ENG-14", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    flow.rpc.respond_sequence(
+        "thread/read",
+        [
+            flow.thread_read("", status="notLoaded"),
+            flow.thread_read("", status="notLoaded"),
+            flow.thread_read("", status="idle"),
+            flow.thread_read("", status="idle"),
+        ],
+    )
+
+    turns_before = flow.rpc.methods.count("turn/start")
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-14")
+
+    assert [(r.event_id, r.retried) for r in results] == [(event_id, True)]
+    assert "thread/resume" in flow.rpc.methods
+    assert flow.rpc.methods.count("turn/start") == turns_before
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-14") == ()

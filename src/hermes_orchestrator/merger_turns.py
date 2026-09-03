@@ -1324,6 +1324,24 @@ class MergerTurnService:
             return None
         try:
             status = await self._merger.thread_status(channel.thread_id)
+            if status == "notLoaded":
+                # INFRA-223 generation-129 recurrence: a fresh App Server
+                # process (the operator's retry command) reports the
+                # pinned task ``notLoaded`` and can prove nothing about
+                # it. Load the exact persisted thread through the
+                # existing official recovery boundary -- ``ensure_thread``
+                # resumes it under the primary Sol policy without
+                # starting a turn -- then re-read its runtime status.
+                loaded = await self._merger.ensure_thread(project_key)
+                current = self._merger.read_channel(project_key)
+                if (
+                    loaded.thread_id != channel.thread_id
+                    or current is None
+                    or current.thread_id != channel.thread_id
+                    or current.generation != channel.generation
+                ):
+                    return None
+                status = await self._merger.thread_status(channel.thread_id)
         except Exception:
             return None
         if status != "idle":
