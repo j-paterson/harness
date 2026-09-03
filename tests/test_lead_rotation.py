@@ -1816,6 +1816,28 @@ async def test_explicit_rotation_retry_rearms_a_delivered_handoff_wake(
         "SELECT count(*) FROM lead_terminal_wakes WHERE cell_id = 'cell-demo'"
     ) == 2
 
+    # If that retry is also consumed without a handoff (for example, the
+    # lead ran a stale local CLI), the next explicit retry chains from the
+    # latest delivery instead of deduplicating forever against the first.
+    LeadTerminalWakes(
+        database=database, events=EventStore(database)
+    ).mark_delivered(str(wakes[1]["wake_id"]))
+    await rotation.rotate("cell-demo", rearm_delivered_handoff=True)
+    wakes = database.execute(
+        "SELECT wake_id, state, turn_key FROM lead_terminal_wakes "
+        "WHERE cell_id = 'cell-demo' ORDER BY rowid"
+    ).fetchall()
+    assert len(wakes) == 3
+    assert str(wakes[2]["state"]) == "pending"
+    assert str(wakes[2]["turn_key"]) == (
+        f"handoff-retry:{first.request_id}:{wakes[1]['wake_id']}"
+    )
+
+    await rotation.rotate("cell-demo", rearm_delivered_handoff=True)
+    assert database.scalar(
+        "SELECT count(*) FROM lead_terminal_wakes WHERE cell_id = 'cell-demo'"
+    ) == 3
+
 
 @pytest.mark.asyncio
 async def test_fresh_submission_resumes_the_same_rotation_changing_both(
