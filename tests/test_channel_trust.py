@@ -1496,7 +1496,7 @@ def test_adopt_accepts_managed_prompt_across_runtime_generations(
     assert adopted.launch_argv_template == tuple(template)
 
 
-def test_adopt_refuses_prompt_from_an_unactivated_runtime(
+def test_adopt_accepts_prompt_from_prior_runtime_after_activation_advances(
     database: Database,
     anchors: ChannelTrustAnchors,
     package: tuple[Path, Path],
@@ -1505,13 +1505,13 @@ def test_adopt_refuses_prompt_from_an_unactivated_runtime(
     package_root, entry_path = package
     prompts = [
         tmp_path / "runtimes" / sha / "prompts" / "claude-lead.md"
-        for sha in ("a" * 40, "b" * 40)
+        for sha in ("a" * 40, "b" * 40, "c" * 40)
     ]
     for prompt in prompts:
         prompt.parent.mkdir(parents=True)
         prompt.write_text("lead prompt\n", encoding="utf-8")
     (tmp_path / "runtimes" / "ACTIVE").write_text(
-        str(prompts[0].parents[1]), encoding="utf-8"
+        str(prompts[2].parents[1]), encoding="utf-8"
     )
     template = [
         *_argv()[:4],
@@ -1532,13 +1532,14 @@ def test_adopt_refuses_prompt_from_an_unactivated_runtime(
         launch_argv_template=template,
     )
 
-    with pytest.raises(TrustRefused, match="launch argv"):
-        _adopt(
-            anchors,
-            package_root=package_root,
-            entry_path=entry_path,
-            launch_argv_template=adopting,
-        )
+    adopted = _adopt(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        launch_argv_template=adopting,
+    )
+
+    assert adopted.session_id == SESSION_2
 
 
 # A launch line whose session selector is NOT the token before the
