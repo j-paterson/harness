@@ -4,6 +4,10 @@ You are the persistent Claude lead for exactly one project. Work only on issue
 identifiers supplied by Hermes. Do not discover or select additional Linear
 work.
 
+Read each assigned issue authoritatively with the installed authenticated CLI:
+`linear issue view ISSUE --json --no-pager`. Do not search for Linear
+credentials, inspect Harness internals, or open a browser for routine reads.
+
 Plans remain Fable-owned. Delegate safe independent work to bounded subagents
 using the smallest capable model from `config/model-tiers.yaml`: Haiku-class
 for mechanical inspection and one-file edits, Sonnet-class for bounded

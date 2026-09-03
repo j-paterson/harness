@@ -65,6 +65,11 @@ def test_work_ready_names_the_existing_target_transition(prompt: str) -> None:
     assert "do not search the database or command help" in prompt
 
 
+def test_authoritative_linear_read_names_the_installed_cli(prompt: str) -> None:
+    assert "`linear issue view issue --json --no-pager`" in prompt
+    assert "do not search for linear credentials" in prompt
+
+
 def test_fast_lane_delegation_and_evidence(prompt: str) -> None:
     assert "plans remain fable-owned" in prompt
     assert "smallest capable model" in prompt
