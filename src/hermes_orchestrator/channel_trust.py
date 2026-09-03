@@ -354,7 +354,8 @@ def _same_runtime_prompt(live_token: str, template_token: str) -> bool:
 
     The approval is for the development-channel plugin, not for Fable's
     system prompt. Both argv slots must still be canonical immutable-runtime
-    ``claude-lead.md`` paths under the same local runtime root.
+    ``claude-lead.md`` paths under the same local runtime root. A process keeps
+    the runtime it was launched with even when a later fix is activated.
     """
 
     live_match = _RUNTIME_PROMPT_PATH.fullmatch(live_token)
@@ -369,17 +370,11 @@ def _same_runtime_prompt(live_token: str, template_token: str) -> bool:
     live = Path(live_token)
     template = Path(template_token)
     try:
-        active = Path(
-            (Path(live_match.group(1)) / "ACTIVE")
-            .read_text(encoding="utf-8")
-            .strip()
-        )
         return (
             live.resolve() == live
             and template.resolve() == template
             and live.is_file()
             and template.is_file()
-            and active.resolve() == active == live.parents[1]
         )
     except OSError:
         return False
