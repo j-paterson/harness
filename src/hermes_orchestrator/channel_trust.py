@@ -901,6 +901,19 @@ class ChannelTrustAnchors:
         active anchor of its own — an existing one is a different trust
         decision and refuses, exactly as :meth:`capture`'s at-most-one-
         active-per-cell rule requires.
+
+        INFRA-187 (reopened): ``source_cell_id`` may belong to a
+        DIFFERENT project than ``cell_id`` — a brand-new project's first
+        cell has no same-project sibling to adopt from, and
+        :meth:`proven_source_cell` widens to a cross-project candidate
+        only in that case. Nothing above changes for that case: every
+        program-identity fact is still re-measured from disk and
+        compared to the predecessor's exactly, so a proven anchor from
+        another project is accepted only when the build it proves is
+        genuinely unchanged. The adopted anchor's event payload records
+        the source cell's project (``source_project_key``) alongside
+        ``source_cell_id`` purely for audit trail; it is never compared
+        against anything.
         """
 
         if channel_entry != CHANNEL_ENTRY:
@@ -1017,6 +1030,18 @@ class ChannelTrustAnchors:
                     f"cell {cell_id!r} already has an active channel trust "
                     "anchor; retire it first"
                 )
+            # Audit trail only (INFRA-187 reopened): which project the
+            # source cell belongs to, so a cross-project adoption is
+            # visible in the event log. Never compared against anything.
+            source_project_row = connection.execute(
+                "SELECT project_key FROM project_cells WHERE cell_id = ?",
+                (source_cell_id,),
+            ).fetchone()
+            source_project_key = (
+                None
+                if source_project_row is None
+                else str(source_project_row["project_key"])
+            )
             connection.execute(
                 "INSERT INTO channel_trust_anchors("
                 "anchor_id, cell_id, profile_alias, canonical_entry_path, "
@@ -1058,6 +1083,7 @@ class ChannelTrustAnchors:
                     payload={
                         "cell_id": cell_id,
                         "source_cell_id": source_cell_id,
+                        "source_project_key": source_project_key,
                         "profile_alias": profile_alias,
                         "canonical_entry_path": str(entry_path),
                         "session_id": canonical_session,
@@ -1201,6 +1227,100 @@ class ChannelTrustAnchors:
             )
         return self.get(anchor_id)
 
+    def capture_after_confirmation(
+        self,
+        *,
+        cell_id: str,
+        session_id: str,
+        workspace_uuid: str,
+        surface_uuid: str,
+        profile_alias: str,
+    ) -> ChannelTrustAnchor | None:
+        """Persist the anchor the operator's one manual Enter proved.
+
+        INFRA-187 (2026-09-03, cell 9e7e5c87): after an ``anchor_present``
+        refusal the operator confirmed the dialog by hand, the exact
+        bound ``hermes-control`` process registered, and nothing
+        captured an anchor -- so no active cell held a proven anchor and
+        no new project could ever adopt one. Called by the channel hub
+        on the FIRST registration of a session: the newest live refusal
+        for this cell must be stashed for exactly this session, its
+        dialog text must be the approved structure the operator-driven
+        CLI capture requires, and the build must measure identical to
+        the refusal-time digests -- otherwise ``None`` with no write.
+        Success reuses :meth:`capture` (the manual-trust-event recorder)
+        with the approved prompt pattern and marks the refusal receipt
+        superseded so a re-registration never captures twice.
+        """
+
+        canonical_session = _canonical_uuid(session_id)
+        if canonical_session is None:
+            return None
+        rows = self._database.execute(
+            "SELECT operation_id, result_json FROM control_operations "
+            "WHERE cell_id = ? AND kind = 'channel.approval_required' "
+            "AND state != 'superseded' ORDER BY created_at DESC, rowid DESC",
+            (cell_id,),
+        ).fetchall()
+        chosen: tuple[str, dict[str, Any]] | None = None
+        for row in rows:
+            try:
+                result = json.loads(str(row["result_json"]))
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(result, dict)
+                and result.get("first_failure") == "anchor_present"
+                and _canonical_uuid(result.get("session_id")) == canonical_session
+            ):
+                chosen = (str(row["operation_id"]), result)
+                break
+        if chosen is None:
+            return None
+        operation_id, evidence = chosen
+        screen = evidence.get("screen")
+        argv = evidence.get("launch_argv")
+        if (
+            not isinstance(screen, str)
+            or not isinstance(argv, list)
+            or any(marker not in screen for marker in APPROVED_PROMPT_MARKERS)
+            or not displayed_channel_entries_valid(screen)
+        ):
+            return None
+        try:
+            entry_path = Path(str(evidence["entry_path"]))
+            package_root = Path(str(evidence["package_root"]))
+            measured_entry = hashlib.sha256(entry_path.read_bytes()).hexdigest()
+            measured_tree = _dist_tree_sha256(package_root)
+        except (KeyError, OSError, ValueError):
+            return None
+        if measured_entry != evidence.get(
+            "entry_sha256"
+        ) or measured_tree != evidence.get("dist_tree_sha256"):
+            return None
+        try:
+            anchor = self.capture(
+                cell_id=cell_id,
+                profile_alias=profile_alias,
+                entry_path=entry_path,
+                package_root=package_root,
+                channel_entry=CHANNEL_ENTRY,
+                launch_argv_template=tuple(str(token) for token in argv),
+                workspace_uuid=workspace_uuid,
+                surface_uuid=surface_uuid,
+                session_id=canonical_session,
+                prompt_pattern=APPROVED_PROMPT_PATTERN,
+            )
+        except Exception:
+            return None
+        with suppress(Exception), self._database.transaction() as connection:
+            connection.execute(
+                "UPDATE control_operations SET state = 'superseded', "
+                "updated_at = ? WHERE operation_id = ? AND state != 'superseded'",
+                (datetime.now(UTC).isoformat(), operation_id),
+            )
+        return anchor
+
     def active_for_cell(self, cell_id: str) -> ChannelTrustAnchor | None:
         row = self._database.execute(
             "SELECT * FROM channel_trust_anchors "
@@ -1237,13 +1357,50 @@ class ChannelTrustAnchors:
         equally valid proofs of the same program identity, and any that
         no longer matches the live entry is refused by the
         re-measurement rather than trusted.
+
+        INFRA-187 (reopened): a same-project sibling is always tried
+        FIRST, exactly as above and with the same ordering. Only when
+        ``project_key`` has no qualifying sibling of its own does the
+        search widen to a proven, actively-held anchor belonging to
+        ANOTHER project — same ``active``-holding-cell requirement, same
+        development-over-harness preference, same newest-wins tiebreak,
+        just without the ``project_key`` filter. This is safe to widen
+        SOLELY because selecting a candidate here still decides nothing:
+        :meth:`adopt` unconditionally re-measures and compares every
+        program-identity fact (canonical entry path, owner uid, entry
+        sha256, dist-tree sha256, manifest name/version, the fixed
+        channel entry, and the launch argv template modulo its two
+        permitted substitution slots) against whatever candidate is
+        returned here, and refuses with zero database writes on any
+        difference. An unchanged build is the same operator-proven
+        PROGRAM identity regardless of which project's cell happens to
+        hold the anchor that proves it — a brand-new project's first
+        cell would otherwise have no possible source, ever, since it can
+        by definition have no siblings in its own project yet.
         """
 
+        same_project = self._proven_source_cell_query(
+            project_key=project_key,
+            exclude_cell_id=exclude_cell_id,
+            other_projects=False,
+        )
+        if same_project is not None:
+            return same_project
+        return self._proven_source_cell_query(
+            project_key=project_key,
+            exclude_cell_id=exclude_cell_id,
+            other_projects=True,
+        )
+
+    def _proven_source_cell_query(
+        self, *, project_key: str, exclude_cell_id: str, other_projects: bool
+    ) -> str | None:
+        comparison = "!=" if other_projects else "="
         row = self._database.execute(
             "SELECT anchors.cell_id AS cell_id FROM channel_trust_anchors "
             "AS anchors JOIN project_cells AS cells "
             "ON cells.cell_id = anchors.cell_id "
-            "WHERE cells.project_key = ? AND anchors.cell_id != ? "
+            f"WHERE cells.project_key {comparison} ? AND anchors.cell_id != ? "
             "AND cells.state = 'active' "
             "AND anchors.state = 'active' "
             "AND anchors.prompt_pattern IS NOT NULL "
@@ -1428,12 +1585,35 @@ class ChannelTrustGate:
                 matches[0].group(0).encode()
             ).hexdigest()
         except _CheckFailed as failed:
+            evidence: dict[str, Any] | None = None
+            if failed.name == "anchor_present":
+                # INFRA-187 (2026-09-03): the one manual Enter that follows
+                # this refusal is a real trust event; stash exactly what
+                # ``capture_after_confirmation`` needs to persist it once
+                # the exact session registers (paths, argv, dialog text,
+                # and the build digests measured right now).
+                evidence = {
+                    "session_id": str(session_id),
+                    "entry_path": str(entry_path),
+                    "package_root": str(package_root),
+                    "launch_argv": list(launch_argv),
+                }
+                if screen_text is not None:
+                    evidence["screen"] = screen_text
+                with suppress(Exception):
+                    evidence["entry_sha256"] = hashlib.sha256(
+                        Path(entry_path).read_bytes()
+                    ).hexdigest()
+                    evidence["dist_tree_sha256"] = _dist_tree_sha256(
+                        Path(package_root)
+                    )
             return self._refuse(
                 cell_id=cell_id,
                 session_id=session_id,
                 project_key=project_key,
                 first_failure=failed.name,
                 anchor_id=(anchor.anchor_id if anchor is not None else None),
+                evidence=evidence,
             )
         except Exception:
             return self._refuse(
@@ -1620,6 +1800,7 @@ class ChannelTrustGate:
         project_key: str,
         first_failure: str,
         anchor_id: str | None,
+        evidence: dict[str, Any] | None = None,
     ) -> TrustVerdict:
         operation = None
         with suppress(Exception):
@@ -1628,7 +1809,7 @@ class ChannelTrustGate:
                 project_key=project_key,
                 cell_id=cell_id,
                 session_id=session_id,
-                result={"first_failure": first_failure},
+                result={"first_failure": first_failure, **(evidence or {})},
                 reason=(
                     f"CHANNEL CONFIRMATION REQUIRED: {first_failure} check "
                     "did not match the trusted anchor"

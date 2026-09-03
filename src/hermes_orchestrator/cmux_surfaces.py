@@ -2422,6 +2422,12 @@ class ChannelTrustConfirmer:
             # genuinely new trust decision: it is recorded and this call
             # falls through to evaluate() unchanged, leaving the manual-
             # dialog fallback and its receipts as they are.
+            #
+            # INFRA-187 (reopened): when this project has no proven
+            # sibling of its own (a brand-new project's first cell),
+            # ``proven_source_cell`` widens to a proven anchor held by an
+            # active cell of ANOTHER project — still only ever a
+            # candidate name; ``adopt`` decides.
             source_cell_id = anchors.proven_source_cell(
                 binding.project_key or "", exclude_cell_id=str(binding.cell_id)
             )
@@ -2441,6 +2447,14 @@ class ChannelTrustConfirmer:
                     )
                 except Exception as error:
                     with suppress(Exception):
+                        source_project_key = None
+                        source_row = self._database.execute(
+                            "SELECT project_key FROM project_cells "
+                            "WHERE cell_id = ?",
+                            (source_cell_id,),
+                        ).fetchone()
+                        if source_row is not None:
+                            source_project_key = str(source_row["project_key"])
                         self._control.record(
                             kind="channel.adopt_refused",
                             project_key=binding.project_key or "",
@@ -2449,6 +2463,7 @@ class ChannelTrustConfirmer:
                             result={
                                 "error": str(error)[:200],
                                 "source_cell_id": source_cell_id,
+                                "source_project_key": source_project_key,
                             },
                             reason=(
                                 "CHANNEL ADOPT REFUSED: this cell has no "

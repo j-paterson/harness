@@ -1629,6 +1629,255 @@ def test_proven_source_cell_prefers_a_development_cell_over_a_harness_cell(
     assert anchors.proven_source_cell("demo", exclude_cell_id=ADOPTING_CELL) == CELL
 
 
+# --------------------------------------------------------------------
+# INFRA-187 (reopened, observed live 2026-09-02): a brand-new project's
+# FIRST cell can, by definition, have no same-project sibling to adopt
+# from -- ``proven_source_cell`` widens to a proven anchor held by an
+# active cell of ANOTHER project only when the same-project search
+# comes up empty. ``adopt`` itself is untouched: it re-measures and
+# compares every program-identity fact regardless of which project the
+# source cell belongs to, so the cross-project widening decides
+# nothing on its own.
+# --------------------------------------------------------------------
+
+# The project a brand-new cell was just configured under -- no siblings
+# of its own anywhere.
+NEW_PROJECT = "harness-lab"
+NEW_PROJECT_CELL = "cell-trust-new-project"
+# A second project holding its own proven anchor, used to prove
+# same-project preference beats cross-project regardless of lane or
+# recency.
+OTHER_PROJECT = "other-project"
+OTHER_PROJECT_CELL = "cell-trust-other-project"
+
+
+def test_new_project_cell_inherits_trust_from_an_unchanged_build(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """Observed live 2026-09-02: the first Fable cell of newly
+    configured project ``harness-lab`` launched on the SAME unchanged
+    hermes-control build as every proven cell of ``agent-orchestration``
+    yet the trust gate refused, because ``proven_source_cell`` only ever
+    considered siblings of the SAME project and a brand-new project has
+    none. With no siblings of its own, project B's first cell now
+    adopts project A's proven anchor: A's anchor stays active, and B's
+    new anchor persists A's argv template verbatim."""
+
+    package_root, entry_path = package
+    _seed_cell(database, CELL, state="active", lane_role="development")
+    _seed_cell(
+        database,
+        NEW_PROJECT_CELL,
+        state="active",
+        lane_role="development",
+        project_key=NEW_PROJECT,
+        session_id=SESSION_2,
+    )
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+
+    source_cell_id = anchors.proven_source_cell(
+        NEW_PROJECT, exclude_cell_id=NEW_PROJECT_CELL
+    )
+    assert source_cell_id == CELL
+
+    adopted = anchors.adopt(
+        source_cell_id=source_cell_id,
+        cell_id=NEW_PROJECT_CELL,
+        profile_alias=PROFILE,
+        entry_path=entry_path,
+        package_root=package_root,
+        channel_entry=CHANNEL_ENTRY,
+        launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+        workspace_uuid=WORKSPACE_2,
+        surface_uuid=SURFACE_2,
+        session_id=SESSION_2,
+    )
+
+    assert adopted.cell_id == NEW_PROJECT_CELL
+    assert adopted.state == "active"
+    assert anchors.get(proven.anchor_id).state == "active"
+    assert anchors.active_for_cell(CELL) == proven
+    assert adopted.launch_argv_template == proven.launch_argv_template
+    assert adopted.launch_argv_template == tuple(_argv())
+    assert adopted.prompt_pattern == proven.prompt_pattern
+    payload = json.loads(
+        str(
+            database.execute(
+                "SELECT payload_json FROM events "
+                "WHERE aggregate_type = 'channel_trust_anchor' "
+                "AND aggregate_id = ?",
+                (adopted.anchor_id,),
+            ).fetchone()["payload_json"]
+        )
+    )
+    assert payload["source_cell_id"] == CELL
+    assert payload["source_project_key"] == "demo"
+
+
+def test_same_project_source_still_wins_over_another_project(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """A same-project sibling wins even when it is the LESS-preferred
+    lane and the OLDER anchor -- the outer same-project-first tier
+    dominates the inner development/newest tiebreak that only applies
+    within one project. Cross-project adoption exists solely to give a
+    project's first cell SOME source, never to outrank a source the
+    adopting cell's own project already has."""
+
+    package_root, entry_path = package
+    _seed_cell(database, CELL, state="active", lane_role="harness")
+    _seed_cell(
+        database,
+        OTHER_PROJECT_CELL,
+        state="active",
+        lane_role="development",
+        project_key=OTHER_PROJECT,
+        session_id=SESSION_2,
+    )
+    _seed_cell(
+        database,
+        ADOPTING_CELL,
+        state="active",
+        lane_role="development",
+        session_id=SESSION_3,
+    )
+    _capture(anchors, package_root=package_root, entry_path=entry_path)
+    later_anchors = ChannelTrustAnchors(
+        database,
+        events=EventStore(database),
+        now=lambda: datetime(2026, 8, 30, 13, tzinfo=UTC),
+    )
+    _capture(
+        later_anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        cell_id=OTHER_PROJECT_CELL,
+    )
+
+    assert (
+        anchors.proven_source_cell("demo", exclude_cell_id=ADOPTING_CELL) == CELL
+    )
+
+
+def test_cross_project_source_refuses_on_any_changed_build_fact(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """Widening the SOURCE selection across projects never loosens
+    ``adopt``'s acceptance rule: a cross-project candidate whose build
+    no longer matches -- an entry rewrite, a manifest edit, or launch
+    argv drift -- still refuses with zero rows written, exactly as a
+    same-project mismatch would."""
+
+    package_root, entry_path = package
+    _seed_cell(database, CELL, state="active", lane_role="development")
+    _seed_cell(
+        database,
+        NEW_PROJECT_CELL,
+        state="active",
+        lane_role="development",
+        project_key=NEW_PROJECT,
+        session_id=SESSION_2,
+    )
+    proven = _capture(anchors, package_root=package_root, entry_path=entry_path)
+    # A build rewritten under the trusted path after the proof.
+    entry_path.write_text("console.log('different!');\n", encoding="utf-8")
+    before = _anchor_rows(database)
+
+    source_cell_id = anchors.proven_source_cell(
+        NEW_PROJECT, exclude_cell_id=NEW_PROJECT_CELL
+    )
+    assert source_cell_id == CELL
+
+    with pytest.raises(TrustRefused, match="new trust decision"):
+        anchors.adopt(
+            source_cell_id=source_cell_id,
+            cell_id=NEW_PROJECT_CELL,
+            profile_alias=PROFILE,
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=_argv(SESSION_2, CONFIG_PATH_2),
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(NEW_PROJECT_CELL) is None
+    assert anchors.get(proven.anchor_id).state == "active"
+
+    with pytest.raises(TrustRefused, match="trusted launch template"):
+        anchors.adopt(
+            source_cell_id=source_cell_id,
+            cell_id=NEW_PROJECT_CELL,
+            profile_alias=PROFILE,
+            entry_path=entry_path,
+            package_root=package_root,
+            channel_entry=CHANNEL_ENTRY,
+            launch_argv_template=[*_argv(SESSION_2, CONFIG_PATH_2), "--verbose"],
+            workspace_uuid=WORKSPACE_2,
+            surface_uuid=SURFACE_2,
+            session_id=SESSION_2,
+        )
+
+    assert _anchor_rows(database) == before
+    assert anchors.active_for_cell(NEW_PROJECT_CELL) is None
+
+
+def test_cross_project_source_requires_an_active_holding_cell_and_bound_prompt(
+    database: Database,
+    anchors: ChannelTrustAnchors,
+    package: tuple[Path, Path],
+) -> None:
+    """The same two bars a same-project source must clear apply
+    identically across projects: the holding cell must still be
+    ``active`` (a retired or failed cell's anchor is dead-seat residue)
+    and the anchor's trust must be fully proven (bound prompt evidence).
+    A cross-project candidate failing either bar is never selected --
+    there is simply no source, not a lesser one."""
+
+    package_root, entry_path = package
+    _seed_cell(
+        database,
+        NEW_PROJECT_CELL,
+        state="active",
+        lane_role="development",
+        project_key=NEW_PROJECT,
+        session_id=SESSION_2,
+    )
+
+    # A dead holding cell in the other project: its anchor is fully
+    # proven but the cell itself is torn down.
+    _seed_cell(database, DEAD_CELL, state="failed", lane_role="development")
+    _capture(
+        anchors, package_root=package_root, entry_path=entry_path, cell_id=DEAD_CELL
+    )
+    assert (
+        anchors.proven_source_cell(NEW_PROJECT, exclude_cell_id=NEW_PROJECT_CELL)
+        is None
+    )
+
+    # A live holding cell in the other project whose anchor is not yet
+    # fully proven (no bound prompt evidence).
+    _seed_cell(database, CELL, state="active", lane_role="development")
+    _capture(
+        anchors,
+        package_root=package_root,
+        entry_path=entry_path,
+        prompt_pattern=None,
+    )
+    assert (
+        anchors.proven_source_cell(NEW_PROJECT, exclude_cell_id=NEW_PROJECT_CELL)
+        is None
+    )
+
+
 def test_gate_still_refuses_anchor_present_for_a_cell_with_no_anchor(
     database: Database,
     events: EventStore,
@@ -2878,3 +3127,94 @@ def test_displayed_channel_entries_valid_fails_closed_on_duplicate_entry() -> No
 def test_displayed_channel_entries_valid_fails_closed_without_a_dialog_region() -> None:
     assert displayed_channel_entries_valid(_LAUNCH_ECHO) is False
     assert displayed_channel_entries_valid("") is False
+
+
+# --------------------------------------------------------------------
+# INFRA-187 (2026-09-03): the one manual confirmation persists an anchor
+# --------------------------------------------------------------------
+
+
+def _refuse_with_dialog(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+) -> str:
+    package_root, entry_path = package
+    gate, _confirm, _read_screen = _make_gate(database, events, anchors, control)
+    result = _evaluate(
+        gate,
+        entry_path=entry_path,
+        package_root=package_root,
+        screen_text=f"...\n{DIALOG_TEXT}\n",
+    )
+    assert result.confirmed is False
+    assert result.first_failure == "anchor_present"
+    assert result.receipt_operation_id is not None
+    return result.receipt_operation_id
+
+
+def _register_after_confirmation(anchors: ChannelTrustAnchors):
+    return anchors.capture_after_confirmation(
+        cell_id=CELL,
+        session_id=SESSION,
+        workspace_uuid=WORKSPACE,
+        surface_uuid=SURFACE,
+        profile_alias=PROFILE,
+    )
+
+
+def test_manual_confirmation_registration_captures_a_proven_anchor(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Sol correction 6246aba3 / live cell 9e7e5c87: an ``anchor_present``
+    refusal followed by the operator's manual Enter and the exact
+    session's registration persists one fully proven anchor on the live
+    cell, so a new project can adopt it for an unchanged build."""
+
+    operation_id = _refuse_with_dialog(database, events, anchors, control, package)
+
+    anchor = _register_after_confirmation(anchors)
+
+    assert anchor is not None
+    assert anchor.cell_id == CELL
+    assert anchor.prompt_pattern == PROMPT_PATTERN
+    assert anchor.launch_argv_template == tuple(_argv())
+    assert control.get(operation_id).state == "superseded"
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at) VALUES ('cell-lab-1', 'lab', 'active', "
+            "?, ?, ?, ?)",
+            (PROFILE, OTHER_UUID, NOW.isoformat(), NOW.isoformat()),
+        )
+    assert anchors.proven_source_cell("lab", exclude_cell_id="cell-lab-1") == CELL
+    # The re-registration of the same session finds no live refusal.
+    assert _register_after_confirmation(anchors) is None
+    assert database.scalar("SELECT count(*) FROM channel_trust_anchors") == 1
+
+
+def test_manual_confirmation_capture_refuses_a_changed_build(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """A build that changed between the refusal and the registration is
+    a new trust decision: nothing is captured and nothing is written."""
+
+    _package_root, entry_path = package
+    _refuse_with_dialog(database, events, anchors, control, package)
+    entry_path.write_text("console.log('drifted');\n", encoding="utf-8")
+
+    assert _register_after_confirmation(anchors) is None
+    assert database.scalar("SELECT count(*) FROM channel_trust_anchors") == 0
