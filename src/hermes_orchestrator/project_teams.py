@@ -407,8 +407,9 @@ class ProjectTeamService:
             if (
                 cell is None
                 or team.fable_cell_id == cell[0]
-                or team.reason
-                != self._fable_mismatch_reason(team.fable_cell_id, cell[0])
+                or not self._is_fable_mismatch_reason(
+                    team.reason, team.fable_cell_id
+                )
                 or not self._fable_replacement_is_unambiguous(team, cell)
             ):
                 return team
@@ -623,6 +624,16 @@ class ProjectTeamService:
         return (
             "reconciliation observed live fable cell "
             f"{live_cell_id!r} but the bound member is {bound_cell_id!r}"
+        )
+
+    @staticmethod
+    def _is_fable_mismatch_reason(
+        reason: str | None, bound_cell_id: str | None
+    ) -> bool:
+        return bool(
+            reason
+            and reason.startswith("reconciliation observed live fable cell ")
+            and reason.endswith(f" but the bound member is {bound_cell_id!r}")
         )
 
     def replace_sol(

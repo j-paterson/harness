@@ -769,6 +769,58 @@ def test_reconcile_existing_recovers_failed_bound_fable_to_sole_live_replacement
     assert str(old["state"]) == "superseded"
 
 
+def test_reconcile_existing_recovers_when_recorded_replacement_also_failed(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET state = 'failed' WHERE cell_id = ?",
+            ("cell-1",),
+        )
+    seed_cell(
+        database,
+        cell_id="cell-2",
+        project_key="demo",
+        session_id="sess-fable-2",
+    )
+    teams.mark_uncertain(
+        "demo",
+        expected_generation=ready.generation,
+        reason=(
+            "reconciliation observed live fable cell 'cell-2' but the "
+            "bound member is 'cell-1'"
+        ),
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET state = 'failed' WHERE cell_id = ?",
+            ("cell-2",),
+        )
+    seed_cell(
+        database,
+        cell_id="cell-3",
+        project_key="demo",
+        session_id="sess-fable-3",
+    )
+
+    recovered = teams.reconcile_existing(
+        "demo",
+        repo_path="/repo/demo",
+        integration_branch="main",
+        cell=("cell-3", "sess-fable-3", "max-c"),
+        channel=("thread-1", 1, SOL_MODEL, SOL_PROVIDER),
+        channel_proven=True,
+    )
+
+    assert recovered is not None
+    assert recovered.generation == ready.generation + 1
+    assert recovered.state == "ready"
+    assert recovered.fable_cell_id == "cell-3"
+    assert recovered.fable_session_id == "sess-fable-3"
+    assert recovered.sol_thread_id == ready.sol_thread_id
+
+
 def test_reconcile_existing_does_not_clear_unrelated_uncertainty(
     teams: ProjectTeamService, database: Database
 ) -> None:
