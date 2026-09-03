@@ -1285,6 +1285,51 @@ class MergerTurnService:
             reason=reason,
         )
 
+    async def _legacy_unsubmitted_wake_for_issue(
+        self, project_key: str, issue_id: str
+    ) -> tuple[WakeEvent, str, ReviewerChannel] | None:
+        """The issue's outstanding delivered/admitted wake when it has no
+        ``submitted_verdicts`` row at all, has never been retried, AND
+        its exact bound thread reports the existing authoritative
+        ``idle`` runtime status (Sol correction 617d7bd0: absence of a
+        verdict is never proof that the turn ended -- a running review
+        turn looks identical); ``None`` otherwise, including whenever the
+        status cannot be read (see ``retry_stalled_wakes_for_issue``)."""
+
+        channel = self._merger.read_channel(project_key)
+        if channel is None or channel.state != "ready":
+            return None
+        outstanding = self.outstanding_wake(project_key)
+        if outstanding is None:
+            return None
+        event, state = outstanding
+        if event.issue_id != issue_id:
+            return None
+        if self._read_submission(event.event_id) is not None:
+            return None
+        retried_before = self._database.execute(
+            "SELECT 1 FROM events WHERE event_type = 'merger.turn_retry_requested' "
+            "AND correlation_id = ? LIMIT 1",
+            (event.event_id,),
+        ).fetchone()
+        if retried_before is not None:
+            return None
+        if not self._wake_binding_matches(
+            project_key,
+            event.event_id,
+            state=state,
+            thread_id=channel.thread_id,
+            generation=channel.generation,
+        ):
+            return None
+        try:
+            status = await self._merger.thread_status(channel.thread_id)
+        except Exception:
+            return None
+        if status != "idle":
+            return None
+        return event, state, channel
+
     async def retry_stalled_wakes_for_issue(
         self, project_key: str, issue_id: str
     ) -> tuple[RetryResult, ...]:
@@ -1303,6 +1348,24 @@ class MergerTurnService:
             for event in self.stalled_wakes(project_key)
             if event.issue_id == issue_id
         ]
+        if not targets:
+            # INFRA-223 (2026-09-03, INFRA-228): a wake whose turn ended
+            # BEFORE the stalled-wake logic existed still reads
+            # ``delivered``/``admitted`` with no submitted verdict, so the
+            # notification-driven transition never ran and nothing could
+            # be retried. The explicit issue-scoped operator retry is the
+            # one supported authority to move that exact legacy row into
+            # the same stalled path -- never a wake with a submission of
+            # its own, never a wake already retried once, and never any
+            # other issue's wake. No verdict is inferred.
+            legacy = await self._legacy_unsubmitted_wake_for_issue(
+                project_key, issue_id
+            )
+            if legacy is not None:
+                event, state, channel = legacy
+                outcome = self._mark_wake_stalled(project_key, event, channel, state)
+                if outcome.kind == "stalled":
+                    targets = [event.event_id]
         results = []
         for target_event_id in targets:
             results.append(

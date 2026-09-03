@@ -2963,3 +2963,58 @@ async def test_reviewer_fix_successor_submission_advances_the_outstanding_wake(
                 flow.verdict(SHA_A, branch, 16, defect=True),
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_issue_scoped_retry_transitions_a_legacy_delivered_wake_without_verdict(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 / INFRA-228 (2026-09-03): a wake delivered before the
+    # stalled-wake logic existed whose turn ended without a verdict still
+    # reads 'delivered'; the explicit issue-scoped retry moves exactly that
+    # row through the stalled path and re-delivers it once. A second retry
+    # of the same issue is a no-op, and no verdict is ever inferred.
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-12", SHA_A, pr_number=17)
+    emitted = await flow.emitter.emit("demo", "ENG-12", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    assert _wake_states(flow)[event_id] == "delivered"
+    # Sol correction 617d7bd0: while the exact thread still reports a
+    # running turn, the retry proves nothing and touches nothing.
+    flow.rpc.respond("thread/read", flow.thread_read("", status="running"))
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-12") == ()
+    assert _wake_states(flow)[event_id] == "delivered"
+    assert flow.database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'merger.turn_stalled'"
+    ) == 0
+
+    flow.rpc.respond("thread/read", flow.thread_read("", status="idle"))
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-12")
+
+    assert [(r.event_id, r.retried) for r in results] == [(event_id, True)]
+    stalled_events = flow.database.execute(
+        "SELECT count(*) FROM events WHERE event_type = 'merger.turn_stalled' "
+        "AND correlation_id = ?",
+        (event_id,),
+    ).fetchone()[0]
+    assert stalled_events == 1
+    assert _wake_states(flow)[event_id] in ("delivered", "pending")
+    assert flow.database.scalar("SELECT count(*) FROM submitted_verdicts") == 0
+
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-12") == ()
+
+
+@pytest.mark.asyncio
+async def test_issue_scoped_retry_never_transitions_a_wake_with_a_submission(
+    flow: ProductionShapedFlow,
+) -> None:
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-13", SHA_A, pr_number=18)
+    emitted = await flow.emitter.emit("demo", "ENG-13", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    _persist_submitted_row(
+        flow, event_id, "ENG-13", SHA_A, flow.verdict(SHA_A, branch, 18, defect=True)
+    )
+
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-13") == ()
+    assert _wake_states(flow)[event_id] == "delivered"

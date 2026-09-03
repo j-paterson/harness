@@ -2661,16 +2661,15 @@ def _hermes_handlers(
         except KeyError:
             return base_retry(command)
         turns = _open_merge_flow(settings, runtime).turns
-        stalled = [
-            event
-            for event in turns.stalled_wakes(project_key)
-            if event.issue_id == command.issue_id
-        ]
-        if not stalled:
-            return base_retry(command)
+        # INFRA-223 (INFRA-228 blocker): the turn service itself decides
+        # whether the issue has a stalled wake OR a legacy delivered wake
+        # that ended without a verdict; only when it retried nothing does
+        # this fall through to the existing requeue handler unchanged.
         results = asyncio.run(
             turns.retry_stalled_wakes_for_issue(project_key, command.issue_id)
         )
+        if not results:
+            return base_retry(command)
         return {
             "retried": [result.event_id for result in results if result.retried],
             "delivered": [
