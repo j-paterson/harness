@@ -14,6 +14,7 @@ import pytest
 
 from hermes_orchestrator.circleci import CiCheck
 from hermes_orchestrator.codex_rpc import RpcNotification
+from hermes_orchestrator.events import EventInput
 from hermes_orchestrator.merge_flow import (
     CIRCLECI_KEYCHAIN_SERVICE,
     GITHUB_KEYCHAIN_SERVICE,
@@ -3001,6 +3002,8 @@ async def test_issue_scoped_retry_transitions_a_legacy_delivered_wake_without_ve
     assert _wake_states(flow)[event_id] in ("delivered", "pending")
     assert flow.database.scalar("SELECT count(*) FROM submitted_verdicts") == 0
 
+    # The started turn is now running on the exact thread: no re-retry.
+    flow.rpc.respond("thread/read", flow.thread_read("", status="running"))
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-12") == ()
 
 
@@ -3049,6 +3052,7 @@ async def test_issue_scoped_retry_loads_a_not_loaded_thread_before_proving_idle(
     assert [(r.event_id, r.retried) for r in results] == [(event_id, True)]
     assert "thread/resume" in flow.rpc.methods
     assert flow.rpc.methods.count("turn/start") == turns_before
+    flow.rpc.respond("thread/read", flow.thread_read("", status="running"))
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-14") == ()
 
 
@@ -3094,3 +3098,44 @@ async def test_retry_keeps_the_wake_actionable_until_the_queued_turn_starts(
     assert _wake_states(flow)[event_id] == "delivered"
     assert "thread/queue/start" in [m for m, _ in flow.queue_rpc.requests]
     assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-15") == ()
+
+
+@pytest.mark.asyncio
+async def test_issue_scoped_retry_recovers_a_pre_fix_false_success(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 generation-133 carry-forward (INFRA-228): a wake left
+    # 'delivered' by a pre-fix retry that reported success without a
+    # start carries a merger.turn_retry_requested marker. That marker
+    # alone is not proof of an effective turn: with the exact thread idle
+    # and no submission, the same issue-scoped retry recovers it once;
+    # while the thread is running it is left untouched.
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-16", SHA_A, pr_number=21)
+    emitted = await flow.emitter.emit("demo", "ENG-16", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    with flow.database.transaction() as connection:
+        flow.events.append(
+            connection,
+            EventInput(
+                event_type="merger.turn_retry_requested",
+                aggregate_type="wake_delivery",
+                aggregate_id=f"wake:demo:{event_id}",
+                correlation_id=event_id,
+                actor="merger_turns",
+                payload={"issue_id": "ENG-16", "project_key": "demo"},
+            ),
+        )
+    assert _wake_states(flow)[event_id] == "delivered"
+
+    flow.rpc.respond("thread/read", flow.thread_read("", status="running"))
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-16") == ()
+    assert _wake_states(flow)[event_id] == "delivered"
+
+    flow.rpc.respond("thread/read", flow.thread_read("", status="idle"))
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-16")
+
+    assert [(r.event_id, r.retried, r.delivered) for r in results] == [
+        (event_id, True, True)
+    ]
+    assert flow.database.scalar("SELECT count(*) FROM submitted_verdicts") == 0

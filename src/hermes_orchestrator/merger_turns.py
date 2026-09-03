@@ -1324,13 +1324,14 @@ class MergerTurnService:
             return None
         if self._read_submission(event.event_id) is not None:
             return None
-        retried_before = self._database.execute(
-            "SELECT 1 FROM events WHERE event_type = 'merger.turn_retry_requested' "
-            "AND correlation_id = ? LIMIT 1",
-            (event.event_id,),
-        ).fetchone()
-        if retried_before is not None:
-            return None
+        # Generation-133 carry-forward (INFRA-228): a prior retry-request
+        # marker alone is never proof of an effective started turn -- the
+        # pre-fix retry recorded one and then reported a false success
+        # without a start. Deduplication rests on the exact evidence
+        # below instead: the wake's own thread/generation binding, no
+        # submission of its own, and the thread's authoritative ``idle``
+        # status (a turn that actually started is running, or ended with
+        # a structured verdict that the submission check already sees).
         if not self._wake_binding_matches(
             project_key,
             event.event_id,
