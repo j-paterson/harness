@@ -5724,7 +5724,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     human=f"{error}.",
                 )
                 return 1
-            report = asyncio.run(rotation.rotate(args.cell))
+            report = asyncio.run(
+                rotation.rotate(args.cell, rearm_delivered_handoff=True)
+            )
             payload = dataclasses.asdict(report)
             if report.phase == "awaiting_handoff":
                 # Non-terminal (Sol 52d15493): the rotation itself filed
