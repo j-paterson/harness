@@ -36,14 +36,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from hermes_orchestrator.cells import ProjectCellService, RotationBlocked
+from hermes_orchestrator.cells import ProjectCell, ProjectCellService, RotationBlocked
 from hermes_orchestrator.cmux_surfaces import (
     CmuxSurfaceBindings,
     classic_resume_command,
 )
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
-from hermes_orchestrator.handoffs import HandoffRecord, HandoffService
+from hermes_orchestrator.handoffs import (
+    HandoffRecord,
+    HandoffService,
+    HandoffStale,
+    refresh_handoff_head,
+    require_current_head,
+)
 from hermes_orchestrator.lead_wakes import (
     LeadTerminalWakes,
     TerminalWake,
@@ -200,6 +206,15 @@ class RotationReport:
     # durable ``handoff_requests`` row asking the incumbent for the
     # fresh handoff this rotation resumes on (Sol 52d15493).
     request_id: str | None = None
+    # INFRA-222: the exact worktree the replacement launched (or
+    # resumed) into -- ``cells.rotation_cwd``'s answer for this cell,
+    # not necessarily the lane's shared ``project.lead_cwd`` -- and the
+    # cell's CURRENT ``worker_bindings`` generation once seating is
+    # attempted. Both ``None`` on a report issued before seating (a
+    # precondition/claim/transfer refusal never reaches a cwd or a
+    # binding).
+    cwd: str | None = None
+    binding_generation: int | None = None
 
 
 class LeadRotation:
@@ -264,6 +279,21 @@ class LeadRotation:
         incumbent_profile = (
             str(row["profile_alias"]) if row["profile_alias"] is not None else None
         )
+        # INFRA-222: the exact worktree this cell's replacement belongs
+        # in -- its own leased issue lane when one is open, the lane
+        # cwd otherwise (``cells.rotation_cwd``) -- derived ONCE here
+        # from the durable row already in hand, then threaded through
+        # every path below (recovery re-seat, the fresh-transfer probe,
+        # and the completion report) so all three agree on one answer.
+        current_cell = ProjectCell(
+            cell_id=cell_id,
+            project_key=project_key,
+            state=state,
+            profile_alias=incumbent_profile or "",
+            session_id=uuid.UUID(incumbent_session),
+            lane_role=str(row["lane_role"]),
+        )
+        replacement_cwd = str(self._cells.rotation_cwd(current_cell))
 
         handoff_id = self._newest_handoff_id(cell_id)
         if handoff_id is None:
@@ -303,6 +333,7 @@ class LeadRotation:
                 replacement_session=incumbent_session,
                 profile_alias=incumbent_profile,
                 claim_token=None,
+                cwd=replacement_cwd,
             )
 
         worktree = self._worktree_state(project_key)
@@ -406,6 +437,47 @@ class LeadRotation:
                     cell_id, handoff_id, phase="claim", failure=refusal
                 )
             assert claim_token is not None
+            # INFRA-222 (the live 2026-09-01 rotation defect): the
+            # acknowledgement turn below can run arbitrarily long, and
+            # this handoff's recorded branch/HEAD were derived whenever
+            # it was submitted -- possibly well before now. Re-probe the
+            # LEASED worktree (the same path the replacement is about to
+            # launch into) immediately before spending that turn on it.
+            # Every handoff's branch/head are themselves mechanically
+            # derived in the first place (``derived_handoff_document``
+            # never takes them from the incumbent's own account), so a
+            # HEAD that merely advanced is refreshed and persisted here
+            # rather than refused; only a branch mismatch or a failed
+            # probe (fail-closed to "" by the worktree probe) can never
+            # be repaired this way and refuses outright.
+            lease_probe = self._worktree_state(replacement_cwd)
+            try:
+                require_current_head(
+                    handoff.document, branch=lease_probe.branch, head=lease_probe.head
+                )
+            except HandoffStale as stale:
+                if (
+                    not lease_probe.branch
+                    or not lease_probe.head
+                    or lease_probe.branch != handoff.document.branch
+                ):
+                    return self._blocked(
+                        cell_id,
+                        handoff_id,
+                        phase="transfer",
+                        failure=(
+                            f"leased worktree {replacement_cwd} failed "
+                            f"currency verification for handoff "
+                            f"{handoff_id!r}: {stale}; submit a fresh "
+                            "handoff for this cell and retry rotate-lead"
+                        ),
+                    )
+                refreshed_document = refresh_handoff_head(
+                    handoff.document,
+                    branch=lease_probe.branch,
+                    head=lease_probe.head,
+                )
+                handoff = self._handoffs.refresh(handoff_id, refreshed_document)
             # Sol 04d013b0 finding 4: the acknowledgement runner stream
             # inside cells.rotate has no upper bound and no seam for
             # LeadRotation to renew from within, so a concurrent
@@ -437,6 +509,7 @@ class LeadRotation:
             replacement_session=replacement_session,
             profile_alias=profile_alias,
             claim_token=claim_token,
+            cwd=replacement_cwd,
         )
 
     async def resume_on_submission(
@@ -822,6 +895,7 @@ class LeadRotation:
         replacement_session: str,
         profile_alias: str | None,
         claim_token: str | None = None,
+        cwd: str | None = None,
     ) -> RotationReport:
         if claim_token is not None:
             # Renewal at the phase transition: entering the seat phase.
@@ -847,6 +921,7 @@ class LeadRotation:
                 replacement_session=replacement_session,
                 profile=profile_alias,
                 failure=f"seat activation failed: {error}",
+                cwd=cwd,
             )
         if binding is None:
             return RotationReport(
@@ -857,6 +932,7 @@ class LeadRotation:
                 replacement_session=replacement_session,
                 profile=profile_alias,
                 failure="lead seat could not be activated for the replacement session",
+                cwd=cwd,
             )
         return await self._completion_report(
             cell_id=cell_id,
@@ -865,6 +941,7 @@ class LeadRotation:
             profile_alias=profile_alias,
             binding_id=binding.binding_id,
             claim_token=claim_token,
+            cwd=cwd,
         )
 
     async def _completion_report(
@@ -876,6 +953,7 @@ class LeadRotation:
         profile_alias: str | None,
         binding_id: str,
         claim_token: str | None = None,
+        cwd: str | None = None,
     ) -> RotationReport:
         """Report ``complete`` only once the replacement session's active
         hermes-control registration is durably observed — a bound seat
@@ -887,6 +965,21 @@ class LeadRotation:
         closes the attempt once, and a concurrent recovery call whose
         completion lost that race reports the loss instead of a second
         success (Sol 04d013b0 finding 5)."""
+
+        # INFRA-222: the cell's CURRENT worker_bindings generation, read
+        # straight off the durable row -- the same identity
+        # ``cells._finalize_transfer`` just swapped (or bound for a
+        # legacy cell with no prior binding). ``None`` only for a cell
+        # with no binding at all, which recovery/an unwired composition
+        # can still reach.
+        generation_row = self._database.execute(
+            "SELECT generation FROM worker_bindings "
+            "WHERE cell_id = ? AND state = 'active'",
+            (cell_id,),
+        ).fetchone()
+        binding_generation = (
+            int(generation_row["generation"]) if generation_row is not None else None
+        )
 
         if await self._replacement_is_registered(
             replacement_session,
@@ -905,6 +998,8 @@ class LeadRotation:
                     replacement_session=replacement_session,
                     profile=profile_alias,
                     binding_id=binding_id,
+                    cwd=cwd,
+                    binding_generation=binding_generation,
                     failure=(
                         "a concurrent recovery call already journaled this "
                         "rotation's completion; the one complete report was "
@@ -919,6 +1014,8 @@ class LeadRotation:
                 replacement_session=replacement_session,
                 profile=profile_alias,
                 binding_id=binding_id,
+                cwd=cwd,
+                binding_generation=binding_generation,
             )
         return RotationReport(
             ok=False,
@@ -928,6 +1025,8 @@ class LeadRotation:
             replacement_session=replacement_session,
             profile=profile_alias,
             binding_id=binding_id,
+            cwd=cwd,
+            binding_generation=binding_generation,
             failure=(
                 f"replacement session {replacement_session} has no active "
                 "hermes-control registration after "

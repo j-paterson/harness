@@ -209,6 +209,46 @@ class DurableWakePort(Protocol):
     def exists(self, project_key: str, event_id: str) -> bool: ...
 
 
+class LeaseWriterSnapshot(Protocol):
+    """The exact ``worktree_leases`` writer columns (migration 0063)."""
+
+    writer_role: str
+    writer_ref: str | None
+    writer_generation: int
+    submitted_candidate_sha: str | None
+
+
+class LeaseWriterTransferPort(LeaseReaderPort, Protocol):
+    """Read the live lease's writer identity and transfer its custody.
+
+    INFRA-222: the immutable review artifact is the recorded candidate
+    SHA; the worktree is an operational resource whose exclusive writer
+    may change. ``WorktreeLeases`` (migration 0063) satisfies this in
+    full -- ``active`` (inherited from :class:`LeaseReaderPort`) is what
+    :func:`resolve_lane` already reads, ``get`` answers the current
+    writer role/ref/generation and recorded candidate sha, and
+    ``transfer_writer`` is the generation-keyed compare-and-swap that
+    moves custody. Every refusal is expected to raise -- the exact
+    exception type is never inspected here, only caught and translated
+    to :class:`EmissionBlocked`.
+    """
+
+    def get(self, lease_id: str) -> LeaseWriterSnapshot: ...
+
+    def transfer_writer(
+        self,
+        lease_id: str,
+        *,
+        expected_writer_role: str,
+        expected_writer_ref: str | None,
+        to_writer_role: str,
+        to_writer_ref: str | None,
+        observed_head: str,
+        tree_clean: bool,
+        submitted_candidate_sha: str | None = None,
+    ) -> object: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedLane:
     """The one publishable lane for an issue: its live worktree lease.
@@ -300,6 +340,8 @@ class CandidateEmitter:
         lead: CorrectionSinkPort | None = None,
         issue_for_failure: Callable[[str, str], str | None] | None = None,
         durable_wake: DurableWakePort | None = None,
+        lease_transfer: LeaseWriterTransferPort | None = None,
+        reviewer_ref: Callable[[str], str | None] | None = None,
     ) -> None:
         self._projects = dict(projects)
         self._git = git
@@ -316,6 +358,16 @@ class CandidateEmitter:
         # caller that has not wired the durable wake registry keeps
         # today's behavior rather than being forced to change at once.
         self._durable_wake = durable_wake
+        # INFRA-222: when wired, the resolved lane's worktree-lease
+        # writer is handed from fable to sol, atomically, right after the
+        # candidate is proven and before the Merger is ever woken --
+        # optional so a caller that has not wired the lease-transfer port
+        # (or that never resolves a lane) keeps today's behavior exactly.
+        self._lease_transfer = lease_transfer
+        # project_key -> the bound Sol reviewer's thread/generation
+        # identity, recorded on the lease as ``writer_ref`` purely for
+        # operator visibility; never read back or compared by this class.
+        self._reviewer_ref = reviewer_ref
 
     async def emit(
         self,
@@ -492,6 +544,14 @@ class CandidateEmitter:
                 intake=intake,
                 intake_reason=intake_reason,
             )
+        # INFRA-222: Fable's exclusive writer lease on the issue's
+        # worktree is handed to Sol here -- after the candidate sha is
+        # proven and the tree is proven clean and pushed (``facts``
+        # above), but strictly before the Merger is woken, so a refused
+        # hand-over never leaves a wake delivered against a lease Sol
+        # does not yet hold.
+        if self._lease_transfer is not None and resolved_lane is not None:
+            self._hand_over_to_sol(resolved_lane, candidate_sha=head)
         delivery = await self._delivery.deliver(project_key, event)
         return EmissionResult(
             event=event,
@@ -520,6 +580,55 @@ class CandidateEmitter:
         except CandidateRejected as rejected:
             return "rejected", str(rejected)
         return "clear", ""
+
+    def _hand_over_to_sol(
+        self, lane: ResolvedLane, *, candidate_sha: str
+    ) -> None:
+        """Transfer the resolved lane's writer lease from fable to sol.
+
+        INFRA-222: a re-emission (the durable manifest and wake both
+        deduplicate on identity) whose lease is already sol-owned with
+        this EXACT candidate sha is a replay, not a conflict -- it is a
+        no-op. Any other refusal (a dirty tree, a writer already
+        replaced by something else, a stale generation, or a lease
+        already sol-owned under a DIFFERENT candidate sha) raises
+        :class:`EmissionBlocked` before the wake is ever delivered.
+        """
+
+        assert self._lease_transfer is not None
+        try:
+            current = self._lease_transfer.get(lane.lease_id)
+        except Exception as error:
+            raise EmissionBlocked(
+                f"could not read worktree lease {lane.lease_id!r} before "
+                f"transferring its writer to sol: {error}"
+            ) from error
+        if (
+            current.writer_role == "sol"
+            and current.submitted_candidate_sha == candidate_sha
+        ):
+            return
+        to_writer_ref = (
+            self._reviewer_ref(lane.project_key)
+            if self._reviewer_ref is not None
+            else None
+        )
+        try:
+            self._lease_transfer.transfer_writer(
+                lane.lease_id,
+                expected_writer_role="fable",
+                expected_writer_ref=None,
+                to_writer_role="sol",
+                to_writer_ref=to_writer_ref,
+                observed_head=candidate_sha,
+                tree_clean=True,
+                submitted_candidate_sha=candidate_sha,
+            )
+        except Exception as error:
+            raise EmissionBlocked(
+                f"worktree lease {lane.lease_id!r} writer transfer to sol "
+                f"was refused: {error}"
+            ) from error
 
     def _run(self, repo: Path, *args: str) -> str:
         try:

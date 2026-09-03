@@ -15,6 +15,7 @@ from hermes_orchestrator.dashboard_render import (
 from hermes_orchestrator.dashboard_sources import (
     BatchFact,
     CapacityFact,
+    ClaimFact,
     CodexFact,
     ControlAttentionFact,
     DashboardSnapshot,
@@ -1034,6 +1035,9 @@ def _lane(
     blocked_issue_ids: tuple[str, ...] = (),
     subagents_total: int = 0,
     subagents_completed: int = 0,
+    claims: tuple[ClaimFact, ...] = (),
+    binding_generation: int | None = None,
+    binding_profile: str | None = None,
 ) -> LaneCellFact:
     return LaneCellFact(
         project_key=project_key,
@@ -1045,6 +1049,9 @@ def _lane(
         blocked_issue_ids=blocked_issue_ids,
         subagents_total=subagents_total,
         subagents_completed=subagents_completed,
+        claims=claims,
+        binding_generation=binding_generation,
+        binding_profile=binding_profile,
     )
 
 
@@ -1124,3 +1131,95 @@ def test_frame_with_lanes_still_honors_exact_height_and_width_contract() -> None
         lines = render_frame(snapshot, width=width, height=height, now=_NOW)
         assert len(lines) == height
         assert all(visible_length(line) == width for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# INFRA-222: work claims and worker binding identity, rendered onto the
+# lane row without exposing any packet-delivery vocabulary
+# (published/acknowledged/superseded never belong in a workflow view).
+# ---------------------------------------------------------------------------
+
+_DELIVERY_STATE_WORDS = ("published", "acknowledged", "superseded")
+
+
+def test_frame_lane_row_shows_claims_and_binding_generation() -> None:
+    dev = _lane(
+        issue_ids=("INFRA-9",),
+        claims=(
+            ClaimFact(
+                issue_id="INFRA-9",
+                role="development",
+                child_lane="",
+                opened_at="2026-08-30T00:00:00+00:00",
+            ),
+        ),
+        binding_generation=2,
+        binding_profile="max-a",
+    )
+    snapshot = _frame_snapshot(lanes=(dev,))
+    lines = render_frame(snapshot, width=200, height=30, now=_NOW)
+    dev_row = next(line for line in lines if "proj/development" in line)
+
+    assert "claims development:INFRA-9" in dev_row
+    assert "worker max-a gen2" in dev_row
+    for word in _DELIVERY_STATE_WORDS:
+        assert word not in dev_row
+
+
+def test_frame_lane_row_shows_child_lane_when_non_empty() -> None:
+    dev = _lane(
+        issue_ids=("INFRA-9",),
+        claims=(
+            ClaimFact(
+                issue_id="INFRA-9",
+                role="development",
+                child_lane="subagent-a",
+                opened_at="2026-08-30T00:00:00+00:00",
+            ),
+        ),
+    )
+    snapshot = _frame_snapshot(lanes=(dev,))
+    lines = render_frame(snapshot, width=200, height=30, now=_NOW)
+    dev_row = next(line for line in lines if "proj/development" in line)
+
+    assert "claims development:INFRA-9/subagent-a" in dev_row
+
+
+def test_frame_lane_row_placeholders_claims_and_worker_when_absent() -> None:
+    dev = _lane()
+    snapshot = _frame_snapshot(lanes=(dev,))
+    lines = render_frame(snapshot, width=200, height=30, now=_NOW)
+    dev_row = next(line for line in lines if "proj/development" in line)
+
+    assert "claims none" in dev_row
+    assert "worker none" in dev_row
+    for word in _DELIVERY_STATE_WORDS:
+        assert word not in dev_row
+
+
+def test_dashboard_lane_line_shows_claims_and_binding_generation() -> None:
+    dev = _lane(
+        issue_ids=("INFRA-9",),
+        claims=(
+            ClaimFact(
+                issue_id="INFRA-9",
+                role="harness",
+                child_lane="",
+                opened_at="2026-08-30T00:00:00+00:00",
+            ),
+        ),
+        binding_generation=3,
+        binding_profile="max-b",
+    )
+    # `_snapshot` (this file's render_dashboard helper) does not accept a
+    # `lanes` kwarg, so thread it on via dataclasses.replace to exercise
+    # `_lane_line`.
+    snapshot = dataclasses.replace(_snapshot(), lanes=(dev,))
+    lines = render_dashboard(snapshot, width=120)
+    lane_line = next(line for line in lines if "proj/development" in line)
+
+    assert "cell cell-dev" in lane_line
+    assert "claims harness:INFRA-9" in lane_line
+    assert "worker max-b gen3" in lane_line
+    for word in _DELIVERY_STATE_WORDS:
+        assert word not in lane_line

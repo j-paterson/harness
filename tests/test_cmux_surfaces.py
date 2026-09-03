@@ -4074,6 +4074,132 @@ def test_retire_dead_lead_cell_returns_false_when_cell_is_not_active(
     assert control_operation_kinds(database) == []
 
 
+def test_release_issue_lease_follows_the_claim_over_a_misleading_assignment(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """INFRA-222: ``lead_assignments`` is a delivery ledger, not an
+    ownership record. The newest live (non-superseded) assignment for
+    this cell/session names a DIFFERENT issue than the one the cell's
+    durable work claim says it owns -- exactly the shape a
+    superseded-then-republished packet sequence leaves behind. The
+    cleanup claim released must be the CLAIM's lane, never whichever
+    lane the assignment happens to point at."""
+
+    from hermes_orchestrator.work_claims import WorkClaims
+    from hermes_orchestrator.worktrees import WorktreeLeaseInput, WorktreeLeases
+
+    seed_cell(database)
+    events = EventStore(database)
+    leases = WorktreeLeases(database, events)
+    claimed_lease = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="issue-claim",
+            repo_path="/repos/demo",
+            path="/repos/demo/lane-claim",
+            branch="feature/claim",
+            remote="origin",
+        )
+    )
+    other_lease = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="issue-other",
+            repo_path="/repos/demo",
+            path="/repos/demo/lane-other",
+            branch="feature/other",
+            remote="origin",
+        )
+    )
+    stamp = NOW.isoformat()
+    for lease_id, owner in (
+        (claimed_lease.lease_id, "owner-claim"),
+        (other_lease.lease_id, "owner-other"),
+    ):
+        database.execute(
+            "UPDATE worktree_leases SET state = 'reclaiming', "
+            "cleanup_owner = ?, cleanup_claimed_at = ?, updated_at = ? "
+            "WHERE lease_id = ?",
+            (owner, stamp, stamp, lease_id),
+        )
+    WorkClaims(database, events=events).open(
+        project_key="demo",
+        issue_id="issue-claim",
+        cell_id="cell-demo",
+        role="development",
+    )
+    # The newest live assignment for this exact cell/session names the
+    # OTHER issue and is NOT superseded -- a plain "latest assignment"
+    # read would release the wrong lane.
+    database.execute(
+        "INSERT INTO lead_assignments("
+        "assignment_id, schema_version, project_key, issue_id, cell_id, "
+        "session_id, profile_alias, instruction_id, queue_transition, "
+        "state, created_at, updated_at) VALUES ("
+        "'assign-1', 1, 'demo', 'issue-other', 'cell-demo', ?, 'max-a', "
+        "'instr-1', 'dispatch', 'published', ?, ?)",
+        (SESSION, stamp, stamp),
+    )
+
+    sweep = _dead_lead_sweep(database, bindings, FakePort(), leases=leases)
+    released = sweep._release_issue_lease("demo", "cell-demo", SESSION)
+
+    assert released == claimed_lease.lease_id
+    assert leases.get(claimed_lease.lease_id).state == "checkpointed"
+    assert leases.get(claimed_lease.lease_id).cleanup_owner is None
+    # The other lane's cleanup claim -- the one the assignment named --
+    # is left exactly as found.
+    assert leases.get(other_lease.lease_id).state == "reclaiming"
+    assert leases.get(other_lease.lease_id).cleanup_owner == "owner-other"
+
+
+def test_release_issue_lease_falls_back_to_the_assignment_when_no_claim_exists(
+    database: Database, bindings: CmuxSurfaceBindings
+) -> None:
+    """Pre-backfill safety: a cell with no work claim at all yet is
+    still resolved from its live ``lead_assignments`` row, exactly as
+    before INFRA-222."""
+
+    from hermes_orchestrator.worktrees import WorktreeLeaseInput, WorktreeLeases
+
+    seed_cell(database)
+    events = EventStore(database)
+    leases = WorktreeLeases(database, events)
+    lease = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="issue-assigned",
+            repo_path="/repos/demo",
+            path="/repos/demo/lane-assigned",
+            branch="feature/assigned",
+            remote="origin",
+        )
+    )
+    stamp = NOW.isoformat()
+    database.execute(
+        "UPDATE worktree_leases SET state = 'reclaiming', "
+        "cleanup_owner = 'owner-1', cleanup_claimed_at = ?, updated_at = ? "
+        "WHERE lease_id = ?",
+        (stamp, stamp, lease.lease_id),
+    )
+    database.execute(
+        "INSERT INTO lead_assignments("
+        "assignment_id, schema_version, project_key, issue_id, cell_id, "
+        "session_id, profile_alias, instruction_id, queue_transition, "
+        "state, created_at, updated_at) VALUES ("
+        "'assign-1', 1, 'demo', 'issue-assigned', 'cell-demo', ?, 'max-a', "
+        "'instr-1', 'dispatch', 'published', ?, ?)",
+        (SESSION, stamp, stamp),
+    )
+    assert database.scalar("SELECT count(*) FROM work_claims") == 0
+
+    sweep = _dead_lead_sweep(database, bindings, FakePort(), leases=leases)
+    released = sweep._release_issue_lease("demo", "cell-demo", SESSION)
+
+    assert released == lease.lease_id
+    assert leases.get(lease.lease_id).state == "checkpointed"
+
+
 # -- relaunched trusted seat restoration (INFRA-198) ---------------------
 
 

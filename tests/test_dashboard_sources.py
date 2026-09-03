@@ -13,6 +13,7 @@ from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.dashboard_sources import (
     BatchProvider,
     CapacityProvider,
+    ClaimFact,
     ClaudeUsageCacheProvider,
     CodexStatusProvider,
     ControlAttentionProvider,
@@ -376,6 +377,66 @@ def _insert_child(
         "INSERT INTO lead_children(session_id, child_id, state, started_at) "
         "VALUES (?, ?, ?, '2026-08-30T00:00:00+00:00')",
         (session_id, child_id, state),
+    )
+
+
+def _insert_claim(
+    connection,
+    *,
+    claim_id: str,
+    project_key: str,
+    issue_id: str,
+    cell_id: str,
+    role: str = "development",
+    child_lane: str = "",
+    state: str = "active",
+    opened_at: str = "2026-08-30T00:00:00+00:00",
+    updated_at: str = "2026-08-30T00:00:00+00:00",
+) -> None:
+    connection.execute(
+        "INSERT INTO work_claims("
+        "claim_id, project_key, issue_id, cell_id, role, child_lane, "
+        "state, opened_at, closed_at, closed_reason, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+        (
+            claim_id,
+            project_key,
+            issue_id,
+            cell_id,
+            role,
+            child_lane,
+            state,
+            opened_at,
+            updated_at,
+        ),
+    )
+
+
+def _insert_binding(
+    connection,
+    *,
+    binding_id: str,
+    cell_id: str,
+    session_id: str,
+    profile_alias: str,
+    generation: int = 1,
+    state: str = "active",
+    bound_at: str = "2026-08-30T00:00:00+00:00",
+) -> None:
+    connection.execute(
+        "INSERT INTO worker_bindings("
+        "binding_id, cell_id, generation, session_id, profile_alias, "
+        "cmux_surface_uuid, state, bound_at, retired_at, retired_reason"
+        ") VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL)",
+        (
+            binding_id,
+            cell_id,
+            generation,
+            session_id,
+            profile_alias,
+            state,
+            bound_at,
+        ),
     )
 
 
@@ -922,6 +983,266 @@ def test_lane_cells_reports_subagents_from_its_own_session_only(
     )
     harness = lanes["harness"]
     assert (harness.subagents_completed, harness.subagents_total) == (0, 0)
+    database.close()
+
+
+# ---------------------------------------------------------------------------
+# INFRA-222: work_claims/worker_bindings replace lead_assignments as the
+# primary ownership/identity source for LaneCellFact -- an issue whose
+# delivery packet was superseded must still be attributed to its owning
+# cell, and a database with no active claims at all must still render via
+# the original lead_assignments join.
+# ---------------------------------------------------------------------------
+
+
+def test_lane_cells_active_claim_survives_a_superseded_assignment(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-50",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-50",
+            project_key="proj",
+            issue_id="INFRA-50",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+            state="superseded",
+        )
+        _insert_claim(
+            connection,
+            claim_id="c-50",
+            project_key="proj",
+            issue_id="INFRA-50",
+            cell_id="cell-dev",
+            role="development",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    development = lanes["development"]
+    assert development.issue_ids == ("INFRA-50",)
+    assert development.claims == (
+        ClaimFact(
+            issue_id="INFRA-50",
+            role="development",
+            child_lane="",
+            opened_at="2026-08-30T00:00:00+00:00",
+        ),
+    )
+    assert lanes["harness"].issue_ids == ()
+    database.close()
+
+
+def test_lane_cells_development_and_harness_claims_on_one_issue_stay_separate(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-51",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_claim(
+            connection,
+            claim_id="c-51-dev",
+            project_key="proj",
+            issue_id="INFRA-51",
+            cell_id="cell-dev",
+            role="development",
+        )
+        _insert_claim(
+            connection,
+            claim_id="c-51-harness",
+            project_key="proj",
+            issue_id="INFRA-51",
+            cell_id="cell-harness",
+            role="harness",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    assert lanes["development"].issue_ids == ("INFRA-51",)
+    assert [claim.role for claim in lanes["development"].claims] == [
+        "development"
+    ]
+    assert lanes["harness"].issue_ids == ("INFRA-51",)
+    assert [claim.role for claim in lanes["harness"].claims] == ["harness"]
+    database.close()
+
+
+def test_lane_cells_falls_back_to_assignments_when_work_claims_is_empty(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-52",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-52",
+            project_key="proj",
+            issue_id="INFRA-52",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    development = lanes["development"]
+    assert development.issue_ids == ("INFRA-52",)
+    # No work_claims row exists for this cell, so the fact carries no
+    # ClaimFact entries even though issue_ids is populated via fallback.
+    assert development.claims == ()
+    database.close()
+
+
+def test_lane_cells_degrades_gracefully_when_work_claims_tables_are_missing(
+    tmp_path: Path,
+) -> None:
+    """A database opened before migration 0062 ran (the dashboard CLI's
+    mode=ro connection applies no migrations) must still render via
+    the pre-INFRA-222 lead_assignments join, not raise."""
+
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_issue(
+            connection,
+            issue_id="INFRA-54",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-54",
+            project_key="proj",
+            issue_id="INFRA-54",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+        )
+        connection.execute("DROP TABLE work_claims")
+        connection.execute("DROP TABLE worker_bindings")
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+    [task] = TaskProvider(database).tasks()
+
+    development = lanes["development"]
+    assert development.issue_ids == ("INFRA-54",)
+    assert development.claims == ()
+    assert development.binding_generation is None
+    assert development.binding_profile is None
+    assert task.lead_profile == "max-a"
+    database.close()
+
+
+def test_lane_cells_reports_active_worker_binding_generation_and_profile(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _lane_setup(connection)
+        _insert_binding(
+            connection,
+            binding_id="b-dev-1",
+            cell_id="cell-dev",
+            session_id="sess-dev-old",
+            profile_alias="max-a",
+            generation=1,
+            state="retired",
+        )
+        _insert_binding(
+            connection,
+            binding_id="b-dev-2",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+            profile_alias="max-a",
+            generation=2,
+        )
+
+    lanes = {lane.lane_role: lane for lane in TaskProvider(database).lane_cells()}
+
+    development = lanes["development"]
+    assert development.binding_generation == 2
+    assert development.binding_profile == "max-a"
+    harness = lanes["harness"]
+    assert harness.binding_generation is None
+    assert harness.binding_profile is None
+    database.close()
+
+
+def test_issue_leads_prefer_the_active_claim_over_a_superseded_assignment(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    with database.transaction() as connection:
+        _insert_issue(
+            connection,
+            issue_id="INFRA-53",
+            project_key="proj",
+            priority=1,
+            state="in_development",
+            updated_at="2026-08-30T10:00:00+00:00",
+        )
+        _insert_cell(
+            connection,
+            cell_id="cell-dev",
+            project_key="proj",
+            state="active",
+            profile_alias="max-b",
+            session_id="sess-dev",
+        )
+        _insert_assignment(
+            connection,
+            assignment_id="a-53",
+            project_key="proj",
+            issue_id="INFRA-53",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+            state="superseded",
+        )
+        _insert_claim(
+            connection,
+            claim_id="c-53",
+            project_key="proj",
+            issue_id="INFRA-53",
+            cell_id="cell-dev",
+            role="development",
+        )
+        _insert_binding(
+            connection,
+            binding_id="b-53",
+            cell_id="cell-dev",
+            session_id="sess-dev",
+            profile_alias="max-b",
+        )
+
+    [task] = TaskProvider(database).tasks()
+
+    assert task.lead_profile == "max-b"
     database.close()
 
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -32,7 +32,11 @@ from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
 from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER, RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
-from hermes_orchestrator.emission import wake_event_with_drift_hint
+from hermes_orchestrator.emission import (
+    LeaseWriterTransferPort,
+    resolve_lane,
+    wake_event_with_drift_hint,
+)
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.github import DiscoveredPull, GitHubError
 from hermes_orchestrator.manifests import (
@@ -400,6 +404,7 @@ class MergerTurnService:
         manifest_root: Path,
         now: Callable[[], datetime] | None = None,
         delivery: WakeDeliverer | None = None,
+        lease_transfer: LeaseWriterTransferPort | None = None,
     ) -> None:
         self._database = database
         self._window = window
@@ -419,6 +424,12 @@ class MergerTurnService:
         self._manifest_root = manifest_root
         self._now = now or (lambda: datetime.now(UTC))
         self._events = EventStore(self._database)
+        # INFRA-222: when wired, a settled REWORK_REQUIRED verdict
+        # returns the issue's worktree-lease writer from sol to fable,
+        # unchanged (the compare-and-swap's own unchanged-return rule).
+        # Optional so a caller that has not wired the lease-transfer port
+        # keeps today's behavior exactly.
+        self._lease_transfer = lease_transfer
 
     def outstanding_wake(self, project_key: str) -> tuple[WakeEvent, str] | None:
         """The project's admitted wake, else its oldest delivered wake.
@@ -1585,12 +1596,108 @@ class MergerTurnService:
                 "no submitted verdict for the outstanding wake; "
                 "observation never infers one from the thread",
             )
+        return await self._settle_and_release(
+            project, project_key, channel, event, state, submitted=submitted
+        )
+
+    async def _settle_and_release(
+        self,
+        project: ProjectConfig,
+        project_key: str,
+        channel: ReviewerChannel,
+        event: WakeEvent,
+        state: str,
+        *,
+        submitted: _Submission,
+    ) -> TurnOutcome:
+        """Settle the wake, then release the reviewer lease exactly once.
+
+        Shared by both entry points that finish a verdict's settlement --
+        the direct submission (``submit_review``) and turn-completed
+        recovery (``handle_turn`` resuming an already-submitted,
+        not-yet-settled row) -- so ``_record_settled``, the INFRA-222
+        rework writer-return, and ``release_next_candidate`` each run
+        exactly once, from whichever entry actually performs the
+        settlement.
+        """
+
         outcome = await self._settle_wake(
             project, project_key, channel, event, state, submitted=submitted
         )
         self._record_settled(event.event_id, outcome)
+        # INFRA-222: REWORK_REQUIRED makes no edits, and the worktree
+        # writer lease returns to fable unchanged -- the compare-and-swap
+        # itself enforces the unchanged-return rule (the observed HEAD
+        # must equal the sha already recorded on the lease). This runs
+        # strictly AFTER the verdict above is durably persisted and
+        # settled: a refusal here (a dirty tree, a writer already
+        # replaced, a stale generation) must never un-persist the
+        # verdict Sol already gave -- it is journaled and folded into
+        # this outcome's reason for the operator, never raised.
+        if outcome.kind == "corrections_required" and self._lease_transfer is not None:
+            note = self._return_writer_to_fable(
+                project_key, event.issue_id, event.candidate_sha
+            )
+            if note is not None:
+                outcome = replace(outcome, reason=f"{outcome.reason}; {note}")
+        # INFRA-221: the next queued candidate is released ONLY after this
+        # verdict's settlement durably succeeded — outputting the document
+        # is not completion, and a non-settling outcome keeps this
+        # candidate current so nothing is released here.
         await self.release_next_candidate(project_key)
         return outcome
+
+    def _return_writer_to_fable(
+        self, project_key: str, issue_id: str, candidate_sha: str
+    ) -> str | None:
+        """Best-effort sol -> fable writer return for a settled rework.
+
+        Resolves the issue's own live worktree lease (the same
+        ``resolve_lane`` boundary the emitter freezes against) and
+        transfers its writer back to fable, unchanged. Never raises:
+        any refusal is journaled as a ``worktree_lease.
+        writer_return_refused`` event and returned as a human-readable
+        note for the caller to fold into the settled ``TurnOutcome``,
+        so the operator sees it without the durably persisted verdict
+        ever being touched.
+        """
+
+        assert self._lease_transfer is not None
+        try:
+            lane = resolve_lane(self._lease_transfer, project_key, issue_id)
+            self._lease_transfer.transfer_writer(
+                lane.lease_id,
+                expected_writer_role="sol",
+                expected_writer_ref=None,
+                to_writer_role="fable",
+                to_writer_ref=None,
+                observed_head=candidate_sha,
+                tree_clean=True,
+            )
+        except Exception as error:
+            note = (
+                "worktree lease writer return to fable was refused for "
+                f"issue {issue_id!r}: {error}"
+            )
+            with self._database.transaction() as connection:
+                self._events.append(
+                    connection,
+                    EventInput(
+                        event_type="worktree_lease.writer_return_refused",
+                        aggregate_type="worktree_lease",
+                        aggregate_id=f"{project_key}:{issue_id}",
+                        correlation_id=candidate_sha,
+                        actor="merger_turns",
+                        payload={
+                            "project_key": project_key,
+                            "issue_id": issue_id,
+                            "candidate_sha": candidate_sha,
+                            "reason": str(error),
+                        },
+                    ),
+                )
+            return note
+        return None
 
     async def _settle_wake(
         self,
@@ -2231,16 +2338,9 @@ class MergerTurnService:
                 reviewed_generation=reviewed_generation,
                 verdict_json=persisted_verdict_json,
             )
-        outcome = await self._settle_wake(
+        return await self._settle_and_release(
             project, project_key, channel, event, state, submitted=submission
         )
-        self._record_settled(event_id, outcome)
-        # INFRA-221: the next queued candidate is released ONLY after this
-        # verdict's settlement durably succeeded — outputting the document
-        # is not completion, and a non-settling outcome keeps this
-        # candidate current so nothing is released here.
-        await self.release_next_candidate(project_key)
-        return outcome
 
     async def _resolve_duplicate(
         self,

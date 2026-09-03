@@ -318,6 +318,58 @@ def test_build_merge_flow_wires_a_durable_wake_reader_into_the_emitter(
     assert reader.exists("demo", "unknown-event") is False
 
 
+def test_build_merge_flow_wires_the_lease_transfer_port(tmp_path: Path) -> None:
+    """INFRA-222: the same durable ``WorktreeLeases`` store is wired into
+    BOTH the emitter (fable -> sol hand-over) and the turn service
+    (sol -> fable rework return), backed by the SAME database the flow
+    was built with -- not a fake, and not two independent stores that
+    could ever disagree."""
+
+    from hermes_orchestrator.worktrees import WorktreeLeaseInput, WorktreeLeases
+
+    repo_root, state_dir = _minimal_repo(tmp_path)
+    settings = load_settings(repo_root, state_dir)
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    database = Database.open(settings.state_dir / "state.db")
+    events = EventStore(database)
+    queue = QueueService(database, events, settings.projects)
+
+    flow = build_merge_flow(
+        settings,
+        database=database,
+        events=events,
+        queue=queue,
+        linear=_NullLinear(),
+        keychain=_FakeKeychain(),
+        base_env={},
+    )
+
+    emitter_leases = flow.emitter._lease_transfer
+    turns_leases = flow.turns._lease_transfer
+    assert emitter_leases is not None
+    assert turns_leases is not None
+    assert isinstance(emitter_leases, WorktreeLeases)
+    assert isinstance(turns_leases, WorktreeLeases)
+
+    # Both wired instances read and write the SAME durable table: a
+    # lease registered through one is visible, and transferable, through
+    # the other.
+    lease = emitter_leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="ENG-9",
+            repo_path=str(repo_root),
+            path=str(tmp_path / "lane-eng-9"),
+            branch="feature/eng-9",
+            remote="origin",
+        )
+    )
+    assert turns_leases.get(lease.lease_id).writer_role == "fable"
+
+    assert callable(flow.emitter._reviewer_ref)
+    assert flow.emitter._reviewer_ref("demo") is None
+
+
 @dataclass
 class FakeBranchHeadGit:
     """Recording fake standing in for GitVerifier's typed ``remote_head``.

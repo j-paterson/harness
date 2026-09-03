@@ -41,6 +41,7 @@ from hermes_orchestrator.cmux import (
 from hermes_orchestrator.control_operations import ControlOperations
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.events import EventInput, EventStore
+from hermes_orchestrator.work_claims import WorkClaims
 from hermes_orchestrator.worktrees import CleanupBlocked, WorktreeLeases
 
 CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID"
@@ -2153,19 +2154,34 @@ class CmuxDeadLeadSweep:
         released back to 'checkpointed' through the same
         ``release_cleanup`` transition the custodian's own failure paths
         use, under the owner token durably recorded on the row.
+
+        INFRA-222: the issue-lane whose claim is released is read from
+        the cell's own durable work claim first -- ``lead_assignments``
+        is a delivery ledger, and its newest row for this cell/session
+        may point at an issue this cell no longer owns (superseded, or
+        simply the newest of several packets) or, per-issue supersession
+        being what it is, may even point at the RIGHT issue for the
+        wrong reason. Only a cell with no work claim at all yet (a
+        pre-backfill row) falls back to that assignment read.
         """
 
         if self._leases is None:
             return None
-        row = self._database.execute(
-            "SELECT issue_id FROM lead_assignments "
-            "WHERE cell_id = ? AND session_id = ? AND state != 'superseded' "
-            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            (cell_id, session_id),
-        ).fetchone()
-        if row is None:
-            return None
-        issue_id = str(row["issue_id"])
+        claim = WorkClaims(self._database, events=self._events).current_for_cell(
+            cell_id
+        )
+        if claim is not None:
+            issue_id = claim.issue_id
+        else:
+            row = self._database.execute(
+                "SELECT issue_id FROM lead_assignments "
+                "WHERE cell_id = ? AND session_id = ? AND state != 'superseded' "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (cell_id, session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            issue_id = str(row["issue_id"])
         for lease in self._leases.active(project_key):
             if lease.issue_id != issue_id:
                 continue

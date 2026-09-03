@@ -47,6 +47,14 @@ _ISSUE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
 
 WIP_MESSAGE_TEMPLATE = "wip({issue}): checkpoint before resource cleanup"
 
+#: The exclusive-writer roles a worktree lease may carry (INFRA-222). The
+#: directory is an operational resource with exactly one writer at a
+#: time; the immutable review artifact is the recorded candidate SHA,
+#: not the directory. Enforced here rather than as a column CHECK
+#: because SQLite's ALTER TABLE ADD COLUMN cannot cheaply add a CHECK
+#: alongside a NOT NULL default across supported SQLite versions.
+WRITER_ROLES = frozenset({"fable", "sol"})
+
 
 class CleanupBlocked(RuntimeError):
     """A reclaim lacks its required safety evidence and changes nothing."""
@@ -252,6 +260,11 @@ class WorktreeLease:
     cleanup_claimed_at: str | None
     reclaimed_at: str | None
     acquired_at: str
+    writer_role: str
+    writer_ref: str | None
+    writer_generation: int
+    submitted_candidate_sha: str | None
+    transferred_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +601,195 @@ class WorktreeLeases:
                     payload={"owner": owner},
                 ),
             )
+
+    def writer_of(
+        self, issue_id: str
+    ) -> tuple[str, str | None, int] | None:
+        """The (writer_role, writer_ref, writer_generation) of the issue's
+        live lease, or ``None`` when it has no live lease.
+
+        "Live" here means 'active' or 'checkpointed' — the same states a
+        writer transfer may act on; a lease claimed for cleanup or
+        already reclaimed has no live writer to report.
+        """
+
+        row = self._database.execute(
+            "SELECT writer_role, writer_ref, writer_generation "
+            "FROM worktree_leases WHERE issue_id = ? "
+            "AND state IN ('active', 'checkpointed') "
+            "ORDER BY acquired_at DESC, rowid DESC LIMIT 1",
+            (issue_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row["writer_role"]),
+            row["writer_ref"],
+            int(row["writer_generation"]),
+        )
+
+    def transfer_writer_in(
+        self,
+        connection: sqlite3.Connection,
+        lease_id: str,
+        *,
+        expected_writer_role: str,
+        expected_writer_ref: str | None,
+        to_writer_role: str,
+        to_writer_ref: str | None,
+        observed_head: str,
+        tree_clean: bool,
+        submitted_candidate_sha: str | None = None,
+    ) -> WorktreeLease:
+        """Atomically move exclusive writer custody of one lease (INFRA-222).
+
+        A single compare-and-swap on ``(lease_id, writer_role,
+        writer_generation)`` moves the lease's writer role and bumps its
+        generation; a concurrent transfer racing on the same starting
+        generation loses. The row is otherwise never touched — the
+        recorded ``submitted_candidate_sha`` is the immutable review
+        artifact, not the directory, so a fable -> sol hand-over records
+        it and a sol -> fable return must reproduce it unchanged.
+
+        Every refusal raises ``CleanupBlocked`` and changes nothing:
+        the lease is not 'active' or 'checkpointed'; the current writer
+        role or ref does not match what the caller expected; the tree
+        is not clean; ``to_writer_role`` is not a recognized role or is
+        the lease's current role; a fable -> sol hand-over's observed
+        HEAD does not equal the candidate SHA being submitted; or a
+        sol -> fable return's observed HEAD does not equal the SHA
+        already recorded on the lease.
+        """
+
+        row = connection.execute(
+            "SELECT * FROM worktree_leases WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(lease_id)
+        lease = _row_to_lease(row)
+        if lease.state not in ("active", "checkpointed"):
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} is {lease.state}; a writer "
+                "transfer requires a live (active or checkpointed) lease"
+            )
+        if lease.writer_role != expected_writer_role:
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} writer is "
+                f"{lease.writer_role!r}, not the expected "
+                f"{expected_writer_role!r}"
+            )
+        if (
+            expected_writer_ref is not None
+            and lease.writer_ref != expected_writer_ref
+        ):
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} writer ref is "
+                f"{lease.writer_ref!r}, not the expected "
+                f"{expected_writer_ref!r}"
+            )
+        if not tree_clean:
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} has a dirty tree; a writer "
+                "transfer requires a clean tree"
+            )
+        if to_writer_role not in WRITER_ROLES:
+            raise CleanupBlocked(
+                f"{to_writer_role!r} is not a recognized writer role"
+            )
+        if to_writer_role == lease.writer_role:
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} is already writer role "
+                f"{to_writer_role!r}"
+            )
+        if to_writer_role == "sol":
+            if (
+                submitted_candidate_sha is None
+                or observed_head != submitted_candidate_sha
+            ):
+                raise CleanupBlocked(
+                    f"worktree lease {lease_id} hand-over to sol requires "
+                    "the observed HEAD to equal the submitted candidate sha"
+                )
+            next_candidate_sha = submitted_candidate_sha
+        else:
+            if observed_head != lease.submitted_candidate_sha:
+                raise CleanupBlocked(
+                    f"worktree lease {lease_id} return to fable requires "
+                    "the observed HEAD to equal the recorded submitted "
+                    "candidate sha, unchanged"
+                )
+            next_candidate_sha = lease.submitted_candidate_sha
+        stamp = self._now().isoformat()
+        cursor = connection.execute(
+            "UPDATE worktree_leases SET writer_role = ?, writer_ref = ?, "
+            "writer_generation = writer_generation + 1, "
+            "submitted_candidate_sha = ?, transferred_at = ?, "
+            "updated_at = ? "
+            "WHERE lease_id = ? AND writer_role = ? AND writer_generation = ?",
+            (
+                to_writer_role,
+                to_writer_ref,
+                next_candidate_sha,
+                stamp,
+                stamp,
+                lease_id,
+                lease.writer_role,
+                lease.writer_generation,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise CleanupBlocked(
+                f"worktree lease {lease_id} writer changed concurrently; "
+                "transfer refused"
+            )
+        self._events.append(
+            connection,
+            EventInput(
+                event_type="worktree.writer_transferred",
+                aggregate_type="worktree_lease",
+                aggregate_id=lease_id,
+                payload={
+                    "from_writer_role": lease.writer_role,
+                    "from_writer_ref": lease.writer_ref,
+                    "to_writer_role": to_writer_role,
+                    "to_writer_ref": to_writer_ref,
+                    "writer_generation": lease.writer_generation + 1,
+                    "submitted_candidate_sha": next_candidate_sha,
+                },
+            ),
+        )
+        refreshed = connection.execute(
+            "SELECT * FROM worktree_leases WHERE lease_id = ?", (lease_id,)
+        ).fetchone()
+        return _row_to_lease(refreshed)
+
+    def transfer_writer(
+        self,
+        lease_id: str,
+        *,
+        expected_writer_role: str,
+        expected_writer_ref: str | None,
+        to_writer_role: str,
+        to_writer_ref: str | None,
+        observed_head: str,
+        tree_clean: bool,
+        submitted_candidate_sha: str | None = None,
+    ) -> WorktreeLease:
+        """Transaction-wrapped ``transfer_writer_in`` for standalone callers."""
+
+        with self._database.transaction() as connection:
+            self.transfer_writer_in(
+                connection,
+                lease_id,
+                expected_writer_role=expected_writer_role,
+                expected_writer_ref=expected_writer_ref,
+                to_writer_role=to_writer_role,
+                to_writer_ref=to_writer_ref,
+                observed_head=observed_head,
+                tree_clean=tree_clean,
+                submitted_candidate_sha=submitted_candidate_sha,
+            )
+        return self.get(lease_id)
 
 
 class WorktreeCustodian:
@@ -1117,4 +1319,9 @@ def _row_to_lease(row: Any) -> WorktreeLease:
         cleanup_claimed_at=row["cleanup_claimed_at"],
         reclaimed_at=row["reclaimed_at"],
         acquired_at=str(row["acquired_at"]),
+        writer_role=str(row["writer_role"]),
+        writer_ref=row["writer_ref"],
+        writer_generation=int(row["writer_generation"]),
+        submitted_candidate_sha=row["submitted_candidate_sha"],
+        transferred_at=row["transferred_at"],
     )

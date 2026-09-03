@@ -63,6 +63,7 @@ from hermes_orchestrator.review_intake import (
 )
 from hermes_orchestrator.reviews import LinearProjector, ReviewService
 from hermes_orchestrator.settlement import MergeSettlements
+from hermes_orchestrator.worktrees import WorktreeLeases
 
 GITHUB_KEYCHAIN_SERVICE = "hermes-orchestrator-github"
 CIRCLECI_KEYCHAIN_SERVICE = "hermes-orchestrator-circleci"
@@ -255,6 +256,15 @@ def build_merge_flow(
     runner = git_runner if git_runner is not None else SubprocessGitRunner()
 
     merge_journal = MergeEffectJournal(database)
+    # INFRA-222: the same durable worktree-lease store the daemon's own
+    # ``WorktreeCustodian`` uses (``runtime.py``), constructed fresh here
+    # from the ``database``/``events`` this function already requires --
+    # the store is a stateless wrapper over those durable tables, so a
+    # second instance sharing the same handle costs nothing and needs no
+    # new constructor parameter. Wired into both the emitter (fable ->
+    # sol hand-over) and the turn service (sol -> fable rework return)
+    # below.
+    leases = WorktreeLeases(database, events)
     # INFRA-212: the GitHub and CircleCI clients are the graph's only
     # credentialed collaborators, and both are now composed at their
     # first point of use rather than here. The durable, local half of
@@ -432,6 +442,12 @@ def build_merge_flow(
         # reader so the stale-manifest gate L5 added actually binds in
         # production — see DatabaseDurableWakeReader above.
         durable_wake=DatabaseDurableWakeReader(database),
+        # INFRA-222: the fable -> sol writer hand-over, and the identity
+        # recorded on the lease for it -- the project's bound reviewer
+        # thread and generation, read from the same ``merger`` channel
+        # ``submit_review``/``_settle_wake`` validate against.
+        lease_transfer=leases,
+        reviewer_ref=lambda project_key: _reviewer_channel_ref(merger, project_key),
     )
     turns = MergerTurnService(
         database=database,
@@ -451,6 +467,9 @@ def build_merge_flow(
         # also adopts the versioned contract on an existing thread that
         # has not yet received it.
         delivery=contract_delivery,
+        # INFRA-222: the sol -> fable rework writer return, once a
+        # settled REWORK_REQUIRED verdict has been durably persisted.
+        lease_transfer=leases,
     )
     return MergeFlow(
         rpc=rpc,
@@ -467,6 +486,24 @@ def build_merge_flow(
         settlements=settlements,
         acceptance=acceptance,
     )
+
+
+def _reviewer_channel_ref(merger: CodexMerger, project_key: str) -> str | None:
+    """The project's bound Sol reviewer identity, for the lease's writer_ref.
+
+    INFRA-222: mirrors exactly the identity ``submit_review`` and
+    ``_settle_wake`` (``merger_turns.py``) validate a submission against
+    -- the project's live ``reviewer_channels`` thread and generation
+    (``CodexMerger.read_channel``) -- so the worktree lease's recorded
+    writer names the same channel binding the review itself is bound
+    to. Purely for operator visibility on the lease row; nothing reads
+    it back. ``None`` when no reviewer channel is bound yet.
+    """
+
+    channel = merger.read_channel(project_key)
+    if channel is None:
+        return None
+    return f"{channel.thread_id}:{channel.generation}"
 
 
 def _branch_head(settings: Settings, git: GitVerifier) -> Callable[[str, str], str]:

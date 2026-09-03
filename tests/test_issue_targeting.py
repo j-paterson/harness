@@ -24,6 +24,7 @@ from hermes_orchestrator.issue_targeting import (
     target_issue,
 )
 from hermes_orchestrator.lead_assignments import LeadAssignments
+from hermes_orchestrator.work_claims import WorkClaims
 
 NOW = datetime(2026, 8, 30, 12, tzinfo=UTC)
 CELL_ID = "cell-demo"
@@ -522,6 +523,42 @@ async def test_retry_after_recovery_activates_exactly_once(
     assert acknowledged_at is not None
     assert _assignment_count(database) == 1
     assert assignments.pending_for_session(SESSION_ID) == ()
+
+
+@pytest.mark.asyncio
+async def test_target_issue_then_ack_leaves_an_active_development_claim(
+    database: Database, assignments: LeadAssignments, events: EventStore
+) -> None:
+    """INFRA-222: the ``target-issue`` / ``target-issue-ack`` pair opens
+    (at publish) and confirms (at ACK) the SAME durable development
+    work claim -- separate from whatever state the delivery packet
+    itself ends up in."""
+
+    _seed_admitted(database, issue_id="INFRA-9")
+    _seed_cell(database)
+    assignment_id = _publish(database, assignments, events)
+
+    claims = WorkClaims(database, events=events)
+    published_claim = claims.current_for_cell(CELL_ID, role="development")
+    assert published_claim is not None
+    assert published_claim.issue_id == "INFRA-9"
+    assert published_claim.state == "active"
+
+    result = await acknowledge_target(
+        database,
+        events=events,
+        linear=_RecordingLinear(),
+        assignments=assignments,
+        assignment_id=assignment_id,
+        session_id=SESSION_ID,
+    )
+
+    assert result.activated is True
+    acknowledged_claim = claims.current_for_cell(CELL_ID, role="development")
+    assert acknowledged_claim is not None
+    assert acknowledged_claim.claim_id == published_claim.claim_id
+    assert acknowledged_claim.state == "active"
+    assert _assignment_row(database, assignment_id)[0] == "acknowledged"
 
 
 @pytest.mark.asyncio
@@ -1319,6 +1356,14 @@ def test_harness_lead_receives_one_admitted_followup_lane_preserving(
     assert str(row["session_id"]) == SESSION_ID
     assert str(row["profile_alias"]) == "max-harness"
     assert str(row["lane_role"]) == HARNESS_LANE
+    # INFRA-222: the follow-up's harness work claim opens in the same
+    # transaction as the packet publish and the issue's transition.
+    claim = WorkClaims(database, events=events).current_for_cell(
+        HARNESS_CELL_ID, role="harness"
+    )
+    assert claim is not None
+    assert claim.issue_id == "INFRA-205"
+    assert claim.state == "active"
 
 
 def test_second_followup_refused_while_one_is_live(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,14 +11,18 @@ import pytest
 
 from hermes_orchestrator.codex_queue import QueueDeliveryResult
 from hermes_orchestrator.config import ProjectConfig
+from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import (
     CandidateEmitter,
     EmissionBlocked,
+    ResolvedLane,
     wake_event_with_drift_hint,
 )
+from hermes_orchestrator.events import EventStore
 from hermes_orchestrator.git import GitResult
 from hermes_orchestrator.manifests import WakeEvent, read_manifest
 from hermes_orchestrator.review_drift import DriftVerdict
+from hermes_orchestrator.worktrees import WorktreeLeaseInput, WorktreeLeases
 
 HEAD = "1" * 40
 BASE = "4" * 40
@@ -439,7 +444,12 @@ class FakeLeases:
 
 
 def _lane_emitter(
-    tmp_path: Path, git: FakeGitRunner, lane_path: Path
+    tmp_path: Path,
+    git: FakeGitRunner,
+    lane_path: Path,
+    *,
+    lease_transfer: object | None = None,
+    reviewer_ref: Callable[[str], str | None] | None = None,
 ) -> tuple[CandidateEmitter, FakeDeliverer]:
     """An emitter whose project anchor is NOT the lane's own worktree."""
 
@@ -464,6 +474,8 @@ def _lane_emitter(
         manifest_root=root,
         delivery=deliverer,
         now=lambda: NOW,
+        lease_transfer=lease_transfer,  # type: ignore[arg-type]
+        reviewer_ref=reviewer_ref,
     )
     return emitter, deliverer
 
@@ -664,3 +676,187 @@ async def test_semantic_drift_delivers_the_plain_event(
         changed_paths=("src/app.py",),
     )
     assert wake_event_with_drift_hint(event, semantic) is event
+
+
+# --- INFRA-222: fable -> sol worktree-lease writer hand-over ----------------
+
+
+@pytest.fixture
+def leased_lane(tmp_path: Path) -> Iterator[tuple[WorktreeLeases, ResolvedLane]]:
+    """A real ``WorktreeLeases`` row for ENG-9, bound to a lane directory."""
+
+    database = Database.open(tmp_path / "leases.db")
+    leases = WorktreeLeases(database, EventStore(database))
+    lane_path = tmp_path / "lane-eng-9"
+    lane_path.mkdir()
+    lease = leases.register(
+        WorktreeLeaseInput(
+            project_key="demo",
+            issue_id="ENG-9",
+            repo_path=str(tmp_path),
+            path=str(lane_path),
+            branch="feature/eng-9",
+            remote="origin",
+        )
+    )
+    lane = ResolvedLane(
+        lease_id=lease.lease_id,
+        project_key="demo",
+        issue_id="ENG-9",
+        path=lane_path,
+        branch="feature/eng-9",
+        expected_head=None,
+    )
+    try:
+        yield leases, lane
+    finally:
+        database.close()
+
+
+def test_fresh_lease_starts_writer_fable(
+    leased_lane: tuple[WorktreeLeases, ResolvedLane],
+) -> None:
+    leases, lane = leased_lane
+    assert leases.get(lane.lease_id).writer_role == "fable"
+
+
+@pytest.mark.asyncio
+async def test_emit_transfers_writer_to_sol_bumping_generation(
+    tmp_path: Path, leased_lane: tuple[WorktreeLeases, ResolvedLane]
+) -> None:
+    leases, lane = leased_lane
+    git = clean_git()
+    emitter, deliverer = _lane_emitter(
+        tmp_path,
+        git,
+        lane.path,
+        lease_transfer=leases,
+        reviewer_ref=lambda project_key: "thr_sol:1",
+    )
+
+    result = await emitter.emit(
+        "demo",
+        "ENG-9",
+        verification=(("pytest", "ok"),),
+        resolved_lane=lane,
+    )
+
+    assert result.delivery.delivered is True
+    assert deliverer.events
+    updated = leases.get(lane.lease_id)
+    assert updated.writer_role == "sol"
+    assert updated.writer_ref == "thr_sol:1"
+    assert updated.writer_generation == 2
+    assert updated.submitted_candidate_sha == HEAD
+
+
+class RefusingLeaseTransfer:
+    """A lease-transfer port that always refuses the hand-over."""
+
+    def __init__(self) -> None:
+        self.transfer_calls: list[dict[str, object]] = []
+
+    def active(self, project_key: str | None = None) -> tuple[object, ...]:
+        return ()
+
+    def get(self, lease_id: str) -> object:
+        @dataclass
+        class Snapshot:
+            writer_role: str = "fable"
+            writer_ref: str | None = None
+            writer_generation: int = 1
+            submitted_candidate_sha: str | None = None
+
+        return Snapshot()
+
+    def transfer_writer(self, lease_id: str, **kwargs: object) -> object:
+        self.transfer_calls.append(kwargs)
+        raise RuntimeError("refused: dirty tree")
+
+
+@pytest.mark.asyncio
+async def test_refused_writer_transfer_blocks_emission_before_delivery(
+    tmp_path: Path, leased_lane: tuple[WorktreeLeases, ResolvedLane]
+) -> None:
+    leases, lane = leased_lane
+    git = clean_git()
+    refusing = RefusingLeaseTransfer()
+    emitter, deliverer = _lane_emitter(
+        tmp_path, git, lane.path, lease_transfer=refusing
+    )
+
+    with pytest.raises(EmissionBlocked, match="writer transfer to sol was refused"):
+        await emitter.emit(
+            "demo",
+            "ENG-9",
+            verification=(("pytest", "ok"),),
+            resolved_lane=lane,
+        )
+
+    assert deliverer.events == []
+    assert len(refusing.transfer_calls) == 1
+    # The lease actually bound to this issue was left completely
+    # untouched by the refusal -- no manifest-reuse side effect leaked
+    # a wake.
+    assert leases.get(lane.lease_id).writer_role == "fable"
+
+
+@pytest.mark.asyncio
+async def test_emitter_without_lease_transfer_port_leaves_writer_untouched(
+    tmp_path: Path, leased_lane: tuple[WorktreeLeases, ResolvedLane]
+) -> None:
+    leases, lane = leased_lane
+    git = clean_git()
+    emitter, _deliverer = _lane_emitter(tmp_path, git, lane.path)
+
+    result = await emitter.emit(
+        "demo",
+        "ENG-9",
+        verification=(("pytest", "ok"),),
+        resolved_lane=lane,
+    )
+
+    assert result.delivery.delivered is True
+    assert leases.get(lane.lease_id).writer_role == "fable"
+
+
+@pytest.mark.asyncio
+async def test_reemission_when_already_sol_owned_with_same_sha_is_a_noop(
+    tmp_path: Path, leased_lane: tuple[WorktreeLeases, ResolvedLane]
+) -> None:
+    leases, lane = leased_lane
+    git = clean_git()
+    emitter, deliverer = _lane_emitter(
+        tmp_path,
+        git,
+        lane.path,
+        lease_transfer=leases,
+        reviewer_ref=lambda project_key: "thr_sol:1",
+    )
+
+    first = await emitter.emit(
+        "demo",
+        "ENG-9",
+        verification=(("pytest", "ok"),),
+        resolved_lane=lane,
+    )
+    after_first = leases.get(lane.lease_id)
+    assert after_first.writer_role == "sol"
+    assert after_first.writer_generation == 2
+
+    second = await emitter.emit(
+        "demo",
+        "ENG-9",
+        verification=(("pytest", "ok"),),
+        resolved_lane=lane,
+    )
+    after_second = leases.get(lane.lease_id)
+
+    assert first.event.event_id == second.event.event_id
+    assert second.reused_manifest is True
+    # A no-op: still sol-owned, at the identical generation and sha --
+    # not refused, and not bumped again.
+    assert after_second.writer_role == "sol"
+    assert after_second.writer_generation == 2
+    assert after_second.submitted_candidate_sha == HEAD
+    assert len(deliverer.events) == 2
