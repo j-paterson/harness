@@ -1230,6 +1230,136 @@ class MergerTurnService:
             merge_sha=outcome.merge_sha,
         )
 
+    def _advance_wake_to_reviewer_fix_successor(
+        self,
+        project_key: str,
+        *,
+        outstanding: WakeEvent,
+        state: str,
+        successor_event_id: str,
+        issue_id: str,
+        final_sha: str,
+    ) -> WakeEvent | None:
+        """Advance the ONE outstanding wake to its reviewer-fix successor.
+
+        INFRA-194 (2026-09-03): Sol's bounded reviewer fix moves the
+        branch head from the submitted candidate to a final SHA and the
+        helper records that mapping durably in ``reviewer_fixes`` (state
+        ``recorded``, carrying the successor ``fable_rework_ready`` event
+        id and the manifest digest it published) -- but the outstanding
+        ``wake_deliveries`` row still names the original event, so a
+        submission against the successor was refused and one against
+        the original could no longer find a pull request at its head.
+        This proves the mapping from durable rows only: the recorded fix
+        must belong to this project and issue, name exactly the
+        outstanding wake's candidate as ``submitted_sha``, exactly the
+        submitted event as its successor and exactly the submitted SHA
+        as ``final_sha``; the successor manifest must exist under the
+        confined root with the recorded digest and agree on event,
+        candidate and issue. Then the exact outstanding row -- and only
+        it, keyed by its original event, candidate and state -- is
+        rewritten in place to the successor identity, keeping its
+        delivered/admitted state, thread, generation and claim, and one
+        ``wake_delivery.advanced`` event is journaled. Anything else
+        returns ``None`` and the caller refuses exactly as before; a
+        retry after the advance finds the successor outstanding
+        directly, so the operation is idempotent.
+        """
+
+        row = self._database.execute(
+            "SELECT fix_id, manifest_digest FROM reviewer_fixes "
+            "WHERE project_key = ? AND issue_id = ? AND event_id = ? "
+            "AND submitted_sha = ? AND final_sha = ? AND state = 'recorded'",
+            (
+                project_key,
+                issue_id,
+                successor_event_id,
+                outstanding.candidate_sha,
+                final_sha,
+            ),
+        ).fetchone()
+        if row is None or outstanding.issue_id != issue_id:
+            return None
+        path = self._manifest_root / f"{successor_event_id}.json"
+        try:
+            snapshot = read_manifest_snapshot(
+                path,
+                root=self._manifest_root,
+                expected_digest=str(row["manifest_digest"]),
+            )
+        except ManifestError as error:
+            raise SubmissionRejected(
+                f"reviewer-fix successor manifest is invalid: {error}"
+            ) from error
+        manifest = snapshot.manifest
+        if (
+            manifest.event_id != successor_event_id
+            or manifest.candidate_sha != final_sha
+            or manifest.base_sha != outstanding.base_sha
+            or issue_id not in manifest.linear_issues
+        ):
+            return None
+        identity = snapshot.identity
+        stamp = datetime.now(UTC).isoformat()
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE wake_deliveries SET event_id = ?, status = ?, "
+                "candidate_sha = ?, base_sha = ?, branch = ?, "
+                "manifest_path = ?, manifest_digest = ?, manifest_device = ?, "
+                "manifest_inode = ?, manifest_size = ?, manifest_mtime_ns = ?, "
+                "manifest_mode = ?, updated_at = ? "
+                "WHERE project_key = ? AND event_id = ? AND candidate_sha = ? "
+                "AND issue_id = ? AND state = ?",
+                (
+                    successor_event_id,
+                    manifest.status,
+                    final_sha,
+                    manifest.base_sha,
+                    manifest.branch,
+                    str(path),
+                    snapshot.digest,
+                    identity.device,
+                    identity.inode,
+                    identity.size,
+                    identity.mtime_ns,
+                    identity.mode,
+                    stamp,
+                    project_key,
+                    outstanding.event_id,
+                    outstanding.candidate_sha,
+                    issue_id,
+                    state,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            self._events.append(
+                connection,
+                EventInput(
+                    event_type="wake_delivery.advanced",
+                    aggregate_type="wake_delivery",
+                    aggregate_id=successor_event_id,
+                    payload={
+                        "project_key": project_key,
+                        "issue_id": issue_id,
+                        "original_event_id": outstanding.event_id,
+                        "original_candidate_sha": outstanding.candidate_sha,
+                        "candidate_sha": final_sha,
+                        "fix_id": str(row["fix_id"]),
+                        "reason": "reviewer-fix successor",
+                    },
+                ),
+            )
+        return WakeEvent(
+            status=manifest.status,
+            issue_id=outstanding.issue_id,
+            candidate_sha=final_sha,
+            base_sha=manifest.base_sha,
+            manifest_path=str(path),
+            event_id=successor_event_id,
+            manifest_digest=snapshot.digest,
+        )
+
     async def submit_review(
         self,
         project_key: str,
@@ -1325,9 +1455,25 @@ class MergerTurnService:
             )
         event, state = outstanding
         if event.event_id != event_id:
-            raise SubmissionRejected(
-                "submission event does not match the outstanding wake"
+            # INFRA-194 (2026-09-03): a reviewer-fix successor is proven
+            # lazily at this boundary -- the recorded ``reviewer_fixes``
+            # row must map the outstanding wake's exact candidate to the
+            # submitted event/final SHA -- and only then is that one wake
+            # advanced to the successor identity so the ordinary
+            # validation below continues against the final head.
+            advanced = self._advance_wake_to_reviewer_fix_successor(
+                project_key,
+                outstanding=event,
+                state=state,
+                successor_event_id=event_id,
+                issue_id=issue_id,
+                final_sha=candidate_sha,
             )
+            if advanced is None:
+                raise SubmissionRejected(
+                    "submission event does not match the outstanding wake"
+                )
+            event = advanced
         if event.issue_id != issue_id or event.candidate_sha != candidate_sha:
             raise SubmissionRejected(
                 "submission does not match the outstanding wake's issue "

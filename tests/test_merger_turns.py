@@ -2451,3 +2451,119 @@ async def test_reconciliation_never_derives_a_verdict_from_transcript_text(
     # Not one thread read: the transcript is never a verdict source.
     assert flow.rpc.methods == before
     assert "thread/read" not in flow.rpc.methods
+
+
+@pytest.mark.asyncio
+async def test_reviewer_fix_successor_submission_advances_the_outstanding_wake(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-194 (2026-09-03): Sol's bounded reviewer fix moved the branch
+    # head from the submitted candidate to a final SHA and recorded the
+    # successor event in reviewer_fixes, but the outstanding wake still
+    # named the original event, so neither event could be submitted.
+    # submit_review now proves the successor mapping lazily from the
+    # recorded row and advances that one wake before the normal
+    # validation; a submission that does not map is refused as before.
+    from hermes_orchestrator.manifests import (
+        MANIFEST_VERSION,
+        CandidateManifest,
+        manifest_digest_for,
+        manifest_document,
+        write_manifest,
+    )
+
+    await flow.merger.ensure_thread("demo")
+    branch = flow.stage("ENG-11", SHA_A, pr_number=16)
+    emitted = await flow.emitter.emit("demo", "ENG-11", verification=(("t", "ok"),))
+    original_id = emitted.event.event_id
+    successor_id = original_id.replace("fable_ready", "fable_rework_ready").replace(
+        SHA_A[:12], SHA_B[:12]
+    )
+    successor = CandidateManifest(
+        manifest_version=MANIFEST_VERSION,
+        event_id=successor_id,
+        status="FABLE_REWORK_READY",
+        candidate_sha=SHA_B,
+        base_sha=BASE,
+        branch=branch,
+        linear_issues=("ENG-11",),
+        changed_files=("src/app.py",),
+        verification=(("t", "ok"),),
+        blockers=(),
+        created_at=flow.clock.isoformat(),
+    )
+    write_manifest(flow.manifest_root, successor, head_sha=SHA_B)
+    with flow.database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO reviewer_fixes("
+            "fix_id, project_key, issue_id, submitted_sha, final_sha, branch, "
+            "expected_remote_sha, owner_token, lease_expires_at, event_id, "
+            "manifest_json, manifest_digest, message, files_json, changed_lines, "
+            "verification_json, state, created_at, updated_at) VALUES "
+            "('fix-eng-11', 'demo', 'ENG-11', ?, ?, ?, ?, 'sol', ?, ?, ?, ?, "
+            "'ACCEPT_WITH_REVIEWER_FIX: tidy', '[\"src/app.py\"]', 5, "
+            "'[[\"t\", \"ok\"]]', 'recorded', ?, ?)",
+            (
+                SHA_A,
+                SHA_B,
+                branch,
+                SHA_A,
+                flow.clock.isoformat(),
+                successor_id,
+                json.dumps(manifest_document(successor)),
+                manifest_digest_for(successor),
+                flow.clock.isoformat(),
+                flow.clock.isoformat(),
+            ),
+        )
+    before = flow.database.execute(
+        "SELECT state, thread_id, generation FROM wake_deliveries "
+        "WHERE event_id = ?",
+        (original_id,),
+    ).fetchone()
+
+    # A successor submission whose candidate is NOT the recorded final SHA
+    # maps to nothing and is refused exactly as before, with no advance.
+    with pytest.raises(SubmissionRejected, match="does not match the outstanding"):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                successor_id, "ENG-11", SHA_A, flow.verdict(SHA_A, branch, 16, defect=True)
+            ),
+        )
+    assert flow.database.scalar(
+        "SELECT count(*) FROM wake_deliveries WHERE event_id = ?", (original_id,)
+    ) == 1
+
+    document = flow.verdict(SHA_B, branch, 16, defect=True)
+    outcome = await flow.turns.submit_review(
+        "demo", **_submission(successor_id, "ENG-11", SHA_B, document)
+    )
+
+    assert outcome.kind == "corrections_required", outcome
+    assert outcome.event_id == successor_id
+    row = flow.database.execute(
+        "SELECT event_id, candidate_sha, status, thread_id, generation "
+        "FROM wake_deliveries WHERE issue_id = 'ENG-11'"
+    ).fetchall()
+    assert [(r["event_id"], r["candidate_sha"], r["status"]) for r in row] == [
+        (successor_id, SHA_B, "FABLE_REWORK_READY")
+    ]
+    assert (row[0]["thread_id"], row[0]["generation"]) == (
+        before["thread_id"],
+        before["generation"],
+    )
+    advanced = flow.database.execute(
+        "SELECT payload_json FROM events WHERE event_type = 'wake_delivery.advanced'"
+    ).fetchall()
+    assert len(advanced) == 1
+    assert json.loads(advanced[0]["payload_json"])["original_event_id"] == original_id
+    assert _submitted_rows(flow) == [(successor_id, "settled", document)]
+    # The original event can no longer be submitted: it names no wake.
+    with pytest.raises(SubmissionRejected):
+        await flow.turns.submit_review(
+            "demo",
+            **_submission(
+                original_id, "ENG-11", SHA_A, flow.verdict(SHA_A, branch, 16, defect=True)
+            ),
+        )
