@@ -1019,16 +1019,10 @@ def test_wake_to_stale_sol_generation_refuses_through_pair(
     assert live.sol_generation == 1
 
 
-def test_candidate_from_stale_fable_generation_refuses_through_pair(
+def test_candidate_admits_after_terminal_fable_cell_is_reconciled(
     merger: CodexMerger, database: Database, tmp_path: Path
 ) -> None:
-    """``WakeEvent``/``CandidateManifest`` carry no Fable cell identity
-    today, so admission resolves the pair through the Sol member alone
-    -- but a pair whose Fable member has drifted underneath it (a live
-    cell reconciliation observes disagrees with the one the ready team
-    is bound to) is marked ``uncertain`` and is therefore no longer
-    *ready* at all, so resolution still refuses fail-closed even though
-    the Sol identity itself never changed."""
+    """A terminal Fable member is replaced in the pair before intake."""
 
     stored_channel(database)
     seed_fable_cell(database, cell_id="cell-a")
@@ -1040,7 +1034,7 @@ def test_candidate_from_stale_fable_generation_refuses_through_pair(
             "UPDATE project_cells SET state = 'released' WHERE cell_id = 'cell-a'"
         )
     seed_fable_cell(database, cell_id="cell-b")
-    uncertain = teams.reconcile_existing(
+    recovered = teams.reconcile_existing(
         "demo",
         repo_path="/repo/demo",
         integration_branch="main",
@@ -1048,19 +1042,21 @@ def test_candidate_from_stale_fable_generation_refuses_through_pair(
         channel=None,
         channel_proven=False,
     )
-    assert uncertain is not None
-    assert uncertain.state == "uncertain"
+    assert recovered is not None
+    assert recovered.state == "ready"
+    assert recovered.generation == 2
+    assert recovered.fable_cell_id == "cell-b"
 
     event = delivered_event(merger, tmp_path)
 
-    with pytest.raises(CandidateRejected, match="pair"):
-        admission(merger, tmp_path, teams=teams).admit(
-            "demo", event, received_generation=1
-        )
+    admitted = admission(merger, tmp_path, teams=teams).admit(
+        "demo", event, received_generation=1
+    )
 
+    assert isinstance(admitted, AdmittedCandidate)
     assert database.scalar(
         "SELECT state FROM wake_deliveries WHERE event_id = 'evt-1'"
-    ) == "delivered"
+    ) == "admitted"
     live = teams.live_team("demo")
     assert live is not None
-    assert live.state == "uncertain"
+    assert live == recovered

@@ -404,19 +404,28 @@ class ProjectTeamService:
             integration_branch=integration_branch,
         )
         if team.state == "uncertain":
-            return team
+            if (
+                cell is None
+                or team.fable_cell_id == cell[0]
+                or team.reason
+                != self._fable_mismatch_reason(team.fable_cell_id, cell[0])
+                or not self._fable_replacement_is_unambiguous(team, cell)
+            ):
+                return team
+            team = self._rotate_fable_member(team, *cell)
         if cell is not None:
             cell_id, session_id, profile_alias = cell
             if team.fable_cell_id is not None and team.fable_cell_id != cell_id:
-                return self.mark_uncertain(
-                    project_key,
-                    expected_generation=team.generation,
-                    reason=(
-                        "reconciliation observed live fable cell "
-                        f"{cell_id!r} but the bound member is "
-                        f"{team.fable_cell_id!r}"
-                    ),
-                )
+                if self._fable_replacement_is_unambiguous(team, cell):
+                    team = self._rotate_fable_member(team, *cell)
+                else:
+                    return self.mark_uncertain(
+                        project_key,
+                        expected_generation=team.generation,
+                        reason=self._fable_mismatch_reason(
+                            team.fable_cell_id, cell_id
+                        ),
+                    )
             if team.fable_cell_id is None:
                 team = self.bind_fable(
                     project_key,
@@ -536,7 +545,18 @@ class ProjectTeamService:
         self._verify_fable_cell(
             project_key, cell_id, session_id=session_id, profile_alias=profile_alias
         )
-        new_generation = expected_generation + 1
+        return self._rotate_fable_member(
+            team, cell_id, session_id, profile_alias
+        )
+
+    def _rotate_fable_member(
+        self,
+        team: ProjectTeam,
+        cell_id: str,
+        session_id: str,
+        profile_alias: str,
+    ) -> ProjectTeam:
+        new_generation = team.generation + 1
         new_fable_generation = team.fable_generation + 1
         new_state = "ready" if team.sol_thread_id is not None else "fable_bound"
         stamp = self._now().isoformat()
@@ -551,7 +571,7 @@ class ProjectTeamService:
                 "updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    project_key,
+                    team.project_key,
                     new_generation,
                     new_state,
                     team.repo_path,
@@ -568,7 +588,42 @@ class ProjectTeamService:
                     stamp,
                 ),
             )
-        return self._team_at(project_key, new_generation)
+        return self._team_at(team.project_key, new_generation)
+
+    def _fable_replacement_is_unambiguous(
+        self,
+        team: ProjectTeam,
+        cell: tuple[str, str, str],
+    ) -> bool:
+        """True when a failed bound cell has exactly one live successor."""
+
+        cell_id, session_id, profile_alias = cell
+        self._verify_fable_cell(
+            team.project_key,
+            cell_id,
+            session_id=session_id,
+            profile_alias=profile_alias,
+        )
+        bound = self._database.execute(
+            "SELECT state FROM project_cells WHERE cell_id = ?",
+            (team.fable_cell_id,),
+        ).fetchone()
+        if bound is None or str(bound["state"]) in _LIVE_CELL_STATES:
+            return False
+        placeholders = ",".join("?" for _ in _LIVE_CELL_STATES)
+        rows = self._database.execute(
+            f"SELECT cell_id FROM project_cells WHERE project_key = ? "
+            f"AND lane_role = 'development' AND state IN ({placeholders})",
+            (team.project_key, *_LIVE_CELL_STATES),
+        ).fetchall()
+        return len(rows) == 1 and str(rows[0]["cell_id"]) == cell_id
+
+    @staticmethod
+    def _fable_mismatch_reason(bound_cell_id: str | None, live_cell_id: str) -> str:
+        return (
+            "reconciliation observed live fable cell "
+            f"{live_cell_id!r} but the bound member is {bound_cell_id!r}"
+        )
 
     def replace_sol(
         self,

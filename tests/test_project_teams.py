@@ -685,7 +685,7 @@ def test_reconcile_existing_is_idempotent_and_never_creates_second_row(
     assert database.scalar("SELECT COUNT(*) FROM project_teams") == 1
 
 
-def test_reconcile_existing_marks_mismatched_bound_member_uncertain(
+def test_reconcile_existing_rotates_terminal_bound_member_to_live_cell(
     teams: ProjectTeamService, database: Database
 ) -> None:
     ready = bind_ready(teams, database)
@@ -694,7 +694,12 @@ def test_reconcile_existing_marks_mismatched_bound_member_uncertain(
             "UPDATE project_cells SET state = 'released' WHERE cell_id = ?",
             ("cell-1",),
         )
-    seed_cell(database, cell_id="cell-2", project_key="demo")
+    seed_cell(
+        database,
+        cell_id="cell-2",
+        project_key="demo",
+        session_id="sess-fable-2",
+    )
 
     team = teams.reconcile_existing(
         "demo",
@@ -706,14 +711,95 @@ def test_reconcile_existing_marks_mismatched_bound_member_uncertain(
     )
 
     assert team is not None
-    assert team.state == "uncertain"
-    assert team.generation == ready.generation
-    assert team.fable_cell_id == "cell-1"
-    assert "cell-2" in (team.reason or "")
+    assert team.state == "ready"
+    assert team.generation == ready.generation + 1
+    assert team.fable_cell_id == "cell-2"
+    assert team.sol_thread_id == "thread-1"
 
     live = teams.live_team("demo")
     assert live is not None
-    assert live.state == "uncertain"
+    assert live == team
+
+
+def test_reconcile_existing_recovers_failed_bound_fable_to_sole_live_replacement(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET state = 'failed' WHERE cell_id = ?",
+            ("cell-1",),
+        )
+    seed_cell(
+        database,
+        cell_id="cell-2",
+        project_key="demo",
+        session_id="sess-fable-2",
+    )
+    teams.mark_uncertain(
+        "demo",
+        expected_generation=ready.generation,
+        reason=(
+            "reconciliation observed live fable cell 'cell-2' but the "
+            "bound member is 'cell-1'"
+        ),
+    )
+
+    recovered = teams.reconcile_existing(
+        "demo",
+        repo_path="/repo/demo",
+        integration_branch="main",
+        cell=("cell-2", "sess-fable-2", "max-c"),
+        channel=("thread-1", 1, SOL_MODEL, SOL_PROVIDER),
+        channel_proven=True,
+    )
+
+    assert recovered is not None
+    assert recovered.generation == ready.generation + 1
+    assert recovered.state == "ready"
+    assert recovered.fable_cell_id == "cell-2"
+    assert recovered.fable_session_id == "sess-fable-2"
+    assert recovered.fable_generation == ready.fable_generation + 1
+    assert recovered.sol_thread_id == ready.sol_thread_id
+    assert recovered.sol_generation == ready.sol_generation
+    old = database.execute(
+        "SELECT state FROM project_teams WHERE project_key = ? AND generation = ?",
+        ("demo", ready.generation),
+    ).fetchone()
+    assert str(old["state"]) == "superseded"
+
+
+def test_reconcile_existing_does_not_clear_unrelated_uncertainty(
+    teams: ProjectTeamService, database: Database
+) -> None:
+    ready = bind_ready(teams, database)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE project_cells SET state = 'failed' WHERE cell_id = ?",
+            ("cell-1",),
+        )
+    seed_cell(
+        database,
+        cell_id="cell-2",
+        project_key="demo",
+        session_id="sess-fable-2",
+    )
+    uncertain = teams.mark_uncertain(
+        "demo",
+        expected_generation=ready.generation,
+        reason="codex rpc outcome unknown",
+    )
+
+    unchanged = teams.reconcile_existing(
+        "demo",
+        repo_path="/repo/demo",
+        integration_branch="main",
+        cell=("cell-2", "sess-fable-2", "max-c"),
+        channel=("thread-1", 1, SOL_MODEL, SOL_PROVIDER),
+        channel_proven=True,
+    )
+
+    assert unchanged == uncertain
 
 
 def test_reconcile_existing_returns_none_when_no_members(
