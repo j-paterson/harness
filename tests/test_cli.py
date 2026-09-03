@@ -481,6 +481,58 @@ def test_queue_complete_reconciles_externally_completed_issue(
     assert json.loads(status.stdout)["queue_count"] == 0
 
 
+def test_status_json_lists_classified_retired_cmux_surfaces(
+    configured_repo: tuple[Path, Path],
+) -> None:
+    """INFRA-233: status classifies retired managed cmux surfaces from
+    durable rows alone -- an empty list with no cmux state, and the
+    seeded residual row once one exists -- without ever opening cmux."""
+
+    from hermes_orchestrator.cmux import CmuxSurfaceRef
+    from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
+    from hermes_orchestrator.db import Database
+    from hermes_orchestrator.events import EventStore
+
+    empty = invoke([*base_arguments(configured_repo), "status", "--json"])
+    assert empty.exit_code == 0
+    assert json.loads(empty.stdout)["cmux_retired_surfaces"] == []
+
+    _repo_root, state_dir = configured_repo
+    database = Database.open(state_dir / "state.db")
+    try:
+        bindings = CmuxSurfaceBindings(
+            database=database, events=EventStore(database)
+        )
+        residual = bindings.record_residual(
+            project_key="demo",
+            cell_id="cell-demo",
+            session_id="99999999-9999-4999-8999-999999999999",
+            profile_alias="max-a",
+            ref=CmuxSurfaceRef(
+                workspace_uuid="33333333-3333-4333-8333-333333333333",
+                surface_uuid="33333333-3333-4333-8333-444444444444",
+            ),
+            reason="session_rotated_close_uncertain",
+        )
+    finally:
+        database.close()
+
+    seeded = invoke([*base_arguments(configured_repo), "status", "--json"])
+    assert seeded.exit_code == 0
+    surfaces = json.loads(seeded.stdout)["cmux_retired_surfaces"]
+    assert surfaces == [
+        {
+            "binding_id": residual.binding_id,
+            "cell_id": "cell-demo",
+            "project_key": "demo",
+            "workspace_uuid": "33333333-3333-4333-8333-333333333333",
+            "state": "residual",
+            "reason": "session_rotated_close_uncertain",
+            "updated_at": residual.updated_at,
+        }
+    ]
+
+
 def test_daemon_once_reconciles_and_samples(
     configured_repo: tuple[Path, Path],
 ) -> None:
