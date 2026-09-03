@@ -971,15 +971,26 @@ async def test_request_before_start_is_unavailable(
         await client.request("thread/read", {"threadId": "a"}, 5)
 
 
-def test_app_server_command_defaults_to_the_installed_absolute_binary() -> None:
-    command = app_server_command()
-
-    assert command == [
+def test_app_server_command_attaches_through_the_app_control_socket_proxy() -> None:
+    # INFRA-223 (2026-09-03): a spawned ``app-server --listen stdio://``
+    # owned the exact queued turn it started and interrupted it on exit
+    # (turn 01a0655d…, 348 ms). Every bounded client now relays through
+    # the Codex app's existing control socket, so the app stays the sole
+    # owner of the thread and its turns; an exact socket may be pinned.
+    assert app_server_command() == [
         "/Applications/Codex.app/Contents/Resources/codex",
         "app-server",
-        "--listen",
-        "stdio://",
+        "proxy",
     ]
+    assert app_server_command(socket_path="/tmp/codex/app-server.sock") == [
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "app-server",
+        "proxy",
+        "--sock",
+        "/tmp/codex/app-server.sock",
+    ]
+    with pytest.raises(ValueError, match="absolute"):
+        app_server_command(socket_path="relative.sock")
 
 
 def test_app_server_command_refuses_path_dependent_executables() -> None:
