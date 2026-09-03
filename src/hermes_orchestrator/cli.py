@@ -4153,10 +4153,21 @@ def _worktree_state(path: Path) -> WorktreeState:
     head = _run(["rev-parse", "HEAD"]) or ""
     origin_head = (_run(["rev-parse", f"origin/{branch}"]) or "") if branch else ""
     if not branch and head:
-        remote_heads = _run(
-            ["for-each-ref", "--format=%(objectname)", "refs/remotes/origin"]
+        remote_refs = _run(
+            [
+                "for-each-ref",
+                "--format=%(refname:strip=3) %(objectname)",
+                "refs/remotes/origin",
+            ]
         )
-        if remote_heads is not None and head in remote_heads.splitlines():
+        exact_branches = []
+        for line in (remote_refs or "").splitlines():
+            name, _, sha = line.partition(" ")
+            if name != "HEAD" and sha == head:
+                exact_branches.append(name)
+        exact_branches.sort()
+        if exact_branches:
+            branch = exact_branches[0]
             origin_head = head
     head_is_integration_ancestor = bool(head) and (
         _run(["merge-base", "--is-ancestor", head, "origin/HEAD"]) is not None
@@ -5089,28 +5100,11 @@ def _submit_handoff(
             ),
             "unknown",
         )
-    elif len(issue_rows) > 1:
-        # No seat-scoped assignment AND a genuinely ambiguous project:
-        # the old project-wide derivation would silently emit issue
-        # "none" against the coordinator's tree. Refuse instead.
-        named = ", ".join(str(row["issue_id"]) for row in issue_rows)
-        message = (
-            f"handoff refused: cell {args.cell!r} has no live lead "
-            f"assignment and project {project_key!r} has "
-            f"{len(issue_rows)} active issues ({named}), so the handoff's "
-            "issue and branch cannot be derived; assign the cell its issue "
-            "before submitting"
-        )
-        _print(
-            {"error": message},
-            json_output=args.json,
-            human=f"{message}.",
-        )
-        return 1
     else:
-        # Preserved fallback: an unassigned cell in a project with at
-        # most one active issue behaves exactly as it did before, down
-        # to the coordinator worktree probe.
+        # A project coordinator owns its checkout, not any one of the
+        # issue lanes it coordinates. Preserve the single-issue fallback
+        # for compatibility; with several lanes, represent the project
+        # explicitly instead of guessing an issue.
         probe_path = project.lead_cwd
         worktree = _worktree_state(probe_path)
         issue_id, issue_state = (
