@@ -2674,7 +2674,17 @@ def _hermes_handlers(
         # fails closed exactly as before.
 
         async def _retry_bounded() -> tuple[Any, ...]:
-            started = await _start_merge_flow(flow, [project_key])
+            # Owner path present: the desktop owns the thread and proves
+            # eligibility over its IPC socket; no stdio App Server is
+            # started here (it could not see, and must never load, the
+            # desktop-owned thread).
+            owner_path = (
+                getattr(getattr(flow, "delivery", None), "_owner_start", None)
+                is not None
+            )
+            started = False if owner_path else await _start_merge_flow(
+                flow, [project_key]
+            )
             try:
                 return tuple(
                     await flow.turns.retry_stalled_wakes_for_issue(

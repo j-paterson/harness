@@ -3178,3 +3178,54 @@ async def test_retry_refuses_before_starting_a_turn_without_a_desktop_owned_endp
         "AND correlation_id = ?",
         (event_id,),
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_owner_path_proves_legacy_eligibility_without_any_app_server(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 (operator direction 2026-09-03): with the desktop owner
+    # adapter present, a legacy delivered wake is recovered when a desktop
+    # window owns the thread -- proven over the IPC socket -- and the turn
+    # is started by that owner; no thread/read or thread/resume happens.
+    from hermes_orchestrator.codex_desktop_ipc import OwnerStartOutcome
+
+    class _Owner:
+        def __init__(self, owner: str | None) -> None:
+            self.owner = owner
+            self.starts: list[tuple[str, str]] = []
+
+        async def discover_owner(self, thread_id: str) -> str | None:
+            return self.owner
+
+        async def start(self, thread_id: str, message: str, *, cwd: str | None = None):
+            self.starts.append((thread_id, message))
+            return OwnerStartOutcome(True, self.owner, "owner_started")
+
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-18", SHA_A, pr_number=23)
+    emitted = await flow.emitter.emit("demo", "ENG-18", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    assert _wake_states(flow)[event_id] == "delivered"
+    reads_before = flow.rpc.methods.count("thread/read")
+    queue_starts_before = [m for m, _ in flow.queue_rpc.requests].count(
+        "thread/queue/start"
+    )
+
+    flow.delivery._owner_start = _Owner(owner=None)
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert _wake_states(flow)[event_id] == "delivered"
+
+    owner = _Owner(owner="window-1")
+    flow.delivery._owner_start = owner
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18")
+
+    assert [(r.retried, r.delivered, r.reason) for r in results] == [
+        (True, True, "owner_started")
+    ]
+    assert owner.starts == [("thr_legacy", emitted.event.render(1))]
+    assert flow.rpc.methods.count("thread/read") == reads_before
+    assert [m for m, _ in flow.queue_rpc.requests].count(
+        "thread/queue/start"
+    ) == queue_starts_before
+    assert _wake_states(flow)[event_id] == "delivered"

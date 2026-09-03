@@ -262,6 +262,23 @@ class OwnerTurnStarter:
         self._register_owner = register_owner or open_thread_in_desktop
         self._owner_wait_seconds = owner_wait_seconds
 
+    async def discover_owner(self, thread_id: str) -> str | None:
+        """The desktop window owning ``thread_id`` (registering it in the
+        background first when needed), or None -- one bounded connection,
+        no App Server, no turn."""
+
+        client = self._client_factory()
+        try:
+            await client.connect()
+            owner = await client.discover_owner(thread_id, host_id=self._host_id)
+            if owner is None:
+                owner = await self._register_and_rediscover(client, thread_id)
+            return owner
+        except DesktopIpcUnavailable:
+            return None
+        finally:
+            await client.close()
+
     async def start(
         self, thread_id: str, message: str, *, cwd: str | None = None
     ) -> OwnerStartOutcome:

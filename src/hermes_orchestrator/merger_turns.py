@@ -1361,6 +1361,21 @@ class MergerTurnService:
             generation=channel.generation,
         ):
             return None
+        owner_start = getattr(self._delivery, "_owner_start", None)
+        discover = getattr(owner_start, "discover_owner", None)
+        if callable(discover):
+            # Owner path (INFRA-223, operator direction 2026-09-03): the
+            # Codex desktop owns the thread. Its owning window is proven
+            # through owner discovery over the desktop IPC socket -- no
+            # stdio App Server is spawned or asked to load the thread --
+            # and an owner-routed start never interrupts a running turn
+            # (the desktop queues it), so the legacy wake is eligible
+            # exactly when a desktop owner exists and no verdict does.
+            try:
+                owner = await discover(channel.thread_id)
+            except Exception:
+                return None
+            return None if owner is None else (event, state, channel)
         try:
             status = await self._merger.thread_status(channel.thread_id)
             if status == "notLoaded":
