@@ -2578,7 +2578,7 @@ def test_worktree_state_recognizes_only_an_exact_detached_remote_head(
 
     pushed = _worktree_state(repository)
 
-    assert pushed.branch == ""
+    assert pushed.branch == "main"
     assert pushed.origin_head == pushed.head
     assert pushed.dirty is False
 
@@ -7257,13 +7257,12 @@ def test_submit_handoff_prefers_the_newest_assignment_for_the_same_seat(
     assert "issue INFRA-215 is in_development" in document["status"]
 
 
-def test_submit_handoff_refuses_a_cell_and_session_no_assignment_names(
+def test_submit_handoff_uses_coordinator_checkout_without_an_exact_assignment(
     configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Dropping the state filter widens nothing beyond the exact bound
-    identity: an assignment naming a different cell, and one naming this
-    cell under a stale session, both leave the seat underivable and the
-    ambiguous project still refuses with the actionable message."""
+    """Assignments for another cell or stale session do not turn a project
+    coordinator into an issue worker. Its handoff uses its own checkout and
+    represents the project rather than guessing among active issue lanes."""
 
     from hermes_orchestrator.db import Database
 
@@ -7285,52 +7284,28 @@ def test_submit_handoff_refuses_a_cell_and_session_no_assignment_names(
         session_id="77777777-7777-4777-8777-777777777777",
     )
     _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
-    _install_detached_coordinator_probe(monkeypatch, {})
+    _install_detached_coordinator_probe(
+        monkeypatch, {repo_root: "feature/coordinator-checkpoint"}
+    )
 
     result = _submit_handoff_for_demo_cell(configured_repo)
 
-    assert result.exit_code == 1
-    message = json.loads(result.stdout)["error"]
-    assert "no live lead assignment" in message
-    assert "2 active issues (INFRA-212, INFRA-215)" in message
-    assert "assign the cell its issue" in message
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
     database = Database.open(state_dir / "state.db")
     try:
-        assert database.scalar("SELECT count(*) FROM handoffs") == 1
+        document = json.loads(
+            str(
+                database.scalar(
+                    "SELECT document_json FROM handoffs WHERE handoff_id = ?",
+                    (payload["handoff_id"],),
+                )
+            )
+        )
     finally:
         database.close()
-
-
-def test_submit_handoff_refuses_an_unassigned_cell_in_an_ambiguous_project(
-    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No live assignment binds the cell and the project has several
-    active issues: the handoff's identity is underivable, so the command
-    refuses with an actionable message and writes nothing."""
-
-    from hermes_orchestrator.db import Database
-
-    repo_root, state_dir = configured_repo
-    _write_cmux_config(repo_root)
-    _write_profiles_config(repo_root)
-    _seed_rotation_cell_state(state_dir)
-    _seed_admitted_issues(state_dir, "INFRA-212", "INFRA-215")
-    _install_rotation_process_and_probe_fakes(monkeypatch, state_dir)
-    _install_detached_coordinator_probe(monkeypatch, {})
-
-    result = _submit_handoff_for_demo_cell(configured_repo)
-
-    assert result.exit_code == 1
-    message = json.loads(result.stdout)["error"]
-    assert "no live lead assignment" in message
-    assert "2 active issues (INFRA-212, INFRA-215)" in message
-    assert "assign the cell its issue" in message
-    database = Database.open(state_dir / "state.db")
-    try:
-        # Only the handoff seeded by the incumbent state exists.
-        assert database.scalar("SELECT count(*) FROM handoffs") == 1
-    finally:
-        database.close()
+    assert document["branch"] == "feature/coordinator-checkpoint"
+    assert "issue none" in document["objective"]
 
 
 def test_submit_handoff_refuses_when_the_assigned_issue_has_no_one_lease(
