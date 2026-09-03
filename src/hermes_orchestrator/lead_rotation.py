@@ -786,23 +786,9 @@ class LeadRotation:
         if claim_token is not None:
             # Renewal at the phase transition: entering the seat phase.
             self._renew(cell_id, handoff_id, claim_token, phase="seat")
-        # A durable read, not an in-memory flag: an active binding
-        # already owned by the replacement session means a prior run (or
-        # this one, replayed) already completed the seat phase, and no
-        # further activation is attempted.
-        existing_binding = self._bindings.active_lead(cell_id)
-        if (
-            existing_binding is not None
-            and existing_binding.session_id == replacement_session
-        ):
-            return await self._completion_report(
-                cell_id=cell_id,
-                handoff_id=handoff_id,
-                replacement_session=replacement_session,
-                profile_alias=profile_alias,
-                binding_id=existing_binding.binding_id,
-                claim_token=claim_token,
-            )
+        # CmuxLeadSeater is the idempotent seat owner. Always pass recovery
+        # through it: it reuses an existing binding and, while the channel is
+        # still unregistered, retries the bounded trust confirmation.
         classic_command = classic_resume_command(replacement_session, resume=True)
         try:
             binding = await self._seater.ensure(
