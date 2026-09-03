@@ -345,29 +345,41 @@ def _channel_entry_appears_once(argv: Sequence[str]) -> bool:
 
 
 _RUNTIME_PROMPT_PATH = re.compile(
-    r"^(.+/runtimes/)[0-9a-f]{40}(/prompts/claude-lead\.md)$"
+    r"^(.+/runtimes/)([0-9a-f]{40})(/prompts/claude-lead\.md)$"
 )
 
 
 def _same_runtime_prompt(live_token: str, template_token: str) -> bool:
-    """Allow only an immutable runtime-generation swap for the same
-    byte-identical Claude lead prompt."""
+    """Allow the managed lead prompt to follow the activated runtime.
+
+    The approval is for the development-channel plugin, not for Fable's
+    system prompt. Both argv slots must still be canonical immutable-runtime
+    ``claude-lead.md`` paths under the same local runtime root.
+    """
 
     live_match = _RUNTIME_PROMPT_PATH.fullmatch(live_token)
     template_match = _RUNTIME_PROMPT_PATH.fullmatch(template_token)
     if (
         live_match is None
         or template_match is None
-        or live_match.groups() != template_match.groups()
+        or live_match.group(1) != template_match.group(1)
+        or live_match.group(3) != template_match.group(3)
     ):
         return False
     live = Path(live_token)
     template = Path(template_token)
     try:
+        active = Path(
+            (Path(live_match.group(1)) / "ACTIVE")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
         return (
             live.resolve() == live
             and template.resolve() == template
-            and live.read_bytes() == template.read_bytes()
+            and live.is_file()
+            and template.is_file()
+            and active.resolve() == active == live.parents[1]
         )
     except OSError:
         return False
@@ -400,8 +412,7 @@ def _argv_matches_template(
       refuses, and the UUID slot itself is still checked against
       ``session_id`` on the next token.
     * the immutable runtime generation in the ``claude-lead.md`` path,
-      only when both paths share the same runtime root and the prompt
-      bytes are identical.
+      when both paths are canonical and share the same runtime root.
 
     Every other difference — token count, order, any other flag,
     value, or path — refuses.
@@ -675,7 +686,7 @@ class ChannelTrustAnchors:
         (Sol correction f7f6471c): ``launch_argv_template`` — the
         replacement seat's live argv — must match the predecessor's
         trusted template under the gate's bounded identity substitutions
-        plus a byte-identical prompt path in a new immutable runtime.
+        plus the managed lead-prompt path in a new immutable runtime.
         The successor persists the PREDECESSOR's template verbatim, so
         the trusted launch baseline never drifts across any number of
         rotations; any other argv difference is refused with zero
@@ -759,8 +770,8 @@ class ChannelTrustAnchors:
             raise TrustRefused(
                 "the replacement launch argv does not match the retiring "
                 f"anchor {predecessor.anchor_id!r}'s trusted launch "
-                "template (only session identity or a byte-identical "
-                "prompt in a new immutable runtime may differ); this is a "
+                "template (only session identity or the managed prompt's "
+                "immutable runtime generation may differ); this is a "
                 "new trust decision, not a rotation carry-forward"
             )
 
@@ -917,7 +928,7 @@ class ChannelTrustAnchors:
         predecessor's exactly; the new seat's ``launch_argv_template``
         must match the predecessor's trusted template token for token
         except at the gate's bounded session substitutions or a
-        byte-identical prompt in a new immutable runtime; and
+        managed prompt in a new immutable runtime; and
         ``profile_alias`` must equal the predecessor's or be
         provably Hermes's own durable selection for this exact seat via
         :meth:`_selected_replacement`. Any difference is a genuinely new
@@ -1003,8 +1014,8 @@ class ChannelTrustAnchors:
             raise TrustRefused(
                 "the adopting launch argv does not match the proven "
                 f"anchor {predecessor.anchor_id!r}'s trusted launch "
-                "template (only session identity or a byte-identical "
-                "prompt in a new immutable runtime may differ); this is a "
+                "template (only session identity or the managed prompt's "
+                "immutable runtime generation may differ); this is a "
                 "new trust decision, not an adoption of proven trust"
             )
 
