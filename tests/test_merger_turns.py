@@ -3139,3 +3139,112 @@ async def test_issue_scoped_retry_recovers_a_pre_fix_false_success(
         (event_id, True, True)
     ]
     assert flow.database.scalar("SELECT count(*) FROM submitted_verdicts") == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_refuses_before_starting_a_turn_without_a_desktop_owned_endpoint(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol correction 9112146a: without a live desktop-owned control
+    # endpoint the ownership-sensitive retry refuses BEFORE any CAS or
+    # delivery, names the exact missing adapter, and never selects the
+    # interrupting stdio launch. The stalled wake stays exactly as it is.
+    from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER
+
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-17", SHA_A, pr_number=22)
+    emitted = await flow.emitter.emit("demo", "ENG-17", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    await flow.turns.on_notification(
+        RpcNotification(
+            method="turn/completed",
+            params={"threadId": "thr_legacy", "turnId": "turn-1"},
+        )
+    )
+    assert _wake_states(flow)[event_id] == "stalled"
+    queued_before = len(flow.processes.messages())
+    flow.delivery._rpc_factory = None
+    assert flow.delivery.owner_endpoint_available is False
+
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-17")
+
+    assert [(r.retried, r.delivered, r.reason) for r in results] == [
+        (False, False, f"blocked: {MISSING_OWNER_ADAPTER}")
+    ]
+    assert _wake_states(flow)[event_id] == "stalled"
+    assert len(flow.processes.messages()) == queued_before
+    assert flow.database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'merger.turn_retry_requested' "
+        "AND correlation_id = ?",
+        (event_id,),
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_owner_path_proves_legacy_eligibility_without_any_app_server(
+    flow: ProductionShapedFlow,
+) -> None:
+    # INFRA-223 (operator direction 2026-09-03): with the desktop owner
+    # adapter present, a legacy delivered wake is recovered when a desktop
+    # window owns the thread -- proven over the IPC socket -- and the turn
+    # is started by that owner; no thread/read or thread/resume happens.
+    from hermes_orchestrator.codex_desktop_ipc import OwnerStartOutcome, ThreadActivity
+
+    class _Owner:
+        def __init__(self, owner: str | None, active: bool | None = False) -> None:
+            self.owner = owner
+            self.active = active
+            self.starts: list[tuple[str, str]] = []
+
+        async def thread_activity(self, thread_id: str) -> ThreadActivity:
+            return ThreadActivity(owner_client_id=self.owner, active=self.active)
+
+        async def discover_owner(self, thread_id: str) -> str | None:
+            return self.owner
+
+        async def start(self, thread_id: str, message: str, *, cwd: str | None = None):
+            self.starts.append((thread_id, message))
+            return OwnerStartOutcome(True, self.owner, "owner_started")
+
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-18", SHA_A, pr_number=23)
+    emitted = await flow.emitter.emit("demo", "ENG-18", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    assert _wake_states(flow)[event_id] == "delivered"
+    reads_before = flow.rpc.methods.count("thread/read")
+    queue_starts_before = [m for m, _ in flow.queue_rpc.requests].count(
+        "thread/queue/start"
+    )
+
+    flow.delivery._owner_start = _Owner(owner=None)
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert _wake_states(flow)[event_id] == "delivered"
+    # Sol 32f98837: the exact owned turn is ACTIVE -> untouched, no start.
+    running = _Owner(owner="window-1", active=True)
+    flow.delivery._owner_start = running
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert running.starts == []
+    assert _wake_states(flow)[event_id] == "delivered"
+    # No authoritative snapshot -> fail closed, no start.
+    unknown = _Owner(owner="window-1", active=None)
+    flow.delivery._owner_start = unknown
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert unknown.starts == []
+
+    owner = _Owner(owner="window-1", active=False)
+    flow.delivery._owner_start = owner
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18")
+
+    assert [(r.retried, r.delivered, r.reason) for r in results] == [
+        (True, True, "owner_started")
+    ]
+    assert owner.starts == [("thr_legacy", emitted.event.render(1))]
+    assert flow.rpc.methods.count("thread/read") == reads_before
+    assert [m for m, _ in flow.queue_rpc.requests].count(
+        "thread/queue/start"
+    ) == queue_starts_before
+    assert _wake_states(flow)[event_id] == "delivered"
+    # Idempotent: the started turn is now active on the owner -> no-op.
+    owner.active = True
+    assert await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-18") == ()
+    assert len(owner.starts) == 1

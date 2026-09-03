@@ -17,6 +17,7 @@ from hermes_orchestrator.codex_merger import (
     WakeRegistration,
 )
 from hermes_orchestrator.codex_ponytail_guard import session_guard_config
+from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER
 from hermes_orchestrator.manifests import (
     WAKE_STATUSES as WAKE_STATUSES,
 )
@@ -194,6 +195,8 @@ class CodexQueueDelivery:
         termination_timeout: float = 5.0,
         processes: ProcessRegistry | None = None,
         rpc_factory: RpcFactory | None = None,
+        owner_start: Any = None,
+        cwd_for_project: Any = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("delivery timeout must be positive")
@@ -207,6 +210,8 @@ class CodexQueueDelivery:
         self._timeout = timeout
         self._termination_timeout = termination_timeout
         self._rpc_factory = rpc_factory
+        self._owner_start = owner_start
+        self._cwd_for_project = cwd_for_project
 
     async def deliver(
         self, project_key: str, event: WakeEvent
@@ -336,6 +341,51 @@ class CodexQueueDelivery:
         claim_token = registration.claim_token
         attempts = 0
         reason = "queue_cli_failed"
+        if self._owner_start is not None:
+            # INFRA-223: the desktop app owns the thread, so the envelope
+            # is delivered as a turn the OWNER starts (owner-routed
+            # thread-follower-start-turn) -- never persisted through
+            # ``codex queue`` and started by a stdio helper that would
+            # own and interrupt it. A start that is not proven leaves the
+            # wake un-delivered and the retry actionable.
+            attempts = 1
+            outcome = await self._owner_start.start(
+                thread_id, event.render(generation), cwd=self._cwd_for(project_key)
+            )
+            if outcome.started:
+                recorded = self._channels.record_wake_delivery_success(
+                    project_key,
+                    thread_id=thread_id,
+                    generation=generation,
+                    event_id=event.event_id,
+                    claim_token=claim_token,
+                    candidate_sha=event.candidate_sha,
+                )
+                return QueueDeliveryResult(
+                    delivered=bool(recorded),
+                    attempts=attempts,
+                    thread_id=thread_id,
+                    generation=generation,
+                    reason="owner_started" if recorded else "redelivery_required",
+                    policy_applied=True,
+                    policy_sandbox="thread_settings",
+                    policy_reason=outcome.reason,
+                    started=bool(recorded),
+                )
+            self._channels.record_delivery_failure(
+                project_key, thread_id=thread_id, generation=generation
+            )
+            self._channels.record_wake_attempt_failed(
+                project_key, event.event_id, claim_token=claim_token
+            )
+            return QueueDeliveryResult(
+                delivered=False,
+                attempts=attempts,
+                thread_id=thread_id,
+                generation=generation,
+                reason=outcome.reason,
+                policy_reason=outcome.reason,
+            )
         for _ in range(2):
             attempts += 1
             failure = await self._invoke(
@@ -392,6 +442,22 @@ class CodexQueueDelivery:
             reason=reason,
         )
 
+    @property
+    def owner_endpoint_available(self) -> bool:
+        """True when a desktop-owned path backs turn starts: the desktop
+        IPC owner adapter, or a control-socket proxy factory."""
+
+        return self._owner_start is not None or self._rpc_factory is not None
+
+    def _cwd_for(self, project_key: str) -> str | None:
+        if self._cwd_for_project is None:
+            return None
+        try:
+            value = self._cwd_for_project(project_key)
+        except Exception:
+            return None
+        return None if value is None else str(value)
+
     async def _start_queued_head(
         self, thread_id: str, event_id: str
     ) -> _QueuePolicyStart:
@@ -430,7 +496,7 @@ class CodexQueueDelivery:
                 started=False,
                 policy_applied=False,
                 sandbox=None,
-                reason="no_rpc_factory",
+                reason=f"blocked: {MISSING_OWNER_ADAPTER}",
             )
         try:
             client = factory()

@@ -29,7 +29,7 @@ from hermes_orchestrator.ci_window import (
     PriorMergeFailed,
 )
 from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
-from hermes_orchestrator.codex_rpc import RpcNotification
+from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER, RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import wake_event_with_drift_hint
@@ -1222,6 +1222,15 @@ class MergerTurnService:
             manifest_digest=str(row["manifest_digest"]),
         )
 
+    def _owner_endpoint_blocked_reason(self) -> str | None:
+        """The exact missing-adapter reason when no desktop-owned control
+        endpoint backs turn starts (Sol 9112146a), else ``None``."""
+
+        available = getattr(self._delivery, "owner_endpoint_available", True)
+        if available:
+            return None
+        return f"blocked: {MISSING_OWNER_ADAPTER}"
+
     async def retry_stalled_wake(
         self, project_key: str, event_id: str
     ) -> RetryResult:
@@ -1255,6 +1264,18 @@ class MergerTurnService:
         already-outstanding candidate.
         """
 
+        blocked = self._owner_endpoint_blocked_reason()
+        if blocked is not None:
+            # Refuse BEFORE any CAS or delivery: the wake stays exactly as
+            # it is (actionable once an owner endpoint exists) and no
+            # turn is ever started through an interrupting transport.
+            return RetryResult(
+                event_id=event_id,
+                issue_id=None,
+                retried=False,
+                delivered=False,
+                reason=blocked,
+            )
         requeued = self._requeue_stalled_wake(project_key, event_id)
         if requeued is None:
             return RetryResult(
@@ -1340,6 +1361,34 @@ class MergerTurnService:
             generation=channel.generation,
         ):
             return None
+        owner_start = getattr(self._delivery, "_owner_start", None)
+        activity = getattr(owner_start, "thread_activity", None)
+        if callable(activity):
+            # Owner path, Sol correction 32f98837: ownership alone proves
+            # nothing (a window owns the thread while its turn runs, too).
+            # The owning window's live snapshot must prove the exact
+            # thread has no turn in progress; no snapshot fails closed.
+            try:
+                probe = await activity(channel.thread_id)
+            except Exception:
+                return None
+            if probe.owner_client_id is None or probe.active is not False:
+                return None
+            return event, state, channel
+        discover = getattr(owner_start, "discover_owner", None)
+        if callable(discover):
+            # Owner path (INFRA-223, operator direction 2026-09-03): the
+            # Codex desktop owns the thread. Its owning window is proven
+            # through owner discovery over the desktop IPC socket -- no
+            # stdio App Server is spawned or asked to load the thread --
+            # and an owner-routed start never interrupts a running turn
+            # (the desktop queues it), so the legacy wake is eligible
+            # exactly when a desktop owner exists and no verdict does.
+            try:
+                owner = await discover(channel.thread_id)
+            except Exception:
+                return None
+            return None if owner is None else (event, state, channel)
         try:
             status = await self._merger.thread_status(channel.thread_id)
             if status == "notLoaded":
