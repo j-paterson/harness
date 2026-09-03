@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from hermes_orchestrator.dashboard_sources import (
+    BatchFact,
     CapacityFact,
     CodexFact,
     DashboardSnapshot,
@@ -53,6 +54,7 @@ def render_dashboard(
         ),
         _codex_line(snapshot.codex),
         *(_lane_line(lane) for lane in snapshot.lanes),
+        *(line for fact in snapshot.batches for line in _batch_lines(fact)),
         _status_line(failure),
     ]
     return tuple(_fit(line, width) for line in lines)
@@ -74,6 +76,37 @@ def _lane_line(lane: LaneCellFact) -> str:
         f"lane     {lane.project_key}/{lane.lane_role:<11} "
         f"issue {issue_text:<12} {lane.state}"
     )
+
+
+def _batch_lines(fact: BatchFact) -> list[str]:
+    """The compact per-project batch-completion section (INFRA-215).
+
+    A complete batch collapses to a single line -- there is nothing
+    left to track once every admitted issue is terminal and nothing is
+    still in flight (see `BatchStatus.complete`). Otherwise the full
+    contract renders: objective, issue counts with the exact active
+    and runnable issues, what is still pending settlement, the next
+    automatic action, and any concrete blocker.
+    """
+
+    if fact.complete:
+        return [f"batch {fact.project_key} complete"]
+    active_text = (
+        " ".join(f"{issue_id}:{state}" for issue_id, state in fact.active)
+        if fact.active
+        else "none"
+    )
+    runnable_text = ",".join(fact.runnable) if fact.runnable else "none"
+    lines = [
+        f"batch {fact.project_key} objective: {fact.objective}",
+        f"issues {fact.terminal_total}/{fact.admitted_total} terminal; "
+        f"active: {active_text}; runnable: {runnable_text}",
+        f"pending {fact.pending}",
+        f"next {fact.next_action}",
+    ]
+    if fact.blocker is not None:
+        lines.append(f"blocker {fact.blocker}")
+    return lines
 
 
 def _profile_line(usage: ProfileUsage, lease: ProfileLeaseFact | None) -> str:

@@ -13,6 +13,7 @@ from hermes_orchestrator.dashboard_render import (
     visible_length,
 )
 from hermes_orchestrator.dashboard_sources import (
+    BatchFact,
     CapacityFact,
     CodexFact,
     ControlAttentionFact,
@@ -35,6 +36,7 @@ def _snapshot(
     *,
     codex: CodexFact | None = None,
     leases: tuple[ProfileLeaseFact, ...] = (),
+    batches: tuple[BatchFact, ...] = (),
 ) -> DashboardSnapshot:
     return DashboardSnapshot(
         generated_at="2026-08-30T12:00:00+00:00",
@@ -48,6 +50,34 @@ def _snapshot(
             available=False,
             unavailable_since="2026-08-30T11:00:00+00:00",
         ),
+        batches=batches,
+    )
+
+
+def _batch_fact(
+    *,
+    project_key: str = "proj-a",
+    objective: str = "chat-INFRA-1, chat-INFRA-2",
+    admitted_total: int = 2,
+    terminal_total: int = 0,
+    active: tuple[tuple[str, str], ...] = (("INFRA-2", "in_development"),),
+    runnable: tuple[str, ...] = ("INFRA-1",),
+    pending: str = "candidates=1 corrections=0 merges=0 leases=1",
+    next_action: str = "replenish:INFRA-1",
+    blocker: str | None = None,
+    complete: bool = False,
+) -> BatchFact:
+    return BatchFact(
+        project_key=project_key,
+        objective=objective,
+        admitted_total=admitted_total,
+        terminal_total=terminal_total,
+        active=active,
+        runnable=runnable,
+        pending=pending,
+        next_action=next_action,
+        blocker=blocker,
+        complete=complete,
     )
 
 
@@ -143,6 +173,108 @@ def test_overlong_content_is_truncated_to_width() -> None:
     )
     lines = render_dashboard(_snapshot(codex=codex), width=24)
     assert all(len(line) == 24 for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# INFRA-215 (reopened): the per-project batch-completion section.
+# ---------------------------------------------------------------------------
+
+
+def test_batch_section_shows_objective_runnable_next_action_and_blocker() -> None:
+    fact = _batch_fact(
+        project_key="proj-a",
+        objective="chat-INFRA-1, chat-INFRA-2",
+        admitted_total=2,
+        terminal_total=0,
+        active=(("INFRA-2", "in_development"),),
+        runnable=("INFRA-1",),
+        pending="candidates=1 corrections=0 merges=0 leases=1",
+        next_action="await_operator_decision:INFRA-2",
+        blocker="operator_decision:INFRA-2",
+        complete=False,
+    )
+    lines = render_dashboard(_snapshot(batches=(fact,)), width=100)
+
+    objective_line = next(line for line in lines if line.startswith("batch proj-a"))
+    assert objective_line.rstrip() == (
+        "batch proj-a objective: chat-INFRA-1, chat-INFRA-2"
+    )
+    issues_line = next(line for line in lines if line.startswith("issues "))
+    assert "0/2 terminal" in issues_line
+    assert "active: INFRA-2:in_development" in issues_line
+    assert "runnable: INFRA-1" in issues_line
+    pending_line = next(line for line in lines if line.startswith("pending "))
+    assert (
+        pending_line.rstrip()
+        == "pending candidates=1 corrections=0 merges=0 leases=1"
+    )
+    next_line = next(line for line in lines if line.startswith("next "))
+    assert next_line.rstrip() == "next await_operator_decision:INFRA-2"
+    blocker_line = next(line for line in lines if line.startswith("blocker "))
+    assert blocker_line.rstrip() == "blocker operator_decision:INFRA-2"
+
+
+def test_batch_section_omits_blocker_line_when_absent() -> None:
+    fact = _batch_fact(blocker=None)
+    lines = render_dashboard(_snapshot(batches=(fact,)), width=100)
+
+    assert not any(line.startswith("blocker") for line in lines)
+    issues_line = next(line for line in lines if line.startswith("issues "))
+    assert "runnable: INFRA-1" in issues_line
+
+
+def test_batch_section_renders_complete() -> None:
+    fact = _batch_fact(
+        project_key="proj-b",
+        active=(),
+        runnable=(),
+        pending="candidates=0 corrections=0 merges=0 leases=0",
+        next_action="complete",
+        blocker=None,
+        complete=True,
+    )
+    lines = render_dashboard(_snapshot(batches=(fact,)), width=100)
+
+    complete_line = next(line for line in lines if line.startswith("batch proj-b"))
+    assert complete_line.rstrip() == "batch proj-b complete"
+    assert not any(line.startswith("objective") for line in lines)
+    assert not any(line.startswith("issues ") for line in lines)
+    assert not any(line.startswith("pending ") for line in lines)
+    assert not any(line.startswith("next ") for line in lines)
+
+
+def test_batch_section_renders_one_block_per_project_in_order() -> None:
+    fact_a = _batch_fact(project_key="proj-a")
+    fact_b = _batch_fact(
+        project_key="proj-b",
+        active=(),
+        runnable=(),
+        next_action="complete",
+        complete=True,
+    )
+    lines = render_dashboard(_snapshot(batches=(fact_a, fact_b)), width=100)
+
+    index_a = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("batch proj-a objective:")
+    )
+    index_b = next(
+        index for index, line in enumerate(lines) if line.startswith("batch proj-b")
+    )
+    assert index_a < index_b
+
+
+def test_no_batches_leaves_existing_render_dashboard_output_unchanged() -> None:
+    """The wiring/render tests above assert exact strings from `_snapshot()`
+    with no `batches` argument -- confirm a default (empty) batches tuple
+    renders no batch lines at all, so every pre-existing assertion in this
+    module still holds unchanged."""
+
+    lines = render_dashboard(_snapshot(), width=80)
+    assert not any(line.strip().startswith("batch") for line in lines)
+    assert not any(line.strip().startswith("issues ") for line in lines)
+    assert not any(line.strip().startswith("pending ") for line in lines)
 
 
 # ---------------------------------------------------------------------------

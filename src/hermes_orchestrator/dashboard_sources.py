@@ -17,6 +17,7 @@ from pathlib import Path
 from hermes_orchestrator.codex_rpc import CodexRateLimits
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.profiles import ProfileRegistry
+from hermes_orchestrator.project_driver import TERMINAL_ISSUE_STATES, batch_status
 
 # The project_cells states that mean "this row is the project's current
 # lead" (mirrors the one_active_cell_per_project unique index in
@@ -292,6 +293,30 @@ class LaneCellFact:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchFact:
+    """The durable batch-completion contract (INFRA-215), one per project.
+
+    Every field except ``objective`` is a plain reshaping of
+    :func:`hermes_orchestrator.project_driver.batch_status` -- this
+    fact performs no aggregation of its own beyond formatting
+    ``pending`` and counting ``admitted``/``terminal``.  ``objective``
+    is the one field ``batch_status`` does not derive: see
+    :class:`BatchProvider`.
+    """
+
+    project_key: str
+    objective: str
+    admitted_total: int
+    terminal_total: int
+    active: tuple[tuple[str, str], ...]
+    runnable: tuple[str, ...]
+    pending: str
+    next_action: str
+    blocker: str | None
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardSnapshot:
     """One frozen tick's worth of dashboard facts."""
 
@@ -308,6 +333,7 @@ class DashboardSnapshot:
     attention_control: ControlAttentionFact | None = None
     idle: tuple[IdleFact, ...] = ()
     lanes: tuple[LaneCellFact, ...] = ()
+    batches: tuple[BatchFact, ...] = ()
 
 
 class UsageAggregator:
@@ -1086,6 +1112,73 @@ class ControlAttentionProvider:
         )
 
 
+class BatchProvider:
+    """Compose ``project_driver.batch_status`` into one fact per project.
+
+    Every field except ``objective`` is read straight off
+    :class:`~hermes_orchestrator.project_driver.BatchStatus` -- this
+    provider adds no aggregation of its own for those fields, only
+    formatting (`pending`) and counting (`admitted_total`,
+    `terminal_total`). ``objective`` names the instruction(s) driving
+    the batch: the distinct ``admitted_issues.instruction_id`` values
+    for the project's non-terminal admitted issues, or -- when none of
+    those carry an instruction id (including when there are no
+    non-terminal issues at all) -- every admitted issue's instruction
+    id instead. This is the one query this module adds beyond what
+    ``batch_status`` itself reads.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def batches(
+        self, project_keys: Sequence[str], *, now: datetime
+    ) -> tuple[BatchFact, ...]:
+        """Return one BatchFact per project key, in the given order."""
+
+        return tuple(
+            self._batch_fact(project_key, now=now) for project_key in project_keys
+        )
+
+    def _batch_fact(self, project_key: str, *, now: datetime) -> BatchFact:
+        status = batch_status(self._database, project_key, now=now)
+        pending = (
+            f"candidates={status.pending_candidates} "
+            f"corrections={status.pending_corrections} "
+            f"merges={status.pending_merges} "
+            f"leases={status.live_leases}"
+        )
+        return BatchFact(
+            project_key=status.project_key,
+            objective=self._objective(project_key),
+            admitted_total=len(status.admitted),
+            terminal_total=len(status.terminal),
+            active=status.active,
+            runnable=status.runnable,
+            pending=pending,
+            next_action=status.next_action,
+            blocker=status.blocker,
+            complete=status.complete,
+        )
+
+    def _objective(self, project_key: str) -> str:
+        placeholders = ",".join("?" for _ in TERMINAL_ISSUE_STATES)
+        rows = self._database.execute(
+            "SELECT DISTINCT instruction_id FROM admitted_issues "
+            f"WHERE project_key = ? AND state NOT IN ({placeholders}) "
+            "AND instruction_id IS NOT NULL ORDER BY instruction_id",
+            (project_key, *TERMINAL_ISSUE_STATES),
+        ).fetchall()
+        if not rows:
+            rows = self._database.execute(
+                "SELECT DISTINCT instruction_id FROM admitted_issues "
+                "WHERE project_key = ? AND instruction_id IS NOT NULL "
+                "ORDER BY instruction_id",
+                (project_key,),
+            ).fetchall()
+        return ", ".join(str(row["instruction_id"]) for row in rows)
+
+
 class DashboardSources:
     """Compose every provider into one frozen snapshot per tick."""
 
@@ -1110,6 +1203,7 @@ class DashboardSources:
         self._workers = WorkerProvider(database)
         self._transitions = TransitionProvider(database)
         self._control_attention = ControlAttentionProvider(database)
+        self._batches = BatchProvider(database)
 
     async def collect(self, now: datetime) -> DashboardSnapshot:
         """Read durable state and return this tick's frozen facts."""
@@ -1139,18 +1233,30 @@ class DashboardSources:
         )
         codex = await self._codex.read(generated_at)
         resource = self._resource.resource()
+        tasks = self._tasks.tasks()
+        idle = self._tasks.idle_notes(resource)
+        lanes = self._tasks.lane_cells()
+        # Known projects: the union of every project already surfaced by
+        # another fact this tick -- never a new query of its own (see
+        # BatchProvider).
+        project_keys = sorted(
+            {task.project_key for task in tasks}
+            | {fact.project_key for fact in idle}
+            | {lane.project_key for lane in lanes}
+        )
         return DashboardSnapshot(
             generated_at=generated_at,
             usage=self._usage.usage_for(aliases),
             leases=leases,
             codex=codex,
-            tasks=self._tasks.tasks(),
+            tasks=tasks,
             capacity=self._capacity.capacity(windows_by_alias),
             resource=resource,
             tasks_observed_at=self._tasks.observed_at(),
             workers=self._workers.workers(),
             transitions=self._transitions.transitions(),
             attention_control=self._control_attention.latest(),
-            idle=self._tasks.idle_notes(resource),
-            lanes=self._tasks.lane_cells(),
+            idle=idle,
+            lanes=lanes,
+            batches=self._batches.batches(project_keys, now=now),
         )
