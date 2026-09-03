@@ -2496,6 +2496,41 @@ class TestChannelTrustLifecycle:
         assert payload["source_project_key"] == "demo"
 
     @pytest.mark.asyncio
+    async def test_replacement_cell_adopts_trust_after_source_cell_dies(
+        self,
+        database: Database,
+        bindings: CmuxSurfaceBindings,
+        tmp_path: Path,
+    ) -> None:
+        """A manual trust decision proves the unchanged channel build,
+        not the lifetime of the cell that happened to display it."""
+
+        seed_cell(database)
+        seed_new_project_cell(database)
+        entry = trust_package(tmp_path)
+        source = capture_trust_anchor(database, entry)
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE project_cells SET state = 'failed' WHERE cell_id = ?",
+                ("cell-demo",),
+            )
+        control = ControlOperations(database, events=EventStore(database))
+        port = FakePort(screen=f"...\n{DIALOG_TEXT}\n")
+        binding = bind_new_project_lead(bindings)
+        confirmer = trust_confirmer(database, port, entry, control=control)
+
+        verdict = await confirmer.confirm_seat(binding)
+
+        assert verdict is not None
+        assert verdict.confirmed is True
+        assert port.confirmed == [NEWPROJ]
+        adopted = ChannelTrustAnchors(
+            database, events=EventStore(database)
+        ).active_for_cell("cell-newproj")
+        assert adopted is not None
+        assert adopted.anchor_id != source.anchor_id
+
+    @pytest.mark.asyncio
     async def test_a_same_session_and_surface_re_ensure_never_rebinds(
         self,
         database: Database,
