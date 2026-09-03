@@ -26,6 +26,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import psutil
+
 from hermes_orchestrator.channel_trust import (
     ChannelTrustAnchors,
     ChannelTrustGate,
@@ -2220,19 +2222,27 @@ def _managed_claude_process_lines(session_id: str) -> list[str] | None:
 def live_claude_argv(session_id: str) -> list[str]:
     """The live ``claude`` process argv for one exact session.
 
-    Read from ``ps`` at trust-gate time so the gate compares what is
-    actually running against the anchored launch template (mirrors the
-    CLI's ``channel-trust-confirm`` measurement). The classic command
-    grammar guarantees metacharacter-free, space-free tokens, so a
-    whitespace split reconstructs the argv exactly. Zero or two
-    matching processes both return an empty argv — the gate then fails
-    closed on the template comparison rather than guessing.
+    Read as an argv vector at trust-gate time so a settings JSON token
+    containing spaces stays one token. Zero or two matching processes
+    both return an empty argv — the gate then fails closed rather than
+    guessing.
     """
 
-    matches = _managed_claude_process_lines(session_id)
-    if matches is None or len(matches) != 1:
+    matches: list[list[str]] = []
+    for process in psutil.process_iter(["cmdline"]):
+        try:
+            argv = [str(token) for token in (process.info["cmdline"] or [])]
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        if (
+            session_id in argv
+            and any(flag in argv for flag in ("--resume", "--session-id"))
+            and any("claude" in Path(token).name.lower() for token in argv[:2])
+        ):
+            matches.append(argv)
+    if len(matches) != 1:
         return []
-    return matches[0].split()
+    return matches[0]
 
 
 def managed_claude_worker_alive(session_id: str) -> bool | None:
