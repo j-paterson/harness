@@ -971,25 +971,7 @@ async def test_request_before_start_is_unavailable(
         await client.request("thread/read", {"threadId": "a"}, 5)
 
 
-def test_app_server_command_relays_through_the_control_socket_only_when_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # INFRA-223 (2026-09-03): a spawned ``app-server --listen stdio://``
-    # owned the exact queued turn it started and interrupted it on exit.
-    # When the desktop app's control socket exists the bounded client
-    # relays through ``codex app-server proxy`` (app stays the owner);
-    # Sol correction b4c58b13: when it does NOT exist on this host, the
-    # working stdio launch is kept rather than replaced with an
-    # unavailable socket.
-    import socket
-    import tempfile
-
-    import hermes_orchestrator.codex_rpc as codex_rpc
-
-    # AF_UNIX paths are length-limited; bind under a short temp root.
-    short_root = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
-    missing = short_root / "control" / "app-server-control.sock"
-    monkeypatch.setattr(codex_rpc, "DEFAULT_CONTROL_SOCKET", missing)
+def test_app_server_command_stays_the_stdio_launch_for_read_clients() -> None:
     assert app_server_command() == [
         "/Applications/Codex.app/Contents/Resources/codex",
         "app-server",
@@ -997,16 +979,37 @@ def test_app_server_command_relays_through_the_control_socket_only_when_present(
         "stdio://",
     ]
 
+
+def test_owner_control_command_relays_only_through_a_present_desktop_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # INFRA-223 (2026-09-03): a spawned ``app-server --listen stdio://``
+    # owned the exact queued turn it started and interrupted it on exit.
+    # Turn starts go only through the Codex desktop's own control socket
+    # (proxy) when it is present; Sol corrections b4c58b13 / 9112146a:
+    # when it is absent the owner path is None -- never a stdio fallback.
+    import socket
+    import tempfile
+
+    import hermes_orchestrator.codex_rpc as codex_rpc
+    from hermes_orchestrator.codex_rpc import owner_control_command
+
+    short_root = Path(tempfile.mkdtemp(prefix="hcs-", dir="/tmp"))
+    missing = short_root / "control" / "app-server-control.sock"
+    monkeypatch.setattr(codex_rpc, "DEFAULT_CONTROL_SOCKET", missing)
+    assert owner_control_command() is None
+    assert owner_control_command(socket_path=str(short_root / "absent.sock")) is None
+
     missing.parent.mkdir()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(missing))
     try:
-        assert app_server_command() == [
+        assert owner_control_command() == [
             "/Applications/Codex.app/Contents/Resources/codex",
             "app-server",
             "proxy",
         ]
-        assert app_server_command(socket_path=str(missing)) == [
+        assert owner_control_command(socket_path=str(missing)) == [
             "/Applications/Codex.app/Contents/Resources/codex",
             "app-server",
             "proxy",
@@ -1016,13 +1019,8 @@ def test_app_server_command_relays_through_the_control_socket_only_when_present(
     finally:
         listener.close()
         missing.unlink(missing_ok=True)
-    # A pinned socket that is not exposed keeps the stdio launch too.
-    assert app_server_command(socket_path=str(short_root / "absent.sock"))[-2:] == [
-        "--listen",
-        "stdio://",
-    ]
     with pytest.raises(ValueError, match="absolute"):
-        app_server_command(socket_path="relative.sock")
+        owner_control_command(socket_path="relative.sock")
 
 
 def test_app_server_command_refuses_path_dependent_executables() -> None:

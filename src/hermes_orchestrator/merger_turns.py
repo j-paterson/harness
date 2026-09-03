@@ -29,7 +29,7 @@ from hermes_orchestrator.ci_window import (
     PriorMergeFailed,
 )
 from hermes_orchestrator.codex_merger import CodexMerger, ReviewerChannel
-from hermes_orchestrator.codex_rpc import RpcNotification
+from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER, RpcNotification
 from hermes_orchestrator.config import ProjectConfig
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import wake_event_with_drift_hint
@@ -1222,6 +1222,15 @@ class MergerTurnService:
             manifest_digest=str(row["manifest_digest"]),
         )
 
+    def _owner_endpoint_blocked_reason(self) -> str | None:
+        """The exact missing-adapter reason when no desktop-owned control
+        endpoint backs turn starts (Sol 9112146a), else ``None``."""
+
+        available = getattr(self._delivery, "owner_endpoint_available", True)
+        if available:
+            return None
+        return f"blocked: {MISSING_OWNER_ADAPTER}"
+
     async def retry_stalled_wake(
         self, project_key: str, event_id: str
     ) -> RetryResult:
@@ -1255,6 +1264,18 @@ class MergerTurnService:
         already-outstanding candidate.
         """
 
+        blocked = self._owner_endpoint_blocked_reason()
+        if blocked is not None:
+            # Refuse BEFORE any CAS or delivery: the wake stays exactly as
+            # it is (actionable once an owner endpoint exists) and no
+            # turn is ever started through an interrupting transport.
+            return RetryResult(
+                event_id=event_id,
+                issue_id=None,
+                retried=False,
+                delivered=False,
+                reason=blocked,
+            )
         requeued = self._requeue_stalled_wake(project_key, event_id)
         if requeued is None:
             return RetryResult(

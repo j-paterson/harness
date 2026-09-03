@@ -17,6 +17,7 @@ from hermes_orchestrator.codex_merger import (
     WakeRegistration,
 )
 from hermes_orchestrator.codex_ponytail_guard import session_guard_config
+from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER
 from hermes_orchestrator.manifests import (
     WAKE_STATUSES as WAKE_STATUSES,
 )
@@ -392,6 +393,12 @@ class CodexQueueDelivery:
             reason=reason,
         )
 
+    @property
+    def owner_endpoint_available(self) -> bool:
+        """True when a desktop-owned control endpoint backs turn starts."""
+
+        return self._rpc_factory is not None
+
     async def _start_queued_head(
         self, thread_id: str, event_id: str
     ) -> _QueuePolicyStart:
@@ -430,7 +437,7 @@ class CodexQueueDelivery:
                 started=False,
                 policy_applied=False,
                 sandbox=None,
-                reason="no_rpc_factory",
+                reason=f"blocked: {MISSING_OWNER_ADAPTER}",
             )
         try:
             client = factory()

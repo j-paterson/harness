@@ -72,50 +72,71 @@ DEFAULT_CONTROL_SOCKET = Path.home() / ".codex" / "app-server-control" / (
     "app-server-control.sock"
 )
 
+#: The one supported adapter that is missing on this host (INFRA-223,
+#: 2026-09-03): the Codex desktop app owns its threads through
+#: ``~/.codex/ipc/ipc.sock`` and implements the owner-routed
+#: ``thread-follower-start-turn`` request there, but no shipped client
+#: (``codex app-server proxy --sock``, plain JSON-RPC) is accepted by that
+#: socket. Until one exists, ownership-sensitive turn starts are blocked
+#: with this exact reason rather than launched through a transport that
+#: becomes the turn's owner and interrupts it on exit.
+MISSING_OWNER_ADAPTER = (
+    "no desktop-owned control endpoint: missing supported adapter for the "
+    "Codex desktop IPC socket (~/.codex/ipc/ipc.sock, owner-routed "
+    "thread-follower-start-turn); the stdio app-server launch is refused "
+    "for turn start because it owns and interrupts the started turn"
+)
 
-def app_server_command(
-    executable: str | None = None, *, socket_path: str | None = None
-) -> list[str]:
-    """Return the stable argv for one bounded App Server client.
 
-    INFRA-223 (turn-interruption ownership blocker, 2026-09-03): a
-    second ``app-server --listen stdio://`` process spawned by Hermes
-    became the OWNER of the exact queued turn it started, so the turn
-    was interrupted the moment that bounded helper exited. When the
-    Codex desktop app exposes its control socket, the client relays
-    through ``codex app-server proxy`` instead: the app stays the sole
-    owner of the thread and its turns while the bounded client connects,
-    acts, and disconnects.
-
-    Sol correction b4c58b13 (Critical): the proxy is selected ONLY when
-    that desktop-owned endpoint is proven present on this host -- the
-    exact ``socket_path`` given, else :data:`DEFAULT_CONTROL_SOCKET`.
-    When no such endpoint exists the previously working bounded stdio
-    launch is kept, never replaced with an unavailable socket; the
-    ownership defect stays observable there until the endpoint is
-    exposed, but nothing that works today stops working.
-
-    Only an absolute executable path (and socket path) is accepted; a
-    bare or relative name would resolve through the caller's PATH and
-    reproduce the observed exit-127 launch failure under cmux's minimal
-    environment.
-    """
+def _validate_executable(executable: str | None) -> str:
     resolved = executable if executable is not None else CODEX_BINARY
     if not Path(resolved).is_absolute():
         raise ValueError(
             "the codex app-server executable must be an absolute path"
         )
+    return resolved
+
+
+def app_server_command(executable: str | None = None) -> list[str]:
+    """Return the stable argv that launches a bounded App Server on stdio.
+
+    Used by read/resume clients (thread status, channel recovery,
+    verdict settlement). It is NEVER used to start a queued Sol turn:
+    a stdio App Server becomes the owner of the turn it starts and
+    interrupts it on exit (INFRA-223, turn 01a0655d… after 348 ms) --
+    see :func:`owner_control_command`.
+
+    Only an absolute executable path is accepted; a bare or relative
+    name would resolve through the caller's PATH and reproduce the
+    observed exit-127 launch failure under cmux's minimal environment.
+    """
+    return [_validate_executable(executable), "app-server", "--listen", "stdio://"]
+
+
+def owner_control_command(
+    executable: str | None = None, *, socket_path: str | None = None
+) -> list[str] | None:
+    """Return the argv that relays to the Codex desktop's OWN app-server
+    control socket, or ``None`` when no desktop-owned endpoint exists.
+
+    Sol corrections b4c58b13 / 9112146a (Critical): the proxy is
+    selected only when the exact pinned ``socket_path`` or
+    :data:`DEFAULT_CONTROL_SOCKET` is present as a socket. There is no
+    stdio fallback here -- a caller that needs the owner path and gets
+    ``None`` must fail closed with :data:`MISSING_OWNER_ADAPTER`.
+    """
+    resolved = _validate_executable(executable)
     if socket_path is not None and not Path(socket_path).is_absolute():
         raise ValueError(
             "the codex app-server control socket must be an absolute path"
         )
     endpoint = Path(socket_path) if socket_path is not None else DEFAULT_CONTROL_SOCKET
-    if endpoint.is_socket():
-        command = [resolved, "app-server", "proxy"]
-        if socket_path is not None:
-            command.extend(["--sock", socket_path])
-        return command
-    return [resolved, "app-server", "--listen", "stdio://"]
+    if not endpoint.is_socket():
+        return None
+    command = [resolved, "app-server", "proxy"]
+    if socket_path is not None:
+        command.extend(["--sock", socket_path])
+    return command
 
 
 class CodexUnavailable(RuntimeError):

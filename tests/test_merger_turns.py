@@ -3139,3 +3139,42 @@ async def test_issue_scoped_retry_recovers_a_pre_fix_false_success(
         (event_id, True, True)
     ]
     assert flow.database.scalar("SELECT count(*) FROM submitted_verdicts") == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_refuses_before_starting_a_turn_without_a_desktop_owned_endpoint(
+    flow: ProductionShapedFlow,
+) -> None:
+    # Sol correction 9112146a: without a live desktop-owned control
+    # endpoint the ownership-sensitive retry refuses BEFORE any CAS or
+    # delivery, names the exact missing adapter, and never selects the
+    # interrupting stdio launch. The stalled wake stays exactly as it is.
+    from hermes_orchestrator.codex_rpc import MISSING_OWNER_ADAPTER
+
+    await flow.merger.ensure_thread("demo")
+    flow.stage("ENG-17", SHA_A, pr_number=22)
+    emitted = await flow.emitter.emit("demo", "ENG-17", verification=(("t", "ok"),))
+    event_id = emitted.event.event_id
+    await flow.turns.on_notification(
+        RpcNotification(
+            method="turn/completed",
+            params={"threadId": "thr_legacy", "turnId": "turn-1"},
+        )
+    )
+    assert _wake_states(flow)[event_id] == "stalled"
+    queued_before = len(flow.processes.messages())
+    flow.delivery._rpc_factory = None
+    assert flow.delivery.owner_endpoint_available is False
+
+    results = await flow.turns.retry_stalled_wakes_for_issue("demo", "ENG-17")
+
+    assert [(r.retried, r.delivered, r.reason) for r in results] == [
+        (False, False, f"blocked: {MISSING_OWNER_ADAPTER}")
+    ]
+    assert _wake_states(flow)[event_id] == "stalled"
+    assert len(flow.processes.messages()) == queued_before
+    assert flow.database.scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'merger.turn_retry_requested' "
+        "AND correlation_id = ?",
+        (event_id,),
+    ) == 0

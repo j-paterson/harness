@@ -26,7 +26,11 @@ from hermes_orchestrator.circleci import (
 )
 from hermes_orchestrator.codex_merger import CodexMerger, ContractAwareDelivery
 from hermes_orchestrator.codex_queue import CodexQueueDelivery
-from hermes_orchestrator.codex_rpc import CodexRpcClient, app_server_command
+from hermes_orchestrator.codex_rpc import (
+    CodexRpcClient,
+    app_server_command,
+    owner_control_command,
+)
 from hermes_orchestrator.config import Settings
 from hermes_orchestrator.db import Database
 from hermes_orchestrator.emission import CandidateEmitter
@@ -308,8 +312,19 @@ def build_merge_flow(
     # INFRA-223: a short-lived App Server connection, built fresh per
     # bounded start and closed immediately, so the queued turn on the idle
     # pinned thread is actually started without ever holding the thread.
-    delivery_kwargs["rpc_factory"] = lambda: CodexRpcClient(
-        app_server_command(), base_env=base_env, processes=processes
+    # INFRA-223: the queued-turn start goes ONLY through a desktop-owned
+    # control endpoint. Without one the factory is None and the delivery
+    # blocks the start with MISSING_OWNER_ADAPTER -- never the stdio
+    # launch that owns and interrupts the started turn.
+    owner_command = owner_control_command()
+    delivery_kwargs["rpc_factory"] = (
+        None
+        if owner_command is None
+        else (
+            lambda: CodexRpcClient(
+                owner_command, base_env=base_env, processes=processes
+            )
+        )
     )
     delivery = CodexQueueDelivery(
         channels=merger, manifest_root=manifest_root, **delivery_kwargs
