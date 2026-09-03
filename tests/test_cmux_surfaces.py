@@ -33,6 +33,7 @@ from hermes_orchestrator.cmux_surfaces import (
     CmuxSurfaceReconciler,
     HibernationDecision,
     classic_channel_command,
+    live_claude_argv,
     managed_claude_worker_alive,
 )
 from hermes_orchestrator.control_operations import ControlOperations
@@ -3531,6 +3532,37 @@ def test_managed_claude_worker_alive_is_unknown_when_ps_fails(
     monkeypatch.setattr(cmux_surfaces.subprocess, "run", _boom)
 
     assert managed_claude_worker_alive(SESSION) is None
+
+
+def test_live_claude_argv_preserves_an_argument_containing_spaces(
+    tmp_path: Path,
+) -> None:
+    """The settings JSON is one argv token even though its hook commands
+    contain spaces; trust comparison must not reconstruct it with split."""
+
+    import subprocess
+    import sys
+    import time
+
+    probe = tmp_path / "claude_probe.py"
+    probe.write_text("import time; time.sleep(10)\n", encoding="utf-8")
+    expected = [
+        sys.executable,
+        str(probe),
+        "--settings",
+        '{"command":"cmux hooks claude session-start"}',
+        "--session-id",
+        SESSION,
+    ]
+    process = subprocess.Popen(expected)
+    try:
+        time.sleep(0.05)
+        actual = live_claude_argv(SESSION)
+        assert len(actual) == len(expected)
+        assert actual[1:] == expected[1:]
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
 
 
 @pytest.mark.asyncio
