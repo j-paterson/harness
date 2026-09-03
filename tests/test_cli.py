@@ -9513,6 +9513,132 @@ def test_reconcile_reports_an_unbindable_issue_lane_instead_of_exiting_clean(
     assert result.output.strip()
 
 
+def _seed_linear_reconcile_row(
+    state_dir: Path, *, issue_id: str, project_key: str, state: str
+) -> None:
+    """One raw ``admitted_issues`` row, free to name a project the
+    fixture never registered -- ``reconcile --linear`` never validates
+    project registration, so this exercises the same isolation the
+    reconciler itself is tested against in ``test_linear_reconcile.py``."""
+
+    from hermes_orchestrator.db import Database
+
+    now = datetime.now(UTC).isoformat()
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at"
+                ") VALUES (?, ?, 1, ?, ?, 1, 0, ?, ?)",
+                (issue_id, project_key, state, f"instr-{issue_id}", now, now),
+            )
+    finally:
+        database.close()
+
+
+def test_reconcile_linear_completes_stale_row_and_isolates_unavailable_project(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-230 end to end: ``reconcile --linear`` moves a Done-in-Linear
+    row to ``done`` locally and reports it as completed, leaves a
+    non-terminal row unchanged, and isolates a read failure in another
+    project to just that one issue -- the base read-only reconcile's own
+    keys survive untouched and the JSON payload gains a ``linear`` block."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_linear_reconcile_row(
+        state_dir, issue_id="INFRA-1", project_key="demo", state="review"
+    )
+    _seed_linear_reconcile_row(
+        state_dir, issue_id="INFRA-2", project_key="demo", state="queued"
+    )
+    _seed_linear_reconcile_row(
+        state_dir, issue_id="INFRA-3", project_key="other", state="review"
+    )
+
+    constructed: list[object] = []
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            if issue_id == "INFRA-1":
+                return types.SimpleNamespace(status="Done")
+            if issue_id == "INFRA-2":
+                return types.SimpleNamespace(status="In Development")
+            raise RuntimeError("linear timed out")
+
+    def _lazy_linear_reads(keychain: object) -> object:
+        constructed.append(keychain)
+        return _FakeLinearReads()
+
+    monkeypatch.setattr(cli_module, "_LazyLinearReads", _lazy_linear_reads)
+
+    result = invoke(
+        [*base_arguments(configured_repo), "reconcile", "--linear", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # The pre-existing keys are untouched.
+    assert set(["completed", "findings", "admission_open"]) <= payload.keys()
+
+    linear = payload["linear"]
+    assert linear["completed"] == 1
+    assert linear["unchanged"] == 1
+    assert linear["unavailable"] == 1
+    outcomes_by_id = {outcome["issue_id"]: outcome for outcome in linear["outcomes"]}
+    assert outcomes_by_id["INFRA-1"]["action"] == "completed"
+    assert outcomes_by_id["INFRA-2"]["action"] == "unchanged"
+    assert outcomes_by_id["INFRA-3"]["action"] == "unavailable"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        rows = {
+            str(row["issue_id"]): str(row["state"])
+            for row in database.execute(
+                "SELECT issue_id, state FROM admitted_issues"
+            ).fetchall()
+        }
+    finally:
+        database.close()
+    assert rows["INFRA-1"] == "done"
+    assert rows["INFRA-2"] == "queued"
+    assert rows["INFRA-3"] == "review"
+    assert constructed  # the reader was actually built for --linear
+
+
+def test_reconcile_without_linear_flag_omits_block_and_never_builds_reader(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``--linear``, ``reconcile --json`` is byte-identical to
+    the pre-INFRA-230 shape: no ``linear`` key, and the Keychain-backed
+    reader is never even constructed."""
+
+    import hermes_orchestrator.cli as cli_module
+
+    invoke([*base_arguments(configured_repo), "init"])
+
+    constructed: list[object] = []
+
+    def _lazy_linear_reads(keychain: object) -> object:
+        constructed.append(keychain)
+        raise AssertionError("reconcile without --linear must not build a reader")
+
+    monkeypatch.setattr(cli_module, "_LazyLinearReads", _lazy_linear_reads)
+
+    result = invoke([*base_arguments(configured_repo), "reconcile", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "linear" not in payload
+    assert constructed == []
+
+
 def test_target_issue_requires_every_binding_flag(
     configured_repo: tuple[Path, Path],
 ) -> None:
