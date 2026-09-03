@@ -342,8 +342,9 @@ async def test_open_thread_creates_a_dedicated_codex_window_before_deep_linking(
     await open_thread_in_desktop(THREAD, process_factory=spawn)
 
     assert calls[0][0:2] == ("/usr/bin/osascript", "-e")
-    assert 'process "ChatGPT"' in calls[0][2]
-    assert 'menu item "New Window"' in calls[0][2]
+    assert 'application id "com.openai.codex"' in calls[0][2]
+    assert "make new window" in calls[0][2]
+    assert "System Events" not in calls[0][2]
     assert calls[1] == ("/usr/bin/open", "-g", f"codex://threads/{THREAD}")
 
 
