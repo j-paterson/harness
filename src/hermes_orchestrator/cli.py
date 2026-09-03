@@ -6471,9 +6471,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     session_id=args.session,
                     instruction=args.instruction,
                     known_projects=settings.projects.keys(),
+                    # INFRA-230: read the issue's authoritative Linear
+                    # state before any assignment is published; a
+                    # terminal status or an unreadable Keychain/Linear
+                    # read refuses this targeting closed (see
+                    # ``_LazyLinearReads`` and
+                    # ``issue_targeting._refuse_if_linear_closed``).
+                    linear_reads=_LazyLinearReads(Keychain()),
                 )
             except IssueTargetingRefused as error:
-                print(str(error), file=sys.stderr)
+                print(
+                    f"target-issue refused for {args.issue_id}: {error}",
+                    file=sys.stderr,
+                )
                 return 1
             _print(
                 result.assignment.as_dict(),

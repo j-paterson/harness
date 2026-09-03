@@ -8984,10 +8984,26 @@ def test_start_lane_harness_checkout_refusal_exits_nonzero(
 
 
 def test_target_issue_refuses_an_unknown_issue_without_writes(
-    configured_repo: tuple[Path, Path],
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # INFRA-220: the CLI surface reaches the strict transition and its
     # fail-closed refusal exits non-zero without publishing anything.
+    #
+    # INFRA-230: ``target-issue`` now reads Linear before it reaches
+    # that local admission predicate at all, so a fake non-terminal
+    # reader is wired in here -- exactly like the ``hermes-command``
+    # tests above -- to keep this test about the unknown-issue refusal
+    # rather than the real Keychain/Linear reader.
+    import hermes_orchestrator.cli as cli_module
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="In Development")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
     invoke([*base_arguments(configured_repo), "init"])
 
     result = invoke(
@@ -9008,6 +9024,154 @@ def test_target_issue_refuses_an_unknown_issue_without_writes(
 
     assert result.exit_code == 1
     assert result.output.strip()
+
+
+def _seed_target_issue_fixture(
+    state_dir: Path,
+    *,
+    issue_id: str,
+    cell_id: str = "cell-demo",
+    session_id: str = "11111111-2222-4333-8444-555555555555",
+    profile_alias: str = "max-c",
+) -> None:
+    """A queued admitted issue plus a live development cell with an
+    active profile lease -- exactly what ``target_issue`` requires
+    before it will publish anything."""
+
+    from hermes_orchestrator.db import Database
+
+    now = "2026-08-30T12:00:00+00:00"
+    database = Database.open(state_dir / "state.db")
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO admitted_issues("
+                "issue_id, project_key, priority, state, instruction_id, "
+                "dependency_ready, overlap_risk, admitted_at, updated_at) "
+                "VALUES (?, 'demo', 2, 'queued', ?, 1, 0, ?, ?)",
+                (issue_id, f"instr-{issue_id}", now, now),
+            )
+            connection.execute(
+                "INSERT INTO project_cells("
+                "cell_id, project_key, state, profile_alias, session_id, "
+                "created_at, updated_at) VALUES (?, 'demo', 'active', ?, ?, ?, ?)",
+                (cell_id, profile_alias, session_id, now, now),
+            )
+            connection.execute(
+                "INSERT INTO profile_leases("
+                "profile_alias, project_key, state, acquired_at) "
+                "VALUES (?, 'demo', 'active', ?)",
+                (profile_alias, now),
+            )
+    finally:
+        database.close()
+
+
+def test_target_issue_refuses_a_terminal_linear_issue_with_no_assignment(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INFRA-230 end to end: ``target-issue`` reads Linear before
+    publishing, and a ``Done`` issue is refused closed -- exit 1, no
+    ``lead_assignments`` row, and the local queued row untouched."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_target_issue_fixture(state_dir, issue_id="INFRA-208")
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="Done")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "target-issue",
+            "INFRA-208",
+            "--project",
+            "demo",
+            "--cell",
+            "cell-demo",
+            "--session",
+            "11111111-2222-4333-8444-555555555555",
+            "--instruction",
+            "work this issue next",
+        ]
+    )
+
+    assert result.exit_code == 1
+    assert "INFRA-208" in result.output
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assignment_count = database.execute(
+            "SELECT COUNT(*) AS n FROM lead_assignments"
+        ).fetchone()["n"]
+        issue_state = database.execute(
+            "SELECT state FROM admitted_issues WHERE issue_id = 'INFRA-208'"
+        ).fetchone()["state"]
+    finally:
+        database.close()
+    assert assignment_count == 0
+    assert str(issue_state) == "queued"
+
+
+def test_target_issue_publishes_when_linear_status_is_not_terminal(
+    configured_repo: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counterpart happy path: a non-terminal Linear status never
+    blocks ``target-issue`` -- it publishes exactly as before."""
+
+    import hermes_orchestrator.cli as cli_module
+    from hermes_orchestrator.db import Database
+
+    _repo_root, state_dir = configured_repo
+    invoke([*base_arguments(configured_repo), "init"])
+    _seed_target_issue_fixture(state_dir, issue_id="INFRA-208")
+
+    class _FakeLinearReads:
+        def get_issue(self, issue_id: str) -> object:
+            return types.SimpleNamespace(status="In Development")
+
+    monkeypatch.setattr(
+        cli_module, "_LazyLinearReads", lambda keychain: _FakeLinearReads()
+    )
+
+    result = invoke(
+        [
+            *base_arguments(configured_repo),
+            "target-issue",
+            "INFRA-208",
+            "--project",
+            "demo",
+            "--cell",
+            "cell-demo",
+            "--session",
+            "11111111-2222-4333-8444-555555555555",
+            "--instruction",
+            "work this issue next",
+            "--json",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["issue_id"] == "INFRA-208"
+
+    database = Database.open(state_dir / "state.db")
+    try:
+        assignment_count = database.execute(
+            "SELECT COUNT(*) AS n FROM lead_assignments"
+        ).fetchone()["n"]
+    finally:
+        database.close()
+    assert assignment_count == 1
 
 
 def test_open_rotation_collaborators_selects_prompt_by_lane(

@@ -95,6 +95,8 @@ from hermes_orchestrator.db import Database
 from hermes_orchestrator.domain import IssueState
 from hermes_orchestrator.events import EventInput, EventStore
 from hermes_orchestrator.lead_assignments import LeadAssignment, LeadAssignments
+from hermes_orchestrator.queue import _LINEAR_TERMINAL_STATUSES
+from hermes_orchestrator.reconcile import LinearReadPort
 from hermes_orchestrator.work_claims import WorkClaims
 
 _ACTIVE_CELL_STATES = ("starting", "active", "handoff_required", "paused")
@@ -104,6 +106,47 @@ _CURRENT_SESSION_STATES = ("starting", "active")
 
 class IssueTargetingRefused(ValueError):
     """Raised when any durable predicate fails; no write has occurred."""
+
+
+def _refuse_if_linear_closed(
+    linear_reads: LinearReadPort | None, issue_id: str
+) -> None:
+    """INFRA-230: refuse closed BEFORE any transaction opens when the
+    issue's authoritative Linear state says it should never be
+    targeted, or cannot be read at all.
+
+    Called before ``database.transaction()`` opens in both
+    :func:`target_issue` and :func:`target_harness_followup`, so a
+    refusal here writes nothing and never journals anything — the
+    admitted-issue row (if any) is left exactly as it was, moved
+    neither forward nor backward.
+
+    ``linear_reads`` is optional and keyword-only at the call sites:
+    when ``None`` (no caller has wired one in yet) this is a no-op and
+    behaviour is byte-identical to the pre-INFRA-230 module. When
+    provided, a transient read failure (network, auth, Keychain, ...)
+    isolates THIS issue — it never propagates past this one call — by
+    raising :class:`IssueTargetingRefused` rather than letting an
+    unrelated exception type escape; the caller can then retry once
+    Linear is reachable again. A durably terminal status (the same
+    vocabulary ``queue._LINEAR_TERMINAL_STATUSES`` already uses for
+    reactivation) or a missing/unknown status is refused the same way.
+    """
+
+    if linear_reads is None:
+        return
+    try:
+        issue = linear_reads.get_issue(issue_id)
+    except Exception as error:  # isolate this issue, refuse closed
+        raise IssueTargetingRefused(
+            f"linear read failed for {issue_id}: {error}; targeting refused closed"
+        ) from error
+    status = getattr(issue, "status", None)
+    if status is None or status in _LINEAR_TERMINAL_STATUSES:
+        raise IssueTargetingRefused(
+            f"issue {issue_id} is {status} in Linear; "
+            "a terminal issue is never targeted"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +178,7 @@ def target_issue(
     instruction: str,
     known_projects: Collection[str],
     claims: WorkClaims | None = None,
+    linear_reads: LinearReadPort | None = None,
 ) -> TargetIssueResult:
     """Publish one assignment packet for an admitted issue — publication
     only; the transition itself happens at :func:`acknowledge_target`.
@@ -153,12 +197,22 @@ def target_issue(
     target that publication itself would refuse. ``WorkClaims.open_in``
     is idempotent, so a re-published (idempotent) target never
     duplicates the live claim either.
+
+    INFRA-230: when ``linear_reads`` is given, the issue's
+    authoritative Linear state is read and checked BEFORE this
+    function's own transaction opens (see
+    :func:`_refuse_if_linear_closed`) — a terminal Linear status (or an
+    unreadable one) refuses this call with zero writes, before any
+    local predicate is even re-proved, and before ``admitted_issues``
+    is touched in either direction. ``linear_reads=None`` (the
+    default) is a no-op: every existing caller is unaffected.
     """
 
     if not instruction.strip():
         raise IssueTargetingRefused("an operator instruction is required")
     if project_key not in known_projects:
         raise IssueTargetingRefused(f"unknown project {project_key!r}")
+    _refuse_if_linear_closed(linear_reads, issue_id)
 
     with database.transaction() as connection:
         issue_row = connection.execute(
@@ -315,6 +369,7 @@ def target_harness_followup(
     instruction: str,
     known_projects: Collection[str],
     claims: WorkClaims | None = None,
+    linear_reads: LinearReadPort | None = None,
 ) -> TargetIssueResult:
     """Attach one explicitly admitted, dependency-ready project issue to
     a lead already durably bound to a HARNESS-lane primary assignment
@@ -377,12 +432,23 @@ def target_harness_followup(
     ``admitted_issues`` state independent of that projection and is
     unaffected; it may still run to completion the ordinary way once
     Fable produces a change for it.
+
+    INFRA-230: this is a distinct, read-only Linear check from the
+    projection effect above — when ``linear_reads`` is given, the
+    issue's authoritative Linear state is read and checked BEFORE this
+    function's own transaction opens (see
+    :func:`_refuse_if_linear_closed`); a terminal or unreadable status
+    refuses the whole call with zero writes, before the CAS on
+    ``admitted_issues`` (or any other local predicate) even runs.
+    ``linear_reads=None`` (the default) is a no-op: every existing
+    caller is unaffected.
     """
 
     if not instruction.strip():
         raise IssueTargetingRefused("an operator instruction is required")
     if project_key not in known_projects:
         raise IssueTargetingRefused(f"unknown project {project_key!r}")
+    _refuse_if_linear_closed(linear_reads, issue_id)
 
     with database.transaction() as connection:
         issue_row = connection.execute(
