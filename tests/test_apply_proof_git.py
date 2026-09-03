@@ -872,7 +872,8 @@ def test_symmetric_repeated_context_untouched_by_parent_rejects_as_ambiguous(
     from its parent), so the merge settles on that binding with the
     distinct ``exact_binding_ambiguous_patch`` relation instead of
     trusting either occurrence (Sol b30c55f3); no applied tree is
-    claimed. The guarded live-merge gate keeps refusing ambiguity.
+    claimed. The exact GitHub binding, not this duplicated context, is the
+    authority for both guarded and externally reconciled merges.
     """
 
     ctx = "# ctx1\n# ctx2\n# ctx3\n"

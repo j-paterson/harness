@@ -208,6 +208,12 @@ class IntegrationMerge:
             result.merge_sha,
             merge_method,
             base_sha=base_sha,
+            # The GitHub merge adapter re-read and matched the exact
+            # repository, branch, base, and reviewed head immediately before
+            # issuing this merge. A duplicated patch preimage is therefore
+            # inconclusive corroboration, not a reason to strand a merge that
+            # GitHub has already completed for that exact candidate.
+            trust_exact_binding=True,
         )
         return ProvenMerge(
             project_key=project_key,
@@ -330,10 +336,9 @@ class IntegrationMerge:
         the merge commit's own tree.
 
         ``trust_exact_binding`` (INFRA-198) is set only by callers that
-        have already independently proven the exact GitHub PR binding
-        (reviewed head SHA == candidate SHA, merged, base matched, merge
-        commit present) before this method ever runs -- it never applies
-        to the guarded live-merge gate in ``merge_approved``. Even then it
+        have already independently proven the exact GitHub PR binding,
+        including ``merge_approved`` after its guarded GitHub adapter has
+        matched the repository, branch, base, and reviewed head. It
         changes nothing about the ancestry proof above (a merge commit
         that is not reachable from the integration branch, or a candidate
         base that is not reachable from the merge parent, still refuses
