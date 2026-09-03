@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DESKTOP_IPC_SOCKET = Path.home() / ".codex" / "ipc" / "ipc.sock"
+CODEX_DESKTOP_CLI = "/Applications/Codex.app/Contents/Resources/codex"
 LOCAL_HOST_ID = "local"
 
 #: Per-method request versions the desktop validates (``request-version-
@@ -457,9 +458,14 @@ class OwnerTurnStarter:
         client = self._client_factory()
         try:
             await client.connect()
+            resolved_cwd = cwd
+            if resolved_cwd is None and self._cwd_for_thread is not None:
+                resolved_cwd = self._cwd_for_thread(thread_id)
             owner = await client.discover_owner(thread_id, host_id=self._host_id)
             if owner is None:
-                owner = await self._register_and_rediscover(client, thread_id)
+                owner = await self._register_and_rediscover(
+                    client, thread_id, cwd=resolved_cwd
+                )
             if owner is None:
                 return OwnerStartOutcome(
                     started=False,
@@ -470,9 +476,6 @@ class OwnerTurnStarter:
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": message, "text_elements": []}],
             }
-            resolved_cwd = cwd
-            if resolved_cwd is None and self._cwd_for_thread is not None:
-                resolved_cwd = self._cwd_for_thread(thread_id)
             if resolved_cwd is not None:
                 request["cwd"] = str(resolved_cwd)
             await client.start_turn(
@@ -502,10 +505,10 @@ class OwnerTurnStarter:
             await client.close()
 
     async def _register_and_rediscover(
-        self, client: DesktopIpcClient, thread_id: str
+        self, client: DesktopIpcClient, thread_id: str, *, cwd: str | None = None
     ) -> str | None:
         try:
-            await self._register_owner(thread_id)
+            await self._register_owner(thread_id, cwd=cwd)
         except Exception:
             return None
         deadline = asyncio.get_running_loop().time() + self._owner_wait_seconds
@@ -517,18 +520,20 @@ class OwnerTurnStarter:
 
 
 async def open_thread_in_desktop(
-    thread_id: str, *, process_factory: Any = asyncio.create_subprocess_exec
+    thread_id: str,
+    *,
+    cwd: str | None = None,
+    process_factory: Any = asyncio.create_subprocess_exec,
 ) -> None:
     """Open ``thread_id`` in its own Codex window, then let IPC prove ownership.
 
     A ``codex://threads`` deep link only navigates the app's current primary
-    window.  An unowned second-project Merger therefore needs Codex's built-in
-    ``New Window`` action first; the caller's bounded owner rediscovery remains
+    window. An unowned second-project Merger therefore opens its workspace
+    through the installed Codex CLI first; bounded owner rediscovery remains
     the authoritative proof that the intended thread actually attached.
     """
 
-    script = 'tell application id "com.openai.codex" to make new window\n'
-    process = await process_factory("/usr/bin/osascript", "-e", script)
+    process = await process_factory(CODEX_DESKTOP_CLI, "app", cwd or str(Path.cwd()))
     code = await asyncio.wait_for(process.wait(), 10.0)
     if code != 0:
         raise DesktopIpcUnavailable(f"new Codex window exited with {code}")
