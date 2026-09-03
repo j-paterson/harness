@@ -38,6 +38,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
+from hermes_orchestrator.channel_trust import ChannelTrustAnchors
 from hermes_orchestrator.cmux_surfaces import CmuxSurfaceBindings
 from hermes_orchestrator.control_operations import (
     CONTROL_READY,
@@ -231,6 +232,7 @@ class ChannelHub:
         ids: Callable[[], str] | None = None,
         now: Callable[[], datetime] | None = None,
         control: ControlOperations | None = None,
+        anchors: ChannelTrustAnchors | None = None,
     ) -> None:
         self._database = database
         self._bindings = bindings
@@ -239,6 +241,7 @@ class ChannelHub:
         self._ids = ids or (lambda: uuid.uuid4().hex)
         self._now = now or _utc_now
         self._control = control
+        self._anchors = anchors
         self._events = EventStore(database)
         self._server: asyncio.AbstractServer | None = None
         self._connections: dict[str, asyncio.StreamWriter] = {}
@@ -785,6 +788,20 @@ class ChannelHub:
         # A registration that follows any earlier one is a recovery:
         # the lead gets a durable, ACKable receipt instead of the
         # operator having to notice a reconnect in a terminal.
+        if self._anchors is not None and int(prior[0]) == 0:
+            # INFRA-187: the first registration of this exact session is
+            # the proof that the operator's manual channel confirmation
+            # succeeded -- persist its trust anchor once, best effort.
+            with suppress(Exception):
+                binding = self._bindings.active_lead(str(message["cell_id"]))
+                if binding is not None:
+                    self._anchors.capture_after_confirmation(
+                        cell_id=str(message["cell_id"]),
+                        session_id=session_id,
+                        workspace_uuid=str(binding.workspace_uuid),
+                        surface_uuid=str(binding.surface_uuid),
+                        profile_alias=str(message["profile"]),
+                    )
         if self._control is not None and int(prior[0]) > 0:
             with suppress(Exception):
                 self._control.record(

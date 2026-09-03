@@ -3127,3 +3127,94 @@ def test_displayed_channel_entries_valid_fails_closed_on_duplicate_entry() -> No
 def test_displayed_channel_entries_valid_fails_closed_without_a_dialog_region() -> None:
     assert displayed_channel_entries_valid(_LAUNCH_ECHO) is False
     assert displayed_channel_entries_valid("") is False
+
+
+# --------------------------------------------------------------------
+# INFRA-187 (2026-09-03): the one manual confirmation persists an anchor
+# --------------------------------------------------------------------
+
+
+def _refuse_with_dialog(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+) -> str:
+    package_root, entry_path = package
+    gate, _confirm, _read_screen = _make_gate(database, events, anchors, control)
+    result = _evaluate(
+        gate,
+        entry_path=entry_path,
+        package_root=package_root,
+        screen_text=f"...\n{DIALOG_TEXT}\n",
+    )
+    assert result.confirmed is False
+    assert result.first_failure == "anchor_present"
+    assert result.receipt_operation_id is not None
+    return result.receipt_operation_id
+
+
+def _register_after_confirmation(anchors: ChannelTrustAnchors):
+    return anchors.capture_after_confirmation(
+        cell_id=CELL,
+        session_id=SESSION,
+        workspace_uuid=WORKSPACE,
+        surface_uuid=SURFACE,
+        profile_alias=PROFILE,
+    )
+
+
+def test_manual_confirmation_registration_captures_a_proven_anchor(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """Sol correction 6246aba3 / live cell 9e7e5c87: an ``anchor_present``
+    refusal followed by the operator's manual Enter and the exact
+    session's registration persists one fully proven anchor on the live
+    cell, so a new project can adopt it for an unchanged build."""
+
+    operation_id = _refuse_with_dialog(database, events, anchors, control, package)
+
+    anchor = _register_after_confirmation(anchors)
+
+    assert anchor is not None
+    assert anchor.cell_id == CELL
+    assert anchor.prompt_pattern == PROMPT_PATTERN
+    assert anchor.launch_argv_template == tuple(_argv())
+    assert control.get(operation_id).state == "superseded"
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO project_cells("
+            "cell_id, project_key, state, profile_alias, session_id, "
+            "created_at, updated_at) VALUES ('cell-lab-1', 'lab', 'active', "
+            "?, ?, ?, ?)",
+            (PROFILE, OTHER_UUID, NOW.isoformat(), NOW.isoformat()),
+        )
+    assert anchors.proven_source_cell("lab", exclude_cell_id="cell-lab-1") == CELL
+    # The re-registration of the same session finds no live refusal.
+    assert _register_after_confirmation(anchors) is None
+    assert database.scalar("SELECT count(*) FROM channel_trust_anchors") == 1
+
+
+def test_manual_confirmation_capture_refuses_a_changed_build(
+    database: Database,
+    events: EventStore,
+    anchors: ChannelTrustAnchors,
+    control: ControlOperations,
+    package: tuple[Path, Path],
+    seeded_cell: None,
+) -> None:
+    """A build that changed between the refusal and the registration is
+    a new trust decision: nothing is captured and nothing is written."""
+
+    _package_root, entry_path = package
+    _refuse_with_dialog(database, events, anchors, control, package)
+    entry_path.write_text("console.log('drifted');\n", encoding="utf-8")
+
+    assert _register_after_confirmation(anchors) is None
+    assert database.scalar("SELECT count(*) FROM channel_trust_anchors") == 0

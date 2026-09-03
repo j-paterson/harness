@@ -24,6 +24,7 @@ from hermes_orchestrator.channel_hub import (
     ChannelPacketRouter,
     hub_socket_path,
 )
+from hermes_orchestrator.channel_trust import ChannelTrustAnchors
 from hermes_orchestrator.checkpoints import CheckpointRequests, CheckpointSafetyStore
 from hermes_orchestrator.circleci import (
     CircleCiClient,
@@ -886,6 +887,7 @@ def open_runtime(
                     capabilities=channel_capabilities,
                     socket_path=hub_socket_path(settings.state_dir),
                     control=control_operations,
+                    anchors=ChannelTrustAnchors(database, events=events),
                 )
                 channel_router = ChannelPacketRouter(channel_hub)
                 channel_router.attach(lead_wakes)
