@@ -951,6 +951,32 @@ class ChannelHub:
                     "AND state = 'published'",
                     (stamp, stamp, packet_id, session_id),
                 )
+                wake = connection.execute(
+                    "UPDATE lead_terminal_wakes SET state = 'delivered', "
+                    "delivered_at = ? WHERE wake_id = ? AND session_id = ? "
+                    "AND state = 'pending' AND EXISTS ("
+                    "SELECT 1 FROM channel_events WHERE event_id = ? "
+                    "AND packet_id = ? AND session_id = ? "
+                    "AND kind = 'HERMES_WORK_READY' AND state = 'acked')",
+                    (
+                        stamp,
+                        packet_id,
+                        session_id,
+                        event_id,
+                        packet_id,
+                        session_id,
+                    ),
+                )
+                if wake.rowcount == 1:
+                    self._events.append(
+                        connection,
+                        EventInput(
+                            event_type="lead_wake.delivered",
+                            aggregate_type="lead_wake",
+                            aggregate_id=packet_id,
+                            payload={},
+                        ),
+                    )
                 return {"op": "ack_ok", "event_id": event_id}
         return {
             "op": "ack_refused",
