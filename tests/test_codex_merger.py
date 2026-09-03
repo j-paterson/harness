@@ -1705,3 +1705,21 @@ def test_constructor_refuses_non_sol_model(
             prompt_file=PROMPT_PATH,
             model="gpt-5.6-other",
         )
+
+
+def test_contract_aware_delivery_exposes_the_owner_path_of_its_inner_delivery() -> None:
+    # INFRA-223: the turn service reads the desktop owner adapter through
+    # this wrapper, so the facts must pass through unchanged.
+    import types
+
+    from hermes_orchestrator.codex_merger import ContractAwareDelivery
+
+    inner = types.SimpleNamespace(owner_endpoint_available=False, _owner_start=None)
+    wrapper = ContractAwareDelivery(merger=types.SimpleNamespace(), inner=inner)  # type: ignore[arg-type]
+    assert wrapper.owner_endpoint_available is False
+    assert wrapper._owner_start is None
+    owner = object()
+    inner = types.SimpleNamespace(owner_endpoint_available=True, _owner_start=owner)
+    wrapper = ContractAwareDelivery(merger=types.SimpleNamespace(), inner=inner)  # type: ignore[arg-type]
+    assert wrapper.owner_endpoint_available is True
+    assert wrapper._owner_start is owner

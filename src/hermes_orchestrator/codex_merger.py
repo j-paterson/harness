@@ -1698,6 +1698,17 @@ class ContractAwareDelivery:
         self._merger = merger
         self._inner = inner
 
+    # INFRA-223: the owner-path facts live on the wrapped queue delivery;
+    # expose them unchanged so the turn service sees the desktop owner
+    # adapter (and its absence) through this wrapper.
+    @property
+    def owner_endpoint_available(self) -> bool:
+        return bool(getattr(self._inner, "owner_endpoint_available", True))
+
+    @property
+    def _owner_start(self) -> object | None:
+        return getattr(self._inner, "_owner_start", None)
+
     async def deliver(self, project_key: str, event: WakeEvent) -> object:
         channel = self._merger.read_channel(project_key)
         if (
