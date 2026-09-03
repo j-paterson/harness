@@ -345,7 +345,7 @@ def _channel_entry_appears_once(argv: Sequence[str]) -> bool:
 
 
 _RUNTIME_PROMPT_PATH = re.compile(
-    r"^(.+/runtimes/)[0-9a-f]{40}(/prompts/claude-lead\.md)$"
+    r"^(.+/runtimes/)([0-9a-f]{40})(/prompts/claude-lead\.md)$"
 )
 
 
@@ -362,17 +362,24 @@ def _same_runtime_prompt(live_token: str, template_token: str) -> bool:
     if (
         live_match is None
         or template_match is None
-        or live_match.groups() != template_match.groups()
+        or live_match.group(1) != template_match.group(1)
+        or live_match.group(3) != template_match.group(3)
     ):
         return False
     live = Path(live_token)
     template = Path(template_token)
     try:
+        active = Path(
+            (Path(live_match.group(1)) / "ACTIVE")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
         return (
             live.resolve() == live
             and template.resolve() == template
             and live.is_file()
             and template.is_file()
+            and active.resolve() == active == live.parents[1]
         )
     except OSError:
         return False
